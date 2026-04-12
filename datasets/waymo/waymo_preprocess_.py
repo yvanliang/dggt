@@ -37,6 +37,8 @@ except ImportError:
 
 import numpy as np
 import tensorflow as tf
+from waymo_open_dataset import label_pb2
+from waymo_open_dataset.protos import camera_segmentation_pb2 as cs_pb2
 from waymo_open_dataset.utils import box_utils, range_image_utils, transform_utils
 from waymo_open_dataset.utils.frame_utils import parse_range_image_and_camera_projection
 from waymo_open_dataset.wdl_limited.camera.ops import py_camera_model_ops
@@ -45,6 +47,27 @@ from waymo_open_dataset.wdl_limited.camera.ops import py_camera_model_ops
 gpu_devices = tf.config.experimental.list_physical_devices("GPU")
 for device in gpu_devices:
     tf.config.experimental.set_memory_growth(device, True)
+
+MOVEABLE_OBJECTS_IDS = [
+    cs_pb2.CameraSegmentation.TYPE_CAR,
+    cs_pb2.CameraSegmentation.TYPE_TRUCK,
+    cs_pb2.CameraSegmentation.TYPE_BUS,
+    cs_pb2.CameraSegmentation.TYPE_OTHER_LARGE_VEHICLE,
+    cs_pb2.CameraSegmentation.TYPE_BICYCLE,
+    cs_pb2.CameraSegmentation.TYPE_MOTORCYCLE,
+    cs_pb2.CameraSegmentation.TYPE_TRAILER,
+    cs_pb2.CameraSegmentation.TYPE_PEDESTRIAN,
+    cs_pb2.CameraSegmentation.TYPE_CYCLIST,
+    cs_pb2.CameraSegmentation.TYPE_MOTORCYCLIST,
+    cs_pb2.CameraSegmentation.TYPE_BIRD,
+    cs_pb2.CameraSegmentation.TYPE_GROUND_ANIMAL,
+    cs_pb2.CameraSegmentation.TYPE_PEDESTRIAN_OBJECT,
+]
+
+WAYMO_CLASSES = ["unknown", "Vehicle", "Pedestrian", "Sign", "Cyclist"]
+WAYMO_DYNAMIC_CLASSES = ["Vehicle", "Pedestrian", "Cyclist"]
+WAYMO_HUMAN_CLASSES = ["Pedestrian", "Cyclist"]
+WAYMO_VEHICLE_CLASSES = ["Vehicle"]
 
 
 def project_vehicle_to_image(vehicle_pose, calibration, points):
@@ -379,6 +402,12 @@ def convert_range_image_to_point_cloud_flow(
         range_image_top_pose_tensor_rotation, range_image_top_pose_tensor_translation
     )
     for c in calibrations:
+        if c.name not in range_images_flow or len(range_images_flow[c.name]) <= ri_index:
+            continue
+        if c.name not in range_images or len(range_images[c.name]) <= ri_index:
+            continue
+        if c.name not in camera_projections or len(camera_projections[c.name]) <= ri_index:
+            continue
         range_image = range_images[c.name][ri_index]
         range_image_flow = range_images_flow[c.name][ri_index]
         if len(c.beam_inclinations) == 0:  # pylint: disable=g-explicit-length-test
@@ -531,6 +560,15 @@ class WaymoProcessor:
                 self.save_dynamic_mask(frame, file_id, frame_id)
             if "ground" in self.process_keys:
                 self.save_ground(frame, file_id, frame_id)
+        if "objects" in self.process_keys:
+            instances_info, frame_instances, object_id_map = self.save_objects(dataset)
+            scene_path = os.path.join(self.save_dir, f"{scene_id:03d}", "instances")
+            with open(os.path.join(scene_path, "instances_info.json"), "w") as f:
+                json.dump(instances_info, f)  # remove indent=4 to save storage
+            with open(os.path.join(scene_path, "frame_instances.json"), "w") as f:
+                json.dump(frame_instances, f)  # remove indent=4 to save storage
+            with open(os.path.join(scene_path, "object_id_map.json"), "w") as f:
+                json.dump(object_id_map, f, indent=4)
         self.make_json(file_id)
 
     def make_json(self, file_id):
@@ -928,11 +966,17 @@ class WaymoProcessor:
         """
         scene_id = self.scene_ids[file_id]
         scene_path = f"{self.save_dir}/{str(scene_id).zfill(3)}"
+        valid_classes_map = {
+            "all": set(WAYMO_DYNAMIC_CLASSES),
+            "human": set(WAYMO_HUMAN_CLASSES),
+            "vehicle": set(WAYMO_VEHICLE_CLASSES),
+        }
+        appearances_by_type = {k: [] for k in valid_classes_map}
         for img in frame.images:
             # dynamic_mask
             img_path = f"{scene_path}/images/" + f"{str(frame_id).zfill(3)}_{str(img.name - 1)}.jpg"
             img_shape = np.array(Image.open(img_path))
-            dynamic_mask = np.zeros_like(img_shape, dtype=np.float32)[..., 0]
+            dynamic_masks = {k: np.zeros_like(img_shape, dtype=np.float32)[..., 0] for k in valid_classes_map}
 
             filter_available = any(
                 [label.num_top_lidar_points_in_box > 0 for label in frame.laser_labels]
@@ -943,6 +987,9 @@ class WaymoProcessor:
             for label in frame.laser_labels:
                 # camera_synced_box is not available for the data with flow.
                 # box = label.camera_synced_box
+                class_name = WAYMO_CLASSES[label.type] if 0 <= label.type < len(WAYMO_CLASSES) else "unknown"
+                if class_name not in WAYMO_DYNAMIC_CLASSES:
+                    continue
                 box = label.box
                 meta = label.metadata
                 speed = np.linalg.norm([meta.speed_x, meta.speed_y])
@@ -992,24 +1039,145 @@ class WaymoProcessor:
                 xy = (u.min(), v.min())
                 width = u.max() - u.min()
                 height = v.max() - v.min()
-                # max pooling
-                dynamic_mask[
-                    int(xy[1]) : int(xy[1] + height),
-                    int(xy[0]) : int(xy[0] + width),
-                ] = np.maximum(
-                    dynamic_mask[
+                bbox = [float(u.min()), float(v.min()), float(u.max()), float(v.max())]
+                for mask_type, valid_classes in valid_classes_map.items():
+                    if class_name not in valid_classes:
+                        continue
+                    dynamic_masks[mask_type][
                         int(xy[1]) : int(xy[1] + height),
                         int(xy[0]) : int(xy[0] + width),
-                    ],
-                    speed,
-                )
-            # thresholding, use 1.0 m/s to determine whether the pixel is moving
-            dynamic_mask = np.clip((dynamic_mask > 1.0) * 255, 0, 255).astype(np.uint8)
-            dynamic_mask = Image.fromarray(dynamic_mask, "L")
-            dynamic_mask_path = (
+                    ] = np.maximum(
+                        dynamic_masks[mask_type][
+                            int(xy[1]) : int(xy[1] + height),
+                            int(xy[0]) : int(xy[0] + width),
+                        ],
+                        speed,
+                    )
+                    if speed > 1.0:
+                        appearances_by_type[mask_type].append(
+                            {
+                                "frame_idx": frame_id,
+                                "camera_id": int(img.name - 1),
+                                "car_id": str(label.id),
+                                "bbox_2d": bbox,
+                            }
+                        )
+            # Keep the legacy flat mask for DGGT compatibility.
+            legacy_dynamic_mask = np.clip((dynamic_masks["all"] > 1.0) * 255, 0, 255).astype(np.uint8)
+            Image.fromarray(legacy_dynamic_mask, "L").save(
                 f"{scene_path}/dynamic_masks/" + f"{str(frame_id).zfill(3)}_{str(img.name - 1)}.png"
             )
-            dynamic_mask.save(dynamic_mask_path)
+            for mask_type in ["human", "vehicle"]:
+                dynamic_mask = dynamic_masks[mask_type]
+                dynamic_mask_uint8 = np.clip((dynamic_mask > 1.0) * 255, 0, 255).astype(np.uint8)
+                Image.fromarray(dynamic_mask_uint8, "L").save(
+                    f"{scene_path}/dynamic_masks/{mask_type}/" + f"{str(frame_id).zfill(3)}_{str(img.name - 1)}.png"
+                )
+        for mask_type, appearances in appearances_by_type.items():
+            if not appearances:
+                continue
+            save_path = os.path.join(scene_path, f"appearances_{mask_type}.json")
+            if os.path.exists(save_path):
+                with open(save_path, "r") as f:
+                    old = json.load(f)
+                appearances = old + appearances
+            with open(save_path, "w") as f:
+                json.dump(appearances, f, indent=2)
+
+    def save_objects(self, dataset):
+        """Collect dynamic object tracks while keeping DGGT's contiguous-id format."""
+        instances_info = {}
+        frame_instances = {}
+
+        for frame_idx, data in enumerate(dataset):
+            frame = dataset_pb2.Frame()
+            frame.ParseFromString(data.numpy())
+            frame_instances[frame_idx] = []
+
+            for label in frame.laser_labels:
+                class_name = WAYMO_CLASSES[label.type] if 0 <= label.type < len(WAYMO_CLASSES) else "unknown"
+                if class_name not in WAYMO_DYNAMIC_CLASSES:
+                    continue
+
+                raw_object_id = str(label.id)
+                frame_instances[frame_idx].append(raw_object_id)
+
+                if raw_object_id not in instances_info:
+                    instances_info[raw_object_id] = {
+                        "id": raw_object_id,
+                        "raw_object_id": raw_object_id,
+                        "class_name": class_name,
+                        "max_speed_mps": 0.0,
+                        "mean_speed_mps": 0.0,
+                        "is_moving_track": False,
+                        "frame_annotations": {
+                            "frame_idx": [],
+                            "obj_to_world": [],
+                            "box_size": [],
+                            "speed_mps": [],
+                        },
+                    }
+
+                frame_pose = np.array(frame.pose.transform).reshape(4, 4)
+                box = label.box
+                meta = label.metadata
+                speed = float(
+                    np.linalg.norm(
+                        [
+                            float(getattr(meta, "speed_x", 0.0)),
+                            float(getattr(meta, "speed_y", 0.0)),
+                            float(getattr(meta, "speed_z", 0.0)),
+                        ]
+                    )
+                )
+                tx, ty, tz = box.center_x, box.center_y, box.center_z
+                c = np.math.cos(box.heading)
+                s = np.math.sin(box.heading)
+                o2v = np.array(
+                    [
+                        [c, -s, 0, tx],
+                        [s, c, 0, ty],
+                        [0, 0, 1, tz],
+                        [0, 0, 0, 1],
+                    ]
+                )
+                obj_to_world = frame_pose @ o2v
+                box_size = [box.length, box.width, box.height]
+
+                instances_info[raw_object_id]["frame_annotations"]["frame_idx"].append(frame_idx)
+                instances_info[raw_object_id]["frame_annotations"]["obj_to_world"].append(obj_to_world.tolist())
+                instances_info[raw_object_id]["frame_annotations"]["box_size"].append(box_size)
+                instances_info[raw_object_id]["frame_annotations"]["speed_mps"].append(speed)
+
+        for raw_object_id, instance_info in instances_info.items():
+            speed_values = instance_info["frame_annotations"].get("speed_mps", [])
+            if len(speed_values) == 0:
+                max_speed = 0.0
+                mean_speed = 0.0
+            else:
+                max_speed = float(np.max(speed_values))
+                mean_speed = float(np.mean(speed_values))
+            instance_info["max_speed_mps"] = max_speed
+            instance_info["mean_speed_mps"] = mean_speed
+            instance_info["is_moving_track"] = bool(max_speed > 1.0)
+
+        raw_to_contig = {}
+        contig_to_raw = {}
+        new_instances_info = {}
+        for contig_id, raw_object_id in enumerate(instances_info.keys()):
+            raw_to_contig[raw_object_id] = contig_id
+            contig_to_raw[str(contig_id)] = raw_object_id
+            new_instances_info[contig_id] = instances_info[raw_object_id]
+
+        new_frame_instances = {}
+        for frame_idx, raw_instance_ids in frame_instances.items():
+            new_frame_instances[frame_idx] = [raw_to_contig[raw_id] for raw_id in raw_instance_ids]
+
+        object_id_map = {
+            "contig_to_raw": contig_to_raw,
+            "raw_to_contig": raw_to_contig,
+        }
+        return new_instances_info, new_frame_instances, object_id_map
 
     def create_folder(self):
         """Create folder for data preprocessing."""
@@ -1017,6 +1185,8 @@ class WaymoProcessor:
             scene_path = f"{self.save_dir}/{str(i).zfill(3)}"
             os.makedirs(f"{scene_path}/images", exist_ok=True)
             os.makedirs(f"{scene_path}/dynamic_masks", exist_ok=True)
+            os.makedirs(f"{scene_path}/dynamic_masks/human", exist_ok=True)
+            os.makedirs(f"{scene_path}/dynamic_masks/vehicle", exist_ok=True)
             for downsample_factor in self.downsample_factors:
                 postfix = "" if downsample_factor == 1 else f"_{downsample_factor}"
                 os.makedirs(f"{scene_path}/images{postfix}", exist_ok=True)
@@ -1026,3 +1196,5 @@ class WaymoProcessor:
             os.makedirs(f"{scene_path}/extrinsics", exist_ok=True)
             os.makedirs(f"{scene_path}/intrinsics", exist_ok=True)
             os.makedirs(f"{scene_path}/lidar", exist_ok=True)
+            if "objects" in self.process_keys:
+                os.makedirs(f"{scene_path}/instances", exist_ok=True)

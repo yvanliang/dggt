@@ -66,7 +66,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--process_keys",
         nargs="+",
-        default=["images", "lidar", "calib", "pose", "ground", "dynamic_masks"],
+        default=["images", "lidar", "calib", "pose", "ground", "dynamic_masks", "objects"],
     )
     args = parser.parse_args()
     if args.dataset != "nuscenes" and args.interpolate_N > 0:

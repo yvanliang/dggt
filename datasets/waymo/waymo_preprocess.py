@@ -499,17 +499,32 @@ class WaymoProcessor(object):
                 if str_id not in instances_info:
                     instances_info[str_id] = dict(
                         id=l.id,
+                        raw_object_id=str_id,
                         # class_ind=l.type,
                         class_name=WAYMO_CLASSES[l.type],
+                        max_speed_mps=0.0,
+                        mean_speed_mps=0.0,
+                        is_moving_track=False,
                         frame_annotations={
                             "frame_idx": [],
                             "obj_to_world": [],
                             "box_size": [],
+                            "speed_mps": [],
                         }
                     )
                 
                 # https://github.com/waymo-research/waymo-open-dataset/blob/master/waymo_open_dataset/label.proto
                 box = l.box
+                meta = l.metadata
+                speed = float(
+                    np.linalg.norm(
+                        [
+                            float(getattr(meta, "speed_x", 0.0)),
+                            float(getattr(meta, "speed_y", 0.0)),
+                            float(getattr(meta, "speed_z", 0.0)),
+                        ]
+                    )
+                )
                 
                 # Box coordinates in vehicle frame.
                 tx, ty, tz = box.center_x, box.center_y, box.center_z
@@ -542,6 +557,19 @@ class WaymoProcessor(object):
                 instances_info[str_id]['frame_annotations']['frame_idx'].append(frame_idx)
                 instances_info[str_id]['frame_annotations']['obj_to_world'].append(pose.tolist())
                 instances_info[str_id]['frame_annotations']['box_size'].append(dimension)
+                instances_info[str_id]['frame_annotations']['speed_mps'].append(speed)
+
+        for instance_info in instances_info.values():
+            speed_values = instance_info["frame_annotations"].get("speed_mps", [])
+            if len(speed_values) == 0:
+                max_speed = 0.0
+                mean_speed = 0.0
+            else:
+                max_speed = float(np.max(speed_values))
+                mean_speed = float(np.mean(speed_values))
+            instance_info["max_speed_mps"] = max_speed
+            instance_info["mean_speed_mps"] = mean_speed
+            instance_info["is_moving_track"] = bool(max_speed > 1.0)
                 
         # Correct ID mapping
         id_map = {}
