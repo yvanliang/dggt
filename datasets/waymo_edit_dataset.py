@@ -831,26 +831,53 @@ class WaymoEditDataset(Dataset):
             )
 
             view_sequences = {}
+            transfer_boxes_by_view = object_record.get("boxes_by_view_transfer", object_record.get("boxes_by_view", {}))
+            raw_boxes_by_view = object_record.get("boxes_by_view_raw", {})
+            model_boxes_by_view = object_record.get("boxes_by_view_model", {})
+            if len(raw_boxes_by_view) == 0 or len(model_boxes_by_view) == 0:
+                raise KeyError(
+                    "Metadata record is missing boxes_by_view_raw/model. "
+                    "Regenerate metadata with datasets/tools/build_edit_metadata.py."
+                )
             for view_offset, cam_id in enumerate(self.camera_ids):
                 cam_name = CAM_ID_TO_NAME[cam_id]
-                boxes, valid_mask = normalize_box_sequence(
-                    object_record["boxes_by_view"].get(cam_name),
+                transfer_boxes, transfer_valid_mask = normalize_box_sequence(
+                    transfer_boxes_by_view.get(cam_name),
                     expected_length=clip_len,
                 )
-                view_sequences[view_offset] = (cam_id, boxes, valid_mask)
+                raw_boxes, raw_valid_mask = normalize_box_sequence(
+                    raw_boxes_by_view.get(cam_name),
+                    expected_length=clip_len,
+                )
+                model_boxes, model_valid_mask = normalize_box_sequence(
+                    model_boxes_by_view.get(cam_name),
+                    expected_length=clip_len,
+                )
+                view_sequences[view_offset] = {
+                    "cam_id": cam_id,
+                    "transfer_boxes": transfer_boxes,
+                    "transfer_valid_mask": transfer_valid_mask,
+                    "raw_boxes": raw_boxes,
+                    "raw_valid_mask": raw_valid_mask,
+                    "model_boxes": model_boxes,
+                    "model_valid_mask": model_valid_mask,
+                }
 
             for local_idx, scene_frame_idx in enumerate(clip_frame_indices):
-                for view_offset, (cam_id, transfer_boxes, transfer_valid_mask) in view_sequences.items():
-                    if not transfer_valid_mask[local_idx]:
+                for view_offset, view_data in view_sequences.items():
+                    transfer_valid = bool(view_data["transfer_valid_mask"][local_idx])
+                    raw_valid = bool(view_data["raw_valid_mask"][local_idx])
+                    model_valid = bool(view_data["model_valid_mask"][local_idx])
+                    if not transfer_valid:
                         continue
-                    raw_hw = scene_cache["image_size_by_cam"][cam_id]
-                    transfer_box = transfer_boxes[local_idx]
-                    raw_box = transfer_box_to_raw_box(
-                        transfer_box,
-                        raw_hw=raw_hw,
-                        transfer_hw=DEFAULT_TRANSFER_HW,
-                    )
-                    model_box, _ = transform_box_xyxy(raw_box, raw_hw)
+                    transfer_box = view_data["transfer_boxes"][local_idx]
+                    if not (raw_valid and model_valid):
+                        raise ValueError(
+                            f"Metadata boxes are invalid for object_slot={object_slot}, frame={local_idx}, cam={view_data['cam_id']}. "
+                            "Regenerate metadata with datasets/tools/build_edit_metadata.py."
+                        )
+                    raw_box = view_data["raw_boxes"][local_idx]
+                    model_box = view_data["model_boxes"][local_idx]
 
                     object_bbox_valid_mask[object_slot, local_idx, view_offset] = True
                     object_bbox_transfer[object_slot, local_idx, view_offset] = numpy_like_to_torch(

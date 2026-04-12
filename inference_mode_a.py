@@ -1,0 +1,811 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from pathlib import Path
+
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
+
+from datasets.waymo_edit_dataset import (
+    DEFAULT_ASSET_ROOT,
+    DEFAULT_PROCESSED_ROOT,
+    DEFAULT_RAW_ROOT,
+    DEFAULT_TRANSFER_ROOT,
+    WaymoEditDataset,
+    draw_projected_3d_box,
+    project_world_points_to_model_image,
+)
+from dggt.utils.gaussian_edit import (
+    apply_mode_a,
+    build_clean_scene_state,
+    estimate_scene_alignment,
+    localize_objects,
+    parse_object_slots,
+)
+from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
+from dggt.utils.geometry import unproject_depth_map_to_point_map
+from dggt.utils.gs import concat_list, get_split_gs
+from dggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+
+def alpha_t(t: torch.Tensor, t0: torch.Tensor | float, alpha: torch.Tensor, gamma0: torch.Tensor, gamma1: float = 0.1):
+    if not torch.is_tensor(t0):
+        t0 = torch.tensor(float(t0), dtype=t.dtype, device=t.device)
+    sigma = torch.log(torch.tensor(gamma1, dtype=alpha.dtype, device=alpha.device)) / ((gamma0) ** 2 + 1e-6)
+    conf = torch.exp(sigma * (t0 - t) ** 2)
+    return (alpha * conf).float()
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Single-sample Mode A inference and online gaussian editing.")
+    parser.add_argument("--index", type=int, required=True, help="WaymoEditDataset sample index.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Where to write renders and PLY files.")
+    parser.add_argument(
+        "--ckpt_path",
+        type=str,
+        default="/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt",
+        help="DGGT checkpoint path.",
+    )
+    parser.add_argument("--split", type=str, default="training")
+    parser.add_argument("--views", type=int, default=1)
+    parser.add_argument("--dataset_mode", type=int, default=2)
+    parser.add_argument("--sequence_length", type=int, default=4)
+    parser.add_argument("--processed_root", type=str, default=DEFAULT_PROCESSED_ROOT)
+    parser.add_argument("--transfer_root", type=str, default=DEFAULT_TRANSFER_ROOT)
+    parser.add_argument("--raw_root", type=str, default=DEFAULT_RAW_ROOT)
+    parser.add_argument("--asset_root", type=str, default=DEFAULT_ASSET_ROOT)
+    parser.add_argument("--manifest_path", type=str, default=None)
+    parser.add_argument("--candidate_path", type=str, default=None)
+    parser.add_argument("--object_slots", type=str, default="all", help="Comma-separated slot ids or 'all'.")
+    parser.add_argument("--min_match_score", type=float, default=0.1, help="Skip low-confidence slot-to-scene matches.")
+    parser.add_argument("--dynamic_thresh", type=float, default=0.5)
+    parser.add_argument("--motion_speed_thresh", type=float, default=1.0)
+    parser.add_argument("--dynamic_prob_thresh", type=float, default=0.55)
+    parser.add_argument("--dynamic_ratio_thresh", type=float, default=0.35)
+    parser.add_argument("--core_scale", type=float, default=0.85)
+    parser.add_argument("--shell_scale", type=float, default=1.05)
+    parser.add_argument("--proposal_scale", type=float, default=1.25)
+    parser.add_argument("--render_max_points", type=int, default=250000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--clean_only", action="store_true", help="Only run clean-pass render and GT 3D box overlay.")
+    parser.add_argument("--skip_ply", action="store_true", help="Skip writing PLY outputs during debug runs.")
+    return parser
+
+
+def _load_model(ckpt_path: str, device: torch.device):
+    from dggt.models.vggt import VGGT
+
+    model = VGGT().to(device)
+    checkpoint = torch.load(ckpt_path, map_location="cpu")
+    state_dict = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Unsupported checkpoint format at {ckpt_path}")
+
+    cleaned = {}
+    for key, value in state_dict.items():
+        new_key = key[7:] if key.startswith("module.") else key
+        cleaned[new_key] = value
+    missing, unexpected = model.load_state_dict(cleaned, strict=False)
+    ignored_prefixes = ("track_head.", "sky_model.")
+    real_missing = [key for key in missing if not key.startswith(ignored_prefixes)]
+    real_unexpected = [key for key in unexpected if not key.startswith(ignored_prefixes)]
+    if real_missing:
+        raise RuntimeError(f"Missing checkpoint keys: {real_missing[:10]}")
+    if real_unexpected:
+        raise RuntimeError(f"Unexpected checkpoint keys: {real_unexpected[:10]}")
+    model.eval()
+    return model
+
+
+def _tensor_to_pil_rgb(image: torch.Tensor) -> Image.Image:
+    if image.dim() != 3:
+        raise ValueError(f"Expected [C,H,W], got {tuple(image.shape)}")
+    image = image.detach().cpu().float().clamp(0.0, 1.0)
+    if image.shape[0] == 1:
+        image = image.repeat(3, 1, 1)
+    if image.shape[0] != 3:
+        raise ValueError(f"Expected 1 or 3 channels, got {image.shape[0]}")
+    image_u8 = image.mul(255.0).add(0.5).clamp(0.0, 255.0).to(torch.uint8).permute(1, 2, 0).contiguous()
+    height, width = image_u8.shape[:2]
+    return Image.frombytes("RGB", (width, height), bytes(image_u8.view(torch.uint8).untyped_storage()))
+
+
+def _make_pil_grid(images: list[Image.Image], nrow: int) -> Image.Image:
+    if len(images) == 0:
+        raise ValueError("Cannot build a grid from zero images")
+    width, height = images[0].size
+    nrow = max(1, min(nrow, len(images)))
+    ncol = int(math.ceil(len(images) / float(nrow)))
+    canvas = Image.new("RGB", (width * nrow, height * ncol))
+    for idx, image in enumerate(images):
+        row = idx // nrow
+        col = idx % nrow
+        canvas.paste(image, (col * width, row * height))
+    return canvas
+
+
+def _save_grid(images: torch.Tensor, path: Path, nrow: int | None = None) -> None:
+    if images.dim() != 4:
+        raise ValueError(f"Expected [N,3,H,W], got {tuple(images.shape)}")
+    if nrow is None:
+        nrow = min(4, images.shape[0])
+    pil_images = [_tensor_to_pil_rgb(image) for image in images]
+    _make_pil_grid(pil_images, nrow=nrow).save(path)
+
+
+def _save_dataset_box_overlay_grid(sample: dict, output_path: Path) -> None:
+    overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in sample["images_clean"]]
+    editable_count = int(sample["editable_object_count"].item())
+    editable_slots = sample["editable_object_indices"][:editable_count].tolist()
+    num_views = int(sample["cam_ids"].numel())
+    colors = [
+        (0, 255, 0),
+        (255, 200, 0),
+        (255, 0, 0),
+        (0, 200, 255),
+        (255, 0, 255),
+        (160, 255, 0),
+    ]
+
+    for color_idx, object_slot in enumerate(editable_slots):
+        track_valid = sample["object_track_valid_mask_selected"][object_slot]
+        corners_world = sample["object_box_corners_world_selected"][object_slot]
+        scene_raw_id = sample["object_scene_raw_ids"][object_slot]
+        asset_object_id = sample["object_asset_ids"][object_slot]
+        color = colors[color_idx % len(colors)]
+
+        for frame_idx in range(min(sample["frame_indices"].numel(), corners_world.shape[0])):
+            if not bool(track_valid[frame_idx].item()):
+                continue
+            for cam_offset, cam_id in enumerate(sample["cam_ids"].tolist()):
+                image_idx = frame_idx * num_views + cam_offset
+                if image_idx >= len(overlay_images):
+                    continue
+                projected_corners, projected_valid = project_world_points_to_model_image(
+                    corners_world[frame_idx].tolist(),
+                    sample["camera_to_world_corrected"][frame_idx, cam_offset].tolist(),
+                    sample["intrinsics"][cam_offset].tolist(),
+                    sample["raw_image_size_hw"][cam_offset].tolist(),
+                )
+                if not projected_valid.any():
+                    continue
+                object_tag = scene_raw_id if scene_raw_id else asset_object_id
+                label = f"{object_tag[:8]} f{int(sample['frame_indices'][frame_idx].item())} c{cam_id}"
+                overlay_images[image_idx] = draw_projected_3d_box(
+                    overlay_images[image_idx],
+                    projected_corners,
+                    projected_valid,
+                    color=color,
+                    label=label,
+                )
+
+    pil_images = [Image.fromarray(image) for image in overlay_images]
+    _make_pil_grid(pil_images, nrow=max(1, num_views)).save(output_path)
+
+
+def _save_target_vs_asset_boxes(clean_images: torch.Tensor, localized_objects, output_path: Path) -> None:
+    pil_images = [_tensor_to_pil_rgb(img) for img in clean_images]
+    colors = [
+        (0, 255, 0),
+        (255, 0, 0),
+        (255, 200, 0),
+        (0, 200, 255),
+        (255, 0, 255),
+        (160, 255, 0),
+    ]
+    for item in localized_objects:
+        if item.frame_idx < 0 or item.frame_idx >= len(pil_images):
+            continue
+        draw = ImageDraw.Draw(pil_images[item.frame_idx])
+        color = colors[item.slot_idx % len(colors)]
+        if item.target_bbox_model is not None:
+            draw.rectangle([float(v) for v in item.target_bbox_model.tolist()], outline=color, width=2)
+        if item.projected_asset_bbox is not None:
+            draw.rectangle([float(v) for v in item.projected_asset_bbox.tolist()], outline=(255, 255, 255), width=2)
+    _make_pil_grid(pil_images, nrow=min(4, len(pil_images))).save(output_path)
+
+
+def _save_mask_overlay_grid(clean_images: torch.Tensor, localized_objects, output_path: Path, mask_attr: str) -> None:
+    overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in clean_images]
+    colors = [
+        np.array((0, 255, 0), dtype=np.float32),
+        np.array((255, 0, 0), dtype=np.float32),
+        np.array((255, 200, 0), dtype=np.float32),
+        np.array((0, 200, 255), dtype=np.float32),
+        np.array((255, 0, 255), dtype=np.float32),
+        np.array((160, 255, 0), dtype=np.float32),
+    ]
+    for item in localized_objects:
+        if item.frame_idx < 0 or item.frame_idx >= len(overlay_images):
+            continue
+        mask = getattr(item, mask_attr, None)
+        if mask is None:
+            continue
+        mask_np = mask.detach().cpu().numpy().astype(bool)
+        if mask_np.ndim != 2 or not mask_np.any():
+            continue
+        color = colors[item.slot_idx % len(colors)]
+        base = overlay_images[item.frame_idx].astype(np.float32)
+        base[mask_np] = 0.35 * base[mask_np] + 0.65 * color
+        overlay_images[item.frame_idx] = base.clip(0.0, 255.0).astype(np.uint8)
+
+    pil_images = [Image.fromarray(image) for image in overlay_images]
+    _make_pil_grid(pil_images, nrow=min(4, len(pil_images))).save(output_path)
+
+
+def _erode_binary_mask(mask: torch.Tensor, radius: int = 1) -> torch.Tensor:
+    if radius <= 0:
+        return mask.bool()
+    mask_f = mask.to(torch.float32).unsqueeze(1)
+    kernel = radius * 2 + 1
+    eroded = 1.0 - torch.nn.functional.max_pool2d(1.0 - mask_f, kernel_size=kernel, stride=1, padding=radius)
+    return eroded[:, 0] > 0.5
+
+
+def _composite_asset_over_scene(
+    scene_rgb: torch.Tensor,
+    asset_fg_rgb: torch.Tensor,
+    asset_alpha: torch.Tensor,
+    asset_depth: torch.Tensor,
+) -> torch.Tensor:
+    composed = scene_rgb.clone()
+    silhouette = asset_depth > 0
+    if not silhouette.any():
+        return composed
+
+    interior = _erode_binary_mask(silhouette, radius=1)
+    edge = silhouette & (~interior)
+
+    interior_3 = interior.unsqueeze(1)
+    composed = torch.where(interior_3, asset_fg_rgb, composed)
+
+    edge_alpha = asset_alpha.clamp(0.0, 1.0).unsqueeze(1)
+    edge_3 = edge.unsqueeze(1)
+    blended_edge = asset_fg_rgb * edge_alpha + composed * (1.0 - edge_alpha)
+    composed = torch.where(edge_3, blended_edge, composed)
+    return composed.clamp(0.0, 1.0)
+
+
+def _rasterize_scene(
+    means: torch.Tensor,
+    rgbs: torch.Tensor,
+    opacity: torch.Tensor,
+    scales: torch.Tensor,
+    rotation: torch.Tensor,
+    viewmat: torch.Tensor,
+    intrinsic: torch.Tensor,
+    height: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from gsplat.rendering import rasterization
+
+    if means.numel() == 0:
+        empty_render = torch.zeros((1, height, width, 4), dtype=torch.float32, device=viewmat.device)
+        empty_alpha = torch.zeros((1, height, width, 1), dtype=torch.float32, device=viewmat.device)
+        return empty_render, empty_alpha
+
+    renders_chunk, alphas_chunk, _ = rasterization(
+        means=means,
+        quats=rotation,
+        scales=scales,
+        opacities=opacity,
+        colors=rgbs,
+        viewmats=viewmat,
+        Ks=intrinsic,
+        width=width,
+        height=height,
+        render_mode="RGB+ED",
+    )
+    return renders_chunk, alphas_chunk
+
+
+def _repeat_timestamps_for_views(sample: dict, num_images: int) -> torch.Tensor:
+    timestamps = sample["timestamps"].detach().cpu().float()
+    num_frames = int(sample["frame_indices"].numel())
+    num_views = max(1, int(sample["cam_ids"].numel()))
+    if timestamps.numel() == num_images:
+        return timestamps
+    if timestamps.numel() == num_frames and num_frames * num_views == num_images:
+        return timestamps.repeat_interleave(num_views)
+    raise ValueError(
+        f"Unexpected timestamp shape: got {timestamps.numel()} values for {num_images} images "
+        f"(frames={num_frames}, views={num_views})"
+    )
+
+
+def _predict_camera_mats(
+    predictions: dict[str, torch.Tensor],
+    image_hw: tuple[int, int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    height, width = image_hw
+    extrinsics, intrinsics = pose_encoding_to_extri_intri(predictions["pose_enc"], (height, width))
+    extrinsic_3x4 = extrinsics[0]
+    bottom = torch.tensor([0.0, 0.0, 0.0, 1.0], device=device, dtype=extrinsic_3x4.dtype).view(1, 1, 4)
+    extrinsic = torch.cat([extrinsic_3x4, bottom.expand(extrinsic_3x4.shape[0], -1, -1)], dim=1)
+    intrinsic = intrinsics[0]
+    return extrinsic, intrinsic
+
+
+def _render_background(model, images: torch.Tensor, extrinsic: torch.Tensor, intrinsic: torch.Tensor) -> torch.Tensor:
+    if hasattr(model, "sky_model") and model.sky_model is not None:
+        bg_render = model.sky_model(images, extrinsic, intrinsic)
+        return (bg_render - bg_render.min()) / (bg_render.max() - bg_render.min() + 1e-8)
+    seq_len, _, _, height, width = images.shape
+    return torch.zeros((seq_len, height, width, 3), dtype=images.dtype, device=images.device)
+
+
+def _render_clean_with_dggt(
+    model,
+    sample: dict,
+    predictions: dict[str, torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    images = sample["images_clean"].unsqueeze(0).to(device)
+    sky_mask = sample["sky_mask"].unsqueeze(0).to(device).permute(0, 1, 3, 4, 2)
+    bg_mask = (sky_mask == 0).any(dim=-1)
+    timestamps = _repeat_timestamps_for_views(sample, images.shape[1]).to(device)
+
+    _, _, _, height, width = images.shape
+    extrinsic, intrinsic = _predict_camera_mats(predictions, (height, width), device)
+    extrinsic_3x4 = extrinsic[:, :3, :]
+
+    depth_map = predictions["depth"][0]
+    point_map = unproject_depth_map_to_point_map(depth_map, extrinsic_3x4, intrinsic)
+    point_map = torch.from_numpy(point_map).to(device).float()[None, ...]
+
+    gs_map = predictions["gs_map"]
+    gs_conf = predictions["gs_conf"]
+    dy_map = predictions["dynamic_conf"].squeeze(-1)
+
+    static_mask = bg_mask & (dy_map < 0.5)
+    static_points = point_map[static_mask].reshape(-1, 3)
+    static_rgbs, static_opacity, static_scales, static_rotations = get_split_gs(gs_map, static_mask)
+    static_dynamic_prob = dy_map[static_mask].sigmoid()
+    static_opacity = static_opacity * (1.0 - static_dynamic_prob)
+    static_gs_conf = gs_conf[static_mask]
+    static_image_idx = torch.nonzero(static_mask, as_tuple=False)[:, 1]
+    gs_timestamps = timestamps[static_image_idx]
+
+    dynamic_points, dynamic_rgbs, dynamic_opacitys, dynamic_scales, dynamic_rotations = [], [], [], [], []
+    for image_idx in range(dy_map.shape[1]):
+        point_map_i = point_map[:, image_idx]
+        bg_mask_i = bg_mask[:, image_idx]
+        dynamic_point = point_map_i[bg_mask_i].reshape(-1, 3)
+        dynamic_rgb, dynamic_opacity, dynamic_scale, dynamic_rotation = get_split_gs(gs_map[:, image_idx], bg_mask_i)
+        dynamic_prob = dy_map[:, image_idx][bg_mask_i].sigmoid()
+        dynamic_opacity = dynamic_opacity * dynamic_prob
+
+        dynamic_points.append(dynamic_point)
+        dynamic_rgbs.append(dynamic_rgb)
+        dynamic_opacitys.append(dynamic_opacity)
+        dynamic_scales.append(dynamic_scale)
+        dynamic_rotations.append(dynamic_rotation)
+
+    chunked_renders, chunked_alphas = [], []
+    for image_idx in range(dy_map.shape[1]):
+        t0 = timestamps[image_idx]
+        static_opacity_t = alpha_t(gs_timestamps, t0, static_opacity, gamma0=static_gs_conf)
+        static_gs_list = [static_points, static_rgbs, static_opacity_t, static_scales, static_rotations]
+        if len(dynamic_points) > 0:
+            world_points, rgbs, opacity, scales, rotation = concat_list(
+                static_gs_list,
+                [
+                    dynamic_points[image_idx],
+                    dynamic_rgbs[image_idx],
+                    dynamic_opacitys[image_idx],
+                    dynamic_scales[image_idx],
+                    dynamic_rotations[image_idx],
+                ],
+            )
+        else:
+            world_points, rgbs, opacity, scales, rotation = static_gs_list
+        renders_chunk, alphas_chunk = _rasterize_scene(
+            means=world_points,
+            rgbs=rgbs,
+            opacity=opacity,
+            scales=scales,
+            rotation=rotation,
+            viewmat=extrinsic[image_idx : image_idx + 1],
+            intrinsic=intrinsic[image_idx : image_idx + 1],
+            height=height,
+            width=width,
+        )
+        chunked_renders.append(renders_chunk)
+        chunked_alphas.append(alphas_chunk)
+
+    renders = torch.cat(chunked_renders, dim=0)[..., :-1]
+    alphas = torch.cat(chunked_alphas, dim=0)
+    bg_render = _render_background(model, images, extrinsic, intrinsic)
+    renders = alphas * renders + (1.0 - alphas) * bg_render
+    return renders.permute(0, 3, 1, 2).detach().cpu().float().clamp(0.0, 1.0)
+
+
+def _gather_assets_by_image(localized_objects, device: torch.device) -> dict[int, dict[str, torch.Tensor]]:
+    per_image: dict[int, list[dict[str, torch.Tensor]]] = {}
+    for item in localized_objects:
+        per_image.setdefault(int(item.source_front_index), []).append(
+            {
+                "means": item.asset_means_world.to(device).float(),
+                "colors": item.asset_colors.to(device).float(),
+                "opacities": item.asset_opacities.to(device).float().view(-1),
+                "scales": item.asset_scales.to(device).float(),
+                "quats": item.asset_quats.to(device).float(),
+            }
+        )
+
+    merged: dict[int, dict[str, torch.Tensor]] = {}
+    for image_idx, chunks in per_image.items():
+        merged[image_idx] = {
+            "means": torch.cat([chunk["means"] for chunk in chunks], dim=0),
+            "colors": torch.cat([chunk["colors"] for chunk in chunks], dim=0),
+            "opacities": torch.cat([chunk["opacities"] for chunk in chunks], dim=0),
+            "scales": torch.cat([chunk["scales"] for chunk in chunks], dim=0),
+            "quats": torch.cat([chunk["quats"] for chunk in chunks], dim=0),
+        }
+    return merged
+
+
+def _render_edited_sequence_with_dggt(
+    model,
+    sample: dict,
+    predictions: dict[str, torch.Tensor],
+    clean_state,
+    delete_mask: torch.Tensor | None,
+    localized_objects,
+    device: torch.device,
+    *,
+    asset_only: bool = False,
+    include_static: bool = True,
+    include_dynamic: bool = True,
+    return_aux: bool = False,
+) -> torch.Tensor | dict[str, torch.Tensor]:
+    images = sample["images_clean"].unsqueeze(0).to(device)
+    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
+    extrinsic, intrinsic = _predict_camera_mats(predictions, image_hw, device)
+    bg_render = _render_background(model, images, extrinsic, intrinsic)
+    timestamps = _repeat_timestamps_for_views(sample, clean_state.images.shape[0]).to(device)
+
+    means = clean_state.means.to(device).float()
+    colors = clean_state.colors.to(device).float()
+    opacities = clean_state.opacities.to(device).float().view(-1)
+    scales = clean_state.scales.to(device).float()
+    quats = clean_state.quats.to(device).float()
+    gs_conf = clean_state.gs_conf.to(device).float()
+    dynamic_prob = clean_state.dynamic_prob.to(device).float()
+    source_image_ids = clean_state.source_image_ids.to(device)
+
+    if delete_mask is None:
+        keep_mask = torch.ones((means.shape[0],), dtype=torch.bool, device=device)
+    else:
+        keep_mask = ~delete_mask.to(device)
+
+    if asset_only or (not include_static):
+        static_mask = torch.zeros_like(keep_mask)
+    else:
+        static_mask = keep_mask & (dynamic_prob < 0.5)
+
+    static_points = means[static_mask]
+    static_rgbs = colors[static_mask]
+    static_opacity = opacities[static_mask] * (1.0 - dynamic_prob[static_mask])
+    static_scales = scales[static_mask]
+    static_rotations = quats[static_mask]
+    static_gs_conf = gs_conf[static_mask]
+    gs_timestamps = timestamps[source_image_ids[static_mask]] if static_mask.any() else torch.zeros((0,), device=device)
+
+    asset_chunks_by_image = _gather_assets_by_image(localized_objects, device)
+
+    chunked_renders, chunked_alphas = [], []
+    num_images = clean_state.images.shape[0]
+    for image_idx in range(num_images):
+        if asset_only or (not include_dynamic):
+            dynamic_mask = torch.zeros_like(keep_mask)
+        else:
+            dynamic_mask = keep_mask & (source_image_ids == image_idx)
+
+        dynamic_points = means[dynamic_mask]
+        dynamic_rgbs = colors[dynamic_mask]
+        dynamic_opacity = opacities[dynamic_mask] * dynamic_prob[dynamic_mask]
+        dynamic_scales = scales[dynamic_mask]
+        dynamic_rotations = quats[dynamic_mask]
+
+        if image_idx in asset_chunks_by_image:
+            asset_chunk = asset_chunks_by_image[image_idx]
+            if dynamic_points.numel() == 0:
+                dynamic_points = asset_chunk["means"]
+                dynamic_rgbs = asset_chunk["colors"]
+                dynamic_opacity = asset_chunk["opacities"]
+                dynamic_scales = asset_chunk["scales"]
+                dynamic_rotations = asset_chunk["quats"]
+            else:
+                dynamic_points = torch.cat([dynamic_points, asset_chunk["means"]], dim=0)
+                dynamic_rgbs = torch.cat([dynamic_rgbs, asset_chunk["colors"]], dim=0)
+                dynamic_opacity = torch.cat([dynamic_opacity, asset_chunk["opacities"]], dim=0)
+                dynamic_scales = torch.cat([dynamic_scales, asset_chunk["scales"]], dim=0)
+                dynamic_rotations = torch.cat([dynamic_rotations, asset_chunk["quats"]], dim=0)
+
+        if static_points.numel() > 0:
+            t0 = timestamps[image_idx]
+            static_opacity_t = alpha_t(gs_timestamps, t0, static_opacity, gamma0=static_gs_conf)
+            world_points, rgbs, opacity, scales_t, rotation = concat_list(
+                [static_points, static_rgbs, static_opacity_t, static_scales, static_rotations],
+                [dynamic_points, dynamic_rgbs, dynamic_opacity, dynamic_scales, dynamic_rotations],
+            )
+        else:
+            world_points, rgbs, opacity, scales_t, rotation = (
+                dynamic_points,
+                dynamic_rgbs,
+                dynamic_opacity,
+                dynamic_scales,
+                dynamic_rotations,
+            )
+
+        renders_chunk, alphas_chunk = _rasterize_scene(
+            means=world_points,
+            rgbs=rgbs,
+            opacity=opacity,
+            scales=scales_t,
+            rotation=rotation,
+            viewmat=extrinsic[image_idx : image_idx + 1],
+            intrinsic=intrinsic[image_idx : image_idx + 1],
+            height=image_hw[0],
+            width=image_hw[1],
+        )
+        chunked_renders.append(renders_chunk)
+        chunked_alphas.append(alphas_chunk)
+
+    renders_raw = torch.cat(chunked_renders, dim=0)
+    foreground = renders_raw[..., :-1]
+    depths = renders_raw[..., -1]
+    alphas = torch.cat(chunked_alphas, dim=0)
+    renders = alphas * foreground + (1.0 - alphas) * bg_render
+    renders_chw = renders.permute(0, 3, 1, 2).detach().cpu().float().clamp(0.0, 1.0)
+    if not return_aux:
+        return renders_chw
+    return {
+        "composed": renders_chw,
+        "foreground": foreground.permute(0, 3, 1, 2).detach().cpu().float().clamp(0.0, 1.0),
+        "alpha": alphas[..., 0].detach().cpu().float().clamp(0.0, 1.0),
+        "depth": depths.detach().cpu().float(),
+    }
+
+
+def _gaussian_to_point_payload(scene: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    return scene["means"], scene["colors"]
+
+
+def _write_scene_outputs(prefix: str, scene: dict[str, torch.Tensor], output_dir: Path) -> None:
+    write_gaussian_ply(
+        {
+            "means": scene["means"],
+            "features_dc_rgb": scene["colors"],
+            "opacities": scene["opacities"],
+            "scales": scene["scales"],
+            "quats": scene["quats"],
+        },
+        output_dir / f"{prefix}_gaussians.ply",
+    )
+    points, colors = _gaussian_to_point_payload(scene)
+    write_point_ply(points, colors, output_dir / f"{prefix}_points.ply")
+
+
+def _build_summary(args, sample, alignment, edited_state) -> dict:
+    localized = []
+    for item in edited_state.localized_objects:
+        localized.append(
+            {
+                "slot_idx": int(item.slot_idx),
+                "frame_idx_local": int(item.frame_idx),
+                "frame_idx_scene": int(sample["frame_indices"][item.frame_idx].item()),
+                "asset_object_id": item.asset_object_id,
+                "scene_raw_object_id": item.scene_raw_object_id,
+                "asset_path": item.asset_path,
+                "match_score": float(item.match_score),
+                "delete_motion_mode": item.delete_motion_mode,
+                "waymo_frame_speed_mps": float(item.waymo_frame_speed_mps),
+                "waymo_max_speed_mps": float(item.waymo_max_speed_mps),
+                "waymo_mean_speed_mps": float(item.waymo_mean_speed_mps),
+                "render_dynamic_ratio": float(item.render_dynamic_ratio),
+                "candidate_count": int(item.candidate_count),
+                "seed_point_count": int(item.seed_point_count),
+                "candidate_pool_count": int(item.candidate_pool_count),
+                "cluster_kept_count": int(item.cluster_kept_count),
+                "delete_core_count": int(item.delete_core_indices.numel()),
+                "delete_shell_count": int(item.delete_shell_indices.numel()),
+                "target_delete_coverage": float(item.target_delete_coverage),
+                "outside_box_leak_ratio": float(item.outside_box_leak_ratio),
+                "gt_center": [float(v) for v in item.gt_center.tolist()],
+                "gt_size": [float(v) for v in item.gt_size.tolist()],
+                "proposal_center": [float(v) for v in item.proposal_center.tolist()],
+                "proposal_size": [float(v) for v in item.proposal_size.tolist()],
+                "refined_center": [float(v) for v in item.refined_center.tolist()],
+                "refined_size": [float(v) for v in item.refined_size.tolist()],
+                "asset_scale": float(item.asset_scale),
+                "asset_bottom_center": [float(v) for v in item.asset_bottom_center.tolist()],
+                "target_bbox_model": None
+                if item.target_bbox_model is None
+                else [float(v) for v in item.target_bbox_model.tolist()],
+                "projected_asset_bbox": None
+                if item.projected_asset_bbox is None
+                else [float(v) for v in item.projected_asset_bbox.tolist()],
+            }
+        )
+
+    return {
+        "sample_index": int(args.index),
+        "scene_name": sample["scene_name"],
+        "clip_name": sample["clip_name"],
+        "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
+        "selected_slots": parse_object_slots(sample, args.object_slots),
+        "editable_asset_object_ids": list(sample["asset_meta"]["editable_asset_object_ids"]),
+        "editable_scene_raw_object_ids": list(sample["asset_meta"]["editable_scene_raw_object_ids"]),
+        "sim3_waymo_to_dggt": alignment.as_dict(),
+        "clean_gaussian_count": int(edited_state.clean["means"].shape[0]),
+        "deleted_gaussian_count": int(edited_state.deleted["means"].shape[0]),
+        "asset_gaussian_count": int(edited_state.asset_only["means"].shape[0]),
+        "edited_gaussian_count": int(edited_state.edited["means"].shape[0]),
+        "localized_objects": localized,
+    }
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    torch.manual_seed(args.seed)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = WaymoEditDataset(
+        processed_root=args.processed_root,
+        transfer_root=args.transfer_root,
+        raw_root=args.raw_root,
+        asset_root=args.asset_root,
+        split=args.split,
+        manifest_path=args.manifest_path,
+        candidate_path=args.candidate_path,
+        views=args.views,
+        mode=args.dataset_mode,
+        sequence_length=args.sequence_length,
+    )
+    sample = dataset[args.index]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = _load_model(args.ckpt_path, device)
+
+    images = sample["images_clean"].unsqueeze(0).to(device)
+    with torch.no_grad():
+        predictions = model(images)
+
+    clean_state = build_clean_scene_state(sample, predictions)
+    clean_render = _render_clean_with_dggt(model, sample, predictions, device)
+    clean_dynamic_render = _render_edited_sequence_with_dggt(
+        model,
+        sample,
+        predictions,
+        clean_state,
+        delete_mask=None,
+        localized_objects=[],
+        device=device,
+        include_static=False,
+        include_dynamic=True,
+    )
+    clean_static_render = _render_edited_sequence_with_dggt(
+        model,
+        sample,
+        predictions,
+        clean_state,
+        delete_mask=None,
+        localized_objects=[],
+        device=device,
+        include_static=True,
+        include_dynamic=False,
+    )
+
+    _save_grid(clean_state.images, output_dir / "input_images_grid.png")
+    _save_grid(clean_render, output_dir / "clean_render_grid.png")
+    _save_grid(clean_dynamic_render, output_dir / "clean_dynamic_render_grid.png")
+    _save_grid(clean_static_render, output_dir / "clean_static_render_grid.png")
+    _save_dataset_box_overlay_grid(sample, output_dir / "projected_boxes_on_inputs.png")
+
+    if args.clean_only:
+        summary = {
+            "sample_index": int(args.index),
+            "scene_name": sample["scene_name"],
+            "clip_name": sample["clip_name"],
+            "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
+            "editable_asset_object_ids": list(sample["asset_meta"]["editable_asset_object_ids"]),
+            "editable_scene_raw_object_ids": list(sample["asset_meta"]["editable_scene_raw_object_ids"]),
+            "clean_only": True,
+        }
+        with open(output_dir / "edit_summary.json", "w") as f:
+            json.dump(summary, f, indent=2)
+        print(json.dumps(summary, indent=2))
+        return
+
+    alignment = estimate_scene_alignment(sample, clean_state)
+    selected_slots = parse_object_slots(sample, args.object_slots)
+    localized_objects = localize_objects(
+        sample,
+        clean_state,
+        alignment,
+        selected_slots,
+        min_match_score=args.min_match_score,
+        dynamic_thresh=args.dynamic_thresh,
+        core_scale=args.core_scale,
+        shell_scale=args.shell_scale,
+        proposal_scale=args.proposal_scale,
+        motion_speed_thresh=args.motion_speed_thresh,
+        dynamic_prob_thresh=args.dynamic_prob_thresh,
+        dynamic_ratio_thresh=args.dynamic_ratio_thresh,
+    )
+    _save_target_vs_asset_boxes(
+        clean_state.images,
+        localized_objects,
+        output_dir / "target_vs_asset_boxes.png",
+    )
+    _save_mask_overlay_grid(
+        clean_state.images,
+        localized_objects,
+        output_dir / "dynamic_seed_overlay.png",
+        "seed_pixel_mask",
+    )
+    _save_mask_overlay_grid(
+        clean_state.images,
+        localized_objects,
+        output_dir / "delete_component_overlay.png",
+        "delete_component_pixel_mask",
+    )
+    edited_state = apply_mode_a(clean_state, localized_objects)
+
+    deleted_bundle = _render_edited_sequence_with_dggt(
+        model,
+        sample,
+        predictions,
+        clean_state,
+        edited_state.delete_mask,
+        [],
+        device,
+        return_aux=True,
+    )
+    asset_bundle = _render_edited_sequence_with_dggt(
+        model,
+        sample,
+        predictions,
+        clean_state,
+        torch.ones_like(edited_state.delete_mask),
+        edited_state.localized_objects,
+        device,
+        asset_only=True,
+        return_aux=True,
+    )
+    deleted_render = deleted_bundle["composed"]
+    asset_render = asset_bundle["composed"]
+    edited_render = _composite_asset_over_scene(
+        deleted_render,
+        asset_bundle["foreground"],
+        asset_bundle["alpha"],
+        asset_bundle["depth"],
+    )
+
+    _save_grid(deleted_render, output_dir / "deleted_render_grid.png")
+    _save_grid(asset_render, output_dir / "asset_only_render_grid.png")
+    _save_grid(edited_render, output_dir / "edited_render_grid.png")
+
+    if not args.skip_ply:
+        _write_scene_outputs("clean", edited_state.clean, output_dir)
+        _write_scene_outputs("deleted", edited_state.deleted, output_dir)
+        _write_scene_outputs("asset_only", edited_state.asset_only, output_dir)
+        _write_scene_outputs("edited", edited_state.edited, output_dir)
+
+    summary = _build_summary(args, sample, alignment, edited_state)
+    with open(output_dir / "edit_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
