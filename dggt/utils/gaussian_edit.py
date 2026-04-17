@@ -496,6 +496,96 @@ def _dilate_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
     return dilated[0, 0] > 0.5
 
 
+def _erode_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    if radius <= 0:
+        return mask
+    mask_f = mask.to(torch.float32).view(1, 1, mask.shape[0], mask.shape[1])
+    kernel = radius * 2 + 1
+    eroded = 1.0 - F.max_pool2d(1.0 - mask_f, kernel_size=kernel, stride=1, padding=radius)
+    return eroded[0, 0] > 0.5
+
+
+def _select_connected_component(mask: torch.Tensor, seed_mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.detach().cpu().bool()
+    seed_mask = seed_mask.detach().cpu().bool() & mask
+    if int(mask.sum().item()) == 0:
+        return mask
+    height, width = mask.shape
+    visited = torch.zeros_like(mask)
+    best_mask = torch.zeros_like(mask)
+    best_score = -1.0
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    seed_center = None
+    if int(seed_mask.sum().item()) > 0:
+        seed_pixels = torch.nonzero(seed_mask, as_tuple=False).float()
+        seed_center = seed_pixels.mean(dim=0)
+
+    for start_y, start_x in torch.nonzero(mask, as_tuple=False).tolist():
+        if visited[start_y, start_x]:
+            continue
+        queue = deque([(start_y, start_x)])
+        component_pixels: list[tuple[int, int]] = []
+        visited[start_y, start_x] = True
+        overlap = 0
+        while queue:
+            y, x = queue.popleft()
+            component_pixels.append((y, x))
+            if seed_mask[y, x]:
+                overlap += 1
+            for dy, dx in neighbors:
+                ny = y + dy
+                nx = x + dx
+                if ny < 0 or ny >= height or nx < 0 or nx >= width:
+                    continue
+                if visited[ny, nx] or not mask[ny, nx]:
+                    continue
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+
+        component_mask = torch.zeros_like(mask)
+        ys = torch.tensor([p[0] for p in component_pixels], dtype=torch.long)
+        xs = torch.tensor([p[1] for p in component_pixels], dtype=torch.long)
+        component_mask[ys, xs] = True
+        area = float(len(component_pixels))
+        if overlap > 0:
+            score = 1e6 + overlap * 1000.0 + area
+        elif seed_center is not None:
+            component_center = torch.stack([ys.float().mean(), xs.float().mean()])
+            score = area - float(torch.norm(component_center - seed_center).item()) * 100.0
+        else:
+            score = area
+        if score > best_score:
+            best_score = score
+            best_mask = component_mask
+    return best_mask
+
+
+def _build_bbox_masks(
+    box_xyxy: torch.Tensor,
+    image_hw: tuple[int, int],
+    inner_ratio: float = 0.08,
+    outer_ratio: float = 0.08,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    height, width = image_hw
+    x1, y1, x2, y2 = [float(v) for v in box_xyxy.tolist()]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+
+    bbox_inner_mask = torch.zeros((height, width), dtype=torch.bool)
+    bbox_outer_mask = torch.zeros((height, width), dtype=torch.bool)
+    ix1 = max(0, min(width - 1, int(math.floor(x1 + inner_ratio * bw))))
+    ix2 = max(ix1 + 1, min(width, int(math.ceil(x2 - inner_ratio * bw))))
+    iy1 = max(0, min(height - 1, int(math.floor(y1 + inner_ratio * bh))))
+    iy2 = max(iy1 + 1, min(height, int(math.ceil(y2 - inner_ratio * bh))))
+    ox1 = max(0, min(width - 1, int(math.floor(x1 - outer_ratio * bw))))
+    ox2 = max(ox1 + 1, min(width, int(math.ceil(x2 + outer_ratio * bw))))
+    oy1 = max(0, min(height - 1, int(math.floor(y1 - outer_ratio * bh))))
+    oy2 = max(oy1 + 1, min(height, int(math.ceil(y2 + outer_ratio * bh))))
+    bbox_inner_mask[iy1:iy2, ix1:ix2] = True
+    bbox_outer_mask[oy1:oy2, ox1:ox2] = True
+    return bbox_inner_mask, bbox_outer_mask
+
+
 def _grow_pixel_component_from_seed(
     point_map_world: torch.Tensor,
     depth_map: torch.Tensor,
@@ -538,42 +628,112 @@ def _grow_pixel_component_from_seed(
     return out_mask
 
 
-def _extract_static_object_pixels(
+def _extract_object_pixels_from_bbox_component(
     point_map_world: torch.Tensor,
     depth_map: torch.Tensor,
     valid_mask: torch.Tensor,
     box_xyxy: torch.Tensor,
-    box_pixel_mask: torch.Tensor,
-    proposal_size: torch.Tensor,
+    dynamic_image_mask: torch.Tensor | None = None,
+    dynamic_mode: bool = False,
+    coarse_center: torch.Tensor | None = None,
+    coarse_rotation: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, seed_mask = _extract_foreground_seed(
+    image_hw = tuple(point_map_world.shape[:2])
+    bbox_inner_mask, bbox_outer_mask = _build_bbox_masks(box_xyxy, image_hw)
+    seed_points, seed_mask = _extract_foreground_seed(
         point_map_world,
         depth_map,
         valid_mask,
         box_xyxy,
-        depth_quantile=0.20,
-        shrink_ratio=0.18,
+        depth_quantile=0.30 if dynamic_mode else 0.22,
+        shrink_ratio=0.10 if dynamic_mode else 0.16,
     )
-    seed_mask = seed_mask & box_pixel_mask
-    if int(seed_mask.sum().item()) < 24:
-        return point_map_world[box_pixel_mask].reshape(-1, 3), box_pixel_mask
+    height, width = image_hw
+    x1, y1, x2, y2 = [float(v) for v in box_xyxy.tolist()]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    sx1 = max(0, min(width - 1, int(math.floor(x1 + 0.12 * bw))))
+    sx2 = max(sx1 + 1, min(width, int(math.ceil(x2 - 0.12 * bw))))
+    sy1 = max(0, min(height - 1, int(math.floor(y1 + 0.08 * bh))))
+    sy2 = max(sy1 + 1, min(height, int(math.ceil(y2 - 0.28 * bh))))
+    seed_region_mask = torch.zeros((height, width), dtype=torch.bool)
+    seed_region_mask[sy1:sy2, sx1:sx2] = True
 
-    xyz_thresh = max(0.02, min(0.08, float(proposal_size.max().item()) * 0.05))
-    depth_thresh = max(0.03, min(0.12, float(proposal_size.max().item()) * 0.08))
-    static_mask = _grow_pixel_component_from_seed(
+    allowed_mask = bbox_outer_mask & valid_mask
+    if dynamic_mode and dynamic_image_mask is not None:
+        dynamic_outer = _dilate_mask(dynamic_image_mask & bbox_outer_mask, radius=2)
+        allowed_mask = allowed_mask & (dynamic_outer | bbox_inner_mask | _dilate_mask(seed_mask, radius=2))
+    region_valid = seed_region_mask & valid_mask
+    region_depths = depth_map[region_valid]
+    if region_depths.numel() > 0:
+        region_q = 0.40 if dynamic_mode else 0.32
+        region_depth_thresh = torch.quantile(region_depths, region_q)
+        biased_seed_mask = region_valid & (depth_map <= region_depth_thresh) & allowed_mask
+    else:
+        biased_seed_mask = seed_mask & seed_region_mask & allowed_mask
+    if int(biased_seed_mask.sum().item()) >= 16:
+        seed_mask = biased_seed_mask
+    else:
+        seed_mask = seed_mask & allowed_mask
+    if int(seed_mask.sum().item()) < 24:
+        seed_mask = seed_region_mask & valid_mask
+    if int(seed_mask.sum().item()) < 24:
+        seed_mask = bbox_inner_mask & valid_mask
+        if dynamic_mode and dynamic_image_mask is not None:
+            seed_mask = seed_mask & (_dilate_mask(dynamic_image_mask, radius=1) | bbox_inner_mask)
+    if int(seed_mask.sum().item()) < 24:
+        fallback_mask = bbox_inner_mask & valid_mask
+        return point_map_world[fallback_mask].reshape(-1, 3), fallback_mask
+
+    if seed_points.shape[0] > 0:
+        visible_extent = (seed_points.max(dim=0).values - seed_points.min(dim=0).values).clamp_min(1e-4)
+        xyz_thresh = float(visible_extent.max().item()) * (1.6 if dynamic_mode else 1.35)
+        depth_thresh = float(visible_extent.norm().item()) * (0.9 if dynamic_mode else 0.7)
+    else:
+        xyz_thresh = 0.04
+        depth_thresh = 0.06
+    xyz_thresh = max(0.02, min(0.12, xyz_thresh))
+    depth_thresh = max(0.03, min(0.16, depth_thresh))
+
+    object_mask = _grow_pixel_component_from_seed(
         point_map_world=point_map_world,
         depth_map=depth_map,
-        allowed_mask=box_pixel_mask & valid_mask,
+        allowed_mask=allowed_mask,
         seed_mask=seed_mask,
         xyz_thresh=xyz_thresh,
         depth_thresh=depth_thresh,
     )
-    max_growth_ratio = 3.0
-    if int(static_mask.sum().item()) > int(seed_mask.sum().item() * max_growth_ratio):
-        static_mask = _dilate_mask(seed_mask, radius=1) & box_pixel_mask & valid_mask
-    if int(static_mask.sum().item()) < 24:
-        return point_map_world[box_pixel_mask].reshape(-1, 3), box_pixel_mask
-    return point_map_world[static_mask].reshape(-1, 3), static_mask
+
+    max_growth_ratio = 5.0 if dynamic_mode else 4.0
+    if int(object_mask.sum().item()) > int(max(seed_mask.sum().item(), 1) * max_growth_ratio):
+        object_mask = _dilate_mask(seed_mask, radius=1) & allowed_mask
+    eroded_mask = _erode_mask(object_mask, radius=1)
+    if int(eroded_mask.sum().item()) >= 16:
+        selected_eroded = _select_connected_component(eroded_mask, seed_mask)
+        if int(selected_eroded.sum().item()) >= 16:
+            object_mask = _select_connected_component(object_mask, selected_eroded)
+    if (
+        coarse_center is not None
+        and coarse_rotation is not None
+        and int(object_mask.sum().item()) >= 24
+    ):
+        object_points = point_map_world[object_mask].reshape(-1, 3)
+        local_coords = (object_points - coarse_center) @ coarse_rotation
+        local_up = local_coords[:, 2]
+        up_low = torch.quantile(local_up, 0.05)
+        up_high = torch.quantile(local_up, 0.95)
+        up_margin = max(0.006, float((up_high - up_low).item()) * 0.12)
+        keep_object = local_up >= (up_low + up_margin)
+        if int(keep_object.sum().item()) >= max(24, int(object_points.shape[0] * 0.55)):
+            filtered_mask = torch.zeros_like(object_mask)
+            object_pixels = torch.nonzero(object_mask, as_tuple=False)
+            kept_pixels = object_pixels[keep_object]
+            filtered_mask[kept_pixels[:, 0], kept_pixels[:, 1]] = True
+            object_mask = filtered_mask
+    if int(object_mask.sum().item()) < 24:
+        fallback_mask = bbox_inner_mask & valid_mask
+        return point_map_world[fallback_mask].reshape(-1, 3), fallback_mask
+    return point_map_world[object_mask].reshape(-1, 3), object_mask
 
 
 def _extract_object_pixels_from_3d_box(
@@ -1062,9 +1222,27 @@ def _refine_box_from_target_support(
     visible_extent = (q_high - q_low).clamp_min(1e-4)
     local_center = 0.5 * (q_low + q_high)
     refined_center = coarse_center + local_center @ coarse_rotation.T
-    refined_size = torch.maximum(coarse_size * 0.9, visible_extent * 1.15)
-    refined_size = torch.minimum(refined_size, coarse_size * 2.5)
+    margin = torch.maximum(visible_extent * 0.18, torch.full_like(visible_extent, 0.025))
+    refined_size = (visible_extent + 2.0 * margin).clamp_min(0.05)
     return refined_center, refined_size, target_local
+
+
+def _fit_box_from_support_points(
+    support_points: torch.Tensor,
+    coarse_center: torch.Tensor,
+    coarse_rotation: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if support_points.shape[0] < 24:
+        return coarse_center.clone(), torch.full((3,), 0.12, dtype=coarse_center.dtype)
+    local = (support_points - coarse_center) @ coarse_rotation
+    q_low = torch.quantile(local, 0.05, dim=0)
+    q_high = torch.quantile(local, 0.95, dim=0)
+    visible_extent = (q_high - q_low).clamp_min(1e-4)
+    local_center = 0.5 * (q_low + q_high)
+    refined_center = coarse_center + local_center @ coarse_rotation.T
+    margin = torch.maximum(visible_extent * 0.18, torch.full_like(visible_extent, 0.025))
+    refined_size = (visible_extent + 2.0 * margin).clamp_min(0.05)
+    return refined_center, refined_size
 
 
 def _voxel_connected_component(
@@ -1183,21 +1361,12 @@ def _extract_delete_component(
     finite_local = torch.isfinite(local_points).all(dim=-1)
 
     height, width = object_pixel_mask.shape
-    x1, y1, x2, y2 = [float(v) for v in box_xyxy.tolist()]
-    bw = max(1.0, x2 - x1)
-    bh = max(1.0, y2 - y1)
-    bbox_inner_mask = torch.zeros((height, width), dtype=torch.bool)
-    bbox_outer_mask = torch.zeros((height, width), dtype=torch.bool)
-    ix1 = max(0, min(width - 1, int(math.floor(x1 + 0.08 * bw))))
-    ix2 = max(ix1 + 1, min(width, int(math.ceil(x2 - 0.08 * bw))))
-    iy1 = max(0, min(height - 1, int(math.floor(y1 + 0.08 * bh))))
-    iy2 = max(iy1 + 1, min(height, int(math.ceil(y2 - 0.08 * bh))))
-    ox1 = max(0, min(width - 1, int(math.floor(x1 - 0.04 * bw))))
-    ox2 = max(ox1 + 1, min(width, int(math.ceil(x2 + 0.04 * bw))))
-    oy1 = max(0, min(height - 1, int(math.floor(y1 - 0.04 * bh))))
-    oy2 = max(oy1 + 1, min(height, int(math.ceil(y2 + 0.04 * bh))))
-    bbox_inner_mask[iy1:iy2, ix1:ix2] = True
-    bbox_outer_mask[oy1:oy2, ox1:ox2] = True
+    bbox_inner_mask, bbox_outer_mask = _build_bbox_masks(
+        box_xyxy,
+        (height, width),
+        inner_ratio=0.08,
+        outer_ratio=0.04,
+    )
 
     _, foreground_seed_mask = _extract_foreground_seed(
         clean_state.point_map_world[source_front_index],
@@ -1226,6 +1395,14 @@ def _extract_delete_component(
         coarse_rotation=gt_rotation,
         coarse_size=gt_size,
     )
+    box_corners = build_box_corners(
+        refined_center,
+        refined_size * max(1.0, proposal_scale),
+        gt_rotation,
+    )
+    box_cam = _world_to_camera_points(box_corners, clean_state.camera_to_world[source_front_index])
+    box_depth_low = float(box_cam[:, 2].min().item()) - 0.05
+    box_depth_high = float(box_cam[:, 2].max().item()) + 0.08
 
     core_box_local = _points_in_box(
         local_points,
@@ -1266,10 +1443,12 @@ def _extract_delete_component(
         depth_band_local = (local_depth >= depth_low) & (local_depth <= depth_high)
     else:
         depth_band_local = torch.ones_like(local_depth, dtype=torch.bool)
+    box_depth_local = (local_depth >= box_depth_low) & (local_depth <= box_depth_high)
+    depth_band_local = depth_band_local & box_depth_local
 
     dynamic_support_local = dynamic_local | (local_dynamic_prob >= dynamic_prob_thresh)
     if delete_motion_mode == "dynamic":
-        candidate_local = shell_box_local & depth_band_local & (support_local | bbox_outer_local) & dynamic_support_local
+        candidate_local = shell_box_local & depth_band_local & bbox_outer_local & dynamic_support_local
         seed_local = target_local & dynamic_support_local
         if int(seed_local.sum().item()) < 12:
             seed_local = support_local & proposal_box_local & dynamic_support_local
@@ -1285,10 +1464,10 @@ def _extract_delete_component(
         voxel_scale = (refined_size * torch.tensor(_DYNAMIC_VOXEL_SCALE, dtype=gt_size.dtype)).clamp_min(0.035)
         connectivity = 26
     else:
-        candidate_local = proposal_box_local & depth_band_local & support_local
-        seed_local = foreground_local & proposal_box_local
+        candidate_local = proposal_box_local & depth_band_local & bbox_outer_local
+        seed_local = target_local | (foreground_local & proposal_box_local)
         if int(seed_local.sum().item()) < 12:
-            seed_local = target_local & proposal_box_local
+            seed_local = support_local & proposal_box_local
         if int(seed_local.sum().item()) < 12:
             seed_local = support_local & core_box_local
         voxel_scale = (refined_size * torch.tensor(_STATIC_VOXEL_SCALE, dtype=gt_size.dtype)).clamp_min(0.04)
@@ -1553,32 +1732,26 @@ def localize_objects(
                 object_size=gt_size,
                 object_rotation=proposal_rotation,
             )
-            candidate_points, object_pixel_mask = _extract_object_pixels_from_3d_box(
-                point_map_world=clean_state.point_map_world[source_front_index],
-                depth_map=clean_state.depth[source_front_index],
-                valid_mask=clean_state.valid_mask[source_front_index],
-                box_xyxy=target_bbox_model,
-                box_center=delete_center,
-                box_rotation=proposal_rotation,
-                box_size=proposal_size,
-                box_scale=1.15,
-                expand_ratio=0.08,
-                min_points=min_candidate_points,
-            )
             waymo_frame_dynamic = (
                 bool(object_is_moving_frame[slot_idx, frame_idx].item())
                 if isinstance(object_is_moving_frame, torch.Tensor)
                 else waymo_dynamic
             )
-            if not waymo_frame_dynamic:
-                candidate_points, object_pixel_mask = _extract_static_object_pixels(
-                    point_map_world=clean_state.point_map_world[source_front_index],
-                    depth_map=clean_state.depth[source_front_index],
-                    valid_mask=clean_state.valid_mask[source_front_index],
-                    box_xyxy=target_bbox_model,
-                    box_pixel_mask=object_pixel_mask,
-                    proposal_size=proposal_size,
-                )
+            candidate_points, object_pixel_mask = _extract_object_pixels_from_bbox_component(
+                point_map_world=clean_state.point_map_world[source_front_index],
+                depth_map=clean_state.depth[source_front_index],
+                valid_mask=clean_state.valid_mask[source_front_index],
+                box_xyxy=target_bbox_model,
+                dynamic_image_mask=_binary_mask_from_image(sample["dynamic_mask"][source_front_index]),
+                dynamic_mode=bool(waymo_frame_dynamic),
+                coarse_center=delete_center,
+                coarse_rotation=proposal_rotation,
+            )
+            delete_center_fit, delete_size_fit = _fit_box_from_support_points(
+                candidate_points,
+                coarse_center=delete_center,
+                coarse_rotation=proposal_rotation,
+            )
             if candidate_points.shape[0] < max(24, min_candidate_points // 2):
                 continue
             frame_specs.append(
@@ -1590,9 +1763,9 @@ def localize_objects(
                     "gt_rotation": gt_rotation,
                     "proposal_center": proposal_center,
                     "proposal_rotation": proposal_rotation,
-                    "delete_center": delete_center,
+                    "delete_center": delete_center_fit,
                     "proposal_bbox": proposal_bbox,
-                    "proposal_size": proposal_size,
+                    "proposal_size": delete_size_fit,
                     "waymo_frame_dynamic": bool(waymo_frame_dynamic),
                     "target_bbox_model": target_bbox_model,
                     "candidate_points": candidate_points,
