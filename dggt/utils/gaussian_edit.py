@@ -103,6 +103,12 @@ class LocalizedFrameObject:
     asset_opacities: torch.Tensor
     asset_scales: torch.Tensor
     asset_quats: torch.Tensor
+    asset_means_local: torch.Tensor
+    asset_scales_local: torch.Tensor
+    asset_quats_local: torch.Tensor
+    asset_scale_factors: torch.Tensor
+    asset_object_to_world: torch.Tensor
+    asset_local_yaw_deg: float = 0.0
 
 
 @dataclass
@@ -848,6 +854,62 @@ def _build_label_track_rotation(gt_rotation: torch.Tensor, scene_up: torch.Tenso
     return _build_upright_rotation(front, up)
 
 
+def _yaw_delta_between_rotations(base_rotation: torch.Tensor, solved_rotation: torch.Tensor) -> float:
+    relative = base_rotation.T @ solved_rotation
+    return float(torch.atan2(relative[1, 0], relative[0, 0]).item())
+
+
+def _robust_shared_yaw_delta(yaw_deltas: list[float], scores: list[float]) -> float:
+    if len(yaw_deltas) == 0:
+        return 0.0
+    if len(yaw_deltas) == 1:
+        return float(yaw_deltas[0])
+
+    angles = torch.tensor(yaw_deltas, dtype=torch.float32)
+    angles = _wrap_angle_rad(angles)
+    anchor = torch.median(angles)
+    diffs = _wrap_angle_rad(angles - anchor).abs()
+    keep_count = max(1, math.ceil(0.75 * len(yaw_deltas)))
+    keep_indices = torch.argsort(diffs)[:keep_count]
+    kept_angles = angles[keep_indices]
+
+    if len(scores) == len(yaw_deltas):
+        weights = torch.tensor(scores, dtype=torch.float32)[keep_indices]
+        weights = torch.softmax(weights, dim=0)
+    else:
+        weights = torch.full((keep_indices.numel(),), 1.0 / float(max(1, keep_indices.numel())), dtype=torch.float32)
+
+    sin_sum = torch.sum(weights * torch.sin(kept_angles))
+    cos_sum = torch.sum(weights * torch.cos(kept_angles))
+    return float(torch.atan2(sin_sum, cos_sum).item())
+
+
+def _rotation_heading_angle(rotation: torch.Tensor) -> float:
+    front = rotation[:, 0]
+    return float(torch.atan2(front[1], front[0]).item())
+
+
+def _shared_track_rotation_candidate(
+    rotations: list[torch.Tensor],
+    scores: list[float],
+    max_spread_deg: float = 8.0,
+) -> torch.Tensor | None:
+    if len(rotations) < 2:
+        return None
+    headings = torch.tensor([_rotation_heading_angle(rot) for rot in rotations], dtype=torch.float32)
+    shared_heading = _robust_shared_yaw_delta(headings.tolist(), scores)
+    diffs = _wrap_angle_rad(headings - shared_heading).abs()
+    spread_deg = float(torch.rad2deg(diffs.max()).item())
+    if spread_deg > max_spread_deg:
+        return None
+    inlier_indices = torch.nonzero(diffs <= math.radians(max_spread_deg), as_tuple=False).flatten()
+    if inlier_indices.numel() == 0:
+        return None
+    best_local = int(torch.tensor(scores, dtype=torch.float32)[inlier_indices].argmax().item())
+    best_index = int(inlier_indices[best_local].item())
+    return rotations[best_index].clone()
+
+
 def _world_to_camera_points(points_world: torch.Tensor, camera_to_world: torch.Tensor) -> torch.Tensor:
     rotation_wc = camera_to_world[:3, :3]
     translation_wc = camera_to_world[:3, 3]
@@ -929,18 +991,20 @@ def _project_box_bbox(
     return compute_bbox_from_projected_points(projected_corners, projected_valid)
 
 
-def _solve_proposal_pose_from_target_bbox(
+def _wrap_angle_rad(angle_rad: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(angle_rad), torch.cos(angle_rad))
+
+
+def _proposal_depth_candidates(
     object_center: torch.Tensor,
     object_size: torch.Tensor,
     object_rotation: torch.Tensor,
-    target_bbox_model: torch.Tensor,
     camera_to_world: torch.Tensor,
-    intrinsics: torch.Tensor,
-    image_hw: tuple[int, int],
     point_map_world: torch.Tensor,
     depth_map: torch.Tensor,
     valid_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    target_bbox_model: torch.Tensor,
+) -> list[torch.Tensor]:
     seed_points, _ = _extract_foreground_seed(
         point_map_world,
         depth_map,
@@ -968,6 +1032,32 @@ def _solve_proposal_pose_from_target_bbox(
         support = torch.sum(view_local.abs() * (object_size * 0.5)).clamp_min(0.05)
         depth_candidates.append((seed_depth + support).clamp_min(1e-2))
         depth_candidates.append((seed_depth + 0.5 * support).clamp_min(1e-2))
+    return depth_candidates
+
+
+def _solve_proposal_pose_from_target_bbox(
+    object_center: torch.Tensor,
+    object_size: torch.Tensor,
+    object_rotation: torch.Tensor,
+    target_bbox_model: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    image_hw: tuple[int, int],
+    point_map_world: torch.Tensor,
+    depth_map: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    depth_candidates = _proposal_depth_candidates(
+        object_center=object_center,
+        object_size=object_size,
+        object_rotation=object_rotation,
+        camera_to_world=camera_to_world,
+        point_map_world=point_map_world,
+        depth_map=depth_map,
+        valid_mask=valid_mask,
+        target_bbox_model=target_bbox_model,
+    )
+    depth_prior = depth_candidates[0]
 
     base_rotation = object_rotation.clone()
     base_bbox = _project_box_bbox(object_center, object_size, base_rotation, camera_to_world, intrinsics, image_hw)
@@ -1022,6 +1112,73 @@ def _solve_proposal_pose_from_target_bbox(
     return best_center, _orthonormalize_rotation(best_rotation), best_bbox
 
 
+def _solve_proposal_center_with_fixed_rotation(
+    object_center: torch.Tensor,
+    object_size: torch.Tensor,
+    object_rotation: torch.Tensor,
+    target_bbox_model: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    image_hw: tuple[int, int],
+    point_map_world: torch.Tensor,
+    depth_map: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    depth_candidates = _proposal_depth_candidates(
+        object_center=object_center,
+        object_size=object_size,
+        object_rotation=object_rotation,
+        camera_to_world=camera_to_world,
+        point_map_world=point_map_world,
+        depth_map=depth_map,
+        valid_mask=valid_mask,
+        target_bbox_model=target_bbox_model,
+    )
+    depth_prior = depth_candidates[0]
+
+    best_bbox = _project_box_bbox(object_center, object_size, object_rotation, camera_to_world, intrinsics, image_hw)
+    best_score = -1e9 if best_bbox is None else _score_projected_bbox(best_bbox, target_bbox_model)
+    best_center = object_center.clone()
+
+    for depth_init in depth_candidates:
+        center_xy_init = _unproject_center_xy(target_bbox_model, depth_init, intrinsics)
+        center_xy = center_xy_init.clone().detach().requires_grad_(True)
+        log_depth = depth_init.log().clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([center_xy, log_depth], lr=0.05)
+
+        for _ in range(50):
+            optimizer.zero_grad()
+            depth = torch.exp(log_depth).clamp_min(1e-3)
+            center_cam = torch.cat([center_xy, depth.view(1)], dim=0)
+            center_world = _camera_to_world_points(center_cam.view(1, 3), camera_to_world)[0]
+            pred_bbox, invalid_penalty = _project_box_bbox_soft(
+                center_world,
+                object_size,
+                object_rotation,
+                camera_to_world,
+                intrinsics,
+                image_hw,
+            )
+            loss = _bbox_alignment_loss(pred_bbox, target_bbox_model)
+            loss = loss + 2.0 * invalid_penalty
+            loss = loss + 0.02 * (log_depth - depth_prior.log()).pow(2)
+            loss.backward()
+            optimizer.step()
+
+        with torch.no_grad():
+            depth = torch.exp(log_depth).clamp_min(1e-3)
+            center_cam = torch.cat([center_xy, depth.view(1)], dim=0)
+            center_world = _camera_to_world_points(center_cam.view(1, 3), camera_to_world)[0]
+            bbox = _project_box_bbox(center_world, object_size, object_rotation, camera_to_world, intrinsics, image_hw)
+            score = -1e9 if bbox is None else _score_projected_bbox(bbox, target_bbox_model)
+            if score > best_score:
+                best_score = score
+                best_center = center_world.clone()
+                best_bbox = bbox
+
+    return best_center, best_bbox
+
+
 def _refine_proposal_box_from_foreground_seed(
     point_map_world: torch.Tensor,
     depth_map: torch.Tensor,
@@ -1061,8 +1218,7 @@ def _load_asset_gaussians(path: str, cache: dict[str, dict[str, torch.Tensor]]) 
     colors = torch.tensor(asset["rgb"].tolist(), dtype=torch.float32).clamp(0.0, 1.0)
     opacities = torch.tensor(asset["opacities"].tolist(), dtype=torch.float32).view(-1, 1).clamp(1e-6, 1.0 - 1e-6)
     scales = torch.tensor(asset["scales"].tolist(), dtype=torch.float32).clamp_min(1e-6)
-    quats_wxyz = torch.tensor(asset["quats"].tolist(), dtype=torch.float32)
-    quats = quats_wxyz[:, [1, 2, 3, 0]]
+    quats = torch.tensor(asset["quats"].tolist(), dtype=torch.float32)
 
     cache[path] = {
         "means_raw": means,
@@ -1075,6 +1231,44 @@ def _load_asset_gaussians(path: str, cache: dict[str, dict[str, torch.Tensor]]) 
     return cache[path]
 
 
+def _quat_wxyz_to_mat(quats_wxyz: torch.Tensor) -> torch.Tensor:
+    quats_xyzw = quats_wxyz[..., [1, 2, 3, 0]]
+    return quat_to_mat(quats_xyzw)
+
+
+def _mat_to_quat_wxyz(rotation_mats: torch.Tensor) -> torch.Tensor:
+    quats_xyzw = mat_to_quat(rotation_mats)
+    return quats_xyzw[..., [3, 0, 1, 2]]
+
+
+def _compute_asset_scale_factors(
+    asset_local: dict[str, torch.Tensor],
+    target_lwh: torch.Tensor,
+    opacity_threshold: float = 0.01,
+) -> torch.Tensor:
+    opacities = asset_local["opacities"].squeeze(-1)
+    visible = opacities > opacity_threshold
+    visible_xyz = asset_local["means_raw"][visible] if torch.any(visible) else asset_local["means_raw"]
+    if visible_xyz.numel() == 0:
+        current_lwh = torch.ones(3, dtype=torch.float32, device=target_lwh.device)
+    else:
+        min_xyz = visible_xyz.min(dim=0).values
+        max_xyz = visible_xyz.max(dim=0).values
+        current_lwh = (max_xyz - min_xyz).clamp_min(1e-6)
+    scale_wlh = torch.tensor(_GS_LWH_TO_XYZ_SCALE, dtype=torch.float32, device=target_lwh.device)
+    return (target_lwh / current_lwh) * scale_wlh
+
+
+def _asset_object_to_world_matrix(
+    object_rotation: torch.Tensor,
+    object_center: torch.Tensor,
+) -> torch.Tensor:
+    transform = torch.eye(4, dtype=object_rotation.dtype)
+    transform[:3, :3] = object_rotation
+    transform[:3, 3] = object_center
+    return transform
+
+
 def _transform_asset_gaussians_simple(
     asset_local: dict[str, torch.Tensor],
     target_lwh: torch.Tensor,
@@ -1082,33 +1276,17 @@ def _transform_asset_gaussians_simple(
     object_center: torch.Tensor,
     opacity_threshold: float = 0.01
 ) -> dict[str, torch.Tensor]:
-    opacities = asset_local["opacities"].squeeze(-1)
-    visible = opacities > opacity_threshold
-    
-    if not torch.any(visible):
-        current_lwh = torch.ones(3, dtype=torch.float32, device=target_lwh.device)
-        center = torch.zeros(3, dtype=torch.float32, device=target_lwh.device)
-    else:
-        visible_xyz = asset_local["means_raw"][visible]
-        min_xyz = visible_xyz.min(dim=0).values
-        max_xyz = visible_xyz.max(dim=0).values
-        center = (min_xyz + max_xyz) / 2.0
-        current_lwh = (max_xyz - min_xyz).clamp_min(1e-6)
-
-    scale_wlh = torch.tensor(_GS_LWH_TO_XYZ_SCALE, dtype=torch.float32, device=target_lwh.device)
-    scale_factors = (target_lwh / current_lwh) * scale_wlh
-
+    scale_factors = _compute_asset_scale_factors(asset_local, target_lwh, opacity_threshold=opacity_threshold)
     world_rot = object_rotation @ _rotation_fix_z_180(dtype=object_rotation.dtype).to(object_rotation.device)
 
-    means_centered = asset_local["means_raw"].to(target_lwh.device) - center
-    means_scaled = means_centered * scale_factors.view(1, 3)
+    means_scaled = asset_local["means_raw"].to(target_lwh.device) * scale_factors.view(1, 3)
     means_world = means_scaled @ world_rot.T + object_center
 
     quats = asset_local["quats"].to(target_lwh.device)
     scales = asset_local["scales"].to(target_lwh.device)
-    local_rot = quat_to_mat(F.normalize(quats, dim=-1))
+    local_rot = _quat_wxyz_to_mat(F.normalize(quats, dim=-1))
     world_rot_batch = world_rot.unsqueeze(0).expand(local_rot.shape[0], -1, -1)
-    world_quats = F.normalize(mat_to_quat(world_rot_batch @ local_rot), dim=-1)
+    world_quats = F.normalize(_mat_to_quat_wxyz(world_rot_batch @ local_rot), dim=-1)
     scales_new = scales * scale_factors.view(1, 3)
 
     return {
@@ -1140,14 +1318,9 @@ def _project_asset_bbox_simple(
         stride = max(1, visible_xyz.shape[0] // 4096)
         visible_xyz = visible_xyz[::stride]
 
-    min_xyz = visible_xyz.min(dim=0).values
-    max_xyz = visible_xyz.max(dim=0).values
-    center = (min_xyz + max_xyz) / 2.0
-    current_lwh = (max_xyz - min_xyz).clamp_min(1e-6)
-    scale_wlh = torch.tensor(_GS_LWH_TO_XYZ_SCALE, dtype=torch.float32, device=target_lwh.device)
-    scale_factors = (target_lwh / current_lwh) * scale_wlh
+    scale_factors = _compute_asset_scale_factors(asset_local, target_lwh, opacity_threshold=opacity_threshold)
     world_rot = object_rotation @ _rotation_fix_z_180(dtype=object_rotation.dtype).to(object_rotation.device)
-    means_world = (visible_xyz.to(target_lwh.device) - center) * scale_factors.view(1, 3)
+    means_world = visible_xyz.to(target_lwh.device) * scale_factors.view(1, 3)
     means_world = means_world @ world_rot.T + object_center
     uv, _, valid = project_world_points(means_world, camera_to_world, intrinsics, image_hw)
     return compute_bbox_from_projected_points(uv, valid)
@@ -1723,26 +1896,94 @@ def localize_objects(
                 depth_map=clean_state.depth[source_front_index],
                 valid_mask=clean_state.valid_mask[source_front_index],
             )
-            delete_center, proposal_size = _refine_proposal_box_from_foreground_seed(
-                point_map_world=clean_state.point_map_world[source_front_index],
-                depth_map=clean_state.depth[source_front_index],
-                valid_mask=clean_state.valid_mask[source_front_index],
-                box_xyxy=target_bbox_model,
-                object_center=proposal_center,
-                object_size=gt_size,
-                object_rotation=proposal_rotation,
-            )
+            proposal_score = -1e9 if proposal_bbox is None else _score_projected_bbox(proposal_bbox, target_bbox_model)
             waymo_frame_dynamic = (
                 bool(object_is_moving_frame[slot_idx, frame_idx].item())
                 if isinstance(object_is_moving_frame, torch.Tensor)
                 else waymo_dynamic
             )
+            frame_specs.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "source_front_index": int(source_front_index),
+                    "gt_center": gt_center,
+                    "gt_size": gt_size,
+                    "gt_rotation": gt_rotation,
+                    "proposal_rotation_base": proposal_rotation_base,
+                    "proposal_center_initial": proposal_center,
+                    "proposal_rotation_initial": proposal_rotation,
+                    "proposal_score_initial": proposal_score,
+                    "waymo_frame_dynamic": bool(waymo_frame_dynamic),
+                    "target_bbox_model": target_bbox_model,
+                }
+            )
+
+        if len(frame_specs) == 0:
+            continue
+
+        shared_yaw_delta = _robust_shared_yaw_delta(
+            [
+                _yaw_delta_between_rotations(spec["proposal_rotation_base"], spec["proposal_rotation_initial"])
+                for spec in frame_specs
+            ],
+            [float(spec["proposal_score_initial"]) for spec in frame_specs],
+        )
+        shared_track_rotation = _shared_track_rotation_candidate(
+            [spec["proposal_rotation_initial"] for spec in frame_specs],
+            [float(spec["proposal_score_initial"]) for spec in frame_specs],
+        )
+
+        for frame_spec_idx, frame_spec in enumerate(frame_specs):
+            frame_idx = frame_spec["frame_idx"]
+            source_front_index = frame_spec["source_front_index"]
+            gt_center = frame_spec["gt_center"]
+            gt_size = frame_spec["gt_size"]
+            gt_rotation = frame_spec["gt_rotation"]
+            if shared_track_rotation is not None:
+                proposal_rotation = shared_track_rotation.clone()
+            else:
+                proposal_rotation_base = frame_spec["proposal_rotation_base"]
+                shared_yaw_tensor = torch.tensor(shared_yaw_delta, dtype=gt_center.dtype)
+                proposal_rotation = _orthonormalize_rotation(
+                    proposal_rotation_base @ _rotation_z_tensor(shared_yaw_tensor, dtype=gt_center.dtype)
+                )
+            proposal_center, _ = _solve_proposal_center_with_fixed_rotation(
+                object_center=frame_spec["proposal_center_initial"],
+                object_size=gt_size,
+                object_rotation=proposal_rotation,
+                target_bbox_model=frame_spec["target_bbox_model"],
+                camera_to_world=clean_state.camera_to_world[source_front_index],
+                intrinsics=clean_state.intrinsics[source_front_index],
+                image_hw=image_hw,
+                point_map_world=clean_state.point_map_world[source_front_index],
+                depth_map=clean_state.depth[source_front_index],
+                valid_mask=clean_state.valid_mask[source_front_index],
+            )
+            delete_center, proposal_size = _refine_proposal_box_from_foreground_seed(
+                point_map_world=clean_state.point_map_world[source_front_index],
+                depth_map=clean_state.depth[source_front_index],
+                valid_mask=clean_state.valid_mask[source_front_index],
+                box_xyxy=frame_spec["target_bbox_model"],
+                object_center=proposal_center,
+                object_size=gt_size,
+                object_rotation=proposal_rotation,
+            )
+            frame_rotation = proposal_rotation
+            target_bbox_model_raw = frame_spec["target_bbox_model"]
+            target_bbox_model = target_bbox_model_raw
+            waymo_frame_speed = (
+                float(object_speed_mps[slot_idx, frame_idx].item())
+                if isinstance(object_speed_mps, torch.Tensor)
+                else waymo_mean_speed
+            )
+            waymo_frame_dynamic = bool(frame_spec.get("waymo_frame_dynamic", waymo_dynamic))
+            dynamic_image_mask = _binary_mask_from_image(sample["dynamic_mask"][source_front_index])
             candidate_points, object_pixel_mask = _extract_object_pixels_from_bbox_component(
                 point_map_world=clean_state.point_map_world[source_front_index],
                 depth_map=clean_state.depth[source_front_index],
                 valid_mask=clean_state.valid_mask[source_front_index],
                 box_xyxy=target_bbox_model,
-                dynamic_image_mask=_binary_mask_from_image(sample["dynamic_mask"][source_front_index]),
+                dynamic_image_mask=dynamic_image_mask,
                 dynamic_mode=bool(waymo_frame_dynamic),
                 coarse_center=delete_center,
                 coarse_rotation=proposal_rotation,
@@ -1754,50 +1995,8 @@ def localize_objects(
             )
             if candidate_points.shape[0] < max(24, min_candidate_points // 2):
                 continue
-            frame_specs.append(
-                {
-                    "frame_idx": int(frame_idx),
-                    "source_front_index": int(source_front_index),
-                    "gt_center": gt_center,
-                    "gt_size": gt_size,
-                    "gt_rotation": gt_rotation,
-                    "proposal_center": proposal_center,
-                    "proposal_rotation": proposal_rotation,
-                    "delete_center": delete_center_fit,
-                    "proposal_bbox": proposal_bbox,
-                    "proposal_size": delete_size_fit,
-                    "waymo_frame_dynamic": bool(waymo_frame_dynamic),
-                    "target_bbox_model": target_bbox_model,
-                    "candidate_points": candidate_points,
-                    "object_pixel_mask": object_pixel_mask,
-                    "dynamic_image_mask": _binary_mask_from_image(sample["dynamic_mask"][source_front_index]),
-                }
-            )
-
-        if len(frame_specs) == 0:
-            continue
-
-        for frame_spec_idx, frame_spec in enumerate(frame_specs):
-            frame_idx = frame_spec["frame_idx"]
-            source_front_index = frame_spec["source_front_index"]
-            gt_center = frame_spec["gt_center"]
-            gt_size = frame_spec["gt_size"]
-            gt_rotation = frame_spec["gt_rotation"]
-            proposal_center = frame_spec["proposal_center"]
-            proposal_rotation = frame_spec["proposal_rotation"]
-            delete_center = frame_spec["delete_center"]
-            proposal_size = frame_spec["proposal_size"]
-            frame_rotation = proposal_rotation
-            target_bbox_model_raw = frame_spec["target_bbox_model"]
-            target_bbox_model = target_bbox_model_raw
-            object_pixel_mask = frame_spec["object_pixel_mask"]
-            dynamic_image_mask = frame_spec["dynamic_image_mask"]
-            waymo_frame_speed = (
-                float(object_speed_mps[slot_idx, frame_idx].item())
-                if isinstance(object_speed_mps, torch.Tensor)
-                else waymo_mean_speed
-            )
-            waymo_frame_dynamic = bool(frame_spec.get("waymo_frame_dynamic", waymo_dynamic))
+            delete_center = delete_center_fit
+            proposal_size = delete_size_fit
             delete_motion_mode = "dynamic" if waymo_frame_dynamic else "static"
             delete_result = _extract_delete_component(
                 clean_state=clean_state,
@@ -1842,6 +2041,8 @@ def localize_objects(
             refined_size = delete_result["refined_size"].clone()
             insert_size = gt_size.clone()
             asset_center = proposal_center.clone()
+            asset_scale_factors = _compute_asset_scale_factors(asset_local, insert_size)
+            asset_object_to_world = _asset_object_to_world_matrix(frame_rotation, asset_center)
             asset_world = _transform_asset_gaussians_simple(
                 asset_local,
                 insert_size,
@@ -1907,6 +2108,11 @@ def localize_objects(
                     asset_opacities=asset_world["opacities"],
                     asset_scales=asset_world["scales"],
                     asset_quats=asset_world["quats"],
+                    asset_means_local=asset_local["means_raw"],
+                    asset_scales_local=asset_local["scales"],
+                    asset_quats_local=asset_local["quats"],
+                    asset_scale_factors=asset_scale_factors,
+                    asset_object_to_world=asset_object_to_world,
                 )
             )
 

@@ -449,6 +449,206 @@ def _gather_assets_by_image(localized_objects, device: torch.device) -> dict[int
     return merged
 
 
+def _group_localized_objects_by_image(localized_objects) -> dict[int, list]:
+    per_image: dict[int, list] = {}
+    for item in localized_objects:
+        per_image.setdefault(int(item.source_front_index), []).append(item)
+    return per_image
+
+
+def _asset_fix_transform(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    fix = torch.eye(4, dtype=dtype, device=device)
+    fix[0, 0] = -1.0
+    fix[1, 1] = -1.0
+    return fix
+
+
+def _asset_local_yaw_transform(device: torch.device, dtype: torch.dtype, yaw_deg: float) -> torch.Tensor:
+    yaw = math.radians(float(yaw_deg))
+    c = math.cos(yaw)
+    s = math.sin(yaw)
+    rot = torch.eye(4, dtype=dtype, device=device)
+    rot[0, 0] = c
+    rot[0, 1] = -s
+    rot[1, 0] = s
+    rot[1, 1] = c
+    return rot
+
+
+def _render_single_local_asset(
+    item,
+    image_idx: int,
+    extrinsic: torch.Tensor,
+    intrinsic: torch.Tensor,
+    height: int,
+    width: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scale_factors = item.asset_scale_factors.to(device).float().view(1, 3)
+    means_local = item.asset_means_local.to(device).float() * scale_factors
+    scales_local = item.asset_scales_local.to(device).float() * scale_factors
+    quats_local = item.asset_quats_local.to(device).float()
+    colors = item.asset_colors.to(device).float()
+    opacities = item.asset_opacities.to(device).float().view(-1)
+    object_to_world = item.asset_object_to_world.to(device).float()
+    local_yaw = _asset_local_yaw_transform(device, object_to_world.dtype, getattr(item, "asset_local_yaw_deg", 0.0))
+    viewmat = extrinsic[image_idx] @ object_to_world @ _asset_fix_transform(device, object_to_world.dtype) @ local_yaw
+    render_chunk, alpha_chunk = _rasterize_scene(
+        means=means_local,
+        rgbs=colors,
+        opacity=opacities,
+        scales=scales_local,
+        rotation=quats_local,
+        viewmat=viewmat.unsqueeze(0),
+        intrinsic=intrinsic[image_idx : image_idx + 1],
+        height=height,
+        width=width,
+    )
+    fg = render_chunk[0, ..., :3]
+    depth = render_chunk[0, ..., 3]
+    alpha = alpha_chunk[0, ..., 0]
+    return fg, alpha, depth
+
+
+def _render_asset_sequence_local(
+    model,
+    sample: dict,
+    predictions: dict[str, torch.Tensor],
+    clean_state,
+    localized_objects,
+    device: torch.device,
+    *,
+    return_aux: bool = False,
+) -> torch.Tensor | dict[str, torch.Tensor]:
+    images = sample["images_clean"].unsqueeze(0).to(device)
+    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
+    extrinsic, intrinsic = _predict_camera_mats(predictions, image_hw, device)
+    bg_render = _render_background(model, images, extrinsic, intrinsic)
+    per_image = _group_localized_objects_by_image(localized_objects)
+
+    num_images = clean_state.images.shape[0]
+    height, width = image_hw
+    composed_list = []
+    fg_list = []
+    alpha_list = []
+    depth_list = []
+
+    for image_idx in range(num_images):
+        items = per_image.get(image_idx, [])
+        if len(items) == 0:
+            empty_fg = torch.zeros((height, width, 3), dtype=torch.float32, device=device)
+            empty_alpha = torch.zeros((height, width), dtype=torch.float32, device=device)
+            empty_depth = torch.zeros((height, width), dtype=torch.float32, device=device)
+            composed_list.append(bg_render[image_idx])
+            fg_list.append(empty_fg)
+            alpha_list.append(empty_alpha)
+            depth_list.append(empty_depth)
+            continue
+
+        layers = []
+        for item in items:
+            fg, alpha, depth = _render_single_local_asset(
+                item,
+                image_idx,
+                extrinsic,
+                intrinsic,
+                height,
+                width,
+                device,
+            )
+            object_to_world = item.asset_object_to_world.to(device).float()
+            local_yaw = _asset_local_yaw_transform(device, object_to_world.dtype, getattr(item, "asset_local_yaw_deg", 0.0))
+            viewmat = extrinsic[image_idx] @ object_to_world @ _asset_fix_transform(device, object_to_world.dtype) @ local_yaw
+            cam_dist = float(viewmat[:3, 3].norm().item())
+            layers.append((cam_dist, fg, alpha, depth))
+
+        layers.sort(key=lambda x: x[0], reverse=True)
+        fg_acc = torch.zeros((height, width, 3), dtype=torch.float32, device=device)
+        alpha_acc = torch.zeros((height, width), dtype=torch.float32, device=device)
+        depth_acc = torch.zeros((height, width), dtype=torch.float32, device=device)
+        for _, fg, alpha, depth in layers:
+            alpha_clamped = alpha.clamp(0.0, 1.0)
+            alpha_3 = alpha_clamped.unsqueeze(-1)
+            fg_acc = fg * alpha_3 + fg_acc * (1.0 - alpha_3)
+            alpha_acc = alpha_clamped + alpha_acc * (1.0 - alpha_clamped)
+            depth_mask = alpha_clamped > 1e-4
+            depth_acc = torch.where(depth_mask & ((depth_acc <= 0) | (depth < depth_acc)), depth, depth_acc)
+
+        composed = alpha_acc.unsqueeze(-1) * fg_acc + (1.0 - alpha_acc.unsqueeze(-1)) * bg_render[image_idx]
+        composed_list.append(composed)
+        fg_list.append(fg_acc)
+        alpha_list.append(alpha_acc)
+        depth_list.append(depth_acc)
+
+    renders_chw = torch.stack(composed_list, dim=0).permute(0, 3, 1, 2).detach().cpu().float().clamp(0.0, 1.0)
+    if not return_aux:
+        return renders_chw
+    return {
+        "composed": renders_chw,
+        "foreground": torch.stack(fg_list, dim=0).permute(0, 3, 1, 2).detach().cpu().float().clamp(0.0, 1.0),
+        "alpha": torch.stack(alpha_list, dim=0).detach().cpu().float().clamp(0.0, 1.0),
+        "depth": torch.stack(depth_list, dim=0).detach().cpu().float(),
+    }
+
+
+def _refine_asset_local_yaw_offsets(
+    sample: dict,
+    predictions: dict[str, torch.Tensor],
+    localized_objects,
+    device: torch.device,
+) -> None:
+    if len(localized_objects) == 0:
+        return
+    image_hw = tuple(int(v) for v in sample["images_clean"].shape[-2:])
+    extrinsic, intrinsic = _predict_camera_mats(predictions, image_hw, device)
+    clean_images = sample["images_clean"].to(device).float()
+    grouped: dict[int, list] = {}
+    for item in localized_objects:
+        grouped.setdefault(int(item.slot_idx), []).append(item)
+
+    candidate_offsets = (-10.0, -7.5, -5.0, -2.5, 0.0, 2.5, 5.0, 7.5, 10.0)
+    for _, items in grouped.items():
+        best_offset = 0.0
+        best_score = -1e9
+        for yaw_deg in candidate_offsets:
+            total_score = 0.0
+            valid_frames = 0
+            for item in items:
+                item.asset_local_yaw_deg = yaw_deg
+                fg, alpha, _ = _render_single_local_asset(
+                    item,
+                    int(item.source_front_index),
+                    extrinsic,
+                    intrinsic,
+                    image_hw[0],
+                    image_hw[1],
+                    device,
+                )
+                if item.target_bbox_model is None:
+                    continue
+                x1, y1, x2, y2 = [int(round(v)) for v in item.target_bbox_model.tolist()]
+                x1 = max(0, min(image_hw[1] - 1, x1))
+                y1 = max(0, min(image_hw[0] - 1, y1))
+                x2 = max(x1 + 1, min(image_hw[1], x2))
+                y2 = max(y1 + 1, min(image_hw[0], y2))
+                alpha_crop = alpha[y1:y2, x1:x2]
+                if alpha_crop.numel() == 0 or float(alpha_crop.max().item()) < 1e-3:
+                    continue
+                fg_crop = fg[y1:y2, x1:x2]
+                gt_crop = clean_images[int(item.source_front_index), :, y1:y2, x1:x2].permute(1, 2, 0)
+                weight = alpha_crop.clamp(0.0, 1.0)
+                photometric = -(torch.abs(fg_crop - gt_crop) * weight.unsqueeze(-1)).mean()
+                total_score += float(photometric.item())
+                valid_frames += 1
+            if valid_frames > 0:
+                total_score -= 0.002 * abs(yaw_deg)
+                if total_score > best_score:
+                    best_score = total_score
+                    best_offset = yaw_deg
+        for item in items:
+            item.asset_local_yaw_deg = best_offset
+
+
 def _render_edited_sequence_with_dggt(
     model,
     sample: dict,
@@ -624,6 +824,7 @@ def _build_summary(args, sample, alignment, edited_state) -> dict:
                 "refined_center": [float(v) for v in item.refined_center.tolist()],
                 "refined_size": [float(v) for v in item.refined_size.tolist()],
                 "asset_scale": float(item.asset_scale),
+                "asset_local_yaw_deg": float(getattr(item, "asset_local_yaw_deg", 0.0)),
                 "asset_bottom_center": [float(v) for v in item.asset_bottom_center.tolist()],
                 "target_bbox_model": None
                 if item.target_bbox_model is None
@@ -741,6 +942,7 @@ def main() -> None:
         dynamic_prob_thresh=args.dynamic_prob_thresh,
         dynamic_ratio_thresh=args.dynamic_ratio_thresh,
     )
+    _refine_asset_local_yaw_offsets(sample, predictions, localized_objects, device)
     _save_target_vs_asset_boxes(
         clean_state.images,
         localized_objects,
@@ -770,15 +972,13 @@ def main() -> None:
         device,
         return_aux=True,
     )
-    asset_bundle = _render_edited_sequence_with_dggt(
+    asset_bundle = _render_asset_sequence_local(
         model,
         sample,
         predictions,
         clean_state,
-        torch.ones_like(edited_state.delete_mask),
         edited_state.localized_objects,
         device,
-        asset_only=True,
         return_aux=True,
     )
     deleted_render = deleted_bundle["composed"]
