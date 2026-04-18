@@ -5,6 +5,7 @@ import json
 import math
 import random
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -190,6 +191,85 @@ def resolve_default_manifest_path(processed_root, split, views):
 
 def resolve_default_candidate_path(processed_root, split):
     return Path(processed_root) / "waymo_edit_cache" / "metadata" / split / "mode_a_candidates.jsonl"
+
+
+def _list_scene_dirs(processed_root, split_name):
+    split_root = Path(processed_root) / split_name
+    if not split_root.is_dir():
+        return []
+    return sorted([path for path in split_root.iterdir() if path.is_dir()])
+
+
+def _list_frame_indices(scene_root, cam_id=0):
+    image_root = scene_root / "images"
+    frame_indices = []
+    for path in sorted(image_root.glob(f"*_{cam_id}.jpg")) + sorted(image_root.glob(f"*_{cam_id}.png")):
+        stem = path.stem
+        try:
+            frame_indices.append(int(stem.split("_")[0]))
+        except Exception:
+            continue
+    return sorted(frame_indices)
+
+
+def build_clean_clip_records(processed_root, views, split_seed=0, train_ratio=0.9, max_clips_per_scene=6, clip_length=29):
+    del views
+    all_records = []
+    for source_split in ("training", "validation"):
+        for scene_dir_path in _list_scene_dirs(processed_root, source_split):
+            frame_indices = _list_frame_indices(scene_dir_path, cam_id=0)
+            if len(frame_indices) < clip_length:
+                continue
+
+            num_clips = min(max_clips_per_scene, len(frame_indices) // clip_length)
+            for clip_index in range(num_clips):
+                start = clip_index * clip_length
+                end = start + clip_length
+                clip_frame_indices = frame_indices[start:end]
+                if len(clip_frame_indices) != clip_length:
+                    continue
+
+                scene_dir = str(scene_dir_path.name)
+                scene_base = f"{source_split}_{scene_dir}"
+                clip_name = f"{scene_base}_{clip_index}"
+                all_records.append(
+                    {
+                        "record_index": len(all_records),
+                        "scene_id": len(all_records),
+                        "scene_name": scene_base,
+                        "scene_dir": scene_dir,
+                        "scene_base": scene_base,
+                        "clip_name": clip_name,
+                        "clip_index": clip_index,
+                        "scene_frame_indices": clip_frame_indices,
+                        "source_split": source_split,
+                        "edit_mode": "clean",
+                        "objects": [],
+                    }
+                )
+
+    rng = random.Random(int(split_seed))
+    rng.shuffle(all_records)
+
+    total = len(all_records)
+    if total == 0:
+        return [], [], {"clean_total": 0, "edited_total": 0, "train_total": 0, "val_total": 0}
+
+    train_count = int(total * float(train_ratio))
+    if total > 1:
+        train_count = min(max(train_count, 1), total - 1)
+    else:
+        train_count = total
+
+    train_records = all_records[:train_count]
+    val_records = all_records[train_count:]
+    stats = {
+        "clean_total": total,
+        "edited_total": 0,
+        "train_total": len(train_records),
+        "val_total": len(val_records),
+    }
+    return train_records, val_records, stats
 
 
 def resolve_image_path(root, frame_idx, cam_id):
@@ -500,6 +580,11 @@ class WaymoEditDataset(Dataset):
         alignment_patch_size=None,
         alignment_cache_path=None,
         persist_alignment_cache=False,
+        tokenizer=None,
+        clean_only=False,
+        clean_caption_template="a clean driving scene",
+        clean_split_seed=0,
+        clean_train_ratio=0.9,
     ):
         super().__init__()
         del transfer_root, transfer_camera, alignment_hw, alignment_num_anchors
@@ -519,6 +604,34 @@ class WaymoEditDataset(Dataset):
         self.views = views
         self.sample_window = sample_window
         self.camera_ids = [0] if views == 1 else [0, 1, 2]
+        self.tokenizer = tokenizer
+        self.clean_only = bool(clean_only)
+        self.clean_caption_template = str(clean_caption_template)
+        self.clean_split_seed = int(clean_split_seed)
+        self.clean_train_ratio = float(clean_train_ratio)
+
+        self.clean_sample_stats = {
+            "clean_total": 0,
+            "edited_total": 0,
+            "train_total": 0,
+            "val_total": 0,
+        }
+        self.dataset_split_name = "train" if split in ("training", "train") else "val"
+
+        if self.clean_only:
+            train_records, val_records, clean_stats = build_clean_clip_records(
+                self.processed_root,
+                self.views,
+                split_seed=self.clean_split_seed,
+                train_ratio=self.clean_train_ratio,
+            )
+            self.clean_sample_stats = clean_stats
+            self.samples = train_records if self.dataset_split_name == "train" else val_records
+            self.max_objects = 0
+            self.processed_split_root = None
+            self.annotations_root = None
+            self._scene_cache = {}
+            return
 
         if manifest_path is None and final_info_path is not None:
             final_info_path = Path(final_info_path)
@@ -625,10 +738,15 @@ class WaymoEditDataset(Dataset):
         segment_end,
         frame_has_preferred_editable_object,
         frame_has_editable_object,
+        sample_num_frames=None,
     ):
+        sample_num_frames = self.sequence_length if sample_num_frames is None else int(sample_num_frames)
+        sample_window = max(int(self.sample_window), sample_num_frames)
         segment_length = segment_end - segment_start
-        if segment_length < self.sequence_length:
-            raise ValueError(f"segment length {segment_length} is smaller than sequence length {self.sequence_length}")
+        if segment_length < sample_num_frames:
+            raise ValueError(
+                f"segment length {segment_length} is smaller than requested num_frames {sample_num_frames}"
+            )
 
         segment_visible_editable = frame_has_preferred_editable_object[segment_start:segment_end]
         segment_editable = frame_has_editable_object[segment_start:segment_end]
@@ -637,21 +755,21 @@ class WaymoEditDataset(Dataset):
         if isinstance(segment_editable, torch.Tensor):
             segment_editable = segment_editable.tolist()
 
-        all_start_candidates = list(range(0, segment_length - self.sequence_length + 1))
-        if segment_length >= self.sample_window:
-            preferred_start_candidates = list(range(0, segment_length - self.sample_window + 1))
+        all_start_candidates = list(range(0, segment_length - sample_num_frames + 1))
+        if segment_length >= sample_window:
+            preferred_start_candidates = list(range(0, segment_length - sample_window + 1))
         else:
             preferred_start_candidates = all_start_candidates
 
         def build_candidate(start_rel, visible_flags):
-            window_end = min(segment_length, start_rel + self.sample_window)
+            window_end = min(segment_length, start_rel + sample_window)
             future_indices = list(range(start_rel + 1, window_end))
-            if len(future_indices) < self.sequence_length - 1:
+            if len(future_indices) < sample_num_frames - 1:
                 return None
             visible_future = [idx for idx in future_indices if visible_flags[idx]]
             start_visible = bool(visible_flags[start_rel])
             num_visible_total = len(visible_future) + int(start_visible)
-            num_non_visible_required = max(0, self.sequence_length - num_visible_total)
+            num_non_visible_required = max(0, sample_num_frames - num_visible_total)
             return {
                 "start_rel": start_rel,
                 "future_indices": future_indices,
@@ -672,7 +790,7 @@ class WaymoEditDataset(Dataset):
             candidate = build_candidate(start_rel, segment_visible_editable)
             if candidate is None:
                 continue
-            if candidate["start_visible"] and len(candidate["visible_future"]) >= self.sequence_length - 1:
+            if candidate["start_visible"] and len(candidate["visible_future"]) >= sample_num_frames - 1:
                 preferred_all_visible.append(candidate)
             elif candidate["start_visible"]:
                 preferred_mixed_start_visible.append(candidate)
@@ -683,7 +801,7 @@ class WaymoEditDataset(Dataset):
             candidate = build_candidate(start_rel, segment_editable)
             if candidate is None:
                 continue
-            if candidate["start_visible"] and len(candidate["visible_future"]) >= self.sequence_length - 1:
+            if candidate["start_visible"] and len(candidate["visible_future"]) >= sample_num_frames - 1:
                 fallback_all_visible.append(candidate)
             elif candidate["start_visible"]:
                 fallback_mixed_start_visible.append(candidate)
@@ -703,7 +821,7 @@ class WaymoEditDataset(Dataset):
                 f"Failed to sample frames inside segment [{segment_start}, {segment_end}) with length {segment_length}"
             )
 
-        num_required_future = self.sequence_length - 1
+        num_required_future = sample_num_frames - 1
         chosen_future = self._pick_indices(
             candidate["visible_future"],
             min(num_required_future, len(candidate["visible_future"])),
@@ -717,6 +835,168 @@ class WaymoEditDataset(Dataset):
         selected_segment_indices = [candidate["start_rel"]] + chosen_future
         intervals = [idx - candidate["start_rel"] for idx in chosen_future]
         return selected_segment_indices, intervals
+
+    def _parse_sample_index(self, idx):
+        sample_num_frames = self.sequence_length
+        tuple_override = False
+
+        if isinstance(idx, tuple):
+            if len(idx) != 2:
+                raise ValueError(f"WaymoEditDataset tuple index must be (idx, num_frames), got {idx}")
+            idx, sample_num_frames = idx
+            tuple_override = True
+
+        sample_index = int(idx)
+        sample_num_frames = int(sample_num_frames)
+        if tuple_override and not 4 <= sample_num_frames <= 8:
+            raise ValueError(f"WaymoEditDataset tuple num_frames must be in [4, 8], got {sample_num_frames}")
+        if sample_num_frames <= 0:
+            raise ValueError(f"WaymoEditDataset num_frames must be positive, got {sample_num_frames}")
+        return sample_index, sample_num_frames
+
+    def _coerce_bool_sequence(self, values, expected_length):
+        if values is None:
+            return None
+        values = list(values)
+        if len(values) < expected_length:
+            values = values + [False] * (expected_length - len(values))
+        else:
+            values = values[:expected_length]
+        return torch.tensor([bool(v) for v in values], dtype=torch.bool)
+
+    def _build_lightweight_sampling_flags(self, record):
+        clip_len = len(record["scene_frame_indices"])
+        frame_has_visible_editable_object = torch.zeros((clip_len,), dtype=torch.bool)
+
+        for object_record in record.get("objects", []):
+            asset_object_id = str(object_record.get("asset_object_id", ""))
+            default_asset_path = self.asset_root / f"{asset_object_id}.ply" if asset_object_id else self.asset_root
+            asset_path = Path(object_record.get("asset_path", default_asset_path))
+            if not asset_path.is_file():
+                continue
+
+            object_visible = torch.zeros((clip_len,), dtype=torch.bool)
+            visibility_by_view = object_record.get("visibility_by_view", {})
+            for cam_id in self.camera_ids:
+                cam_name = CAM_ID_TO_NAME[cam_id]
+                view_flags = self._coerce_bool_sequence(visibility_by_view.get(cam_name), clip_len)
+                if view_flags is not None:
+                    object_visible |= view_flags
+            frame_has_visible_editable_object |= object_visible
+
+        if not bool(frame_has_visible_editable_object.any().item()):
+            top_level_key = "frame_has_front_visible_object" if self.views == 1 else "frame_has_front3_visible_object"
+            top_level_flags = self._coerce_bool_sequence(record.get(top_level_key), clip_len)
+            if top_level_flags is not None:
+                frame_has_visible_editable_object = top_level_flags
+
+        frame_has_editable_object = frame_has_visible_editable_object.clone()
+        if not bool(frame_has_editable_object.any().item()):
+            frame_has_editable_object = torch.ones((clip_len,), dtype=torch.bool)
+        return frame_has_visible_editable_object, frame_has_editable_object
+
+    def _build_normalized_timestamps(self, local_indices):
+        timestamps = np.array(local_indices, dtype=np.float32)
+        if len(timestamps) == 0:
+            return timestamps
+        timestamps = timestamps - float(timestamps[0])
+        if len(timestamps) > 1 and float(timestamps[-1]) > 0:
+            timestamps = timestamps / float(timestamps[-1])
+        else:
+            timestamps = np.zeros_like(timestamps, dtype=np.float32)
+        if len(self.camera_ids) > 1:
+            timestamps = np.repeat(timestamps, len(self.camera_ids))
+        return timestamps.astype(np.float32, copy=False)
+
+    def _build_base_sample(
+        self,
+        record,
+        sample_index,
+        sample_num_frames,
+        clip_frame_indices,
+        local_indices,
+        scene_frame_indices,
+        image_paths,
+        images,
+        timestamps,
+        intervals,
+    ):
+        return {
+            "sample_index": int(sample_index),
+            "num_frames": torch.tensor(int(sample_num_frames), dtype=torch.long),
+            "images": images,
+            "images_clean": images,
+            "image_paths": image_paths,
+            "timestamps": torch.tensor(timestamps, dtype=torch.float32),
+            "interval": torch.tensor(intervals, dtype=torch.long),
+            "scene_id": int(record["scene_id"]),
+            "scene_name": str(record["scene_name"]),
+            "scene_dir": str(record["scene_dir"]),
+            "scene_base": str(record["scene_base"]),
+            "clip_name": str(record["clip_name"]),
+            "clip_index": torch.tensor(int(record["clip_index"]), dtype=torch.long),
+            "cam_ids": torch.tensor(self.camera_ids, dtype=torch.long),
+            "frame_indices": torch.tensor(scene_frame_indices, dtype=torch.long),
+            "local_frame_indices": torch.tensor(local_indices, dtype=torch.long),
+            "clip_frame_indices": torch.tensor(clip_frame_indices, dtype=torch.long),
+            "edit_mode": str(record.get("edit_mode", "replace")),
+            "edit_spec": {
+                "clip_name": str(record["clip_name"]),
+                "scene_base": str(record["scene_base"]),
+                "clip_index": int(record["clip_index"]),
+                "scene_frame_indices": clip_frame_indices,
+                "selected_scene_frame_indices": scene_frame_indices,
+                "selected_local_indices": local_indices,
+                "sample_num_frames": int(sample_num_frames),
+            },
+        }
+
+    def _build_clean_caption(self, record, sample_num_frames):
+        template_context: dict[str, Any] = {
+            "scene_name": str(record["scene_name"]),
+            "scene_base": str(record["scene_base"]),
+            "clip_name": str(record["clip_name"]),
+            "clip_index": int(record["clip_index"]),
+            "edit_mode": str(record.get("edit_mode", "replace")),
+            "num_frames": int(sample_num_frames),
+            "num_views": int(len(self.camera_ids)),
+        }
+        try:
+            return self.clean_caption_template.format(**template_context)
+        except Exception:
+            return self.clean_caption_template
+
+    def _build_tokenizer_payload(self, record, sample_num_frames, images):
+        if self.tokenizer is None:
+            return {}
+
+        caption = self._build_clean_caption(record, sample_num_frames)
+        pixel_values = images.mul(2.0).sub(1.0)
+        payload = {
+            "caption": caption,
+            "conditioning_pixel_values": pixel_values,
+            "output_pixel_values": pixel_values,
+        }
+        tokenizer_kwargs = {
+            "padding": "max_length",
+            "truncation": True,
+            "return_tensors": "pt",
+        }
+        model_max_length = getattr(self.tokenizer, "model_max_length", None)
+        if model_max_length is not None:
+            tokenizer_kwargs["max_length"] = model_max_length
+        encoded = self.tokenizer(caption, **tokenizer_kwargs)
+
+        if hasattr(encoded, "input_ids"):
+            payload["input_ids"] = encoded.input_ids
+        elif isinstance(encoded, dict) and "input_ids" in encoded:
+            payload["input_ids"] = encoded["input_ids"]
+
+        if hasattr(encoded, "attention_mask"):
+            payload["attention_mask"] = encoded.attention_mask
+        elif isinstance(encoded, dict) and "attention_mask" in encoded:
+            payload["attention_mask"] = encoded["attention_mask"]
+        return payload
 
     def _resolve_mask_root(self, scene_root):
         candidates = [
@@ -1097,9 +1377,49 @@ class WaymoEditDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        record = self.samples[idx]
-        scene_cache = self._get_scene_cache(record)
+        sample_index, sample_num_frames = self._parse_sample_index(idx)
+        record = self.samples[sample_index]
         clip_frame_indices = [int(v) for v in record["scene_frame_indices"]]
+
+        if self.clean_only:
+            frame_has_visible_editable_object, frame_has_editable_object = self._build_lightweight_sampling_flags(record)
+            local_indices, intervals = self._sample_local_indices(
+                0,
+                len(clip_frame_indices),
+                frame_has_visible_editable_object,
+                frame_has_editable_object,
+                sample_num_frames=sample_num_frames,
+            )
+            scene_frame_indices = [clip_frame_indices[local_idx] for local_idx in local_indices]
+
+            source_split = str(record.get("source_split", self.split))
+            scene_root = self.processed_root / source_split / str(record["scene_dir"])
+            image_paths = []
+            sky_mask_paths = []
+            for frame_idx in scene_frame_indices:
+                for cam_id in self.camera_ids:
+                    image_paths.append(resolve_image_path(scene_root / "images", frame_idx, cam_id))
+                    sky_mask_paths.append(resolve_image_path(scene_root / "sky_masks", frame_idx, cam_id))
+            images = load_and_preprocess_images(image_paths)
+            sky_masks = self._load_optional_image_stack(sky_mask_paths, images)
+            sample = self._build_base_sample(
+                record=record,
+                sample_index=sample_index,
+                sample_num_frames=sample_num_frames,
+                clip_frame_indices=clip_frame_indices,
+                local_indices=local_indices,
+                scene_frame_indices=scene_frame_indices,
+                image_paths=image_paths,
+                images=images,
+                timestamps=self._build_normalized_timestamps(local_indices),
+                intervals=intervals,
+            )
+            sample["masks"] = sky_masks
+            sample["sky_mask"] = sky_masks
+            sample.update(self._build_tokenizer_payload(record, sample_num_frames, images))
+            return sample
+
+        scene_cache = self._get_scene_cache(record)
 
         object_data = self._prepare_object_data(record, scene_cache)
         local_indices, intervals = self._sample_local_indices(
@@ -1107,6 +1427,7 @@ class WaymoEditDataset(Dataset):
             len(clip_frame_indices),
             object_data["frame_has_visible_editable_object"],
             object_data["frame_has_editable_object"],
+            sample_num_frames=sample_num_frames,
         )
         scene_frame_indices = [clip_frame_indices[local_idx] for local_idx in local_indices]
 
@@ -1131,11 +1452,7 @@ class WaymoEditDataset(Dataset):
         dynamic_masks = self._load_optional_image_stack(dynamic_mask_paths, images)
         gt_depth = self._load_optional_depth_stack(depth_flow_paths, images)
 
-        timestamps = np.array(local_indices, dtype=np.float32) - float(local_indices[0])
-        if len(timestamps) > 1 and timestamps[-1] > 0:
-            timestamps = timestamps / timestamps[-1] * (self.sequence_length / 4)
-        if self.views == 3:
-            timestamps = np.repeat(timestamps, 3)
+        timestamps = self._build_normalized_timestamps(local_indices)
 
         annotation = scene_cache["annotation"]
         camera_to_world = []
@@ -1182,28 +1499,24 @@ class WaymoEditDataset(Dataset):
         object_tensors = self._select_object_tensors(object_data, local_indices)
         asset_payload = self._build_asset_metadata(object_tensors)
 
-        sample = {
-            "sample_index": idx,
-            "images": images,
-            "images_clean": images,
+        sample = self._build_base_sample(
+            record=record,
+            sample_index=sample_index,
+            sample_num_frames=sample_num_frames,
+            clip_frame_indices=clip_frame_indices,
+            local_indices=local_indices,
+            scene_frame_indices=scene_frame_indices,
+            image_paths=image_paths,
+            images=images,
+            timestamps=timestamps,
+            intervals=intervals,
+        )
+        sample.update(
+            {
             "masks": sky_masks,
             "sky_mask": sky_masks,
             "dynamic_mask": dynamic_masks,
             "gt_depth": gt_depth,
-            "image_paths": image_paths,
-            "timestamps": torch.tensor(timestamps, dtype=torch.float32),
-            "interval": torch.tensor(intervals, dtype=torch.long),
-            "scene_id": int(record["scene_id"]),
-            "scene_name": str(record["scene_name"]),
-            "scene_dir": str(record["scene_dir"]),
-            "scene_base": str(record["scene_base"]),
-            "clip_name": str(record["clip_name"]),
-            "clip_index": torch.tensor(int(record["clip_index"]), dtype=torch.long),
-            "cam_ids": torch.tensor(self.camera_ids, dtype=torch.long),
-            "frame_indices": torch.tensor(scene_frame_indices, dtype=torch.long),
-            "local_frame_indices": torch.tensor(local_indices, dtype=torch.long),
-            "clip_frame_indices": torch.tensor(clip_frame_indices, dtype=torch.long),
-            "edit_mode": str(record.get("edit_mode", "replace")),
             "camera_to_world": camera_to_world,
             "camera_to_world_corrected": camera_to_world_corrected,
             "camera_to_ego": camera_to_ego,
@@ -1211,17 +1524,11 @@ class WaymoEditDataset(Dataset):
             "intrinsics": intrinsics,
             "raw_image_size_hw": torch.tensor(raw_image_size_hw, dtype=torch.long),
             "transfer_image_size_hw": torch.tensor(DEFAULT_TRANSFER_HW, dtype=torch.long),
-            "edit_spec": {
-                "clip_name": str(record["clip_name"]),
-                "scene_base": str(record["scene_base"]),
-                "clip_index": int(record["clip_index"]),
-                "scene_frame_indices": clip_frame_indices,
-                "selected_scene_frame_indices": scene_frame_indices,
-                "selected_local_indices": local_indices,
-            },
-        }
+            }
+        )
         sample.update(object_tensors)
         sample.update(asset_payload)
+        sample.update(self._build_tokenizer_payload(record, sample_num_frames, images))
         return sample
 
 

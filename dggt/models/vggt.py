@@ -9,6 +9,7 @@ import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from dggt.models.aggregator import Aggregator
+from dggt.models.joint_scene_tokenizer import JointSceneTokenizer
 from dggt.heads.camera_head import CameraHead
 from dggt.heads.dpt_head import DPTHead, GaussianHead
 from dggt.heads.track_head import TrackHead
@@ -23,6 +24,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         super().__init__()
 
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim)
+        self.scene_tokenizer = JointSceneTokenizer()
         self.camera_head = CameraHead(dim_in=2 * embed_dim)
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")# ,down_ratio=2)
         #self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")# ,down_ratio=2)
@@ -40,8 +42,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         #self.splatformer = FeaturePredictor()
         #self.point_offset_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log_1")
 
-
-    def forward(
+    def _prepare_inputs(
         self,
         images: torch.Tensor,
         query_points: torch.Tensor = None,
@@ -51,6 +52,41 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             images = images.unsqueeze(0)
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
+        return images, query_points
+
+    def get_aggregator_token_outputs(self, images: torch.Tensor):
+        """
+        Expose raw aggregator token outputs for external tokenizer / flow code.
+
+        This helper is read-only: it does not run any dense heads and it keeps
+        the existing forward path unchanged.
+        """
+        images, _ = self._prepare_inputs(images)
+        aggregated_tokens_list, image_tokens_list, dino_token_list, image_feature, patch_start_idx = self.aggregator(images)
+        return {
+            "aggregated_tokens_list": aggregated_tokens_list,
+            "image_tokens_list": image_tokens_list,
+            "dino_token_list": dino_token_list,
+            "image_feature": image_feature,
+            "patch_start_idx": patch_start_idx,
+        }
+
+    def extract_scene_tokens(self, images: torch.Tensor):
+        outputs = self.get_aggregator_token_outputs(images)
+        return (
+            outputs["aggregated_tokens_list"],
+            outputs["image_tokens_list"],
+            outputs["dino_token_list"],
+            outputs["image_feature"],
+            outputs["patch_start_idx"],
+        )
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        query_points: torch.Tensor = None,
+    ):
+        images, query_points = self._prepare_inputs(images, query_points)
 
         aggregated_tokens_list, image_tokens_list, dino_token_list, image_feature, patch_start_idx = self.aggregator(images)
         
