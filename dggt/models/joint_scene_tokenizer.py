@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from dggt.layers.block import Block
+from dggt.layers.rope import PositionGetter, RotaryPositionEmbedding2D
 
 
 def _reset_linear(module: nn.Module) -> None:
@@ -25,6 +26,16 @@ def _resolve_joint_refine_heads(joint_dim: int, preferred_heads: int) -> int:
             return candidate
 
     raise ValueError(f"Could not find a valid attention head count for joint_dim={joint_dim}")
+
+
+def _validate_rope_head_dim(dim: int, num_heads: int, module_name: str) -> None:
+    if dim % num_heads != 0:
+        raise ValueError(f"{module_name}: dim={dim} must be divisible by num_heads={num_heads}")
+    head_dim = dim // num_heads
+    if head_dim % 4 != 0:
+        raise ValueError(
+            f"{module_name}: head_dim={head_dim} must be divisible by 4 for 2D RoPE"
+        )
 
 
 def _normalize_patch_grid(
@@ -57,6 +68,52 @@ def _normalize_patch_grid(
     return best_h, best_w
 
 
+def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, positions: torch.Tensor) -> torch.Tensor:
+    if embed_dim % 2 != 0:
+        raise ValueError(f"embed_dim must be even, got {embed_dim}")
+
+    omega = torch.arange(embed_dim // 2, device=positions.device, dtype=torch.float32)
+    omega /= embed_dim / 2.0
+    omega = 1.0 / (10000**omega)
+
+    pos = positions.reshape(-1).to(dtype=torch.float32)
+    out = torch.einsum("m,d->md", pos, omega)
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=1)
+
+
+def _get_2d_sincos_pos_embed(
+    embed_dim: int,
+    patch_h: int,
+    patch_w: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    if embed_dim % 2 != 0:
+        raise ValueError(f"embed_dim must be even, got {embed_dim}")
+
+    grid_h = torch.arange(patch_h, device=device, dtype=torch.float32)
+    grid_w = torch.arange(patch_w, device=device, dtype=torch.float32)
+    grid_h, grid_w = torch.meshgrid(grid_h, grid_w, indexing="ij")
+    emb_h = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_h)
+    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_w)
+    return torch.cat([emb_h, emb_w], dim=1)
+
+
+def _get_cached_2d_sincos_pos_embed(
+    cache: dict[tuple[int, int, int, str], torch.Tensor],
+    embed_dim: int,
+    patch_h: int,
+    patch_w: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    cache_key = (embed_dim, patch_h, patch_w, str(device))
+    if cache_key not in cache:
+        cache[cache_key] = _get_2d_sincos_pos_embed(embed_dim, patch_h, patch_w, device=device)
+    return cache[cache_key].to(dtype=dtype).view(1, 1, patch_h * patch_w, embed_dim)
+
+
 class FrameGlobalBlockPair(nn.Module):
     """Alternates per-frame attention with global cross-frame attention."""
 
@@ -71,8 +128,11 @@ class FrameGlobalBlockPair(nn.Module):
         ffn_bias: bool = True,
         qk_norm: bool = True,
         init_values: float = 1e-6,
+        rope: RotaryPositionEmbedding2D | None = None,
     ) -> None:
         super().__init__()
+        if rope is not None:
+            _validate_rope_head_dim(dim, num_heads, "FrameGlobalBlockPair")
         self.frame_block = Block(
             dim=dim,
             num_heads=num_heads,
@@ -82,6 +142,7 @@ class FrameGlobalBlockPair(nn.Module):
             ffn_bias=ffn_bias,
             qk_norm=qk_norm,
             init_values=init_values,
+            rope=rope,
         )
         self.global_block = Block(
             dim=dim,
@@ -94,13 +155,21 @@ class FrameGlobalBlockPair(nn.Module):
             init_values=init_values,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, patch_positions: torch.Tensor | None = None) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Expected [B, S, P, D], got shape={tuple(x.shape)}")
 
         batch_size, seq_len, num_patches, dim = x.shape
+        frame_positions = None
+        if patch_positions is not None:
+            expected_shape = (batch_size, seq_len, num_patches, 2)
+            if tuple(patch_positions.shape) != expected_shape:
+                raise ValueError(
+                    f"Expected patch_positions shape {expected_shape}, got {tuple(patch_positions.shape)}"
+                )
+            frame_positions = patch_positions.reshape(batch_size * seq_len, num_patches, 2)
         x = x.reshape(batch_size * seq_len, num_patches, dim)
-        x = self.frame_block(x)
+        x = self.frame_block(x, pos=frame_positions)
         x = x.reshape(batch_size, seq_len, num_patches, dim)
 
         # Cross-frame attention is applied per patch location instead of over the
@@ -240,10 +309,13 @@ class PerLayerDecoderHead(nn.Module):
         ffn_bias: bool = True,
         qk_norm: bool = True,
         init_values: float = 1e-6,
+        rope: RotaryPositionEmbedding2D | None = None,
     ) -> None:
         super().__init__()
         self.joint_dim = stream_dim * 3
         refine_heads = _resolve_joint_refine_heads(self.joint_dim, num_heads)
+        if rope is not None:
+            _validate_rope_head_dim(self.joint_dim, refine_heads, "PerLayerDecoderHead")
         self.pre_norm = nn.LayerNorm(hidden_dim)
         self.pre_proj = nn.Linear(hidden_dim, self.joint_dim)
         self.refine = Block(
@@ -255,19 +327,29 @@ class PerLayerDecoderHead(nn.Module):
             ffn_bias=ffn_bias,
             qk_norm=qk_norm,
             init_values=init_values,
+            rope=rope,
         )
         self.out_norm = nn.LayerNorm(self.joint_dim)
         self.apply(_reset_linear)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, patch_positions: torch.Tensor | None = None) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Expected [B, S, P, D], got shape={tuple(x.shape)}")
 
         batch_size, seq_len, num_patches, _ = x.shape
+        frame_positions = None
+        if patch_positions is not None:
+            expected_shape = (batch_size, seq_len, num_patches, 2)
+            if tuple(patch_positions.shape) != expected_shape:
+                raise ValueError(
+                    f"Expected patch_positions shape {expected_shape}, got {tuple(patch_positions.shape)}"
+                )
+            frame_positions = patch_positions.reshape(batch_size * seq_len, num_patches, 2)
         x = self.pre_proj(self.pre_norm(x))
-        x = self.refine(x.reshape(batch_size * seq_len, num_patches, self.joint_dim)).reshape(
-            batch_size, seq_len, num_patches, self.joint_dim
-        )
+        x = self.refine(
+            x.reshape(batch_size * seq_len, num_patches, self.joint_dim),
+            pos=frame_positions,
+        ).reshape(batch_size, seq_len, num_patches, self.joint_dim)
         return self.out_norm(x)
 
 
@@ -300,7 +382,11 @@ class JointSceneTokenizerEncoder(nn.Module):
             )
 
         self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
         self.stream_dim = stream_dim
+        self.position_getter = PositionGetter()
+        self.patch_rope = RotaryPositionEmbedding2D()
+        self._patch_pos_embed_cache: dict[tuple[int, int, int, str], torch.Tensor] = {}
         self.stream_norms = nn.ModuleList(
             [
                 nn.ModuleDict(
@@ -350,6 +436,7 @@ class JointSceneTokenizerEncoder(nn.Module):
                     ffn_bias=ffn_bias,
                     qk_norm=qk_norm,
                     init_values=init_values,
+                    rope=self.patch_rope,
                 )
                 for _ in range(num_block_pairs)
             ]
@@ -372,10 +459,31 @@ class JointSceneTokenizerEncoder(nn.Module):
         if len(image_tokens_list_4) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} levels, got {len(image_tokens_list_4)}")
 
+        reference_tokens = image_tokens_list_4[0]
+        if reference_tokens.ndim != 4:
+            raise ValueError(f"Expected [B, S, P, C] input, got shape={tuple(reference_tokens.shape)}")
+        batch_size, seq_len, num_patches, _ = reference_tokens.shape
+        patch_h, patch_w = _normalize_patch_grid(num_patches, patch_grid)
+        patch_pos_embed = _get_cached_2d_sincos_pos_embed(
+            self._patch_pos_embed_cache,
+            self.hidden_dim,
+            patch_h,
+            patch_w,
+            device=reference_tokens.device,
+            dtype=reference_tokens.dtype,
+        )
+        patch_positions = self.position_getter(batch_size * seq_len, patch_h, patch_w, reference_tokens.device)
+        patch_positions = patch_positions.view(batch_size, seq_len, num_patches, 2)
+
         per_layer_tokens = []
         for layer_idx, x_layer in enumerate(image_tokens_list_4):
             if x_layer.ndim != 4:
                 raise ValueError(f"Expected [B, S, P, C] input, got shape={tuple(x_layer.shape)}")
+            if x_layer.shape[:3] != (batch_size, seq_len, num_patches):
+                raise ValueError(
+                    "All levels must share the same [B, S, P] dimensions, got "
+                    f"{tuple(x_layer.shape[:3])} vs {(batch_size, seq_len, num_patches)}"
+                )
             if x_layer.shape[-1] != self.stream_dim * 3:
                 raise ValueError(
                     f"Expected joint channel dim {self.stream_dim * 3}, got {x_layer.shape[-1]}"
@@ -391,13 +499,15 @@ class JointSceneTokenizerEncoder(nn.Module):
                 dim=-1,
             )
             detail = self.detail_branch(projected, patch_grid=patch_grid)
-            per_layer_tokens.append(torch.cat([projected, detail], dim=-1) + self.layer_embed[layer_idx])
+            per_layer_tokens.append(
+                torch.cat([projected, detail], dim=-1) + self.layer_embed[layer_idx] + patch_pos_embed
+            )
 
         x = torch.stack(per_layer_tokens, dim=-2)
         x = self.layer_attn(x)
         x = self.layer_pool(x)
         for block in self.blocks:
-            x = block(x)
+            x = block(x, patch_positions=patch_positions)
         z = self.out_proj(self.out_norm(x))
         return self.latent_norm(z)
 
@@ -423,6 +533,10 @@ class JointSceneTokenizerDecoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.position_getter = PositionGetter()
+        self.patch_rope = RotaryPositionEmbedding2D()
+        self._patch_pos_embed_cache: dict[tuple[int, int, int, str], torch.Tensor] = {}
         self.in_proj = nn.Linear(latent_dim, hidden_dim)
         self.in_norm = nn.LayerNorm(hidden_dim)
         self.blocks = nn.ModuleList(
@@ -436,6 +550,7 @@ class JointSceneTokenizerDecoder(nn.Module):
                     ffn_bias=ffn_bias,
                     qk_norm=qk_norm,
                     init_values=init_values,
+                    rope=self.patch_rope,
                 )
                 for _ in range(num_block_pairs)
             ]
@@ -465,6 +580,7 @@ class JointSceneTokenizerDecoder(nn.Module):
                     ffn_bias=ffn_bias,
                     qk_norm=qk_norm,
                     init_values=init_values,
+                    rope=self.patch_rope,
                 )
                 for _ in range(num_layers)
             ]
@@ -475,13 +591,30 @@ class JointSceneTokenizerDecoder(nn.Module):
         nn.init.trunc_normal_(self.layer_embed, std=0.02)
         self.apply(_reset_linear)
 
-    def forward(self, z: torch.Tensor) -> list[torch.Tensor]:
+    def forward(
+        self,
+        z: torch.Tensor,
+        patch_grid: tuple[int, int] | None = None,
+    ) -> list[torch.Tensor]:
         if z.ndim != 4:
             raise ValueError(f"Expected latent shape [B, S, P, C], got {tuple(z.shape)}")
 
-        x = self.in_norm(self.in_proj(z))
+        batch_size, seq_len, num_patches, _ = z.shape
+        patch_h, patch_w = _normalize_patch_grid(num_patches, patch_grid)
+        patch_pos_embed = _get_cached_2d_sincos_pos_embed(
+            self._patch_pos_embed_cache,
+            self.hidden_dim,
+            patch_h,
+            patch_w,
+            device=z.device,
+            dtype=z.dtype,
+        )
+        patch_positions = self.position_getter(batch_size * seq_len, patch_h, patch_w, z.device)
+        patch_positions = patch_positions.view(batch_size, seq_len, num_patches, 2)
+
+        x = self.in_norm(self.in_proj(z)) + patch_pos_embed
         for block in self.blocks:
-            x = block(x)
+            x = block(x, patch_positions=patch_positions)
 
         x = self.layer_unpool(x)
         x = x + self.layer_embed.view(1, 1, 1, self.num_layers, -1)
@@ -489,7 +622,7 @@ class JointSceneTokenizerDecoder(nn.Module):
 
         outputs = []
         for layer_idx in range(self.num_layers):
-            outputs.append(self.layer_heads[layer_idx](x[..., layer_idx, :]))
+            outputs.append(self.layer_heads[layer_idx](x[..., layer_idx, :], patch_positions=patch_positions))
         return outputs
 
 
@@ -506,12 +639,16 @@ class JointSceneTokenizer(nn.Module):
     ) -> torch.Tensor:
         return self.encoder(image_tokens_4, patch_grid=patch_grid)
 
-    def decode(self, z: torch.Tensor) -> list[torch.Tensor]:
-        return self.decoder(z)
+    def decode(
+        self,
+        z: torch.Tensor,
+        patch_grid: tuple[int, int] | None = None,
+    ) -> list[torch.Tensor]:
+        return self.decoder(z, patch_grid=patch_grid)
 
     def forward(
         self,
         image_tokens_4: Sequence[torch.Tensor],
         patch_grid: tuple[int, int] | None = None,
     ) -> list[torch.Tensor]:
-        return self.decode(self.encode(image_tokens_4, patch_grid=patch_grid))
+        return self.decode(self.encode(image_tokens_4, patch_grid=patch_grid), patch_grid=patch_grid)

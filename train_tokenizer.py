@@ -75,7 +75,7 @@ NCCL_P2P_DISABLE=1 torchrun \
     --seed 0 \
     --wandb \
     --wandb_project dggt-tokenizer \
-    --wandb_name tokenizer_f48_bs1_acc8_lr2e-4_views1
+    --wandb_name tokenizer_rope_f48_bs1_acc8_lr2e-4_views1
 '''
 
 
