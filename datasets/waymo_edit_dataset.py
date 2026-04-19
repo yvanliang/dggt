@@ -1356,12 +1356,37 @@ class WaymoEditDataset(Dataset):
             float(object_tensors["object_scene_match_scores"][idx].item()) for idx in editable_slots_list
         ]
 
+        protected_object_mask = object_tensors["object_valid_mask"] & ~editable_object_mask
+        protected_indices = torch.nonzero(protected_object_mask, as_tuple=False).flatten()
+        protected_count = int(protected_indices.numel())
+
+        protected_object_indices = torch.full((self.max_objects,), -1, dtype=torch.long)
+        if protected_count > 0:
+            protected_object_indices[:protected_count] = protected_indices
+
+        protected_slots_list = [int(idx) for idx in protected_indices.tolist()]
+        protected_scene_raw_object_ids = [
+            object_tensors["object_scene_raw_ids"][idx] for idx in protected_slots_list
+        ]
+        protected_boxes = [
+            object_tensors["object_bbox_model_selected"][idx].tolist() for idx in protected_slots_list
+        ]
+
         edit_object_slot = int(editable_slots_list[0]) if editable_count > 0 else -1
         selected_asset_path = editable_asset_paths[0] if editable_count > 0 else ""
         return {
             "editable_object_indices": editable_object_indices,
             "editable_object_count": torch.tensor(editable_count, dtype=torch.long),
             "edit_object_slot": torch.tensor(edit_object_slot, dtype=torch.long),
+            "protected_object_mask": protected_object_mask,
+            "protected_object_indices": protected_object_indices,
+            "protected_object_count": torch.tensor(protected_count, dtype=torch.long),
+            "protected_object_meta": {
+                "protected_object_slots": protected_slots_list,
+                "protected_scene_raw_object_ids": protected_scene_raw_object_ids,
+                "protected_boxes": protected_boxes,
+                "box_source": "object_bbox_model_selected",
+            },
             "asset_meta": {
                 "asset_root": str(self.asset_root),
                 "editable_object_slots": editable_slots_list,

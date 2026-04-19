@@ -55,6 +55,8 @@ class CleanSceneState:
     point_map_world: torch.Tensor
     valid_mask: torch.Tensor
     depth: torch.Tensor
+    semantic_vehicle_prob: torch.Tensor
+    semantic_vehicle_mask: torch.Tensor
     camera_to_world: torch.Tensor
     world_to_camera: torch.Tensor
     intrinsics: torch.Tensor
@@ -193,6 +195,15 @@ def build_clean_scene_state(sample: dict[str, Any], predictions: dict[str, torch
         dynamic_logits = dynamic_logits[..., 0]
     dynamic_prob = torch.sigmoid(dynamic_logits)
     gs_conf = predictions["gs_conf"][0].detach().cpu().float()
+    semantic_logits = predictions.get("semantic_logits")
+    semantic_vehicle_prob = torch.zeros((seq_len, height, width), dtype=torch.float32)
+    semantic_vehicle_mask = torch.zeros((seq_len, height, width), dtype=torch.bool)
+    if semantic_logits is not None:
+        semantic_logits = semantic_logits[0].detach().cpu().float()
+        semantic_probs = torch.softmax(semantic_logits, dim=-1)
+        if semantic_probs.shape[-1] > 4:
+            semantic_vehicle_prob = semantic_probs[..., 4]
+            semantic_vehicle_mask = semantic_probs.argmax(dim=-1) == 4
 
     sky_mask = sample.get("sky_mask", sample["masks"]).detach().cpu().float()
     sky_mask_hw = sky_mask.permute(0, 2, 3, 1)
@@ -237,6 +248,8 @@ def build_clean_scene_state(sample: dict[str, Any], predictions: dict[str, torch
         point_map_world=point_map_world,
         valid_mask=valid_mask,
         depth=depth,
+        semantic_vehicle_prob=semantic_vehicle_prob,
+        semantic_vehicle_mask=semantic_vehicle_mask,
         camera_to_world=camera_to_world,
         world_to_camera=world_to_camera,
         intrinsics=intrinsics,
@@ -511,6 +524,14 @@ def _erode_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
     return eroded[0, 0] > 0.5
 
 
+def _close_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    return _erode_mask(_dilate_mask(mask, radius), radius)
+
+
+def _open_mask(mask: torch.Tensor, radius: int) -> torch.Tensor:
+    return _dilate_mask(_erode_mask(mask, radius), radius)
+
+
 def _select_connected_component(mask: torch.Tensor, seed_mask: torch.Tensor) -> torch.Tensor:
     mask = mask.detach().cpu().bool()
     seed_mask = seed_mask.detach().cpu().bool() & mask
@@ -564,6 +585,188 @@ def _select_connected_component(mask: torch.Tensor, seed_mask: torch.Tensor) -> 
             best_score = score
             best_mask = component_mask
     return best_mask
+
+
+def _points_in_protected_boxes(
+    points: torch.Tensor,
+    protected_boxes: list[dict[str, torch.Tensor]],
+    scale: float = 1.05,
+) -> torch.Tensor:
+    if points.shape[0] == 0 or len(protected_boxes) == 0:
+        return torch.zeros((points.shape[0],), dtype=torch.bool)
+    inside = torch.zeros((points.shape[0],), dtype=torch.bool)
+    for box in protected_boxes:
+        inside |= _points_in_box(
+            points,
+            box["center"],
+            box["rotation"],
+            box["size"],
+            scale=scale,
+        )
+    return inside
+
+
+def _collect_protected_boxes(
+    sample: dict[str, Any],
+    alignment: Sim3Transform,
+    target_slot_idx: int,
+    frame_idx: int,
+    view_offset: int,
+) -> list[dict[str, torch.Tensor]]:
+    protected_boxes: list[dict[str, torch.Tensor]] = []
+    protected_count = int(sample.get("protected_object_count", torch.tensor(0)).item())
+    if protected_count > 0:
+        candidate_slots = sample["protected_object_indices"][:protected_count].tolist()
+    else:
+        candidate_slots = []
+
+    if len(candidate_slots) == 0:
+        total_objects = int(sample["object_track_valid_mask_selected"].shape[0])
+        candidate_slots = [slot for slot in range(total_objects) if slot != target_slot_idx]
+
+    for slot_idx in candidate_slots:
+        if slot_idx == target_slot_idx:
+            continue
+        if not bool(sample["object_valid_mask"][slot_idx].item()):
+            continue
+        if not bool(sample["object_track_valid_mask_selected"][slot_idx, frame_idx].item()):
+            continue
+        if "object_bbox_valid_mask_selected" in sample:
+            if not bool(sample["object_bbox_valid_mask_selected"][slot_idx, frame_idx, view_offset].item()):
+                continue
+        center, size, rotation = _transform_track_box(
+            sample["object_obj_to_world_selected"][slot_idx, frame_idx],
+            sample["object_box_size_selected"][slot_idx, frame_idx],
+            alignment,
+        )
+        protected_boxes.append(
+            {
+                "slot_idx": torch.tensor(slot_idx, dtype=torch.long),
+                "scene_raw_object_id": str(sample["object_scene_raw_ids"][slot_idx]),
+                "center": center,
+                "size": size,
+                "rotation": rotation,
+            }
+        )
+    return protected_boxes
+
+
+def _extract_semantic_object_component_3d(
+    clean_state: CleanSceneState,
+    source_front_index: int,
+    target_bbox_model: torch.Tensor,
+    proposal_center: torch.Tensor,
+    proposal_rotation: torch.Tensor,
+    proposal_size: torch.Tensor,
+    protected_boxes: list[dict[str, torch.Tensor]],
+    proposal_scale: float,
+    dynamic_mode: bool,
+) -> dict[str, torch.Tensor]:
+    semantic_vehicle_mask = clean_state.semantic_vehicle_mask[source_front_index]
+    semantic_vehicle_prob = clean_state.semantic_vehicle_prob[source_front_index]
+    valid_mask = clean_state.valid_mask[source_front_index]
+    if int((semantic_vehicle_mask & valid_mask).sum().item()) == 0 and float(semantic_vehicle_prob.max().item()) < 0.10:
+        empty_pixel = torch.zeros_like(valid_mask)
+        empty_points = torch.zeros((0, 3), dtype=torch.float32)
+        empty_local = torch.zeros((0,), dtype=torch.bool)
+        return {"points": empty_points, "pixel_mask": empty_pixel, "local_mask": empty_local}
+
+    image_hw = tuple(valid_mask.shape)
+    bbox_inner_mask, bbox_outer_mask = _build_bbox_masks(
+        target_bbox_model,
+        image_hw,
+        inner_ratio=0.08,
+        outer_ratio=0.18,
+    )
+    semantic_raw = ((semantic_vehicle_mask | (semantic_vehicle_prob >= 0.22)) & valid_mask & bbox_outer_mask)
+    semantic_raw = _close_mask(semantic_raw, radius=1)
+    semantic_raw = _open_mask(semantic_raw, radius=1)
+
+    seed_mask = semantic_raw & bbox_inner_mask
+    if int(seed_mask.sum().item()) < 12:
+        seed_mask = (semantic_vehicle_prob >= 0.30) & bbox_inner_mask & valid_mask
+    if int(seed_mask.sum().item()) < 6:
+        seed_mask = bbox_inner_mask & valid_mask
+
+    semantic_component = _select_connected_component(semantic_raw | seed_mask, seed_mask)
+    semantic_component = _close_mask(semantic_component, radius=1) & bbox_outer_mask & valid_mask
+
+    in_view_mask = clean_state.source_image_ids == int(source_front_index)
+    local_indices = torch.nonzero(in_view_mask, as_tuple=False).flatten()
+    if local_indices.numel() == 0:
+        empty_pixel = torch.zeros_like(valid_mask)
+        empty_points = torch.zeros((0, 3), dtype=torch.float32)
+        empty_local = torch.zeros((0,), dtype=torch.bool)
+        return {"points": empty_points, "pixel_mask": empty_pixel, "local_mask": empty_local}
+
+    local_points = clean_state.means[in_view_mask]
+    local_y = clean_state.source_y[in_view_mask]
+    local_x = clean_state.source_x[in_view_mask]
+    local_depth = clean_state.depth[source_front_index][local_y, local_x]
+    semantic_local = semantic_component[local_y, local_x] & torch.isfinite(local_points).all(dim=-1)
+    if int(semantic_local.sum().item()) == 0:
+        empty_pixel = torch.zeros_like(valid_mask)
+        empty_points = torch.zeros((0, 3), dtype=torch.float32)
+        return {"points": empty_points, "pixel_mask": empty_pixel, "local_mask": semantic_local}
+
+    proposal_box_local = _points_in_box(
+        local_points,
+        proposal_center,
+        proposal_rotation,
+        proposal_size,
+        scale=max(1.30, proposal_scale + 0.05),
+    )
+    box_corners = build_box_corners(
+        proposal_center,
+        proposal_size * max(1.0, proposal_scale),
+        proposal_rotation,
+    )
+    box_cam = _world_to_camera_points(box_corners, clean_state.camera_to_world[source_front_index])
+    depth_low = float(box_cam[:, 2].min().item()) - 0.08
+    depth_high = float(box_cam[:, 2].max().item()) + 0.08
+    depth_local = (local_depth >= depth_low) & (local_depth <= depth_high)
+
+    protected_local = _points_in_protected_boxes(local_points, protected_boxes, scale=1.08)
+    target_core_local = _points_in_box(local_points, proposal_center, proposal_rotation, proposal_size, scale=1.05)
+
+    semantic_local = semantic_local & proposal_box_local & depth_local
+    semantic_local = semantic_local & (~protected_local | target_core_local)
+    if int(semantic_local.sum().item()) == 0:
+        empty_pixel = torch.zeros_like(valid_mask)
+        empty_points = torch.zeros((0, 3), dtype=torch.float32)
+        return {"points": empty_points, "pixel_mask": empty_pixel, "local_mask": semantic_local}
+
+    seed_local = semantic_local & bbox_inner_mask[local_y, local_x]
+    if int(seed_local.sum().item()) < 6:
+        seed_local = semantic_local
+    voxel_scale = proposal_size * torch.tensor(
+        _DYNAMIC_VOXEL_SCALE if dynamic_mode else _STATIC_VOXEL_SCALE,
+        dtype=proposal_size.dtype,
+    )
+    voxel_scale = voxel_scale.clamp_min(0.03)
+    semantic_points = local_points[semantic_local]
+    semantic_seed = seed_local[semantic_local]
+    keep_mask, _ = _voxel_connected_component(
+        semantic_points,
+        semantic_seed,
+        voxel_scale,
+        connectivity=6,
+    )
+    if int(keep_mask.sum().item()) == 0:
+        empty_pixel = torch.zeros_like(valid_mask)
+        empty_points = torch.zeros((0, 3), dtype=torch.float32)
+        return {"points": empty_points, "pixel_mask": empty_pixel, "local_mask": semantic_local.new_zeros(semantic_local.shape)}
+
+    semantic_keep_local = torch.zeros_like(semantic_local)
+    semantic_keep_local[semantic_local] = keep_mask
+    semantic_pixel_mask = torch.zeros_like(valid_mask)
+    kept_global = local_indices[semantic_keep_local]
+    semantic_pixel_mask[clean_state.source_y[kept_global], clean_state.source_x[kept_global]] = True
+    return {
+        "points": local_points[semantic_keep_local],
+        "pixel_mask": semantic_pixel_mask,
+        "local_mask": semantic_keep_local,
+    }
 
 
 def _build_bbox_masks(
@@ -1504,6 +1707,7 @@ def _extract_delete_component(
     box_xyxy: torch.Tensor,
     object_pixel_mask: torch.Tensor,
     dynamic_image_mask: torch.Tensor,
+    protected_boxes: list[dict[str, torch.Tensor]] | None,
     delete_motion_mode: str,
     dynamic_prob_thresh: float,
     core_scale: float,
@@ -1559,6 +1763,7 @@ def _extract_delete_component(
     bbox_inner_local = bbox_inner_mask[local_y, local_x]
     bbox_outer_local = bbox_outer_mask[local_y, local_x]
     dynamic_local = dynamic_image_mask[local_y, local_x]
+    protected_local = _points_in_protected_boxes(local_points, protected_boxes or [], scale=1.08)
     refined_center, refined_size, target_local = _refine_box_from_target_support(
         local_points=local_points,
         local_y=local_y,
@@ -1645,6 +1850,9 @@ def _extract_delete_component(
             seed_local = support_local & core_box_local
         voxel_scale = (refined_size * torch.tensor(_STATIC_VOXEL_SCALE, dtype=gt_size.dtype)).clamp_min(0.04)
         connectivity = 6
+
+    candidate_local = candidate_local & (~protected_local | core_box_local)
+    seed_local = seed_local & (~protected_local | core_box_local)
 
     candidate_local = candidate_local & finite_local
     candidate_pool_count = int(candidate_local.sum().item())
@@ -1936,6 +2144,7 @@ def localize_objects(
         for frame_spec_idx, frame_spec in enumerate(frame_specs):
             frame_idx = frame_spec["frame_idx"]
             source_front_index = frame_spec["source_front_index"]
+            view_offset = int(source_front_index % num_views)
             gt_center = frame_spec["gt_center"]
             gt_size = frame_spec["gt_size"]
             gt_rotation = frame_spec["gt_rotation"]
@@ -1978,6 +2187,13 @@ def localize_objects(
             )
             waymo_frame_dynamic = bool(frame_spec.get("waymo_frame_dynamic", waymo_dynamic))
             dynamic_image_mask = _binary_mask_from_image(sample["dynamic_mask"][source_front_index])
+            protected_boxes = _collect_protected_boxes(
+                sample,
+                alignment,
+                target_slot_idx=int(slot_idx),
+                frame_idx=int(frame_idx),
+                view_offset=view_offset,
+            )
             candidate_points, object_pixel_mask = _extract_object_pixels_from_bbox_component(
                 point_map_world=clean_state.point_map_world[source_front_index],
                 depth_map=clean_state.depth[source_front_index],
@@ -1988,12 +2204,32 @@ def localize_objects(
                 coarse_center=delete_center,
                 coarse_rotation=proposal_rotation,
             )
+            semantic_support = _extract_semantic_object_component_3d(
+                clean_state=clean_state,
+                source_front_index=source_front_index,
+                target_bbox_model=target_bbox_model,
+                proposal_center=delete_center,
+                proposal_rotation=proposal_rotation,
+                proposal_size=proposal_size,
+                protected_boxes=protected_boxes,
+                proposal_scale=proposal_scale,
+                dynamic_mode=bool(waymo_frame_dynamic),
+            )
+            if semantic_support["points"].shape[0] >= 24:
+                semantic_pixel_mask = semantic_support["pixel_mask"]
+                object_pixel_mask = semantic_pixel_mask | (
+                    object_pixel_mask & _dilate_mask(semantic_pixel_mask, radius=2)
+                )
+                support_points_for_fit = clean_state.point_map_world[source_front_index][object_pixel_mask].reshape(-1, 3)
+            else:
+                support_points_for_fit = candidate_points
+
             delete_center_fit, delete_size_fit = _fit_box_from_support_points(
-                candidate_points,
+                support_points_for_fit,
                 coarse_center=delete_center,
                 coarse_rotation=proposal_rotation,
             )
-            if candidate_points.shape[0] < max(24, min_candidate_points // 2):
+            if support_points_for_fit.shape[0] < max(24, min_candidate_points // 2):
                 continue
             delete_center = delete_center_fit
             proposal_size = delete_size_fit
@@ -2007,6 +2243,7 @@ def localize_objects(
                 box_xyxy=target_bbox_model,
                 object_pixel_mask=object_pixel_mask,
                 dynamic_image_mask=dynamic_image_mask,
+                protected_boxes=protected_boxes,
                 delete_motion_mode=delete_motion_mode,
                 dynamic_prob_thresh=dynamic_prob_thresh,
                 core_scale=core_scale,
@@ -2027,6 +2264,7 @@ def localize_objects(
                     box_xyxy=target_bbox_model,
                     object_pixel_mask=object_pixel_mask,
                     dynamic_image_mask=dynamic_image_mask,
+                    protected_boxes=protected_boxes,
                     delete_motion_mode="static",
                     dynamic_prob_thresh=dynamic_prob_thresh,
                     core_scale=core_scale,

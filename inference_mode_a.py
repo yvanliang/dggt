@@ -30,6 +30,9 @@ from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_split_gs
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 
+PRED_VEHICLE_SEMANTIC_CLASS_ID = 4
+CUSTOM_MASK_VEHICLE_VALUE = 40
+
 
 def alpha_t(t: torch.Tensor, t0: torch.Tensor | float, alpha: torch.Tensor, gamma0: torch.Tensor, gamma1: float = 0.1):
     if not torch.is_tensor(t0):
@@ -89,7 +92,7 @@ def _load_model(ckpt_path: str, device: torch.device):
         new_key = key[7:] if key.startswith("module.") else key
         cleaned[new_key] = value
     missing, unexpected = model.load_state_dict(cleaned, strict=False)
-    ignored_prefixes = ("track_head.", "sky_model.")
+    ignored_prefixes = ("track_head.", "sky_model.", "scene_tokenizer.")
     real_missing = [key for key in missing if not key.startswith(ignored_prefixes)]
     real_unexpected = [key for key in unexpected if not key.startswith(ignored_prefixes)]
     if real_missing:
@@ -134,6 +137,150 @@ def _save_grid(images: torch.Tensor, path: Path, nrow: int | None = None) -> Non
         nrow = min(4, images.shape[0])
     pil_images = [_tensor_to_pil_rgb(image) for image in images]
     _make_pil_grid(pil_images, nrow=nrow).save(path)
+
+
+def _binary_masks_to_rgb(masks: torch.Tensor, color: tuple[float, float, float] = (0.0, 1.0, 0.0)) -> torch.Tensor:
+    if masks.dim() != 3:
+        raise ValueError(f"Expected [N,H,W], got {tuple(masks.shape)}")
+    masks_f = masks.detach().cpu().float().clamp(0.0, 1.0)
+    color_tensor = torch.tensor(color, dtype=torch.float32).view(1, 3, 1, 1)
+    return masks_f.unsqueeze(1) * color_tensor
+
+
+def _overlay_binary_masks_on_images(
+    images: torch.Tensor,
+    masks: torch.Tensor,
+    color: tuple[float, float, float] = (0.0, 1.0, 0.0),
+    alpha: float = 0.55,
+) -> torch.Tensor:
+    if images.dim() != 4 or masks.dim() != 3:
+        raise ValueError(f"Expected images [N,3,H,W] and masks [N,H,W], got {tuple(images.shape)} and {tuple(masks.shape)}")
+    if images.shape[0] != masks.shape[0] or tuple(images.shape[-2:]) != tuple(masks.shape[-2:]):
+        raise ValueError(
+            f"Image/mask shape mismatch: images {tuple(images.shape)}, masks {tuple(masks.shape)}"
+        )
+    overlays = images.detach().cpu().float().clamp(0.0, 1.0).clone()
+    color_tensor = torch.tensor(color, dtype=torch.float32).view(1, 3, 1, 1)
+    mask_bool = masks.detach().cpu().bool().unsqueeze(1)
+    blended = overlays * (1.0 - alpha) + color_tensor * alpha
+    return torch.where(mask_bool, blended, overlays).clamp(0.0, 1.0)
+
+
+def _resize_label_mask_to_model(
+    label_mask: Image.Image,
+    raw_hw: tuple[int, int],
+    target_hw: tuple[int, int],
+    target_width: int = 518,
+) -> torch.Tensor:
+    raw_h, raw_w = [int(v) for v in raw_hw]
+    target_h, target_w = [int(v) for v in target_hw]
+    new_width = target_width
+    new_height = round(raw_h * (new_width / raw_w) / 14) * 14
+    resized = label_mask.resize((new_width, new_height), Image.Resampling.NEAREST)
+    if new_height > target_width:
+        crop_top = (new_height - target_width) // 2
+        resized = resized.crop((0, crop_top, new_width, crop_top + target_width))
+    resized_np = np.array(resized, dtype=np.uint8)
+    out_h, out_w = resized_np.shape[:2]
+    if out_h != target_h or out_w != target_w:
+        canvas = np.zeros((target_h, target_w), dtype=np.uint8)
+        pad_top = max(0, (target_h - out_h) // 2)
+        pad_left = max(0, (target_w - out_w) // 2)
+        y_end = min(target_h, pad_top + out_h)
+        x_end = min(target_w, pad_left + out_w)
+        canvas[pad_top:y_end, pad_left:x_end] = resized_np[: y_end - pad_top, : x_end - pad_left]
+        resized_np = canvas
+    return torch.from_numpy(resized_np)
+
+
+def _find_custom_mask_path(custom_mask_root: Path, frame_idx: int, cam_id: int) -> Path | None:
+    for ext in (".png", ".jpg"):
+        path = custom_mask_root / f"{frame_idx:03d}_{cam_id}{ext}"
+        if path.is_file():
+            return path
+    return None
+
+
+def _load_input_vehicle_semantic_masks(sample: dict, processed_root: str, split: str) -> torch.Tensor | None:
+    custom_mask_root = Path(processed_root) / split / str(sample["scene_dir"]) / "custom_masks"
+    if not custom_mask_root.is_dir():
+        return None
+
+    masks: list[torch.Tensor] = []
+    num_views = int(sample["cam_ids"].numel())
+    num_frames = int(sample["frame_indices"].numel())
+    image_hw = tuple(int(v) for v in sample["images_clean"].shape[-2:])
+    raw_hw_all = sample["raw_image_size_hw"]
+
+    for frame_idx in range(num_frames):
+        scene_frame = int(sample["frame_indices"][frame_idx].item())
+        for view_offset, cam_id_tensor in enumerate(sample["cam_ids"]):
+            cam_id = int(cam_id_tensor.item())
+            mask_path = _find_custom_mask_path(custom_mask_root, scene_frame, cam_id)
+            if mask_path is None:
+                return None
+            raw_hw = tuple(int(v) for v in raw_hw_all[view_offset].tolist())
+            with Image.open(mask_path) as label_mask:
+                label_mask = label_mask.convert("L")
+                resized = _resize_label_mask_to_model(label_mask, raw_hw=raw_hw, target_hw=image_hw)
+            masks.append((resized == CUSTOM_MASK_VEHICLE_VALUE).to(torch.bool))
+
+    if len(masks) != num_frames * num_views:
+        return None
+    return torch.stack(masks, dim=0)
+
+
+def _save_vehicle_semantic_outputs(
+    sample: dict,
+    predictions: dict[str, torch.Tensor],
+    processed_root: str,
+    split: str,
+    output_dir: Path,
+) -> dict[str, object]:
+    semantic_logits = predictions.get("semantic_logits")
+    if semantic_logits is None:
+        return {
+            "semantic_available": False,
+            "vehicle_class_index": None,
+            "input_vehicle_semantic_available": False,
+        }
+
+    pred_classes = semantic_logits[0].detach().cpu().argmax(dim=-1)
+    pred_vehicle_mask = pred_classes == PRED_VEHICLE_SEMANTIC_CLASS_ID
+    pred_vehicle_rgb = _binary_masks_to_rgb(pred_vehicle_mask)
+    pred_vehicle_overlay = _overlay_binary_masks_on_images(sample["images_clean"], pred_vehicle_mask)
+    _save_grid(pred_vehicle_rgb, output_dir / "pred_vehicle_semantic_grid.png")
+    _save_grid(pred_vehicle_overlay, output_dir / "pred_vehicle_semantic_overlay_grid.png")
+
+    summary: dict[str, object] = {
+        "semantic_available": True,
+        "vehicle_class_index": int(PRED_VEHICLE_SEMANTIC_CLASS_ID),
+        "pred_vehicle_pixel_counts": [int(v) for v in pred_vehicle_mask.view(pred_vehicle_mask.shape[0], -1).sum(dim=1).tolist()],
+        "input_vehicle_semantic_available": False,
+    }
+
+    input_vehicle_mask = _load_input_vehicle_semantic_masks(sample, processed_root=processed_root, split=split)
+    if input_vehicle_mask is not None:
+        input_vehicle_rgb = _binary_masks_to_rgb(input_vehicle_mask)
+        input_vehicle_overlay = _overlay_binary_masks_on_images(sample["images_clean"], input_vehicle_mask)
+        _save_grid(input_vehicle_rgb, output_dir / "input_vehicle_semantic_grid.png")
+        _save_grid(input_vehicle_overlay, output_dir / "input_vehicle_semantic_overlay_grid.png")
+
+        input_counts = [int(v) for v in input_vehicle_mask.view(input_vehicle_mask.shape[0], -1).sum(dim=1).tolist()]
+        ious = []
+        for idx in range(pred_vehicle_mask.shape[0]):
+            pred_mask_i = pred_vehicle_mask[idx]
+            input_mask_i = input_vehicle_mask[idx]
+            inter = int((pred_mask_i & input_mask_i).sum().item())
+            union = int((pred_mask_i | input_mask_i).sum().item())
+            ious.append(float(inter / union) if union > 0 else 0.0)
+        summary["input_vehicle_semantic_available"] = True
+        summary["input_vehicle_pixel_counts"] = input_counts
+        summary["pred_vehicle_iou_vs_input"] = ious
+
+    with open(output_dir / "semantic_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    return summary
 
 
 def _save_dataset_box_overlay_grid(sample: dict, output_path: Path) -> None:
@@ -880,6 +1027,14 @@ def main() -> None:
     with torch.no_grad():
         predictions = model(images)
 
+    semantic_summary = _save_vehicle_semantic_outputs(
+        sample,
+        predictions,
+        processed_root=args.processed_root,
+        split=args.split,
+        output_dir=output_dir,
+    )
+
     clean_state = build_clean_scene_state(sample, predictions)
     clean_render = _render_clean_with_dggt(model, sample, predictions, device)
     clean_dynamic_render = _render_edited_sequence_with_dggt(
@@ -919,6 +1074,7 @@ def main() -> None:
             "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
             "editable_asset_object_ids": list(sample["asset_meta"]["editable_asset_object_ids"]),
             "editable_scene_raw_object_ids": list(sample["asset_meta"]["editable_scene_raw_object_ids"]),
+            "semantic_summary": semantic_summary,
             "clean_only": True,
         }
         with open(output_dir / "edit_summary.json", "w") as f:
@@ -1001,6 +1157,7 @@ def main() -> None:
         _write_scene_outputs("edited", edited_state.edited, output_dir)
 
     summary = _build_summary(args, sample, alignment, edited_state)
+    summary["semantic_summary"] = semantic_summary
     with open(output_dir / "edit_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
