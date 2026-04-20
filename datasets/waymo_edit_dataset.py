@@ -1000,10 +1000,10 @@ class WaymoEditDataset(Dataset):
 
     def _resolve_mask_root(self, scene_root):
         candidates = [
-            scene_root / "fine_dynamic_masks" / "vehicle",
             scene_root / "fine_dynamic_masks" / "all",
-            scene_root / "dynamic_masks" / "vehicle",
             scene_root / "dynamic_masks",
+            scene_root / "fine_dynamic_masks" / "vehicle",
+            scene_root / "dynamic_masks" / "vehicle",
         ]
         for root in candidates:
             if root.is_dir():
@@ -1421,12 +1421,18 @@ class WaymoEditDataset(Dataset):
             scene_root = self.processed_root / source_split / str(record["scene_dir"])
             image_paths = []
             sky_mask_paths = []
+            dynamic_mask_paths = []
+            dynamic_root = self._resolve_mask_root(scene_root)
             for frame_idx in scene_frame_indices:
                 for cam_id in self.camera_ids:
                     image_paths.append(resolve_image_path(scene_root / "images", frame_idx, cam_id))
                     sky_mask_paths.append(resolve_image_path(scene_root / "sky_masks", frame_idx, cam_id))
+                    dynamic_mask_paths.append(
+                        resolve_image_path(dynamic_root, frame_idx, cam_id) if dynamic_root is not None else ""
+                    )
             images = load_and_preprocess_images(image_paths)
             sky_masks = self._load_optional_image_stack(sky_mask_paths, images)
+            dynamic_masks = self._load_optional_image_stack(dynamic_mask_paths, images)
             sample = self._build_base_sample(
                 record=record,
                 sample_index=sample_index,
@@ -1441,6 +1447,7 @@ class WaymoEditDataset(Dataset):
             )
             sample["masks"] = sky_masks
             sample["sky_mask"] = sky_masks
+            sample["dynamic_mask"] = dynamic_masks
             sample.update(self._build_tokenizer_payload(record, sample_num_frames, images))
             return sample
 

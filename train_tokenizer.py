@@ -64,7 +64,7 @@ NCCL_P2P_DISABLE=1 torchrun \
     --warmup_steps 1000 \
     --head_start_step 2000 \
     --render_start_step 4000 \
-    --noisy_start_step 80000 \
+    --noisy_start_step 8000 \
     --lambda_tok_rec 1.0 \
     --lambda_tok_cos 0.2 \
     --lambda_head_anchor 0.5 \
@@ -144,6 +144,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_render_anchor", type=float, default=0.25)
     parser.add_argument("--lambda_noisy", type=float, default=0.1)
     parser.add_argument("--lambda_lat_stat", type=float, default=0.01)
+    parser.add_argument("--lambda_dynamic_bce", type=float, default=0.05)
+    parser.add_argument("--lambda_gs_lifespan", type=float, default=0.01)
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
@@ -463,6 +465,21 @@ def normalized_huber_loss(
     return reduce_per_sample(per_element).mean()
 
 
+def dynamic_mask_bce_loss(dynamic_logits: torch.Tensor, dynamic_mask: torch.Tensor) -> torch.Tensor:
+    logits = dynamic_logits.float().squeeze(-1)
+    if dynamic_mask.ndim != 5:
+        raise ValueError(f"Expected dynamic_mask to have shape [B,S,C,H,W], got {tuple(dynamic_mask.shape)}")
+    target = dynamic_mask[:, :, 0].float()
+    per_element = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return reduce_per_sample(per_element).mean()
+
+
+def compute_lifespan_loss(gs_conf: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    gamma = gs_conf.float()
+    per_element = torch.abs(1.0 / (gamma + eps))
+    return reduce_per_sample(per_element).mean()
+
+
 def split_gs_with_mask(gs_map: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, ...]:
     rgbs = gs_map[..., :3][mask].reshape(-1, 3)
     opacity = gs_map[..., 3:4][mask].reshape(-1)
@@ -551,10 +568,10 @@ def _render_scene_single_from_outputs(
     point_map = unproject_depth_map_to_point_map_torch(depth.float(), extrinsics_3x4.float(), intrinsics.float())
 
     sky_mask_hw = sky_mask.permute(0, 1, 3, 4, 2)
-    non_sky_mask = (sky_mask_hw < 0.5).any(dim=-1)
+    non_sky_mask = (sky_mask_hw == 0).any(dim=-1)
     dynamic_prob = torch.sigmoid(dynamic_conf.float().squeeze(-1))
 
-    static_mask = non_sky_mask & (dynamic_prob < 0.5)
+    static_mask = torch.ones_like(non_sky_mask, dtype=torch.bool)
     static_points = point_map[static_mask].reshape(-1, 3)
     static_rgbs, static_opacity, static_scales, static_rotations = split_gs_with_mask(gs_map.float(), static_mask)
     static_opacity = static_opacity * (1.0 - dynamic_prob[static_mask])
@@ -574,23 +591,14 @@ def _render_scene_single_from_outputs(
         dynamic_rgbs, dynamic_opacity, dynamic_scales, dynamic_rotations = split_gs_with_mask(gs_map[:, image_idx].float(), mask_i)
         dynamic_opacity = dynamic_opacity * dynamic_prob[:, image_idx][mask_i]
 
-        if static_points.numel() > 0:
-            opacity_t = alpha_t(gs_timestamps, timestamps[0, image_idx], static_opacity, gamma0=static_gs_conf)
-            world_points, rgbs, opacity, scales, rotation = concat_tensor_lists(
-                [static_points, static_rgbs, opacity_t, static_scales, static_rotations],
-                [dynamic_points, dynamic_rgbs, dynamic_opacity, dynamic_scales, dynamic_rotations],
-            )
-        else:
-            world_points, rgbs, opacity, scales, rotation = (
-                dynamic_points,
-                dynamic_rgbs,
-                dynamic_opacity,
-                dynamic_scales,
-                dynamic_rotations,
-            )
+        opacity_t = alpha_t(gs_timestamps, timestamps[0, image_idx], static_opacity, gamma0=static_gs_conf)
+        world_points, rgbs, opacity, scales, rotation = concat_tensor_lists(
+            [static_points, static_rgbs, opacity_t, static_scales, static_rotations],
+            [dynamic_points, dynamic_rgbs, dynamic_opacity, dynamic_scales, dynamic_rotations],
+        )
 
         if world_points.numel() == 0:
-            empty_render = torch.zeros((1, height, width, 4), device=images.device, dtype=images.dtype)
+            empty_render = torch.zeros((1, height, width, 3), device=images.device, dtype=images.dtype)
             empty_alpha = torch.zeros((1, height, width, 1), device=images.device, dtype=images.dtype)
             chunked_renders.append(empty_render)
             chunked_alphas.append(empty_alpha)
@@ -606,12 +614,11 @@ def _render_scene_single_from_outputs(
             Ks=intrinsics[0, image_idx : image_idx + 1].float(),
             width=width,
             height=height,
-            render_mode="RGB+ED",
         )
         chunked_renders.append(render_chunk)
         chunked_alphas.append(alpha_chunk)
 
-    renders = torch.cat(chunked_renders, dim=0)[..., :-1]
+    renders = torch.cat(chunked_renders, dim=0)
     alphas = torch.cat(chunked_alphas, dim=0)
     composed = alphas * renders + (1.0 - alphas) * bg_render
     return composed.permute(0, 3, 1, 2).contiguous()
@@ -843,6 +850,11 @@ def compute_losses(
     losses["geom_anchor"] = geom_anchor
     losses["dyn_anchor"] = dyn_anchor
     losses["head_anchor"] = gs_anchor + geom_anchor + dyn_anchor
+    losses["dynamic_bce"] = student["z"].new_tensor(0.0)
+    if "dynamic_mask" in sample:
+        dynamic_mask = unwrap_tensor(sample["dynamic_mask"]).to(student["z"].device)
+        losses["dynamic_bce"] = dynamic_mask_bce_loss(student["dynamic_conf"], dynamic_mask)
+    losses["gs_lifespan"] = compute_lifespan_loss(student["gs_conf"])
 
     losses["noisy"] = student["z"].new_tensor(0.0)
     if student["decoded_noisy"] is not None:
@@ -899,6 +911,18 @@ def compute_losses(
         args.head_warmup_steps,
         args.lambda_head_anchor,
     )
+    dynamic_bce_weight = scheduled_weight(
+        global_step,
+        args.head_start_step,
+        args.head_warmup_steps,
+        args.lambda_dynamic_bce,
+    )
+    gs_lifespan_weight = scheduled_weight(
+        global_step,
+        args.head_start_step,
+        args.head_warmup_steps,
+        args.lambda_gs_lifespan,
+    )
     noisy_weight = scheduled_weight(
         global_step,
         args.noisy_start_step,
@@ -916,6 +940,8 @@ def compute_losses(
         args.lambda_tok_rec * losses["tok_rec"]
         + args.lambda_tok_cos * losses["tok_cos"]
         + head_weight * losses["head_anchor"]
+        + dynamic_bce_weight * losses["dynamic_bce"]
+        + gs_lifespan_weight * losses["gs_lifespan"]
         + render_weight * losses["render_anchor"]
         + noisy_weight * losses["noisy"]
         + args.lambda_lat_stat * losses["lat_stat"]
@@ -928,6 +954,8 @@ def compute_losses(
         "gs_anchor": float(losses["gs_anchor"].detach().item()),
         "geom_anchor": float(losses["geom_anchor"].detach().item()),
         "dyn_anchor": float(losses["dyn_anchor"].detach().item()),
+        "dynamic_bce": float(losses["dynamic_bce"].detach().item()),
+        "gs_lifespan": float(losses["gs_lifespan"].detach().item()),
         "render_anchor": float(losses["render_anchor"].detach().item()),
         "render_lpips": float(losses["render_lpips"].detach().item()),
         "noisy": float(losses["noisy"].detach().item()),
@@ -935,6 +963,8 @@ def compute_losses(
         "latent_mean": float(student["z"].mean().detach().item()),
         "latent_std": float(student["z"].std(unbiased=False).detach().item()),
         "head_weight": float(head_weight),
+        "dynamic_bce_weight": float(dynamic_bce_weight),
+        "gs_lifespan_weight": float(gs_lifespan_weight),
         "render_weight": float(render_weight),
         "noisy_weight": float(noisy_weight),
     }
@@ -1287,6 +1317,8 @@ def main() -> None:
                         loss=f"{step_logs['loss']:.4g}",
                         tok=f"{step_logs['tok_rec']:.4g}",
                         head=f"{step_logs['gs_anchor'] + step_logs['geom_anchor'] + step_logs['dyn_anchor']:.4g}",
+                        dynb=f"{step_logs['dynamic_bce']:.4g}",
+                        life=f"{step_logs['gs_lifespan']:.4g}",
                         hwt=f"{step_logs['head_weight']:.3f}",
                         lr=f"{scheduler.get_last_lr()[0]:.2e}",
                     )
