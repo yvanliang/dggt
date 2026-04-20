@@ -2006,6 +2006,133 @@ def _select_localization_view(
     )
 
 
+def _morphology_opening(mask_2d: torch.Tensor, radius: int = 1) -> torch.Tensor:
+    if radius <= 0:
+        return mask_2d.bool()
+    return _dilate_mask(_erode_mask(mask_2d.bool(), radius), radius)
+
+
+def _connected_components_4(mask_2d: torch.Tensor) -> list[dict[str, Any]]:
+    mask = mask_2d.detach().cpu().bool()
+    height, width = mask.shape
+    visited = torch.zeros_like(mask)
+    components: list[dict[str, Any]] = []
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    for start_y, start_x in torch.nonzero(mask, as_tuple=False).tolist():
+        if visited[start_y, start_x]:
+            continue
+        queue = deque([(start_y, start_x)])
+        visited[start_y, start_x] = True
+        ys_list: list[int] = []
+        xs_list: list[int] = []
+        while queue:
+            y, x = queue.popleft()
+            ys_list.append(y)
+            xs_list.append(x)
+            for dy, dx in neighbors:
+                ny = y + dy
+                nx = x + dx
+                if ny < 0 or ny >= height or nx < 0 or nx >= width:
+                    continue
+                if visited[ny, nx] or not mask[ny, nx]:
+                    continue
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+        ys = torch.tensor(ys_list, dtype=torch.long)
+        xs = torch.tensor(xs_list, dtype=torch.long)
+        comp_mask = torch.zeros_like(mask)
+        comp_mask[ys, xs] = True
+        components.append(
+            {
+                "mask": comp_mask,
+                "ys": ys,
+                "xs": xs,
+                "bbox_xyxy": torch.tensor(
+                    [int(xs.min().item()), int(ys.min().item()), int(xs.max().item()) + 1, int(ys.max().item()) + 1],
+                    dtype=torch.float32,
+                ),
+                "area": int(ys.numel()),
+            }
+        )
+    return components
+
+
+def _geodesic_reconstruction(seed_mask: torch.Tensor, raw_mask: torch.Tensor) -> torch.Tensor:
+    seed = (seed_mask.bool() & raw_mask.bool()).to(torch.float32)
+    raw = raw_mask.bool().to(torch.float32)
+    if seed.sum().item() == 0:
+        return torch.zeros_like(raw_mask, dtype=torch.bool)
+    current = seed
+    for _ in range(256):
+        dilated = F.max_pool2d(current.view(1, 1, *current.shape), kernel_size=3, stride=1, padding=1)[0, 0]
+        nxt = dilated * raw
+        if torch.equal(nxt, current):
+            break
+        current = nxt
+    return current > 0.5
+
+
+def _component_in_bbox_ratio(component: dict[str, Any], bbox_xyxy: torch.Tensor | None) -> float:
+    if bbox_xyxy is None:
+        return 0.0
+    x1 = float(bbox_xyxy[0].item())
+    y1 = float(bbox_xyxy[1].item())
+    x2 = float(bbox_xyxy[2].item())
+    y2 = float(bbox_xyxy[3].item())
+    ys = component["ys"].float()
+    xs = component["xs"].float()
+    inside = (xs >= x1) & (xs < x2) & (ys >= y1) & (ys < y2)
+    box_w = max(1.0, x2 - x1)
+    box_h = max(1.0, y2 - y1)
+    box_area = box_w * box_h
+    return float(inside.sum().item()) / float(box_area)
+
+
+def _assign_shared_pixels_by_nearest_center(
+    shared_mask: torch.Tensor,
+    point_map_world_view: torch.Tensor,
+    valid_mask_view: torch.Tensor,
+    involved_centers: list[torch.Tensor],
+    current_center_idx: int,
+) -> torch.Tensor:
+    if len(involved_centers) == 0 or int(shared_mask.sum().item()) == 0:
+        return torch.zeros_like(shared_mask, dtype=torch.bool)
+    resolved = shared_mask.bool() & valid_mask_view.bool()
+    if int(resolved.sum().item()) == 0:
+        return torch.zeros_like(shared_mask, dtype=torch.bool)
+    pts3d = point_map_world_view[resolved].reshape(-1, 3)
+    centers = torch.stack([c.detach().cpu().float().view(3) for c in involved_centers], dim=0)
+    dists = torch.cdist(pts3d, centers)
+    nearest = dists.argmin(dim=1)
+    keep = nearest == int(current_center_idx)
+    out = torch.zeros_like(shared_mask, dtype=torch.bool)
+    coords = torch.nonzero(resolved, as_tuple=False)
+    if keep.any():
+        kept_coords = coords[keep]
+        out[kept_coords[:, 0], kept_coords[:, 1]] = True
+    return out
+
+
+def _gaussian_indices_from_pixel_mask(
+    clean_state: CleanSceneState,
+    pixel_mask_2d: torch.Tensor,
+    view_image_idx: int,
+) -> torch.Tensor:
+    view_match = clean_state.source_image_ids == int(view_image_idx)
+    if not view_match.any():
+        return torch.zeros_like(view_match)
+    mask_2d = pixel_mask_2d.detach().cpu().bool()
+    ys = clean_state.source_y
+    xs = clean_state.source_x
+    result = torch.zeros_like(view_match)
+    idx = torch.nonzero(view_match, as_tuple=False).flatten()
+    if idx.numel() == 0:
+        return result
+    sampled = mask_2d[ys[idx], xs[idx]]
+    result[idx[sampled]] = True
+    return result
+
+
 def localize_objects(
     sample: dict[str, Any],
     clean_state: CleanSceneState,
@@ -2020,14 +2147,18 @@ def localize_objects(
     motion_speed_thresh: float = WAYMO_DYNAMIC_SPEED_THRESH_MPS,
     dynamic_prob_thresh: float | None = None,
     dynamic_ratio_thresh: float = 0.35,
+    use_pose_refine: bool = True,
 ) -> list[LocalizedFrameObject]:
     if dynamic_prob_thresh is None:
         dynamic_prob_thresh = dynamic_thresh
     num_views = int(sample["cam_ids"].numel())
+    if num_views != 1:
+        raise NotImplementedError(
+            f"localize_objects currently supports views=1 only; got views={num_views}"
+        )
     image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
     asset_cache: dict[str, dict[str, torch.Tensor]] = {}
     asset_root = sample.get("asset_meta", {}).get("asset_root", "")
-    localized: list[LocalizedFrameObject] = []
     track_valid = sample["object_track_valid_mask_selected"]
     object_obj_to_world = sample["object_obj_to_world_selected"]
     object_box_size = sample["object_box_size_selected"]
@@ -2038,6 +2169,9 @@ def localize_objects(
     object_is_moving_frame = sample.get("object_is_moving_frame_selected")
     scene_up = alignment.rotation @ torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
     scene_up = scene_up / scene_up.norm().clamp_min(1e-6)
+
+    slot_meta: dict[int, dict[str, Any]] = {}
+    slot_frame_geom: dict[int, dict[int, dict[str, Any]]] = {}
 
     for slot_idx in object_slots:
         if slot_idx < 0 or slot_idx >= track_valid.shape[0]:
@@ -2092,36 +2226,50 @@ def localize_objects(
             )
             source_front_index = frame_idx * num_views + int(view_offset)
             proposal_rotation_base = _build_label_track_rotation(gt_rotation, scene_up)
-            proposal_center, proposal_rotation, proposal_bbox = _solve_proposal_pose_from_target_bbox(
-                object_center=gt_center,
-                object_size=gt_size,
-                object_rotation=proposal_rotation_base,
-                target_bbox_model=target_bbox_model,
-                camera_to_world=clean_state.camera_to_world[source_front_index],
-                intrinsics=clean_state.intrinsics[source_front_index],
-                image_hw=image_hw,
-                point_map_world=clean_state.point_map_world[source_front_index],
-                depth_map=clean_state.depth[source_front_index],
-                valid_mask=clean_state.valid_mask[source_front_index],
-            )
-            proposal_score = -1e9 if proposal_bbox is None else _score_projected_bbox(proposal_bbox, target_bbox_model)
+
+            if use_pose_refine:
+                proposal_center_init, proposal_rotation_init, proposal_bbox = _solve_proposal_pose_from_target_bbox(
+                    object_center=gt_center,
+                    object_size=gt_size,
+                    object_rotation=proposal_rotation_base,
+                    target_bbox_model=target_bbox_model,
+                    camera_to_world=clean_state.camera_to_world[source_front_index],
+                    intrinsics=clean_state.intrinsics[source_front_index],
+                    image_hw=image_hw,
+                    point_map_world=clean_state.point_map_world[source_front_index],
+                    depth_map=clean_state.depth[source_front_index],
+                    valid_mask=clean_state.valid_mask[source_front_index],
+                )
+                proposal_score = -1e9 if proposal_bbox is None else _score_projected_bbox(proposal_bbox, target_bbox_model)
+            else:
+                proposal_center_init = gt_center.clone()
+                proposal_rotation_init = proposal_rotation_base.clone()
+                proposal_score = 0.0
+
             waymo_frame_dynamic = (
                 bool(object_is_moving_frame[slot_idx, frame_idx].item())
                 if isinstance(object_is_moving_frame, torch.Tensor)
                 else waymo_dynamic
             )
+            waymo_frame_speed = (
+                float(object_speed_mps[slot_idx, frame_idx].item())
+                if isinstance(object_speed_mps, torch.Tensor)
+                else waymo_mean_speed
+            )
             frame_specs.append(
                 {
                     "frame_idx": int(frame_idx),
                     "source_front_index": int(source_front_index),
+                    "view_offset": int(view_offset),
                     "gt_center": gt_center,
                     "gt_size": gt_size,
                     "gt_rotation": gt_rotation,
                     "proposal_rotation_base": proposal_rotation_base,
-                    "proposal_center_initial": proposal_center,
-                    "proposal_rotation_initial": proposal_rotation,
+                    "proposal_center_initial": proposal_center_init,
+                    "proposal_rotation_initial": proposal_rotation_init,
                     "proposal_score_initial": proposal_score,
                     "waymo_frame_dynamic": bool(waymo_frame_dynamic),
+                    "waymo_frame_speed": waymo_frame_speed,
                     "target_bbox_model": target_bbox_model,
                 }
             )
@@ -2129,64 +2277,127 @@ def localize_objects(
         if len(frame_specs) == 0:
             continue
 
-        shared_yaw_delta = _robust_shared_yaw_delta(
-            [
-                _yaw_delta_between_rotations(spec["proposal_rotation_base"], spec["proposal_rotation_initial"])
-                for spec in frame_specs
-            ],
-            [float(spec["proposal_score_initial"]) for spec in frame_specs],
-        )
-        shared_track_rotation = _shared_track_rotation_candidate(
-            [spec["proposal_rotation_initial"] for spec in frame_specs],
-            [float(spec["proposal_score_initial"]) for spec in frame_specs],
-        )
+        if use_pose_refine:
+            shared_yaw_delta = _robust_shared_yaw_delta(
+                [
+                    _yaw_delta_between_rotations(spec["proposal_rotation_base"], spec["proposal_rotation_initial"])
+                    for spec in frame_specs
+                ],
+                [float(spec["proposal_score_initial"]) for spec in frame_specs],
+            )
+            shared_track_rotation = _shared_track_rotation_candidate(
+                [spec["proposal_rotation_initial"] for spec in frame_specs],
+                [float(spec["proposal_score_initial"]) for spec in frame_specs],
+            )
+        else:
+            shared_yaw_delta = 0.0
+            shared_track_rotation = None
 
-        for frame_spec_idx, frame_spec in enumerate(frame_specs):
+        slot_meta[int(slot_idx)] = {
+            "match_score": match_score,
+            "scene_raw_object_id": scene_raw_object_id,
+            "asset_path": asset_path,
+            "asset_local": asset_local,
+            "waymo_max_speed": waymo_max_speed,
+            "waymo_mean_speed": waymo_mean_speed,
+        }
+        frame_geom: dict[int, dict[str, Any]] = {}
+        for frame_spec in frame_specs:
             frame_idx = frame_spec["frame_idx"]
             source_front_index = frame_spec["source_front_index"]
-            view_offset = int(source_front_index % num_views)
             gt_center = frame_spec["gt_center"]
             gt_size = frame_spec["gt_size"]
-            gt_rotation = frame_spec["gt_rotation"]
-            if shared_track_rotation is not None:
-                proposal_rotation = shared_track_rotation.clone()
-            else:
-                proposal_rotation_base = frame_spec["proposal_rotation_base"]
-                shared_yaw_tensor = torch.tensor(shared_yaw_delta, dtype=gt_center.dtype)
-                proposal_rotation = _orthonormalize_rotation(
-                    proposal_rotation_base @ _rotation_z_tensor(shared_yaw_tensor, dtype=gt_center.dtype)
+
+            if use_pose_refine:
+                if shared_track_rotation is not None:
+                    proposal_rotation = shared_track_rotation.clone()
+                else:
+                    shared_yaw_tensor = torch.tensor(shared_yaw_delta, dtype=gt_center.dtype)
+                    proposal_rotation = _orthonormalize_rotation(
+                        frame_spec["proposal_rotation_base"] @ _rotation_z_tensor(shared_yaw_tensor, dtype=gt_center.dtype)
+                    )
+                proposal_center, _ = _solve_proposal_center_with_fixed_rotation(
+                    object_center=frame_spec["proposal_center_initial"],
+                    object_size=gt_size,
+                    object_rotation=proposal_rotation,
+                    target_bbox_model=frame_spec["target_bbox_model"],
+                    camera_to_world=clean_state.camera_to_world[source_front_index],
+                    intrinsics=clean_state.intrinsics[source_front_index],
+                    image_hw=image_hw,
+                    point_map_world=clean_state.point_map_world[source_front_index],
+                    depth_map=clean_state.depth[source_front_index],
+                    valid_mask=clean_state.valid_mask[source_front_index],
                 )
-            proposal_center, _ = _solve_proposal_center_with_fixed_rotation(
-                object_center=frame_spec["proposal_center_initial"],
-                object_size=gt_size,
-                object_rotation=proposal_rotation,
-                target_bbox_model=frame_spec["target_bbox_model"],
-                camera_to_world=clean_state.camera_to_world[source_front_index],
-                intrinsics=clean_state.intrinsics[source_front_index],
-                image_hw=image_hw,
-                point_map_world=clean_state.point_map_world[source_front_index],
-                depth_map=clean_state.depth[source_front_index],
-                valid_mask=clean_state.valid_mask[source_front_index],
+            else:
+                proposal_rotation = frame_spec["proposal_rotation_base"].clone()
+                proposal_center = gt_center.clone()
+
+            proposal_size = gt_size.clone()
+            target_bbox_2d = _project_box_bbox(
+                proposal_center,
+                proposal_size,
+                proposal_rotation,
+                clean_state.camera_to_world[source_front_index],
+                clean_state.intrinsics[source_front_index],
+                image_hw,
             )
-            delete_center, proposal_size = _refine_proposal_box_from_foreground_seed(
-                point_map_world=clean_state.point_map_world[source_front_index],
-                depth_map=clean_state.depth[source_front_index],
-                valid_mask=clean_state.valid_mask[source_front_index],
-                box_xyxy=frame_spec["target_bbox_model"],
-                object_center=proposal_center,
-                object_size=gt_size,
-                object_rotation=proposal_rotation,
-            )
-            frame_rotation = proposal_rotation
-            target_bbox_model_raw = frame_spec["target_bbox_model"]
-            target_bbox_model = target_bbox_model_raw
-            waymo_frame_speed = (
-                float(object_speed_mps[slot_idx, frame_idx].item())
-                if isinstance(object_speed_mps, torch.Tensor)
-                else waymo_mean_speed
-            )
-            waymo_frame_dynamic = bool(frame_spec.get("waymo_frame_dynamic", waymo_dynamic))
-            dynamic_image_mask = _binary_mask_from_image(sample["dynamic_mask"][source_front_index])
+
+            frame_geom[int(frame_idx)] = {
+                **frame_spec,
+                "proposal_center": proposal_center,
+                "proposal_rotation": proposal_rotation,
+                "proposal_size": proposal_size,
+                "target_bbox_2d": target_bbox_2d,
+            }
+        slot_frame_geom[int(slot_idx)] = frame_geom
+
+    if not slot_frame_geom:
+        return []
+
+    per_frame_components: dict[int, list[dict[str, Any]]] = {}
+    total_frames = clean_state.semantic_vehicle_mask.shape[0]
+    for img_idx in range(total_frames):
+        raw_mask = clean_state.semantic_vehicle_mask[img_idx]
+        if int(raw_mask.sum().item()) == 0:
+            per_frame_components[img_idx] = []
+            continue
+        clean_mask = _morphology_opening(raw_mask, radius=1)
+        per_frame_components[img_idx] = _connected_components_4(clean_mask)
+
+    localized: list[LocalizedFrameObject] = []
+
+    for slot_idx, frames in slot_frame_geom.items():
+        meta = slot_meta[slot_idx]
+        asset_local = meta["asset_local"]
+        scene_raw_object_id = meta["scene_raw_object_id"]
+        asset_path = meta["asset_path"]
+        match_score = meta["match_score"]
+        waymo_max_speed = meta["waymo_max_speed"]
+        waymo_mean_speed = meta["waymo_mean_speed"]
+
+        for frame_idx, geom in frames.items():
+            source_front_index = int(geom["source_front_index"])
+            view_offset = int(geom["view_offset"])
+            gt_center = geom["gt_center"]
+            gt_size = geom["gt_size"]
+            gt_rotation = geom["gt_rotation"]
+            proposal_center = geom["proposal_center"]
+            proposal_rotation = geom["proposal_rotation"]
+            proposal_size = geom["proposal_size"]
+            target_bbox_model = geom["target_bbox_model"]
+            target_bbox_2d = geom["target_bbox_2d"]
+            waymo_frame_dynamic = bool(geom["waymo_frame_dynamic"])
+            waymo_frame_speed = float(geom["waymo_frame_speed"])
+
+            raw_mask = clean_state.semantic_vehicle_mask[source_front_index]
+            valid_mask_view = clean_state.valid_mask[source_front_index]
+
+            if target_bbox_2d is None:
+                continue
+            components = per_frame_components.get(source_front_index, [])
+            if len(components) == 0 or int(raw_mask.sum().item()) < 16:
+                continue
+
             protected_boxes = _collect_protected_boxes(
                 sample,
                 alignment,
@@ -2194,89 +2405,122 @@ def localize_objects(
                 frame_idx=int(frame_idx),
                 view_offset=view_offset,
             )
-            candidate_points, object_pixel_mask = _extract_object_pixels_from_bbox_component(
-                point_map_world=clean_state.point_map_world[source_front_index],
-                depth_map=clean_state.depth[source_front_index],
-                valid_mask=clean_state.valid_mask[source_front_index],
-                box_xyxy=target_bbox_model,
-                dynamic_image_mask=dynamic_image_mask,
-                dynamic_mode=bool(waymo_frame_dynamic),
-                coarse_center=delete_center,
-                coarse_rotation=proposal_rotation,
-            )
-            semantic_support = _extract_semantic_object_component_3d(
-                clean_state=clean_state,
-                source_front_index=source_front_index,
-                target_bbox_model=target_bbox_model,
-                proposal_center=delete_center,
-                proposal_rotation=proposal_rotation,
-                proposal_size=proposal_size,
-                protected_boxes=protected_boxes,
-                proposal_scale=proposal_scale,
-                dynamic_mode=bool(waymo_frame_dynamic),
-            )
-            if semantic_support["points"].shape[0] >= 24:
-                semantic_pixel_mask = semantic_support["pixel_mask"]
-                object_pixel_mask = semantic_pixel_mask | (
-                    object_pixel_mask & _dilate_mask(semantic_pixel_mask, radius=2)
+
+            other_boxes_2d: list[torch.Tensor] = []
+            other_centers_3d: list[torch.Tensor] = []
+            for other_slot_idx, other_frames in slot_frame_geom.items():
+                if other_slot_idx == slot_idx:
+                    continue
+                other_geom = other_frames.get(frame_idx)
+                if other_geom is None or other_geom["target_bbox_2d"] is None:
+                    continue
+                other_boxes_2d.append(other_geom["target_bbox_2d"])
+                other_centers_3d.append(other_geom["proposal_center"])
+            for prot in protected_boxes:
+                prot_bbox_2d = _project_box_bbox(
+                    prot["center"],
+                    prot["size"],
+                    prot["rotation"],
+                    clean_state.camera_to_world[source_front_index],
+                    clean_state.intrinsics[source_front_index],
+                    image_hw,
                 )
-                support_points_for_fit = clean_state.point_map_world[source_front_index][object_pixel_mask].reshape(-1, 3)
+                if prot_bbox_2d is None:
+                    continue
+                other_boxes_2d.append(prot_bbox_2d)
+                other_centers_3d.append(prot["center"])
+
+            case1_ccs: list[dict[str, Any]] = []
+            case2_ccs: list[dict[str, Any]] = []
+            case2_other_involved: set[int] = set()
+            for cc in components:
+                if cc["area"] < 4:
+                    continue
+                in_target = _component_in_bbox_ratio(cc, target_bbox_2d)
+                if in_target < 0.10:
+                    continue
+                other_overlaps = [
+                    _component_in_bbox_ratio(cc, box)
+                    for box in other_boxes_2d
+                ]
+                max_other = max(other_overlaps) if other_overlaps else 0.0
+                if max_other < 0.10:
+                    case1_ccs.append(cc)
+                else:
+                    case2_ccs.append(cc)
+                    for other_list_idx, over_ratio in enumerate(other_overlaps):
+                        if over_ratio >= 0.10:
+                            case2_other_involved.add(other_list_idx)
+
+            if len(case1_ccs) == 0 and len(case2_ccs) == 0:
+                continue
+
+            matched_mask = torch.zeros_like(raw_mask, dtype=torch.bool)
+            for cc in case1_ccs:
+                matched_mask |= _geodesic_reconstruction(cc["mask"], raw_mask)
+
+            if len(case2_ccs) > 0:
+                shared_seed = torch.zeros_like(raw_mask, dtype=torch.bool)
+                for cc in case2_ccs:
+                    shared_seed |= cc["mask"]
+                shared_full = _geodesic_reconstruction(shared_seed, raw_mask)
+                involved_centers = [proposal_center]
+                for other_list_idx in case2_other_involved:
+                    involved_centers.append(other_centers_3d[other_list_idx])
+                kept = _assign_shared_pixels_by_nearest_center(
+                    shared_mask=shared_full,
+                    point_map_world_view=clean_state.point_map_world[source_front_index],
+                    valid_mask_view=valid_mask_view,
+                    involved_centers=involved_centers,
+                    current_center_idx=0,
+                )
+                matched_mask |= kept
+
+            matched_pixel_count = int(matched_mask.sum().item())
+            if matched_pixel_count < 16:
+                continue
+
+            delete_candidates = _gaussian_indices_from_pixel_mask(
+                clean_state,
+                matched_mask,
+                view_image_idx=source_front_index,
+            )
+            candidate_count = int(delete_candidates.sum().item())
+            if candidate_count == 0:
+                continue
+
+            if waymo_frame_dynamic:
+                dyn_pass = clean_state.dynamic_prob >= dynamic_prob_thresh
+                delete_set = delete_candidates & dyn_pass
+                if int(delete_set.sum().item()) < 24:
+                    delete_set = delete_candidates.clone()
+                    delete_motion_mode = "dynamic_waymo_static_render"
+                else:
+                    delete_motion_mode = "dynamic"
             else:
-                support_points_for_fit = candidate_points
+                delete_set = delete_candidates.clone()
+                delete_motion_mode = "static"
 
-            delete_center_fit, delete_size_fit = _fit_box_from_support_points(
-                support_points_for_fit,
-                coarse_center=delete_center,
-                coarse_rotation=proposal_rotation,
-            )
-            if support_points_for_fit.shape[0] < max(24, min_candidate_points // 2):
-                continue
-            delete_center = delete_center_fit
-            proposal_size = delete_size_fit
-            delete_motion_mode = "dynamic" if waymo_frame_dynamic else "static"
-            delete_result = _extract_delete_component(
-                clean_state=clean_state,
-                source_front_index=source_front_index,
-                gt_center=delete_center,
-                gt_rotation=proposal_rotation,
-                gt_size=proposal_size,
-                box_xyxy=target_bbox_model,
-                object_pixel_mask=object_pixel_mask,
-                dynamic_image_mask=dynamic_image_mask,
-                protected_boxes=protected_boxes,
-                delete_motion_mode=delete_motion_mode,
-                dynamic_prob_thresh=dynamic_prob_thresh,
-                core_scale=core_scale,
-                shell_scale=shell_scale,
-                proposal_scale=proposal_scale,
-            )
-            if waymo_frame_dynamic and (
-                delete_result["render_dynamic_ratio"] < dynamic_ratio_thresh
-                or delete_result["cluster_kept_count"] < max(24, min_candidate_points // 4)
-            ):
-                delete_motion_mode = "dynamic_waymo_static_render"
-                delete_result = _extract_delete_component(
-                    clean_state=clean_state,
-                    source_front_index=source_front_index,
-                    gt_center=delete_center,
-                    gt_rotation=proposal_rotation,
-                    gt_size=proposal_size,
-                    box_xyxy=target_bbox_model,
-                    object_pixel_mask=object_pixel_mask,
-                    dynamic_image_mask=dynamic_image_mask,
-                    protected_boxes=protected_boxes,
-                    delete_motion_mode="static",
-                    dynamic_prob_thresh=dynamic_prob_thresh,
-                    core_scale=core_scale,
-                    shell_scale=shell_scale,
-                    proposal_scale=proposal_scale,
-                )
+            if len(protected_boxes) > 0:
+                prot_mask = _points_in_protected_boxes(clean_state.means, protected_boxes, scale=1.05)
+                delete_set &= ~prot_mask
 
-            if delete_result["cluster_kept_count"] == 0:
+            cluster_kept_count = int(delete_set.sum().item())
+            if cluster_kept_count == 0:
                 continue
 
-            refined_center = delete_result["refined_center"].clone()
-            refined_size = delete_result["refined_size"].clone()
+            render_dynamic_ratio = 0.0
+            if candidate_count > 0:
+                render_dynamic_ratio = float(
+                    (delete_candidates & (clean_state.dynamic_prob >= dynamic_prob_thresh)).sum().item()
+                ) / float(candidate_count)
+
+            delete_core_indices = torch.nonzero(delete_set, as_tuple=False).flatten().to(torch.long)
+            delete_shell_indices = torch.empty((0,), dtype=torch.long)
+
+            refined_center = proposal_center.clone()
+            refined_size = proposal_size.clone()
+            frame_rotation = proposal_rotation
             insert_size = gt_size.clone()
             asset_center = proposal_center.clone()
             asset_scale_factors = _compute_asset_scale_factors(asset_local, insert_size)
@@ -2316,7 +2560,7 @@ def localize_objects(
                     waymo_frame_speed_mps=waymo_frame_speed,
                     waymo_max_speed_mps=waymo_max_speed,
                     waymo_mean_speed_mps=waymo_mean_speed,
-                    render_dynamic_ratio=float(delete_result["render_dynamic_ratio"]),
+                    render_dynamic_ratio=render_dynamic_ratio,
                     gt_center=gt_center,
                     gt_size=gt_size,
                     gt_rotation=gt_rotation,
@@ -2329,18 +2573,18 @@ def localize_objects(
                     asset_rotation=frame_rotation,
                     asset_scale=asset_scale,
                     asset_bottom_center=asset_center,
-                    delete_core_indices=delete_result["delete_core_indices"],
-                    delete_shell_indices=delete_result["delete_shell_indices"],
-                    candidate_count=int(delete_result["candidate_pool_count"]),
-                    seed_point_count=int(delete_result["seed_point_count"]),
-                    candidate_pool_count=int(delete_result["candidate_pool_count"]),
-                    cluster_kept_count=int(delete_result["cluster_kept_count"]),
-                    target_delete_coverage=float(delete_result["target_delete_coverage"]),
-                    outside_box_leak_ratio=float(delete_result["outside_box_leak_ratio"]),
+                    delete_core_indices=delete_core_indices,
+                    delete_shell_indices=delete_shell_indices,
+                    candidate_count=matched_pixel_count,
+                    seed_point_count=matched_pixel_count,
+                    candidate_pool_count=candidate_count,
+                    cluster_kept_count=cluster_kept_count,
+                    target_delete_coverage=float(cluster_kept_count) / float(max(1, candidate_count)),
+                    outside_box_leak_ratio=0.0,
                     target_bbox_model=target_bbox_model,
                     projected_asset_bbox=projected_asset_bbox,
-                    seed_pixel_mask=delete_result["seed_pixel_mask"],
-                    delete_component_pixel_mask=delete_result["delete_component_pixel_mask"],
+                    seed_pixel_mask=matched_mask.clone(),
+                    delete_component_pixel_mask=matched_mask.clone(),
                     asset_means_world=asset_world["means"],
                     asset_colors=asset_world["colors"],
                     asset_opacities=asset_world["opacities"],

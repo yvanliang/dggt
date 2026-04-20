@@ -75,6 +75,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--clean_only", action="store_true", help="Only run clean-pass render and GT 3D box overlay.")
     parser.add_argument("--skip_ply", action="store_true", help="Skip writing PLY outputs during debug runs.")
+    parser.add_argument(
+        "--pose_refine",
+        type=str,
+        choices=["on", "off"],
+        default="on",
+        help="Enable (on) or bypass (off) the 3D-box pose refinement before semantic-mask deletion.",
+    )
     return parser
 
 
@@ -1001,6 +1008,10 @@ def _build_summary(args, sample, alignment, edited_state) -> dict:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    if args.views != 1:
+        raise NotImplementedError(
+            f"inference_mode_a.py currently supports --views 1 only; got --views {args.views}"
+        )
     torch.manual_seed(args.seed)
 
     output_dir = Path(args.output_dir)
@@ -1097,18 +1108,13 @@ def main() -> None:
         motion_speed_thresh=args.motion_speed_thresh,
         dynamic_prob_thresh=args.dynamic_prob_thresh,
         dynamic_ratio_thresh=args.dynamic_ratio_thresh,
+        use_pose_refine=(args.pose_refine == "on"),
     )
     _refine_asset_local_yaw_offsets(sample, predictions, localized_objects, device)
     _save_target_vs_asset_boxes(
         clean_state.images,
         localized_objects,
         output_dir / "target_vs_asset_boxes.png",
-    )
-    _save_mask_overlay_grid(
-        clean_state.images,
-        localized_objects,
-        output_dir / "dynamic_seed_overlay.png",
-        "seed_pixel_mask",
     )
     _save_mask_overlay_grid(
         clean_state.images,
