@@ -3115,7 +3115,6 @@ def apply_mode_a(clean_state: CleanSceneState, localized_objects: list[Localized
     }
     delete_mask = torch.zeros((clean_state.means.shape[0],), dtype=torch.bool)
     shell_mask = torch.zeros((clean_state.means.shape[0],), dtype=torch.bool)
-    asset_chunks: list[dict[str, torch.Tensor]] = []
 
     for item in localized_objects:
         if item.delete_core_indices.numel() > 0:
@@ -3123,19 +3122,9 @@ def apply_mode_a(clean_state: CleanSceneState, localized_objects: list[Localized
         if item.delete_shell_indices.numel() > 0:
             shell_mask[item.delete_shell_indices] = True
             delete_mask[item.delete_shell_indices] = True
-        asset_chunks.append(
-            {
-                "means": item.asset_means_world,
-                "colors": item.asset_colors,
-                "opacities": item.asset_opacities,
-                "scales": item.asset_scales,
-                "quats": item.asset_quats,
-            }
-        )
-
     deleted = _subset_gaussians(clean, ~delete_mask)
-    asset_only = _concat_gaussians(asset_chunks)
-    edited = _concat_gaussians([deleted, asset_only])
+    asset_only = _concat_gaussians([])
+    edited = deleted
 
     return EditedSceneState(
         clean=clean,
