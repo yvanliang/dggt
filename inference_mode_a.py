@@ -340,6 +340,79 @@ def _save_dataset_box_overlay_grid(sample: dict, output_path: Path) -> None:
     _make_pil_grid(pil_images, nrow=max(1, num_views)).save(output_path)
 
 
+def _save_dggt_box_overlay_grid(sample: dict, clean_state, alignment, output_path: Path) -> None:
+    from dggt.utils.gaussian_edit import _transform_track_box, build_box_corners, project_world_box_corners
+    overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in clean_state.images]
+    editable_count = int(sample["editable_object_count"].item())
+    editable_slots = sample["editable_object_indices"][:editable_count].tolist()
+    num_views = int(sample["cam_ids"].numel())
+    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
+    colors = [
+        (0, 255, 0),
+        (255, 200, 0),
+        (255, 0, 0),
+        (0, 200, 255),
+        (255, 0, 255),
+        (160, 255, 0),
+    ]
+
+    for color_idx, object_slot in enumerate(editable_slots):
+        track_valid = sample["object_track_valid_mask_selected"][object_slot]
+        scene_raw_id = sample["object_scene_raw_ids"][object_slot]
+        asset_object_id = sample["object_asset_ids"][object_slot]
+        color = colors[color_idx % len(colors)]
+
+        for frame_idx in range(min(sample["frame_indices"].numel(), track_valid.shape[0])):
+            if not bool(track_valid[frame_idx].item()):
+                continue
+            for cam_offset, cam_id in enumerate(sample["cam_ids"].tolist()):
+                image_idx = frame_idx * num_views + cam_offset
+                if image_idx >= len(overlay_images):
+                    continue
+                
+                corners_waymo = sample["object_box_corners_world_selected"][object_slot, frame_idx]
+                corners_dggt = alignment.apply_points(corners_waymo.to(alignment.translation.device))
+                
+                rotation_wc = clean_state.camera_to_world[image_idx][:3, :3]
+                translation_wc = clean_state.camera_to_world[image_idx][:3, 3]
+                rotation_cw = rotation_wc.T
+                translation_cw = -rotation_cw @ translation_wc
+                points_cam = corners_dggt @ rotation_cw.T + translation_cw
+                depths = points_cam[:, 2]
+                
+                # Always use GT intrinsics for visualization to isolate pose error
+                from datasets.waymo_edit_dataset import compute_resize_geometry
+                geom = compute_resize_geometry(tuple(int(v) for v in sample["raw_image_size_hw"][cam_offset]), target_width=image_hw[1])
+                fx = sample["intrinsics"][cam_offset][0, 0] * geom["scale_x"]
+                fy = sample["intrinsics"][cam_offset][1, 1] * geom["scale_y"]
+                cx = sample["intrinsics"][cam_offset][0, 2] * geom["scale_x"]
+                cy = sample["intrinsics"][cam_offset][1, 2] * geom["scale_y"] - geom["crop_top"]
+                
+                u = fx * points_cam[:, 0] / depths.clamp_min(1e-6) + cx
+                v = fy * points_cam[:, 1] / depths.clamp_min(1e-6) + cy
+                
+                valid = torch.isfinite(u) & torch.isfinite(v) & torch.isfinite(depths) & (depths > 1e-4)
+                if not valid.any():
+                    continue
+                
+                uv = torch.stack([u, v], dim=-1)
+                projected_corners = uv.tolist()
+                projected_valid = valid.cpu().numpy()
+                
+                object_tag = scene_raw_id if scene_raw_id else asset_object_id
+                label = f"{object_tag[:8]} f{int(sample['frame_indices'][frame_idx].item())} c{cam_id} DGGT"
+                overlay_images[image_idx] = draw_projected_3d_box(
+                    overlay_images[image_idx],
+                    projected_corners,
+                    projected_valid,
+                    color=color,
+                    label=label,
+                )
+
+    pil_images = [Image.fromarray(image) for image in overlay_images]
+    _make_pil_grid(pil_images, nrow=max(1, num_views)).save(output_path)
+
+
 def _save_target_vs_asset_boxes(clean_images: torch.Tensor, localized_objects, output_path: Path) -> None:
     pil_images = [_tensor_to_pil_rgb(img) for img in clean_images]
     colors = [
@@ -1094,6 +1167,8 @@ def main() -> None:
         return
 
     alignment = estimate_scene_alignment(sample, clean_state)
+    _save_dggt_box_overlay_grid(sample, clean_state, alignment, output_dir / "projected_boxes_on_inputs_dggt.png")
+
     selected_slots = parse_object_slots(sample, args.object_slots)
     localized_objects = localize_objects(
         sample,
