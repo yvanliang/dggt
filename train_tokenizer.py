@@ -21,6 +21,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from torch.utils.data import DataLoader
 from torch.utils.data._utils.collate import default_collate
 from tqdm import tqdm
@@ -146,6 +147,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_lat_stat", type=float, default=0.01)
     parser.add_argument("--lambda_dynamic_bce", type=float, default=0.05)
     parser.add_argument("--lambda_gs_lifespan", type=float, default=0.01)
+    parser.add_argument("--lambda_ghost_static", type=float, default=0.05)
 
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
@@ -401,6 +403,15 @@ def reduce_per_sample(values: torch.Tensor) -> torch.Tensor:
     return values.reshape(values.shape[0], -1).mean(dim=1)
 
 
+def reduce_masked_per_sample(values: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    if values.shape != mask.shape:
+        raise ValueError(f"values and mask must share shape, got {tuple(values.shape)} and {tuple(mask.shape)}")
+    values = values.reshape(values.shape[0], -1)
+    mask = mask.reshape(mask.shape[0], -1).float()
+    denom = mask.sum(dim=1).clamp_min(eps)
+    return (values * mask).sum(dim=1) / denom
+
+
 def normalized_token_reconstruction_loss(
     pred_tokens: list[torch.Tensor],
     target_tokens: list[torch.Tensor],
@@ -470,14 +481,50 @@ def dynamic_mask_bce_loss(dynamic_logits: torch.Tensor, dynamic_mask: torch.Tens
     if dynamic_mask.ndim != 5:
         raise ValueError(f"Expected dynamic_mask to have shape [B,S,C,H,W], got {tuple(dynamic_mask.shape)}")
     target = dynamic_mask[:, :, 0].float()
-    per_element = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    flat_target = target.reshape(target.shape[0], -1)
+    pos = flat_target.sum(dim=1)
+    neg = flat_target.shape[1] - pos
+    pos_weight = (neg / pos.clamp_min(1.0)).clamp_min(1.0).clamp_max(8.0)
+    weight = torch.where(
+        target > 0.5,
+        pos_weight.view(-1, 1, 1, 1),
+        torch.ones_like(target),
+    )
+    per_element = F.binary_cross_entropy_with_logits(logits, target, reduction="none") * weight
     return reduce_per_sample(per_element).mean()
 
 
-def compute_lifespan_loss(gs_conf: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def compute_lifespan_loss(
+    gs_conf: torch.Tensor,
+    dynamic_mask: torch.Tensor | None = None,
+    sky_mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
     gamma = gs_conf.float()
-    per_element = torch.abs(1.0 / (gamma + eps))
-    return reduce_per_sample(per_element).mean()
+    gamma_inv = torch.abs(1.0 / gamma.clamp_min(eps))
+    if dynamic_mask is None:
+        return reduce_per_sample(gamma_inv).mean()
+
+    static_mask = dynamic_mask[:, :, 0].float() < 0.5
+    if sky_mask is not None:
+        static_mask = static_mask & (sky_mask[:, :, 0].float() < 0.5)
+    return reduce_masked_per_sample(gamma_inv, static_mask).mean()
+
+
+def ghost_static_loss(
+    gs_map: torch.Tensor,
+    dynamic_conf: torch.Tensor,
+    dynamic_mask: torch.Tensor,
+    sky_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    opacity = gs_map[..., 3].float()
+    dynamic_prob = torch.sigmoid(dynamic_conf.float().squeeze(-1))
+    dynamic_target = dynamic_mask[:, :, 0].float()
+    static_leak = opacity * (1.0 - dynamic_prob)
+    mask = dynamic_target > 0.5
+    if sky_mask is not None:
+        mask = mask & (sky_mask[:, :, 0].float() < 0.5)
+    return reduce_masked_per_sample(static_leak, mask).mean()
 
 
 def split_gs_with_mask(gs_map: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -780,6 +827,7 @@ def build_student_outputs(
     images: torch.Tensor,
     levels: tuple[int, ...],
     teacher: dict[str, Any],
+    feature_std: torch.Tensor,
     autocast_enabled,
     global_step: int,
     args: argparse.Namespace,
@@ -808,15 +856,22 @@ def build_student_outputs(
         dynamic_hat, _ = model.instance_head(dino_hat_all, images, teacher["patch_start_idx"])
         del image_hat_all, dino_hat_all, agg_hat_all
 
-        decoded_noisy = None
+        noisy_loss = None
         if global_step >= args.noisy_start_step and args.lambda_noisy > 0.0:
-            z_noisy, _, _ = sample_noisy_latent(z)
-            decoded_noisy = tokenizer_runner(latent=z_noisy)
+            z_noisy, _, _ = sample_noisy_latent(z.detach())
+
+            def _decode_noisy_tuple(latent: torch.Tensor):
+                decoded = tokenizer_runner(latent=latent, patch_grid=patch_grid)
+                return tuple(decoded)
+
+            decoded_noisy = activation_checkpoint(_decode_noisy_tuple, z_noisy, use_reentrant=False)
+            noisy_loss = normalized_token_reconstruction_loss(list(decoded_noisy), teacher["image_patch"], feature_std)
+            del decoded_noisy, z_noisy
 
     return {
         "z": z,
         "decoded_patch": decoded_patch,
-        "decoded_noisy": decoded_noisy,
+        "noisy_loss": noisy_loss,
         "gs_map": gs_map_hat,
         "gs_conf": gs_conf_hat,
         "depth": depth_hat,
@@ -838,6 +893,8 @@ def compute_losses(
     losses: dict[str, torch.Tensor] = {}
     losses["tok_rec"] = normalized_token_reconstruction_loss(student["decoded_patch"], teacher["image_patch"], std_stats)
     losses["tok_cos"] = token_cosine_loss(student["decoded_patch"], teacher["image_patch"])
+    dynamic_mask = unwrap_tensor(sample["dynamic_mask"]).to(student["z"].device) if "dynamic_mask" in sample else None
+    sky_mask = unwrap_tensor(sample.get("sky_mask", sample["masks"])).to(student["z"].device)
 
     gs_anchor = normalized_huber_loss(student["gs_map"], teacher["gs_map"]) + 0.1 * normalized_huber_loss(
         student["gs_conf"], teacher["gs_conf"]
@@ -851,14 +908,21 @@ def compute_losses(
     losses["dyn_anchor"] = dyn_anchor
     losses["head_anchor"] = gs_anchor + geom_anchor + dyn_anchor
     losses["dynamic_bce"] = student["z"].new_tensor(0.0)
-    if "dynamic_mask" in sample:
-        dynamic_mask = unwrap_tensor(sample["dynamic_mask"]).to(student["z"].device)
+    if dynamic_mask is not None:
         losses["dynamic_bce"] = dynamic_mask_bce_loss(student["dynamic_conf"], dynamic_mask)
-    losses["gs_lifespan"] = compute_lifespan_loss(student["gs_conf"])
+    losses["gs_lifespan"] = compute_lifespan_loss(student["gs_conf"], dynamic_mask=dynamic_mask, sky_mask=sky_mask)
+    losses["ghost_static"] = student["z"].new_tensor(0.0)
+    if dynamic_mask is not None:
+        losses["ghost_static"] = ghost_static_loss(
+            student["gs_map"],
+            student["dynamic_conf"],
+            dynamic_mask,
+            sky_mask=sky_mask,
+        )
 
     losses["noisy"] = student["z"].new_tensor(0.0)
-    if student["decoded_noisy"] is not None:
-        losses["noisy"] = normalized_token_reconstruction_loss(student["decoded_noisy"], teacher["image_patch"], std_stats)
+    if student["noisy_loss"] is not None:
+        losses["noisy"] = student["noisy_loss"]
     losses["lat_stat"] = latent_stat_loss(student["z"])
 
     render_ref = None
@@ -869,7 +933,6 @@ def compute_losses(
     if global_step >= args.render_start_step:
         if model.lpips_loss_fn is None:
             raise RuntimeError("Render anchor is active but LPIPS has not been initialized")
-        sky_mask = unwrap_tensor(sample.get("sky_mask", sample["masks"])).to(student["z"].device)
         timestamps = unwrap_tensor(sample["timestamps"]).to(student["z"].device)
         render_ref = render_scene_from_outputs(
             model,
@@ -923,6 +986,12 @@ def compute_losses(
         args.head_warmup_steps,
         args.lambda_gs_lifespan,
     )
+    ghost_static_weight = scheduled_weight(
+        global_step,
+        args.head_start_step,
+        args.head_warmup_steps,
+        args.lambda_ghost_static,
+    )
     noisy_weight = scheduled_weight(
         global_step,
         args.noisy_start_step,
@@ -942,6 +1011,7 @@ def compute_losses(
         + head_weight * losses["head_anchor"]
         + dynamic_bce_weight * losses["dynamic_bce"]
         + gs_lifespan_weight * losses["gs_lifespan"]
+        + ghost_static_weight * losses["ghost_static"]
         + render_weight * losses["render_anchor"]
         + noisy_weight * losses["noisy"]
         + args.lambda_lat_stat * losses["lat_stat"]
@@ -956,6 +1026,7 @@ def compute_losses(
         "dyn_anchor": float(losses["dyn_anchor"].detach().item()),
         "dynamic_bce": float(losses["dynamic_bce"].detach().item()),
         "gs_lifespan": float(losses["gs_lifespan"].detach().item()),
+        "ghost_static": float(losses["ghost_static"].detach().item()),
         "render_anchor": float(losses["render_anchor"].detach().item()),
         "render_lpips": float(losses["render_lpips"].detach().item()),
         "noisy": float(losses["noisy"].detach().item()),
@@ -965,6 +1036,7 @@ def compute_losses(
         "head_weight": float(head_weight),
         "dynamic_bce_weight": float(dynamic_bce_weight),
         "gs_lifespan_weight": float(gs_lifespan_weight),
+        "ghost_static_weight": float(ghost_static_weight),
         "render_weight": float(render_weight),
         "noisy_weight": float(noisy_weight),
     }
@@ -1074,6 +1146,7 @@ def run_visualization_eval(
         images,
         levels,
         teacher,
+        feature_stats["std"],
         autocast_context(args, device),
         global_step,
         args,
@@ -1276,6 +1349,7 @@ def main() -> None:
                         images,
                         levels,
                         teacher,
+                        feature_stats["std"],
                         autocast_context(args, device),
                         global_step,
                         args,
@@ -1319,6 +1393,7 @@ def main() -> None:
                         head=f"{step_logs['gs_anchor'] + step_logs['geom_anchor'] + step_logs['dyn_anchor']:.4g}",
                         dynb=f"{step_logs['dynamic_bce']:.4g}",
                         life=f"{step_logs['gs_lifespan']:.4g}",
+                        ghost=f"{step_logs['ghost_static']:.4g}",
                         hwt=f"{step_logs['head_weight']:.3f}",
                         lr=f"{scheduler.get_last_lr()[0]:.2e}",
                     )
