@@ -17,13 +17,10 @@ from datasets.waymo_edit_dataset import (
     draw_projected_3d_box,
     project_world_points_to_model_image,
 )
-from dggt.utils.gaussian_edit import (
-    apply_mode_a,
-    build_clean_scene_state,
-    estimate_scene_alignment,
-    localize_objects,
-    parse_object_slots,
-)
+from dggt.models.asset_pass import AssetAggregatorPass, AssetPassResult
+from dggt.models.gaussian_scene_editor import GaussianSceneEditor
+from dggt.utils.asset_bank import AssetBank
+from dggt.utils.gaussian_edit import parse_object_slots
 from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
 from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_split_gs
@@ -42,7 +39,15 @@ def alpha_t(t: torch.Tensor, t0: torch.Tensor | float, alpha: torch.Tensor, gamm
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Single-sample Mode A inference and online gaussian editing.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Single-sample Mode A inference: runs GaussianSceneEditor (Phase 1 "
+            "deletion) and AssetAggregatorPass (Phase 4 Waymo-coord per-object "
+            "render) on the same sample, with Phase 4 gated by Phase 1's "
+            "(slot, frame) deletion coverage so per-frame asset renders line "
+            "up one-to-one with deletions."
+        )
+    )
     parser.add_argument("--index", type=int, required=True, help="WaymoEditDataset sample index.")
     parser.add_argument("--output_dir", type=str, required=True, help="Where to write renders and PLY files.")
     parser.add_argument(
@@ -142,14 +147,6 @@ def _save_grid(images: torch.Tensor, path: Path, nrow: int | None = None) -> Non
         nrow = min(4, images.shape[0])
     pil_images = [_tensor_to_pil_rgb(image) for image in images]
     _make_pil_grid(pil_images, nrow=nrow).save(path)
-
-
-def _binary_masks_to_rgb(masks: torch.Tensor, color: tuple[float, float, float] = (0.0, 1.0, 0.0)) -> torch.Tensor:
-    if masks.dim() != 3:
-        raise ValueError(f"Expected [N,H,W], got {tuple(masks.shape)}")
-    masks_f = masks.detach().cpu().float().clamp(0.0, 1.0)
-    color_tensor = torch.tensor(color, dtype=torch.float32).view(1, 3, 1, 1)
-    return masks_f.unsqueeze(1) * color_tensor
 
 
 def _overlay_binary_masks_on_images(
@@ -252,10 +249,8 @@ def _save_vehicle_semantic_outputs(
 
     pred_classes = semantic_logits[0].detach().cpu().argmax(dim=-1)
     pred_vehicle_mask = pred_classes == PRED_VEHICLE_SEMANTIC_CLASS_ID
-    pred_vehicle_rgb = _binary_masks_to_rgb(pred_vehicle_mask)
     pred_vehicle_overlay = _overlay_binary_masks_on_images(sample["images_clean"], pred_vehicle_mask)
-    _save_grid(pred_vehicle_rgb, output_dir / "pred_vehicle_semantic_grid.png")
-    _save_grid(pred_vehicle_overlay, output_dir / "pred_vehicle_semantic_overlay_grid.png")
+    _save_grid(pred_vehicle_overlay, output_dir / "pred_vehicle_semantic_overlay_grid.jpg")
 
     summary: dict[str, object] = {
         "semantic_available": True,
@@ -266,10 +261,8 @@ def _save_vehicle_semantic_outputs(
 
     input_vehicle_mask = _load_input_vehicle_semantic_masks(sample, processed_root=processed_root, split=split)
     if input_vehicle_mask is not None:
-        input_vehicle_rgb = _binary_masks_to_rgb(input_vehicle_mask)
         input_vehicle_overlay = _overlay_binary_masks_on_images(sample["images_clean"], input_vehicle_mask)
-        _save_grid(input_vehicle_rgb, output_dir / "input_vehicle_semantic_grid.png")
-        _save_grid(input_vehicle_overlay, output_dir / "input_vehicle_semantic_overlay_grid.png")
+        _save_grid(input_vehicle_overlay, output_dir / "input_vehicle_semantic_overlay_grid.jpg")
 
         input_counts = [int(v) for v in input_vehicle_mask.view(input_vehicle_mask.shape[0], -1).sum(dim=1).tolist()]
         ious = []
@@ -326,79 +319,6 @@ def _save_dataset_box_overlay_grid(sample: dict, output_path: Path) -> None:
                     continue
                 object_tag = scene_raw_id if scene_raw_id else asset_object_id
                 label = f"{object_tag[:8]} f{int(sample['frame_indices'][frame_idx].item())} c{cam_id}"
-                overlay_images[image_idx] = draw_projected_3d_box(
-                    overlay_images[image_idx],
-                    projected_corners,
-                    projected_valid,
-                    color=color,
-                    label=label,
-                )
-
-    pil_images = [Image.fromarray(image) for image in overlay_images]
-    _make_pil_grid(pil_images, nrow=max(1, num_views)).save(output_path)
-
-
-def _save_dggt_box_overlay_grid(sample: dict, clean_state, alignment, output_path: Path) -> None:
-    from dggt.utils.gaussian_edit import _transform_track_box, build_box_corners, project_world_box_corners
-    overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in clean_state.images]
-    editable_count = int(sample["editable_object_count"].item())
-    editable_slots = sample["editable_object_indices"][:editable_count].tolist()
-    num_views = int(sample["cam_ids"].numel())
-    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
-    colors = [
-        (0, 255, 0),
-        (255, 200, 0),
-        (255, 0, 0),
-        (0, 200, 255),
-        (255, 0, 255),
-        (160, 255, 0),
-    ]
-
-    for color_idx, object_slot in enumerate(editable_slots):
-        track_valid = sample["object_track_valid_mask_selected"][object_slot]
-        scene_raw_id = sample["object_scene_raw_ids"][object_slot]
-        asset_object_id = sample["object_asset_ids"][object_slot]
-        color = colors[color_idx % len(colors)]
-
-        for frame_idx in range(min(sample["frame_indices"].numel(), track_valid.shape[0])):
-            if not bool(track_valid[frame_idx].item()):
-                continue
-            for cam_offset, cam_id in enumerate(sample["cam_ids"].tolist()):
-                image_idx = frame_idx * num_views + cam_offset
-                if image_idx >= len(overlay_images):
-                    continue
-                
-                corners_waymo = sample["object_box_corners_world_selected"][object_slot, frame_idx]
-                corners_dggt = alignment.apply_points(corners_waymo.to(alignment.translation.device))
-                
-                rotation_wc = clean_state.camera_to_world[image_idx][:3, :3]
-                translation_wc = clean_state.camera_to_world[image_idx][:3, 3]
-                rotation_cw = rotation_wc.T
-                translation_cw = -rotation_cw @ translation_wc
-                points_cam = corners_dggt @ rotation_cw.T + translation_cw
-                depths = points_cam[:, 2]
-                
-                # Always use GT intrinsics for visualization to isolate pose error
-                from datasets.waymo_edit_dataset import compute_resize_geometry
-                geom = compute_resize_geometry(tuple(int(v) for v in sample["raw_image_size_hw"][cam_offset]), target_width=image_hw[1])
-                fx = sample["intrinsics"][cam_offset][0, 0] * geom["scale_x"]
-                fy = sample["intrinsics"][cam_offset][1, 1] * geom["scale_y"]
-                cx = sample["intrinsics"][cam_offset][0, 2] * geom["scale_x"]
-                cy = sample["intrinsics"][cam_offset][1, 2] * geom["scale_y"] - geom["crop_top"]
-                
-                u = fx * points_cam[:, 0] / depths.clamp_min(1e-6) + cx
-                v = fy * points_cam[:, 1] / depths.clamp_min(1e-6) + cy
-                
-                valid = torch.isfinite(u) & torch.isfinite(v) & torch.isfinite(depths) & (depths > 1e-4)
-                if not valid.any():
-                    continue
-                
-                uv = torch.stack([u, v], dim=-1)
-                projected_corners = uv.tolist()
-                projected_valid = valid.cpu().numpy()
-                
-                object_tag = scene_raw_id if scene_raw_id else asset_object_id
-                label = f"{object_tag[:8]} f{int(sample['frame_indices'][frame_idx].item())} c{cam_id} DGGT"
                 overlay_images[image_idx] = draw_projected_3d_box(
                     overlay_images[image_idx],
                     projected_corners,
@@ -747,6 +667,154 @@ def _write_scene_outputs(prefix: str, scene: dict[str, torch.Tensor], output_dir
     write_point_ply(points, colors, output_dir / f"{prefix}_points.ply")
 
 
+def _build_phase1_asset_coverage(
+    sample: dict,
+    localized_objects,
+) -> tuple[torch.Tensor, list[int]]:
+    """For each (slot, image) pair that Phase 1 actually deleted, mark True.
+
+    Phase 4 re-uses this mask to guarantee that per-frame asset renders match
+    Phase 1 one-to-one in both count and pose.
+    """
+    image_valid = sample["object_asset_image_valid_mask_selected"]
+    num_slots, num_images = int(image_valid.shape[0]), int(image_valid.shape[1])
+    coverage = torch.zeros((num_slots, num_images), dtype=torch.bool)
+    slot_set: set[int] = set()
+    for item in localized_objects:
+        slot_idx = int(item.slot_idx)
+        image_idx = int(item.source_front_index)
+        if 0 <= slot_idx < num_slots and 0 <= image_idx < num_images:
+            coverage[slot_idx, image_idx] = True
+            slot_set.add(slot_idx)
+    return coverage, sorted(slot_set)
+
+
+def _composite_asset_over_clean(
+    clean_images: torch.Tensor,
+    i_asset_per_slot: dict[int, torch.Tensor],
+    a_asset_per_slot: dict[int, torch.Tensor],
+) -> torch.Tensor:
+    """Over-compose every object's I_asset / A_asset onto the clean views.
+
+    Mirrors how Phase 4's asset renders are consumed downstream — this grid
+    answers "on each frame, which pixels does the asset pass claim to own".
+    """
+    base = clean_images.detach().cpu().float().clamp(0.0, 1.0).clone()
+    num_images = base.shape[0]
+    for slot_idx, i_asset in i_asset_per_slot.items():
+        alpha = a_asset_per_slot[slot_idx]
+        rgb = i_asset[0].detach().cpu().float().clamp(0.0, 1.0)
+        a = alpha[0].detach().cpu().float().clamp(0.0, 1.0)
+        if rgb.shape[0] != num_images or a.shape[0] != num_images:
+            continue
+        base = a * rgb + (1.0 - a) * base
+    return base.clamp(0.0, 1.0)
+
+
+def _save_asset_pass_outputs(
+    result: AssetPassResult,
+    clean_images: torch.Tensor,
+    output_dir: Path,
+    num_views: int,
+    skip_ply: bool,
+) -> dict:
+    asset_pass_dir = output_dir / "asset_pass"
+    asset_pass_dir.mkdir(parents=True, exist_ok=True)
+
+    per_object_info: list[dict] = []
+    for slot_idx in result.object_keys:
+        i_asset = result.I_asset[slot_idx][0]
+        a_asset = result.A_asset[slot_idx][0]
+        nrow = max(1, num_views)
+        _save_grid(i_asset, asset_pass_dir / f"I_asset_slot{slot_idx:02d}_grid.jpg", nrow=nrow)
+        _save_grid(
+            a_asset.expand(-1, 3, -1, -1).contiguous(),
+            asset_pass_dir / f"A_asset_slot{slot_idx:02d}_grid.jpg",
+            nrow=nrow,
+        )
+        per_object_info.append(
+            {
+                "slot_idx": int(slot_idx),
+                "num_gauss_per_frame": [
+                    int(g["means"].shape[0]) for g in result.G_asset_waymo[slot_idx]
+                ],
+                "num_visible_pointers_per_frame": [
+                    int(p.visible_mask.sum().item()) for p in result.ptr_asset[slot_idx]
+                ],
+                "F_g_lut_asset_shape": list(result.F_g_lut_asset[slot_idx][0].shape),
+            }
+        )
+
+    composite = _composite_asset_over_clean(
+        clean_images=clean_images,
+        i_asset_per_slot=result.I_asset,
+        a_asset_per_slot=result.A_asset,
+    )
+    _save_grid(composite, asset_pass_dir / "asset_pass_over_clean_grid.jpg", nrow=max(1, num_views))
+
+    if not skip_ply:
+        for slot_idx in result.object_keys:
+            for frame_i, gauss in enumerate(result.G_asset_waymo[slot_idx]):
+                if gauss["means"].numel() == 0:
+                    continue
+                write_gaussian_ply(
+                    {
+                        "means": gauss["means"],
+                        "features_dc_rgb": gauss["colors"],
+                        "opacities": gauss["opacities"],
+                        "scales": gauss["scales"],
+                        "quats": gauss["quats"],
+                    },
+                    asset_pass_dir / f"slot{slot_idx:02d}_frame{frame_i:02d}_waymo_gaussians.ply",
+                )
+
+    feature_pack = {
+        "patch_grid": result.patch_grid,
+        "patch_start_idx": int(result.patch_start_idx),
+        "object_keys": [int(k) for k in result.object_keys],
+        "cameras_waymo": {k: v.detach().cpu() for k, v in result.cameras_waymo.items()},
+        "F_g_lut_asset": {
+            int(k): [lvl.detach().cpu() for lvl in v] for k, v in result.F_g_lut_asset.items()
+        },
+        "ptr_asset": {
+            int(k): [
+                {
+                    "src_kind": p.src_kind.detach().cpu(),
+                    "object_id": p.object_id.detach().cpu(),
+                    "view_n": p.view_n.detach().cpu(),
+                    "patch_idx": p.patch_idx.detach().cpu(),
+                    "visible_mask": p.visible_mask.detach().cpu(),
+                }
+                for p in v
+            ]
+            for k, v in result.ptr_asset.items()
+        },
+        "G_asset_waymo": {
+            int(k): [{kk: vv.detach().cpu() for kk, vv in g.items()} for g in v]
+            for k, v in result.G_asset_waymo.items()
+        },
+        "G_asset_dggt": (
+            None
+            if result.G_asset_dggt is None
+            else {
+                int(k): [{kk: vv.detach().cpu() for kk, vv in g.items()} for g in v]
+                for k, v in result.G_asset_dggt.items()
+            }
+        ),
+        "I_asset": {int(k): v.detach().cpu() for k, v in result.I_asset.items()},
+        "A_asset": {int(k): v.detach().cpu() for k, v in result.A_asset.items()},
+    }
+    torch.save(feature_pack, asset_pass_dir / "asset_pass.pt")
+
+    return {
+        "num_objects": len(result.object_keys),
+        "object_keys": [int(k) for k in result.object_keys],
+        "patch_grid": list(result.patch_grid),
+        "patch_start_idx": int(result.patch_start_idx),
+        "per_object": per_object_info,
+    }
+
+
 def _build_summary(args, sample, alignment, edited_state) -> dict:
     localized = []
     for item in edited_state.localized_objects:
@@ -795,8 +863,6 @@ def _build_summary(args, sample, alignment, edited_state) -> dict:
         "sim3_waymo_to_dggt": alignment.as_dict(),
         "clean_gaussian_count": int(edited_state.clean["means"].shape[0]),
         "deleted_gaussian_count": int(edited_state.deleted["means"].shape[0]),
-        "asset_gaussian_count": 0,
-        "edited_gaussian_count": int(edited_state.edited["means"].shape[0]),
         "localized_objects": localized,
     }
 
@@ -805,7 +871,7 @@ def main() -> None:
     args = build_argparser().parse_args()
     if args.views != 1:
         raise NotImplementedError(
-            f"inference_mode_a.py currently supports --views 1 only; got --views {args.views}"
+            f"inference_scene_editor.py currently supports --views 1 only; got --views {args.views}"
         )
     torch.manual_seed(args.seed)
 
@@ -832,6 +898,18 @@ def main() -> None:
     with torch.no_grad():
         predictions = model(images)
 
+    editor = GaussianSceneEditor(
+        min_match_score=args.min_match_score,
+        dynamic_thresh=args.dynamic_thresh,
+        core_scale=args.core_scale,
+        shell_scale=args.shell_scale,
+        proposal_scale=args.proposal_scale,
+        motion_speed_thresh=args.motion_speed_thresh,
+        dynamic_prob_thresh=args.dynamic_prob_thresh,
+        dynamic_ratio_thresh=args.dynamic_ratio_thresh,
+        use_pose_refine=(args.pose_refine == "on"),
+    )
+
     semantic_summary = _save_vehicle_semantic_outputs(
         sample,
         predictions,
@@ -840,7 +918,7 @@ def main() -> None:
         output_dir=output_dir,
     )
 
-    clean_state = build_clean_scene_state(sample, predictions)
+    clean_state = editor.build_clean_bundle(sample, predictions)
     clean_render = _render_clean_with_dggt(model, sample, predictions, device)
     clean_dynamic_render = _render_edited_sequence_with_dggt(
         model,
@@ -863,11 +941,11 @@ def main() -> None:
         include_dynamic=False,
     )
 
-    _save_grid(clean_state.images, output_dir / "input_images_grid.png")
-    _save_grid(clean_render, output_dir / "clean_render_grid.png")
-    _save_grid(clean_dynamic_render, output_dir / "clean_dynamic_render_grid.png")
-    _save_grid(clean_static_render, output_dir / "clean_static_render_grid.png")
-    _save_dataset_box_overlay_grid(sample, output_dir / "projected_boxes_on_inputs.png")
+    _save_grid(clean_state.images, output_dir / "input_images_grid.jpg")
+    _save_grid(clean_render, output_dir / "clean_render_grid.jpg")
+    _save_grid(clean_dynamic_render, output_dir / "clean_dynamic_render_grid.jpg")
+    _save_grid(clean_static_render, output_dir / "clean_static_render_grid.jpg")
+    _save_dataset_box_overlay_grid(sample, output_dir / "projected_boxes_on_inputs.jpg")
 
     if args.clean_only:
         summary = {
@@ -885,37 +963,28 @@ def main() -> None:
         print(json.dumps(summary, indent=2))
         return
 
-    alignment = estimate_scene_alignment(sample, clean_state)
-    _save_dggt_box_overlay_grid(sample, clean_state, alignment, output_dir / "projected_boxes_on_inputs_dggt.png")
+    alignment = editor.align(sample, clean_state)
 
     selected_slots = parse_object_slots(sample, args.object_slots)
-    localized_objects = localize_objects(
+    localized_objects = editor.localize(
         sample,
         clean_state,
         alignment,
         selected_slots,
-        min_match_score=args.min_match_score,
-        dynamic_thresh=args.dynamic_thresh,
-        core_scale=args.core_scale,
-        shell_scale=args.shell_scale,
-        proposal_scale=args.proposal_scale,
-        motion_speed_thresh=args.motion_speed_thresh,
-        dynamic_prob_thresh=args.dynamic_prob_thresh,
-        dynamic_ratio_thresh=args.dynamic_ratio_thresh,
-        use_pose_refine=(args.pose_refine == "on"),
+        load_asset=False,
     )
     _save_target_boxes(
         clean_state.images,
         localized_objects,
-        output_dir / "target_boxes.png",
+        output_dir / "target_boxes.jpg",
     )
     _save_mask_overlay_grid(
         clean_state.images,
         localized_objects,
-        output_dir / "delete_component_overlay.png",
+        output_dir / "delete_component_overlay.jpg",
         "delete_component_pixel_mask",
     )
-    edited_state = apply_mode_a(clean_state, localized_objects)
+    edited_state = editor.apply_mode_a(clean_state, localized_objects)
 
     deleted_bundle = _render_edited_sequence_with_dggt(
         model,
@@ -927,18 +996,46 @@ def main() -> None:
         return_aux=True,
     )
     deleted_render = deleted_bundle["composed"]
-    edited_render = deleted_render
 
-    _save_grid(deleted_render, output_dir / "deleted_render_grid.png")
-    _save_grid(edited_render, output_dir / "edited_render_grid.png")
+    _save_grid(deleted_render, output_dir / "deleted_render_grid.jpg")
 
     if not args.skip_ply:
         _write_scene_outputs("clean", edited_state.clean, output_dir)
         _write_scene_outputs("deleted", edited_state.deleted, output_dir)
-        _write_scene_outputs("edited", edited_state.edited, output_dir)
+
+    phase1_coverage, phase4_slots = _build_phase1_asset_coverage(sample, localized_objects)
+    phase4_sample = dict(sample)
+    phase4_sample["object_asset_image_valid_mask_selected"] = (
+        sample["object_asset_image_valid_mask_selected"].bool() & phase1_coverage
+    )
+
+    asset_bank = AssetBank()
+    asset_pass = AssetAggregatorPass(model.aggregator).to(device)
+    with torch.no_grad():
+        asset_pass_result = asset_pass(
+            phase4_sample,
+            selected_object_slots=phase4_slots,
+            alignment=alignment,
+            asset_cache=asset_bank.as_raw_cache(),
+            occlusion_test=True,
+        )
+
+    num_views = int(sample["cam_ids"].numel())
+    asset_pass_summary = _save_asset_pass_outputs(
+        asset_pass_result,
+        clean_images=clean_state.images,
+        output_dir=output_dir,
+        num_views=num_views,
+        skip_ply=args.skip_ply,
+    )
+    asset_pass_summary["phase1_coverage_per_slot"] = {
+        int(slot_idx): [int(i) for i in torch.nonzero(phase1_coverage[slot_idx], as_tuple=False).flatten().tolist()]
+        for slot_idx in phase4_slots
+    }
 
     summary = _build_summary(args, sample, alignment, edited_state)
     summary["semantic_summary"] = semantic_summary
+    summary["asset_pass_summary"] = asset_pass_summary
     with open(output_dir / "edit_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 

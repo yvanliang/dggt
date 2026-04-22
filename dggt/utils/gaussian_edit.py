@@ -9,7 +9,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from dggt.utils.gaussian_ply import read_gaussian_ply
+from dggt.utils.gaussian_ply import GAUSSIAN_SH_C0, read_gaussian_ply
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.rotation import mat_to_quat, quat_to_mat
 
@@ -1459,10 +1459,8 @@ def _load_asset_gaussians(path: str, cache: dict[str, dict[str, torch.Tensor]]) 
         unpack_options.to_coord = spz.CoordinateSystem.UNSPECIFIED
         cloud = spz.load_spz(str(path_obj), unpack_options)
         means = _to_cpu_float_tensor(getattr(cloud, "positions"), shape_last=3)
-        colors = _to_cpu_float_tensor(getattr(cloud, "colors"), shape_last=3)
-        if colors.numel() > 0 and float(colors.max().item()) > 1.0:
-            colors = colors / 255.0
-        colors = colors.clamp(0.0, 1.0)
+        features_dc = _to_cpu_float_tensor(getattr(cloud, "colors"), shape_last=3)
+        colors = (GAUSSIAN_SH_C0 * features_dc + 0.5).clamp(0.0, 1.0)
 
         alpha_values = getattr(cloud, "alphas", None)
         if alpha_values is None:
@@ -1472,7 +1470,8 @@ def _load_asset_gaussians(path: str, cache: dict[str, dict[str, torch.Tensor]]) 
         alpha_raw = _to_cpu_float_tensor(alpha_values, shape_last=1)
         opacities = torch.sigmoid(alpha_raw).clamp(1e-6, 1.0 - 1e-6)
 
-        scales = _to_cpu_float_tensor(getattr(cloud, "scales"), shape_last=3).clamp_min(1e-6)
+        scale_raw = _to_cpu_float_tensor(getattr(cloud, "scales"), shape_last=3)
+        scales = torch.exp(scale_raw).clamp_min(1e-6)
         rotations_xyzw = _to_cpu_float_tensor(getattr(cloud, "rotations"), shape_last=4)
         quats = F.normalize(rotations_xyzw[:, [3, 0, 1, 2]], dim=-1)
     else:
@@ -1504,9 +1503,11 @@ def _compute_asset_scale_factors(
     target_lwh: torch.Tensor,
     opacity_threshold: float = 0.01,
 ) -> torch.Tensor:
-    opacities = asset_local["opacities"].squeeze(-1)
+    target_lwh = target_lwh.float()
+    opacities = asset_local["opacities"].squeeze(-1).to(target_lwh.device)
     visible = opacities > opacity_threshold
-    visible_xyz = asset_local["means_raw"][visible] if torch.any(visible) else asset_local["means_raw"]
+    means_raw = asset_local["means_raw"].to(target_lwh.device)
+    visible_xyz = means_raw[visible] if torch.any(visible) else means_raw
     if visible_xyz.numel() == 0:
         current_lwh = torch.ones(3, dtype=torch.float32, device=target_lwh.device)
     else:
@@ -2775,6 +2776,8 @@ def localize_objects(
     dynamic_prob_thresh: float | None = None,
     dynamic_ratio_thresh: float = 0.35,
     use_pose_refine: bool = True,
+    asset_cache: dict[str, dict[str, torch.Tensor]] | None = None,
+    load_asset: bool = True,
 ) -> list[LocalizedFrameObject]:
     if dynamic_prob_thresh is None:
         dynamic_prob_thresh = dynamic_thresh
@@ -2784,7 +2787,8 @@ def localize_objects(
             f"localize_objects currently supports views=1 only; got views={num_views}"
         )
     image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
-    asset_cache: dict[str, dict[str, torch.Tensor]] = {}
+    if asset_cache is None:
+        asset_cache = {}
     asset_root = sample.get("asset_meta", {}).get("asset_root", "")
     track_valid = sample["object_track_valid_mask_selected"]
     object_obj_to_world = sample["object_obj_to_world_selected"]
@@ -2821,7 +2825,7 @@ def localize_objects(
                 pass
         if not asset_path:
             continue
-        asset_local = _load_asset_gaussians(asset_path, asset_cache)
+        asset_local = _load_asset_gaussians(asset_path, asset_cache) if load_asset else None
         waymo_max_speed = (
             float(object_max_speed_mps[slot_idx].item())
             if isinstance(object_max_speed_mps, torch.Tensor)
@@ -3117,29 +3121,50 @@ def localize_objects(
             frame_rotation = proposal_rotation
             insert_size = gt_size.clone()
             asset_center = proposal_center.clone()
-            asset_scale_factors = _compute_asset_scale_factors(asset_local, insert_size)
             asset_object_to_world = _asset_object_to_world_matrix(frame_rotation, asset_center)
-            asset_world = _transform_asset_gaussians_simple(
-                asset_local,
-                insert_size,
-                frame_rotation,
-                asset_center,
-            )
-            projected_asset_bbox = _project_asset_bbox_simple(
-                asset_local=asset_local,
-                target_lwh=insert_size,
-                object_rotation=frame_rotation,
-                object_center=asset_center,
-                camera_to_world=clean_state.camera_to_world[source_front_index],
-                intrinsics=clean_state.intrinsics[source_front_index],
-                image_hw=image_hw,
-            )
-            asset_scale = float(
-                torch.mean(
-                    insert_size
-                    / (asset_local["means_raw"].max(dim=0).values - asset_local["means_raw"].min(dim=0).values).clamp_min(1e-6)
-                ).item()
-            )
+            if asset_local is not None:
+                asset_scale_factors = _compute_asset_scale_factors(asset_local, insert_size)
+                asset_world = _transform_asset_gaussians_simple(
+                    asset_local,
+                    insert_size,
+                    frame_rotation,
+                    asset_center,
+                )
+                projected_asset_bbox = _project_asset_bbox_simple(
+                    asset_local=asset_local,
+                    target_lwh=insert_size,
+                    object_rotation=frame_rotation,
+                    object_center=asset_center,
+                    camera_to_world=clean_state.camera_to_world[source_front_index],
+                    intrinsics=clean_state.intrinsics[source_front_index],
+                    image_hw=image_hw,
+                )
+                asset_scale = float(
+                    torch.mean(
+                        insert_size
+                        / (asset_local["means_raw"].max(dim=0).values - asset_local["means_raw"].min(dim=0).values).clamp_min(1e-6)
+                    ).item()
+                )
+                asset_means_world = asset_world["means"]
+                asset_colors = asset_world["colors"]
+                asset_opacities = asset_world["opacities"]
+                asset_scales_world = asset_world["scales"]
+                asset_quats_world = asset_world["quats"]
+                asset_means_local = asset_local["means_raw"]
+                asset_scales_local = asset_local["scales"]
+                asset_quats_local = asset_local["quats"]
+            else:
+                asset_scale_factors = torch.ones(3, dtype=torch.float32)
+                projected_asset_bbox = None
+                asset_scale = 1.0
+                asset_means_world = torch.zeros((0, 3), dtype=torch.float32)
+                asset_colors = torch.zeros((0, 3), dtype=torch.float32)
+                asset_opacities = torch.zeros((0, 1), dtype=torch.float32)
+                asset_scales_world = torch.zeros((0, 3), dtype=torch.float32)
+                asset_quats_world = torch.zeros((0, 4), dtype=torch.float32)
+                asset_means_local = torch.zeros((0, 3), dtype=torch.float32)
+                asset_scales_local = torch.zeros((0, 3), dtype=torch.float32)
+                asset_quats_local = torch.zeros((0, 4), dtype=torch.float32)
 
             localized.append(
                 LocalizedFrameObject(
@@ -3179,14 +3204,14 @@ def localize_objects(
                     projected_asset_bbox=projected_asset_bbox,
                     seed_pixel_mask=matched_mask.clone(),
                     delete_component_pixel_mask=matched_mask.clone(),
-                    asset_means_world=asset_world["means"],
-                    asset_colors=asset_world["colors"],
-                    asset_opacities=asset_world["opacities"],
-                    asset_scales=asset_world["scales"],
-                    asset_quats=asset_world["quats"],
-                    asset_means_local=asset_local["means_raw"],
-                    asset_scales_local=asset_local["scales"],
-                    asset_quats_local=asset_local["quats"],
+                    asset_means_world=asset_means_world,
+                    asset_colors=asset_colors,
+                    asset_opacities=asset_opacities,
+                    asset_scales=asset_scales_world,
+                    asset_quats=asset_quats_world,
+                    asset_means_local=asset_means_local,
+                    asset_scales_local=asset_scales_local,
+                    asset_quats_local=asset_quats_local,
                     asset_scale_factors=asset_scale_factors,
                     asset_object_to_world=asset_object_to_world,
                 )
