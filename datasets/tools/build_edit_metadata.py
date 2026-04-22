@@ -28,6 +28,15 @@ TRANSFER_BOX_LONG_EDGE_PX = float(max(DEFAULT_TRANSFER_HW))
 MIN_EDIT_BOX_SIZE_PX = TRANSFER_BOX_LONG_EDGE_PX / 10.0
 EDIT_OCCLUSION_IOU_THRESHOLD = 0.8
 DEPTH_TIE_EPS = 1e-4
+VEHICLE_CLASS_KEYWORDS = (
+    "vehicle",
+    "car",
+    "truck",
+    "bus",
+    "van",
+    "pickup",
+    "trailer",
+)
 WAYMO_OPENCV2DATASET = np.array(
     [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]],
     dtype=np.float32,
@@ -111,12 +120,36 @@ def build_filter_stats():
         "num_boxes_filtered_small": 0,
         "num_high_iou_pairs": 0,
         "num_boxes_filtered_occluded": 0,
+        "num_objects_filtered_non_vehicle": 0,
+        "kept_vehicle_class_counts": {},
+        "filtered_non_vehicle_class_counts": {},
     }
 
 
 def accumulate_filter_stats(target: dict, source: dict):
     for key, value in source.items():
+        if isinstance(value, dict):
+            target.setdefault(key, {})
+            for child_key, child_value in value.items():
+                target[key][child_key] = int(target[key].get(child_key, 0)) + int(child_value)
+            continue
         target[key] = int(target.get(key, 0)) + int(value)
+
+
+def normalize_class_name(class_name):
+    return str(class_name).strip()
+
+
+def is_vehicle_related_class(class_name):
+    normalized = normalize_class_name(class_name).lower().replace("-", "_").replace(" ", "_")
+    if normalized == "":
+        return False
+    return any(keyword in normalized for keyword in VEHICLE_CLASS_KEYWORDS)
+
+
+def increment_counter(counter_dict, key):
+    key = normalize_class_name(key) or "__EMPTY__"
+    counter_dict[key] = int(counter_dict.get(key, 0)) + 1
 
 
 def box_size_xyxy(box_xyxy):
@@ -435,18 +468,29 @@ def build_clip_candidate(
         for camera_name in CAMERA_NAMES
     }
 
-    objects = []
-    object_track_contexts = []
-    for slot, (asset_object_id, position_payload) in enumerate(zip(object_list, object_position)):
+    filtered_objects = []
+    for asset_object_id, position_payload in zip(object_list, object_position):
         asset_object_id = str(asset_object_id)
-        asset_path = asset_root / f"{asset_object_id}.ply"
-        if not asset_path.is_file():
-            return None, "missing_asset", filter_stats
-
         scene_object = scene_object_index.get(asset_object_id)
         if scene_object is None:
             return None, "missing_scene_object", filter_stats
+        class_name = str(scene_object["class_name"])
+        if not is_vehicle_related_class(class_name):
+            filter_stats["num_objects_filtered_non_vehicle"] += 1
+            increment_counter(filter_stats["filtered_non_vehicle_class_counts"], class_name)
+            continue
+        increment_counter(filter_stats["kept_vehicle_class_counts"], class_name)
+        filtered_objects.append((asset_object_id, position_payload, scene_object))
 
+    if len(filtered_objects) == 0:
+        return None, "no_vehicle_object", filter_stats
+
+    objects = []
+    object_track_contexts = []
+    for slot, (asset_object_id, position_payload, scene_object) in enumerate(filtered_objects):
+        asset_path = asset_root / f"{asset_object_id}.ply"
+        if not asset_path.is_file():
+            return None, "missing_asset", filter_stats
         instance_info = scene_object["instance_info"]
         frame_annotations = instance_info["frame_annotations"]
         track_frame_indices = [int(v) for v in frame_annotations.get("frame_idx", [])]
@@ -712,12 +756,16 @@ def main():
         "skipped_missing_scene": 0,
         "skipped_invalid_payload": 0,
         "skipped_clip_out_of_range": 0,
+        "skipped_no_vehicle_object": 0,
         "skipped_missing_asset": 0,
         "skipped_missing_scene_object": 0,
         "num_boxes_total": 0,
         "num_boxes_filtered_small": 0,
         "num_high_iou_pairs": 0,
         "num_boxes_filtered_occluded": 0,
+        "num_objects_filtered_non_vehicle": 0,
+        "kept_vehicle_class_counts": {},
+        "filtered_non_vehicle_class_counts": {},
     }
 
     for record_idx, record in enumerate(records):
@@ -748,6 +796,8 @@ def main():
         if candidate is None:
             if skip_reason == "clip_out_of_range":
                 summary["skipped_clip_out_of_range"] += 1
+            elif skip_reason == "no_vehicle_object":
+                summary["skipped_no_vehicle_object"] += 1
             elif skip_reason == "missing_asset":
                 summary["skipped_missing_asset"] += 1
             elif skip_reason == "missing_scene_object":

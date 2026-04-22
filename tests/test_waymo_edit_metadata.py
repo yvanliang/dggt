@@ -6,6 +6,7 @@ from datasets.tools.build_edit_metadata import (
     MIN_EDIT_BOX_SIZE_PX,
     box_overlap_ratios_xyxy,
     is_transfer_box_large_enough,
+    is_vehicle_related_class,
     resolve_occluded_slots,
 )
 from datasets.waymo_edit_dataset import WaymoEditDataset
@@ -98,3 +99,10 @@ def test_resolve_object_bbox_editable_view_flags_reads_bbox_editable_metadata():
     )
 
     assert flags.tolist() == [True, False, True]
+
+
+def test_is_vehicle_related_class_only_keeps_vehicle_like_labels():
+    assert is_vehicle_related_class("Vehicle")
+    assert is_vehicle_related_class("truck")
+    assert not is_vehicle_related_class("Pedestrian")
+    assert not is_vehicle_related_class("Cyclist")
