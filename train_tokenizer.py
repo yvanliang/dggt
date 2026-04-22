@@ -182,11 +182,11 @@ class TokenizerTrainWrapper(nn.Module):
         patch_grid: tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]] | list[torch.Tensor]:
         if latent is not None:
-            return self.tokenizer.decode(latent)
+            return self.tokenizer.decode(latent, patch_grid=patch_grid)
         if image_tokens is None:
             raise ValueError("Either image_tokens or latent must be provided")
         z = self.tokenizer.encode(image_tokens, patch_grid=patch_grid)
-        decoded = self.tokenizer.decode(z)
+        decoded = self.tokenizer.decode(z, patch_grid=patch_grid)
         return z, decoded
 
 
@@ -827,9 +827,7 @@ def build_student_outputs(
     images: torch.Tensor,
     levels: tuple[int, ...],
     teacher: dict[str, Any],
-    feature_std: torch.Tensor,
     autocast_enabled,
-    global_step: int,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     patch_grid = infer_patch_grid(images, teacher["image_patch"][0].shape[2])
@@ -856,28 +854,39 @@ def build_student_outputs(
         dynamic_hat, _ = model.instance_head(dino_hat_all, images, teacher["patch_start_idx"])
         del image_hat_all, dino_hat_all, agg_hat_all
 
-        noisy_loss = None
-        if global_step >= args.noisy_start_step and args.lambda_noisy > 0.0:
-            z_noisy, _, _ = sample_noisy_latent(z.detach())
-
-            def _decode_noisy_tuple(latent: torch.Tensor):
-                decoded = tokenizer_runner(latent=latent, patch_grid=patch_grid)
-                return tuple(decoded)
-
-            decoded_noisy = activation_checkpoint(_decode_noisy_tuple, z_noisy, use_reentrant=False)
-            noisy_loss = normalized_token_reconstruction_loss(list(decoded_noisy), teacher["image_patch"], feature_std)
-            del decoded_noisy, z_noisy
-
     return {
         "z": z,
         "decoded_patch": decoded_patch,
-        "noisy_loss": noisy_loss,
         "gs_map": gs_map_hat,
         "gs_conf": gs_conf_hat,
         "depth": depth_hat,
         "depth_conf": depth_conf_hat,
         "dynamic_conf": dynamic_hat,
     }
+
+
+def compute_noisy_decoder_loss(
+    tokenizer_runner: nn.Module,
+    latent: torch.Tensor,
+    target_tokens: list[torch.Tensor],
+    std_stats: torch.Tensor,
+    patch_grid: tuple[int, int],
+    autocast_enabled,
+) -> torch.Tensor:
+    with autocast_enabled:
+        z_noisy, _, _ = sample_noisy_latent(latent)
+
+        def _decode_noisy_tuple(noisy_latent: torch.Tensor):
+            decoded = tokenizer_runner(latent=noisy_latent, patch_grid=patch_grid)
+            return tuple(decoded)
+
+        if torch.is_grad_enabled():
+            decoded_noisy = activation_checkpoint(_decode_noisy_tuple, z_noisy, use_reentrant=False)
+        else:
+            decoded_noisy = _decode_noisy_tuple(z_noisy)
+        noisy_loss = normalized_token_reconstruction_loss(list(decoded_noisy), target_tokens, std_stats)
+        del decoded_noisy, z_noisy
+    return noisy_loss
 
 
 def compute_losses(
@@ -920,9 +929,6 @@ def compute_losses(
             sky_mask=sky_mask,
         )
 
-    losses["noisy"] = student["z"].new_tensor(0.0)
-    if student["noisy_loss"] is not None:
-        losses["noisy"] = student["noisy_loss"]
     losses["lat_stat"] = latent_stat_loss(student["z"])
 
     render_ref = None
@@ -1013,7 +1019,6 @@ def compute_losses(
         + gs_lifespan_weight * losses["gs_lifespan"]
         + ghost_static_weight * losses["ghost_static"]
         + render_weight * losses["render_anchor"]
-        + noisy_weight * losses["noisy"]
         + args.lambda_lat_stat * losses["lat_stat"]
     )
 
@@ -1029,7 +1034,7 @@ def compute_losses(
         "ghost_static": float(losses["ghost_static"].detach().item()),
         "render_anchor": float(losses["render_anchor"].detach().item()),
         "render_lpips": float(losses["render_lpips"].detach().item()),
-        "noisy": float(losses["noisy"].detach().item()),
+        "noisy": 0.0,
         "lat_stat": float(losses["lat_stat"].detach().item()),
         "latent_mean": float(student["z"].mean().detach().item()),
         "latent_std": float(student["z"].std(unbiased=False).detach().item()),
@@ -1146,14 +1151,25 @@ def run_visualization_eval(
         images,
         levels,
         teacher,
-        feature_stats["std"],
         autocast_context(args, device),
-        global_step,
         args,
     )
     if was_training:
         tokenizer_runner.train()
     _, scalar_logs, aux = compute_losses(model, sample, args, feature_stats, teacher, student, global_step)
+    noisy_weight = scalar_logs["noisy_weight"]
+    if noisy_weight > 0.0:
+        patch_grid = infer_patch_grid(images, teacher["image_patch"][0].shape[2])
+        noisy_loss = compute_noisy_decoder_loss(
+            tokenizer_runner,
+            student["z"].detach(),
+            teacher["image_patch"],
+            feature_stats["std"],
+            patch_grid,
+            autocast_context(args, device),
+        )
+        scalar_logs["noisy"] = float(noisy_loss.detach().item())
+        scalar_logs["loss"] += noisy_weight * scalar_logs["noisy"]
     if not aux:
         return None, scalar_logs
     grid = build_triplet_grid(aux["render_ref"][0], aux["render_hat"][0])
@@ -1282,7 +1298,14 @@ def main() -> None:
     vis_tokenizer_runner = TokenizerTrainWrapper(model.scene_tokenizer).to(device)
     tokenizer_runner.train()
     if world_size > 1:
-        tokenizer_runner = DDP(tokenizer_runner, device_ids=[local_rank], broadcast_buffers=False)
+        noisy_decoder_only = args.lambda_noisy > 0.0 and args.noisy_start_step < args.max_steps
+        tokenizer_runner = DDP(
+            tokenizer_runner,
+            device_ids=[local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=noisy_decoder_only,
+            gradient_as_bucket_view=True,
+        )
 
     optimizer = AdamW(model.scene_tokenizer.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -1349,9 +1372,7 @@ def main() -> None:
                         images,
                         levels,
                         teacher,
-                        feature_stats["std"],
                         autocast_context(args, device),
-                        global_step,
                         args,
                     )
                     total_loss, scalar_logs, aux = compute_losses(
@@ -1365,6 +1386,26 @@ def main() -> None:
                     )
                     del aux
                     (total_loss / float(args.grad_accum_steps)).backward()
+                    noisy_weight = scalar_logs["noisy_weight"]
+                    if noisy_weight > 0.0:
+                        z_detached = student["z"].detach()
+                        teacher_image_patch = teacher["image_patch"]
+                        patch_grid = infer_patch_grid(images, teacher_image_patch[0].shape[2])
+                        del teacher, student, total_loss
+                        noisy_loss = compute_noisy_decoder_loss(
+                            tokenizer_runner,
+                            z_detached,
+                            teacher_image_patch,
+                            feature_stats["std"],
+                            patch_grid,
+                            autocast_context(args, device),
+                        )
+                        scalar_logs["noisy"] = float(noisy_loss.detach().item())
+                        scalar_logs["loss"] += noisy_weight * scalar_logs["noisy"]
+                        (noisy_weight * noisy_loss / float(args.grad_accum_steps)).backward()
+                        del noisy_loss, z_detached, teacher_image_patch
+                    else:
+                        del teacher, student, total_loss
 
                 for key, value in scalar_logs.items():
                     accum_log_sums[key] = accum_log_sums.get(key, 0.0) + float(value)
