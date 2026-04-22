@@ -29,6 +29,77 @@
 - 新训练脚本以 [train_tokenizer.py](/home/dancer/code/dm/dggt/train_tokenizer.py) 的 DDP / autocast / logging 骨架为模板克隆，不重造轮子。
 - `inference_mode_a.py` 作为 reference baseline 冻结；Feature-Splat 分支另开文件，不破坏它。
 
+## 0.5 当前 Mode-A 数据语义约定
+
+为避免再次混淆，Waymo 编辑数据里的“目标在这一帧是否有 2D 框”和“这一帧是否适合作为编辑锚点”必须彻底分开。
+
+### 0.5.1 两套语义
+
+| 语义 | 含义 | 来源 | 用途 |
+|---|---|---|---|
+| `bbox present` | 该目标在该帧/该视角确实有有效投影框，`boxes_by_view_transfer/raw/model` 都存在 | metadata 里的 `boxes_by_view_*` | 几何定位、语义匹配、protected boxes、逐帧执行编辑 |
+| `bbox editable` | 该目标在该帧/该视角满足 metadata 的“适合作为编辑锚点”规则 | `bbox_editable_by_view` | 训练采样、决定一个 object 是否进入本条样本的 editable 集合 |
+
+### 0.5.2 为什么要拆开
+
+`bbox_editable_by_view` 包含了额外过滤，不等价于“目标不可见”：
+
+- 小框过滤：目标虽然在画面中，但 transfer box 太小，会被置为 `False`
+- 元数据侧遮挡过滤：某些帧会被标成“不适合作为锚点”，但目标仍然在图中
+
+因此：
+
+- `bbox_editable_by_view=False` 不能解释成“这一帧没有框”
+- 推理删除阶段如果拿 `bbox_editable_by_view` 驱动逐帧定位，会漏掉本来应该继续编辑的 follower frame
+
+### 0.5.3 Dataset 导出约定
+
+`WaymoEditDataset` 必须同时导出下面两组字段：
+
+- `object_bbox_present_mask[_selected]`
+- `object_front_bbox_present_mask[_selected]`
+- `object_bbox_editable_mask[_selected]`
+- `object_front_bbox_editable_mask[_selected]`
+
+硬约束：
+
+- 不再保留 `object_bbox_valid_mask` / `object_front_bbox_valid_mask` 这类旧字段
+- 新代码必须只读 `present/editable` 命名的字段
+- metadata / manifest cache 不做旧 schema 兼容；字段切换后必须整包重建
+
+### 0.5.4 Anchor Frame / Follower Frame 策略
+
+对一条 4 帧 inference / training sample，object-level 编辑资格与 frame-level 执行资格分开处理：
+
+1. object 是否进入 `editable_object_indices`
+
+- 仍按 `editable` 语义决定
+- 只要该 object 在当前 sample 的任意一帧、任一视角存在 `bbox_editable=True`，它就进入本条样本的 editable object 集合
+
+2. 某一帧是否对这个 object 执行删除/插入
+
+- 按 `present` 语义决定，而不是按 `editable`
+- 一旦 object 已经进入本条样本的 editable 集合，则对该 sample 内所有 `bbox_present=True` 的帧都尝试执行编辑
+
+3. 非锚点帧的角色
+
+- `bbox_editable=True` 的帧是 anchor frame：用于保证这个 object 在本条样本中“值得编辑”
+- `bbox_present=True && bbox_editable=False` 的帧是 follower frame：只要目标仍在画面中，就应该继续编辑，以保证时序一致性
+
+4. 安全约束
+
+- follower frame 不做“强制编辑”
+- 如果该帧虽然 `present=True`，但语义/深度/几何证据不足，允许该帧局部定位失败并跳过，不能为了追求全帧一致而盲删背景
+
+### 0.5.5 Inference 侧强制规则
+
+Mode-A 删除 / 插入链路必须遵守：
+
+- object 选择：看 `editable_object_indices`
+- 逐帧 view 选择：看 `bbox_present_mask`
+- protected boxes：看 `bbox_present_mask`
+- 调试图里如果要画“目标在哪”，默认画 `present` 框；如果要画“哪些帧是锚点”，单独画 `editable` 标记，不允许再共用一个 mask 字段
+
 ---
 
 ## 1. 整体实施路径

@@ -96,12 +96,22 @@ python datasets/tools/extract_masks.py \
 - 每条 `final_info.json` 记录直接对应一个 29 帧 clip
 - `object_list` 里的 id 既是 scene 中的目标 `raw_object_id`，也是要加载的 asset id
 - asset 直接读取已经存在的 `/data/disk2/lyy_dataset/test_transfer/objects_ply_transformed/*.ply`
+- `final_info.json` 里的 2D bbox 坐标是相对 DGGT transfer 图像 `704x1280`，不是 Waymo 原图；因此尺寸过滤阈值固定为长边 `1280 / 10 = 128 px`
+- `build_edit_metadata.py` 会先按 frame/view 做两个过滤：
+  - 小目标过滤：若 bbox 宽或高小于 `128 px`，该 frame/view 不编辑该目标
+  - 遮挡过滤：若同一 frame/view 中两个目标 bbox 的交集面积分别除以任一目标框面积后超过 `0.8`，则读取 Waymo 3D track，比较目标中心到相机的深度，删除更远的那个
 - `build_edit_metadata.py` 现在会同时写：
   - `metadata/<split>/mode_a_candidates.jsonl`
   - `manifests/<split>/<split>_mode_a_views1.jsonl`
   - `manifests/<split>/<split>_mode_a_views3.jsonl`
-- `views=1` 版本会删除整个 29 帧 clip 中 `front` 始终不可见的样本
-- `views=3` 版本会删除整个 29 帧 clip 中 `front/front_left/front_right` 都始终不可见的样本
+- 不再写旧的 `manifests/<split>/<split>_mode_a.jsonl` 别名；切到这套 schema 后必须重建 cache，不能继续复用旧 manifest
+- 候选 metadata 统一只保留新命名字段：
+  - object 级：`bbox_present_by_view`、`bbox_editable_by_view`
+  - clip 级：`frame_has_front_present_object`、`frame_has_front3_present_object`
+  - clip 级：`frame_has_front_editable_object`、`frame_has_front3_editable_object`
+  - clip 级：`editable_object_slots_by_frame_front`、`editable_object_slots_by_frame_front3`
+- `views=1` 版本会删除整个 29 帧 clip 中 `front` 始终没有可编辑目标的样本
+- `views=3` 版本会删除整个 29 帧 clip 中 `front/front_left/front_right` 都始终没有可编辑目标的样本
 
 ```bash
 python datasets/tools/build_edit_metadata.py \
