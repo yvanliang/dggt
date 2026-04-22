@@ -14,6 +14,11 @@ CAMERA_NAMES = (
     "pinhole_front_left",
     "pinhole_front_right",
 )
+CAMERA_NAME_TO_ASSET_VIEW = {
+    "pinhole_front": "front",
+    "pinhole_front_left": "front_left",
+    "pinhole_front_right": "front_right",
+}
 CAM_NAME_TO_ID = {
     "pinhole_front": 0,
     "pinhole_front_left": 1,
@@ -121,6 +126,7 @@ def build_filter_stats():
         "num_high_iou_pairs": 0,
         "num_boxes_filtered_occluded": 0,
         "num_objects_filtered_non_vehicle": 0,
+        "num_objects_filtered_missing_asset_dir_or_empty": 0,
         "kept_vehicle_class_counts": {},
         "filtered_non_vehicle_class_counts": {},
     }
@@ -150,6 +156,69 @@ def is_vehicle_related_class(class_name):
 def increment_counter(counter_dict, key):
     key = normalize_class_name(key) or "__EMPTY__"
     counter_dict[key] = int(counter_dict.get(key, 0)) + 1
+
+
+def parse_spz_asset_filename(path: Path):
+    stem = path.stem
+    if "-" not in stem:
+        return None
+    view_name, remainder = stem.split("-", 1)
+    if "-" not in remainder:
+        return None
+    clip_name, frame_str = remainder.rsplit("-", 1)
+    if clip_name == "":
+        return None
+    try:
+        global_frame_idx = int(frame_str)
+    except ValueError:
+        return None
+    return {
+        "view_name": view_name,
+        "clip_name": clip_name,
+        "global_frame_idx": int(global_frame_idx),
+        "path": str(path),
+    }
+
+
+def build_asset_index(asset_root: Path):
+    asset_index = {}
+    if not asset_root.is_dir():
+        raise FileNotFoundError(f"Asset root not found: {asset_root}")
+    for object_dir in sorted(asset_root.iterdir()):
+        if not object_dir.is_dir():
+            continue
+        parsed_assets = []
+        for spz_path in sorted(object_dir.glob("*.spz")):
+            parsed = parse_spz_asset_filename(spz_path)
+            if parsed is None:
+                continue
+            parsed_assets.append(parsed)
+        if parsed_assets:
+            asset_index[object_dir.name] = parsed_assets
+    return asset_index
+
+
+def choose_best_asset_match(asset_entries, camera_name: str, clip_name: str, global_frame_idx: int):
+    if len(asset_entries) == 0:
+        return None
+
+    target_view = CAMERA_NAME_TO_ASSET_VIEW.get(camera_name, "")
+    candidate_a = [entry for entry in asset_entries if entry["view_name"] == target_view]
+    if len(candidate_a) == 0:
+        candidate_a = list(asset_entries)
+
+    candidate_b = [entry for entry in candidate_a if entry["clip_name"] == clip_name]
+    if len(candidate_b) == 0:
+        candidate_b = list(candidate_a)
+
+    return min(
+        candidate_b,
+        key=lambda entry: (
+            abs(int(entry["global_frame_idx"]) - int(global_frame_idx)),
+            int(entry["global_frame_idx"]),
+            str(entry["path"]),
+        ),
+    )
 
 
 def box_size_xyxy(box_xyxy):
@@ -429,7 +498,7 @@ def build_clip_candidate(
     record: dict,
     scene_info: dict,
     scene_context: dict,
-    asset_root: Path,
+    asset_index: dict,
 ):
     filter_stats = build_filter_stats()
     clip_name = str(record["clip_name"])
@@ -469,6 +538,7 @@ def build_clip_candidate(
     }
 
     filtered_objects = []
+    had_vehicle_object = False
     for asset_object_id, position_payload in zip(object_list, object_position):
         asset_object_id = str(asset_object_id)
         scene_object = scene_object_index.get(asset_object_id)
@@ -479,18 +549,20 @@ def build_clip_candidate(
             filter_stats["num_objects_filtered_non_vehicle"] += 1
             increment_counter(filter_stats["filtered_non_vehicle_class_counts"], class_name)
             continue
+        had_vehicle_object = True
+        object_asset_entries = asset_index.get(asset_object_id, [])
+        if len(object_asset_entries) == 0:
+            filter_stats["num_objects_filtered_missing_asset_dir_or_empty"] += 1
+            continue
         increment_counter(filter_stats["kept_vehicle_class_counts"], class_name)
-        filtered_objects.append((asset_object_id, position_payload, scene_object))
+        filtered_objects.append((asset_object_id, position_payload, scene_object, object_asset_entries))
 
     if len(filtered_objects) == 0:
-        return None, "no_vehicle_object", filter_stats
+        return None, ("no_asset_object" if had_vehicle_object else "no_vehicle_object"), filter_stats
 
     objects = []
     object_track_contexts = []
-    for slot, (asset_object_id, position_payload, scene_object) in enumerate(filtered_objects):
-        asset_path = asset_root / f"{asset_object_id}.ply"
-        if not asset_path.is_file():
-            return None, "missing_asset", filter_stats
+    for slot, (asset_object_id, position_payload, scene_object, object_asset_entries) in enumerate(filtered_objects):
         instance_info = scene_object["instance_info"]
         frame_annotations = instance_info["frame_annotations"]
         track_frame_indices = [int(v) for v in frame_annotations.get("frame_idx", [])]
@@ -508,6 +580,9 @@ def build_clip_candidate(
         box_mapping_mode_by_view = {}
         bbox_present_by_view = {}
         bbox_present_count_by_view = {}
+        asset_paths_by_view = {}
+        asset_valid_by_view = {}
+        asset_match_global_frame_by_view = {}
         for camera_name in CAMERA_NAMES:
             transfer_sequence = normalize_box_sequence(
                 position_payload.get(camera_name),
@@ -536,19 +611,50 @@ def build_clip_candidate(
                 mode_sequence.append(mapping_mode)
 
             bbox_present = build_present_flags_from_boxes(transfer_sequence)
+            matched_paths = []
+            matched_valid = []
+            matched_global_frames = []
+            for scene_frame_idx in clip_frame_indices:
+                matched_asset = choose_best_asset_match(
+                    object_asset_entries,
+                    camera_name=camera_name,
+                    clip_name=clip_name,
+                    global_frame_idx=scene_frame_idx,
+                )
+                if matched_asset is None:
+                    matched_paths.append(None)
+                    matched_valid.append(False)
+                    matched_global_frames.append(None)
+                    continue
+                matched_paths.append(str(matched_asset["path"]))
+                matched_valid.append(True)
+                matched_global_frames.append(int(matched_asset["global_frame_idx"]))
             boxes_by_view_transfer[camera_name] = transfer_sequence
             boxes_by_view_raw[camera_name] = raw_sequence
             boxes_by_view_model[camera_name] = model_sequence
             box_mapping_mode_by_view[camera_name] = mode_sequence
             bbox_present_by_view[camera_name] = bbox_present
             bbox_present_count_by_view[camera_name] = int(sum(bbox_present))
+            asset_paths_by_view[camera_name] = matched_paths
+            asset_valid_by_view[camera_name] = matched_valid
+            asset_match_global_frame_by_view[camera_name] = matched_global_frames
+
+        representative_asset_path = ""
+        for camera_name in CAMERA_NAMES:
+            for asset_path in asset_paths_by_view[camera_name]:
+                if asset_path:
+                    representative_asset_path = str(asset_path)
+                    break
+            if representative_asset_path:
+                break
 
         objects.append(
             {
                 "slot": int(slot),
                 "asset_object_id": asset_object_id,
                 "scene_raw_object_id": asset_object_id,
-                "asset_path": str(asset_path),
+                "asset_dir": str(Path(object_asset_entries[0]["path"]).parent),
+                "asset_path": str(representative_asset_path),
                 "contig_instance_id": int(scene_object["contig_instance_id"]),
                 "class_name": str(scene_object["class_name"]),
                 "match_score": 1.0,
@@ -558,6 +664,9 @@ def build_clip_candidate(
                 "box_mapping_mode_by_view": box_mapping_mode_by_view,
                 "bbox_present_by_view": bbox_present_by_view,
                 "bbox_present_count_by_view": bbox_present_count_by_view,
+                "asset_paths_by_view": asset_paths_by_view,
+                "asset_valid_by_view": asset_valid_by_view,
+                "asset_match_global_frame_by_view": asset_match_global_frame_by_view,
             }
         )
 
@@ -728,6 +837,7 @@ def main():
         raise ValueError(f"{final_info_path} does not contain a list")
 
     scene_index = load_scene_index(processed_root, args.split)
+    asset_index = build_asset_index(asset_root)
     scene_context_cache = {}
 
     scene_name_to_index = {}
@@ -757,6 +867,7 @@ def main():
         "skipped_invalid_payload": 0,
         "skipped_clip_out_of_range": 0,
         "skipped_no_vehicle_object": 0,
+        "skipped_no_asset_object": 0,
         "skipped_missing_asset": 0,
         "skipped_missing_scene_object": 0,
         "num_boxes_total": 0,
@@ -764,6 +875,7 @@ def main():
         "num_high_iou_pairs": 0,
         "num_boxes_filtered_occluded": 0,
         "num_objects_filtered_non_vehicle": 0,
+        "num_objects_filtered_missing_asset_dir_or_empty": 0,
         "kept_vehicle_class_counts": {},
         "filtered_non_vehicle_class_counts": {},
     }
@@ -790,7 +902,7 @@ def main():
             record=record,
             scene_info=scene_info,
             scene_context=scene_context_cache[scene_dir],
-            asset_root=asset_root,
+            asset_index=asset_index,
         )
         accumulate_filter_stats(summary, filter_stats)
         if candidate is None:
@@ -798,6 +910,8 @@ def main():
                 summary["skipped_clip_out_of_range"] += 1
             elif skip_reason == "no_vehicle_object":
                 summary["skipped_no_vehicle_object"] += 1
+            elif skip_reason == "no_asset_object":
+                summary["skipped_no_asset_object"] += 1
             elif skip_reason == "missing_asset":
                 summary["skipped_missing_asset"] += 1
             elif skip_reason == "missing_scene_object":

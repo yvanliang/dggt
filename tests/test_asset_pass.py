@@ -40,10 +40,10 @@ def _map_raw_box_with_intrinsics(
 
 
 def _make_stub_sample(tmp_path: Path) -> dict[str, object]:
-    ply_a = tmp_path / "asset_a.ply"
-    ply_b = tmp_path / "asset_b.ply"
-    ply_a.write_text("stub\n", encoding="ascii")
-    ply_b.write_text("stub\n", encoding="ascii")
+    asset_a = tmp_path / "asset_a.spz"
+    asset_b = tmp_path / "asset_b.spz"
+    asset_a.write_text("stub\n", encoding="ascii")
+    asset_b.write_text("stub\n", encoding="ascii")
 
     eye = torch.eye(4, dtype=torch.float32)
     pose_f0 = eye.clone()
@@ -75,7 +75,18 @@ def _make_stub_sample(tmp_path: Path) -> dict[str, object]:
         "editable_object_indices": torch.tensor([0, 1], dtype=torch.long),
         "editable_object_count": torch.tensor(2, dtype=torch.long),
         "object_asset_valid_mask": torch.tensor([True, True], dtype=torch.bool),
-        "object_asset_paths": [str(ply_a), str(ply_b)],
+        "object_asset_paths": [str(asset_a), str(asset_b)],
+        "object_asset_image_valid_mask_selected": torch.tensor(
+            [
+                [True, True],
+                [True, True],
+            ],
+            dtype=torch.bool,
+        ),
+        "object_asset_image_paths_selected": [
+            [str(asset_a), str(asset_a)],
+            [str(asset_b), str(asset_b)],
+        ],
         "object_track_valid_mask_selected": torch.tensor(
             [[True, True], [True, True]],
             dtype=torch.bool,
@@ -210,8 +221,8 @@ def test_asset_pass_forward_batches_objects_independently(tmp_path, monkeypatch)
             "vertex_count": torch.tensor([2], dtype=torch.long),
         }
 
-    def fake_render_object_sequence(self, sample, slot_idx, asset_local, cameras_waymo, model_hw, device):
-        del sample, asset_local, cameras_waymo
+    def fake_render_object_sequence(self, sample, slot_idx, cameras_waymo, model_hw, device, asset_cache):
+        del sample, cameras_waymo, asset_cache
         H, W = model_hw
         gauss = {
             "means": torch.tensor([[0.0, 0.0, 4.0], [0.2, 0.0, 4.0]], dtype=torch.float32, device=device),
@@ -282,3 +293,18 @@ def test_asset_pass_forward_batches_objects_independently(tmp_path, monkeypatch)
         assert result.ptr_asset[slot_idx][0].patch_idx.shape[0] == 2
 
     assert result.G_asset_dggt is None
+
+
+def test_asset_pass_resolves_per_image_asset_paths(tmp_path):
+    sample = _make_stub_sample(tmp_path)
+    module = AssetAggregatorPass(torch.nn.Identity())
+
+    assert module._resolve_asset_path_for_image(sample, 0, 0).endswith("asset_a.spz")
+    assert module._resolve_asset_path_for_image(sample, 1, 1).endswith("asset_b.spz")
+
+    sample["object_asset_image_valid_mask_selected"] = torch.tensor(
+        [[True, False], [False, False]],
+        dtype=torch.bool,
+    )
+    assert module._resolve_asset_path_for_image(sample, 0, 1) == ""
+    assert not module._is_valid_asset_slot(sample, 1)

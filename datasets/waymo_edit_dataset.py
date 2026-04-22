@@ -28,7 +28,7 @@ DEFAULT_TRANSFER_HW = (704, 1280)
 DEFAULT_PROCESSED_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt"
 DEFAULT_TRANSFER_ROOT = "/data/disk2/lyy_dataset/waymo_transfer"
 DEFAULT_RAW_ROOT = "/data/disk2/lyy_dataset/waymo"
-DEFAULT_ASSET_ROOT = "/data/disk2/lyy_dataset/test_transfer/objects_ply_transformed"
+DEFAULT_ASSET_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt/object_spz_transformed"
 WAYMO_DYNAMIC_SPEED_THRESH_MPS = 1.0
 WAYMO_OPENCV2DATASET = np.array(
     [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]],
@@ -856,6 +856,16 @@ class WaymoEditDataset(Dataset):
             values = values[:expected_length]
         return torch.tensor([bool(v) for v in values], dtype=torch.bool)
 
+    def _coerce_path_sequence(self, values, expected_length):
+        if values is None:
+            return None
+        values = list(values)
+        if len(values) < expected_length:
+            values = values + [None] * (expected_length - len(values))
+        else:
+            values = values[:expected_length]
+        return [str(value) if value not in (None, "") else "" for value in values]
+
     def _resolve_object_bbox_editable_view_flags(self, object_record, cam_name, expected_length):
         bbox_editable_by_view = object_record.get("bbox_editable_by_view", {})
         return self._coerce_bool_sequence(bbox_editable_by_view.get(cam_name), expected_length)
@@ -866,6 +876,54 @@ class WaymoEditDataset(Dataset):
 
     def _resolve_record_frame_flags(self, record, key, expected_length):
         return self._coerce_bool_sequence(record.get(key), expected_length)
+
+    def _resolve_default_object_asset_path(self, object_record):
+        asset_object_id = str(object_record.get("asset_object_id", ""))
+        asset_path_value = str(object_record.get("asset_path", "") or "")
+        if asset_path_value:
+            return Path(asset_path_value)
+        if asset_object_id:
+            return self.asset_root / f"{asset_object_id}.ply"
+        return self.asset_root
+
+    def _resolve_object_asset_view_paths(self, object_record, cam_name, expected_length, default_asset_path):
+        asset_paths_by_view = object_record.get("asset_paths_by_view", {})
+        resolved = self._coerce_path_sequence(asset_paths_by_view.get(cam_name), expected_length)
+        if resolved is not None:
+            return resolved
+        fallback = str(default_asset_path) if str(default_asset_path) not in ("", ".") else ""
+        return [fallback] * expected_length
+
+    def _resolve_object_asset_view_valid_flags(
+        self,
+        object_record,
+        cam_name,
+        expected_length,
+        asset_paths,
+        default_asset_path,
+    ):
+        asset_valid_by_view = object_record.get("asset_valid_by_view", {})
+        resolved = self._coerce_bool_sequence(asset_valid_by_view.get(cam_name), expected_length)
+        if resolved is not None:
+            return resolved
+        if asset_paths is not None:
+            return torch.tensor(
+                [bool(path) and Path(path).is_file() for path in asset_paths],
+                dtype=torch.bool,
+            )
+        fallback_valid = bool(str(default_asset_path)) and Path(default_asset_path).is_file()
+        return torch.full((expected_length,), fallback_valid, dtype=torch.bool)
+
+    def _select_object_asset_image_paths(self, object_asset_image_paths, selected_indices):
+        selected_indices = [int(idx) for idx in selected_indices.tolist()]
+        selected_paths = []
+        for slot_paths in object_asset_image_paths:
+            flat_paths = []
+            for local_idx in selected_indices:
+                for view_offset in range(len(self.camera_ids)):
+                    flat_paths.append(str(slot_paths[local_idx][view_offset]))
+            selected_paths.append(flat_paths)
+        return selected_paths
 
     def _build_editable_object_indices_by_frame(self, frame_editable_object_mask):
         clip_len = int(frame_editable_object_mask.shape[1])
@@ -881,18 +939,26 @@ class WaymoEditDataset(Dataset):
         frame_has_present_editable_object = torch.zeros((clip_len,), dtype=torch.bool)
 
         for object_record in record.get("objects", []):
-            asset_object_id = str(object_record.get("asset_object_id", ""))
-            default_asset_path = self.asset_root / f"{asset_object_id}.ply" if asset_object_id else self.asset_root
-            asset_path = Path(object_record.get("asset_path", default_asset_path))
-            if not asset_path.is_file():
-                continue
-
             object_present_editable = torch.zeros((clip_len,), dtype=torch.bool)
+            default_asset_path = self._resolve_default_object_asset_path(object_record)
             for cam_id in self.camera_ids:
                 cam_name = CAM_ID_TO_NAME[cam_id]
                 view_flags = self._resolve_object_bbox_editable_view_flags(object_record, cam_name, clip_len)
                 if view_flags is not None:
-                    object_present_editable |= view_flags
+                    asset_paths = self._resolve_object_asset_view_paths(
+                        object_record,
+                        cam_name,
+                        clip_len,
+                        default_asset_path,
+                    )
+                    asset_valid_flags = self._resolve_object_asset_view_valid_flags(
+                        object_record,
+                        cam_name,
+                        clip_len,
+                        asset_paths,
+                        default_asset_path,
+                    )
+                    object_present_editable |= (view_flags & asset_valid_flags)
             frame_has_present_editable_object |= object_present_editable
 
         if not bool(frame_has_present_editable_object.any().item()):
@@ -1057,6 +1123,7 @@ class WaymoEditDataset(Dataset):
         object_mean_speed_mps = torch.zeros((self.max_objects,), dtype=torch.float32)
         object_is_moving_track = torch.zeros((self.max_objects,), dtype=torch.bool)
         object_asset_valid_mask = torch.zeros((self.max_objects,), dtype=torch.bool)
+        object_asset_image_valid_mask = torch.zeros((self.max_objects, clip_len, num_views), dtype=torch.bool)
 
         object_bbox_transfer = torch.zeros((self.max_objects, clip_len, num_views, 4), dtype=torch.float32)
         object_bbox_raw = torch.zeros((self.max_objects, clip_len, num_views, 4), dtype=torch.float32)
@@ -1074,20 +1141,22 @@ class WaymoEditDataset(Dataset):
         object_scene_raw_ids = [""] * self.max_objects
         object_class_names = [""] * self.max_objects
         object_asset_paths = [""] * self.max_objects
+        object_asset_image_paths = [
+            [[""] * num_views for _ in range(clip_len)]
+            for _ in range(self.max_objects)
+        ]
 
         for object_slot, object_record in enumerate(record.get("objects", [])):
             object_valid_mask[object_slot] = True
 
             asset_object_id = str(object_record["asset_object_id"])
             scene_raw_id = str(object_record.get("scene_raw_object_id", asset_object_id))
-            asset_path = Path(object_record.get("asset_path", self.asset_root / f"{asset_object_id}.ply"))
             match_score = float(object_record.get("match_score", 1.0))
+            default_asset_path = self._resolve_default_object_asset_path(object_record)
 
             object_asset_ids[object_slot] = asset_object_id
             object_scene_raw_ids[object_slot] = scene_raw_id
-            object_asset_paths[object_slot] = str(asset_path)
             object_scene_match_scores[object_slot] = match_score
-            object_asset_valid_mask[object_slot] = asset_path.is_file()
 
             instance_entry = scene_cache["raw_to_instance"].get(scene_raw_id)
             if instance_entry is None:
@@ -1136,6 +1205,19 @@ class WaymoEditDataset(Dataset):
                 )
             for view_offset, cam_id in enumerate(self.camera_ids):
                 cam_name = CAM_ID_TO_NAME[cam_id]
+                asset_paths = self._resolve_object_asset_view_paths(
+                    object_record,
+                    cam_name,
+                    clip_len,
+                    default_asset_path,
+                )
+                asset_valid_flags = self._resolve_object_asset_view_valid_flags(
+                    object_record,
+                    cam_name,
+                    clip_len,
+                    asset_paths,
+                    default_asset_path,
+                )
                 transfer_boxes, transfer_valid_mask = normalize_box_sequence(
                     transfer_boxes_by_view.get(cam_name),
                     expected_length=clip_len,
@@ -1157,6 +1239,8 @@ class WaymoEditDataset(Dataset):
                     editable_flags = torch.zeros((clip_len,), dtype=torch.bool)
                 view_sequences[view_offset] = {
                     "cam_id": cam_id,
+                    "asset_paths": asset_paths,
+                    "asset_valid_flags": asset_valid_flags,
                     "transfer_boxes": transfer_boxes,
                     "transfer_valid_mask": transfer_valid_mask,
                     "raw_boxes": raw_boxes,
@@ -1168,6 +1252,10 @@ class WaymoEditDataset(Dataset):
 
             for local_idx, scene_frame_idx in enumerate(clip_frame_indices):
                 for view_offset, view_data in view_sequences.items():
+                    asset_path_here = str(view_data["asset_paths"][local_idx])
+                    asset_valid_here = bool(view_data["asset_valid_flags"][local_idx].item())
+                    object_asset_image_paths[object_slot][local_idx][view_offset] = asset_path_here
+                    object_asset_image_valid_mask[object_slot, local_idx, view_offset] = asset_valid_here
                     transfer_valid = bool(view_data["transfer_valid_mask"][local_idx])
                     raw_valid = bool(view_data["raw_valid_mask"][local_idx])
                     model_valid = bool(view_data["model_valid_mask"][local_idx])
@@ -1241,6 +1329,19 @@ class WaymoEditDataset(Dataset):
                         frame_speed > WAYMO_DYNAMIC_SPEED_THRESH_MPS
                     )
 
+            representative_asset_path = str(object_record.get("asset_path", "") or "")
+            if representative_asset_path == "":
+                for local_idx in range(clip_len):
+                    for view_offset in range(num_views):
+                        candidate_asset_path = object_asset_image_paths[object_slot][local_idx][view_offset]
+                        if candidate_asset_path:
+                            representative_asset_path = str(candidate_asset_path)
+                            break
+                    if representative_asset_path:
+                        break
+            object_asset_paths[object_slot] = representative_asset_path
+            object_asset_valid_mask[object_slot] = bool(object_asset_image_valid_mask[object_slot].any().item())
+
         if front_view_offset is not None:
             object_front_bbox_present_mask = object_bbox_present_mask[:, :, front_view_offset]
             object_front_bbox_editable_mask = object_bbox_editable_mask[:, :, front_view_offset]
@@ -1256,11 +1357,7 @@ class WaymoEditDataset(Dataset):
             object_front_bbox_model = torch.zeros((self.max_objects, clip_len, 4), dtype=torch.float32)
             object_front_bbox_patch = torch.zeros((self.max_objects, clip_len, 4), dtype=torch.float32)
 
-        object_present_mask = (
-            object_track_valid_mask[:, :, None]
-            & object_bbox_present_mask
-            & object_asset_valid_mask[:, None, None]
-        )
+        object_present_mask = object_track_valid_mask[:, :, None] & object_bbox_present_mask & object_asset_image_valid_mask
         object_present_editable_mask = object_present_mask & object_bbox_editable_mask
         object_projected_mask = object_present_mask.clone()
         object_projected_editable_mask = object_present_editable_mask.clone()
@@ -1270,9 +1367,9 @@ class WaymoEditDataset(Dataset):
         editable_object_count_by_frame = frame_editable_object_mask.sum(dim=0).to(torch.long)
         editable_object_indices_by_frame = self._build_editable_object_indices_by_frame(frame_editable_object_mask)
         frame_has_editable_object = (
-            object_track_valid_mask
-            & object_asset_valid_mask[:, None]
-        ).any(dim=0)
+            object_track_valid_mask[:, :, None]
+            & object_asset_image_valid_mask
+        ).any(dim=(0, 2))
         frame_has_present_object = frame_present_object_mask.any(dim=0)
         frame_has_present_editable_object = frame_editable_object_mask.any(dim=0)
         frame_has_projected_object = object_projected_mask.any(dim=(0, 2))
@@ -1304,6 +1401,7 @@ class WaymoEditDataset(Dataset):
             "object_mean_speed_mps": object_mean_speed_mps,
             "object_is_moving_track": object_is_moving_track,
             "object_asset_valid_mask": object_asset_valid_mask,
+            "object_asset_image_valid_mask": object_asset_image_valid_mask,
             "object_bbox_transfer": object_bbox_transfer,
             "object_bbox_raw": object_bbox_raw,
             "object_bbox_model": object_bbox_model,
@@ -1324,6 +1422,7 @@ class WaymoEditDataset(Dataset):
             "object_scene_raw_ids": object_scene_raw_ids,
             "object_class_names": object_class_names,
             "object_asset_paths": object_asset_paths,
+            "object_asset_image_paths": object_asset_image_paths,
             "object_present_mask": object_present_mask,
             "object_editable_mask": object_editable_mask,
             "object_present_editable_mask": object_present_editable_mask,
@@ -1401,6 +1500,15 @@ class WaymoEditDataset(Dataset):
             1,
             selected_indices,
         )
+        object_tensors["object_asset_image_valid_mask_selected"] = (
+            object_data["object_asset_image_valid_mask"]
+            .index_select(1, selected_indices)
+            .reshape(self.max_objects, -1)
+        )
+        object_tensors["object_asset_image_paths_selected"] = self._select_object_asset_image_paths(
+            object_data["object_asset_image_paths"],
+            selected_indices,
+        )
         for key in [
             "editable_object_count_by_frame",
             "editable_object_indices_by_frame",
@@ -1429,6 +1537,10 @@ class WaymoEditDataset(Dataset):
         editable_asset_object_ids = [object_tensors["object_asset_ids"][idx] for idx in editable_slots_list]
         editable_scene_raw_object_ids = [object_tensors["object_scene_raw_ids"][idx] for idx in editable_slots_list]
         editable_asset_paths = [object_tensors["object_asset_paths"][idx] for idx in editable_slots_list]
+        editable_asset_image_paths = [
+            object_tensors["object_asset_image_paths_selected"][idx]
+            for idx in editable_slots_list
+        ]
         editable_scene_match_scores = [
             float(object_tensors["object_scene_match_scores"][idx].item()) for idx in editable_slots_list
         ]
@@ -1450,7 +1562,14 @@ class WaymoEditDataset(Dataset):
         ]
 
         edit_object_slot = int(editable_slots_list[0]) if editable_count > 0 else -1
-        selected_asset_path = editable_asset_paths[0] if editable_count > 0 else ""
+        selected_asset_path = ""
+        if editable_count > 0:
+            for candidate_path in editable_asset_image_paths[0]:
+                if candidate_path:
+                    selected_asset_path = str(candidate_path)
+                    break
+            if selected_asset_path == "":
+                selected_asset_path = str(editable_asset_paths[0])
         return {
             "editable_object_indices": editable_object_indices,
             "editable_object_count": torch.tensor(editable_count, dtype=torch.long),
@@ -1470,6 +1589,7 @@ class WaymoEditDataset(Dataset):
                 "editable_asset_object_ids": editable_asset_object_ids,
                 "editable_scene_raw_object_ids": editable_scene_raw_object_ids,
                 "editable_asset_paths": editable_asset_paths,
+                "editable_asset_image_paths": editable_asset_image_paths,
                 "editable_scene_match_scores": editable_scene_match_scores,
                 "selected_asset_path": selected_asset_path,
             },

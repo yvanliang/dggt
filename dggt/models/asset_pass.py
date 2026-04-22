@@ -227,15 +227,13 @@ class AssetAggregatorPass(nn.Module):
         for slot_idx in candidate_slots:
             if not self._is_valid_asset_slot(sample, slot_idx):
                 continue
-            asset_path = str(sample["object_asset_paths"][slot_idx])
-            asset_local = load_asset_gaussians(asset_path, cache)
             gauss_seq, rgb_seq, alpha_seq, depth_seq = self._render_object_sequence(
                 sample,
                 slot_idx,
-                asset_local,
                 cameras_waymo,
                 model_hw,
                 device,
+                cache,
             )
             if len(gauss_seq) == 0:
                 continue
@@ -328,6 +326,11 @@ class AssetAggregatorPass(nn.Module):
 
     @staticmethod
     def _is_valid_asset_slot(sample: dict[str, Any], slot_idx: int) -> bool:
+        image_valid = sample.get("object_asset_image_valid_mask_selected")
+        if isinstance(image_valid, torch.Tensor):
+            if slot_idx < 0 or slot_idx >= image_valid.shape[0]:
+                return False
+            return bool(image_valid[slot_idx].any().item())
         asset_valid = sample.get("object_asset_valid_mask")
         if isinstance(asset_valid, torch.Tensor):
             if slot_idx < 0 or slot_idx >= asset_valid.shape[0]:
@@ -389,10 +392,10 @@ class AssetAggregatorPass(nn.Module):
         self,
         sample: dict[str, Any],
         slot_idx: int,
-        asset_local: dict[str, torch.Tensor],
         cameras_waymo: dict[str, torch.Tensor],
         model_hw: tuple[int, int],
         device: torch.device,
+        asset_cache: dict[str, dict[str, torch.Tensor]],
     ) -> tuple[
         list[dict[str, torch.Tensor]],
         list[torch.Tensor],
@@ -416,13 +419,20 @@ class AssetAggregatorPass(nn.Module):
 
         for image_idx in range(num_images):
             frame_idx = int(cameras_waymo["image_to_frame"][image_idx].item())
-            if frame_idx < 0 or frame_idx >= track_valid.shape[0] or not bool(track_valid[frame_idx].item()):
+            asset_path = self._resolve_asset_path_for_image(sample, slot_idx, image_idx)
+            if (
+                frame_idx < 0
+                or frame_idx >= track_valid.shape[0]
+                or not bool(track_valid[frame_idx].item())
+                or asset_path == ""
+            ):
                 gauss_seq.append(empty_gaussian_dict())
                 rgb_seq.append(zero_rgb.clone())
                 alpha_seq.append(zero_alpha.clone())
                 depth_seq.append(zero_depth.clone())
                 continue
 
+            asset_local = load_asset_gaussians(asset_path, asset_cache)
             object_rotation = obj_to_world[frame_idx, :3, :3].to(device)
             object_center = obj_to_world[frame_idx, :3, 3].to(device)
             target_lwh = box_size[frame_idx].to(device)
@@ -444,6 +454,34 @@ class AssetAggregatorPass(nn.Module):
             depth_seq.append(depth)
 
         return gauss_seq, rgb_seq, alpha_seq, depth_seq
+
+    def _resolve_asset_path_for_image(
+        self,
+        sample: dict[str, Any],
+        slot_idx: int,
+        image_idx: int,
+    ) -> str:
+        image_valid = sample.get("object_asset_image_valid_mask_selected")
+        image_paths = sample.get("object_asset_image_paths_selected")
+        if (
+            isinstance(image_valid, torch.Tensor)
+            and image_paths is not None
+            and 0 <= slot_idx < image_valid.shape[0]
+            and 0 <= image_idx < image_valid.shape[1]
+            and 0 <= slot_idx < len(image_paths)
+            and 0 <= image_idx < len(image_paths[slot_idx])
+        ):
+            if bool(image_valid[slot_idx, image_idx].item()):
+                return str(image_paths[slot_idx][image_idx])
+            return ""
+
+        asset_paths = sample.get("object_asset_paths")
+        if asset_paths is None or slot_idx < 0 or slot_idx >= len(asset_paths):
+            return ""
+        asset_path = str(asset_paths[slot_idx])
+        if asset_path == "" or not Path(asset_path).is_file():
+            return ""
+        return asset_path
 
     def _render_gaussians_for_camera(
         self,

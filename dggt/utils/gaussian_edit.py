@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -1433,12 +1434,49 @@ def _load_asset_gaussians(path: str, cache: dict[str, dict[str, torch.Tensor]]) 
     if path in cache:
         return cache[path]
 
-    asset = read_gaussian_ply(path)
-    means = torch.tensor(asset["means"].tolist(), dtype=torch.float32)
-    colors = torch.tensor(asset["rgb"].tolist(), dtype=torch.float32).clamp(0.0, 1.0)
-    opacities = torch.tensor(asset["opacities"].tolist(), dtype=torch.float32).view(-1, 1).clamp(1e-6, 1.0 - 1e-6)
-    scales = torch.tensor(asset["scales"].tolist(), dtype=torch.float32).clamp_min(1e-6)
-    quats = torch.tensor(asset["quats"].tolist(), dtype=torch.float32)
+    path_obj = Path(path)
+    suffix = path_obj.suffix.lower()
+    if suffix == ".ply":
+        asset = read_gaussian_ply(path)
+        means = torch.tensor(asset["means"].tolist(), dtype=torch.float32)
+        colors = torch.tensor(asset["rgb"].tolist(), dtype=torch.float32).clamp(0.0, 1.0)
+        opacities = (
+            torch.tensor(asset["opacities"].tolist(), dtype=torch.float32)
+            .view(-1, 1)
+            .clamp(1e-6, 1.0 - 1e-6)
+        )
+        scales = torch.tensor(asset["scales"].tolist(), dtype=torch.float32).clamp_min(1e-6)
+        quats = torch.tensor(asset["quats"].tolist(), dtype=torch.float32)
+    elif suffix == ".spz":
+        try:
+            import spz
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Loading .spz assets requires the `spz` Python package to be installed."
+            ) from exc
+
+        unpack_options = spz.UnpackOptions()
+        unpack_options.to_coord = spz.CoordinateSystem.UNSPECIFIED
+        cloud = spz.load_spz(str(path_obj), unpack_options)
+        means = _to_cpu_float_tensor(getattr(cloud, "positions"), shape_last=3)
+        colors = _to_cpu_float_tensor(getattr(cloud, "colors"), shape_last=3)
+        if colors.numel() > 0 and float(colors.max().item()) > 1.0:
+            colors = colors / 255.0
+        colors = colors.clamp(0.0, 1.0)
+
+        alpha_values = getattr(cloud, "alphas", None)
+        if alpha_values is None:
+            alpha_values = getattr(cloud, "alpha", None)
+        if alpha_values is None:
+            raise ValueError(f"SPZ cloud does not expose alpha values: {path}")
+        alpha_raw = _to_cpu_float_tensor(alpha_values, shape_last=1)
+        opacities = torch.sigmoid(alpha_raw).clamp(1e-6, 1.0 - 1e-6)
+
+        scales = _to_cpu_float_tensor(getattr(cloud, "scales"), shape_last=3).clamp_min(1e-6)
+        rotations_xyzw = _to_cpu_float_tensor(getattr(cloud, "rotations"), shape_last=4)
+        quats = F.normalize(rotations_xyzw[:, [3, 0, 1, 2]], dim=-1)
+    else:
+        raise ValueError(f"Unsupported asset format for {path}; expected .ply or .spz")
 
     cache[path] = {
         "means_raw": means,
@@ -1575,6 +1613,56 @@ def _concat_gaussians(chunks: list[dict[str, torch.Tensor]]) -> dict[str, torch.
         "opacities": torch.cat([chunk["opacities"] for chunk in chunks], dim=0),
         "scales": torch.cat([chunk["scales"] for chunk in chunks], dim=0),
         "quats": torch.cat([chunk["quats"] for chunk in chunks], dim=0),
+    }
+
+
+def empty_gaussian_dict() -> dict[str, torch.Tensor]:
+    return _empty_gaussian_dict()
+
+
+def load_asset_gaussians(path: str, cache: dict[str, dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    return _load_asset_gaussians(path, cache)
+
+
+def transform_asset_gaussians(
+    asset_local: dict[str, torch.Tensor],
+    target_lwh: torch.Tensor,
+    object_rotation: torch.Tensor,
+    object_center: torch.Tensor,
+    opacity_threshold: float = 0.01,
+) -> dict[str, torch.Tensor]:
+    return _transform_asset_gaussians_simple(
+        asset_local,
+        target_lwh,
+        object_rotation,
+        object_center,
+        opacity_threshold=opacity_threshold,
+    )
+
+
+def apply_sim3_to_gaussian_dict(
+    gaussians: dict[str, torch.Tensor],
+    transform: Sim3Transform,
+) -> dict[str, torch.Tensor]:
+    means = _to_cpu_float_tensor(gaussians["means"], shape_last=3)
+    colors = _to_cpu_float_tensor(gaussians["colors"], shape_last=3)
+    opacities = _to_cpu_float_tensor(gaussians["opacities"], shape_last=1)
+    scales = _to_cpu_float_tensor(gaussians["scales"], shape_last=3)
+    quats = _to_cpu_float_tensor(gaussians["quats"], shape_last=4)
+
+    means_out = transform.apply_points(means)
+    scales_out = scales * float(transform.scale)
+    local_rot = _quat_wxyz_to_mat(F.normalize(quats, dim=-1))
+    world_rot = transform.rotation.detach().cpu().float().view(1, 3, 3)
+    world_rot = world_rot.expand(local_rot.shape[0], -1, -1)
+    quats_out = F.normalize(_mat_to_quat_wxyz(world_rot @ local_rot), dim=-1)
+
+    return {
+        "means": means_out.contiguous(),
+        "colors": colors.contiguous(),
+        "opacities": opacities.contiguous(),
+        "scales": scales_out.contiguous(),
+        "quats": quats_out.contiguous(),
     }
 
 
