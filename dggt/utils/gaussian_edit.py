@@ -636,7 +636,7 @@ def _collect_protected_boxes(
 ) -> list[dict[str, torch.Tensor]]:
     protected_boxes: list[dict[str, torch.Tensor]] = []
     total_objects = int(sample["object_track_valid_mask_selected"].shape[0])
-    bbox_valid = sample.get("object_bbox_valid_mask_selected")
+    bbox_present = sample["object_bbox_present_mask_selected"]
     bbox_model = sample.get("object_bbox_model_selected")
 
     for slot_idx in range(total_objects):
@@ -647,8 +647,8 @@ def _collect_protected_boxes(
         if not bool(sample["object_track_valid_mask_selected"][slot_idx, frame_idx].item()):
             continue
         bbox_model_view = None
-        if isinstance(bbox_valid, torch.Tensor) and isinstance(bbox_model, torch.Tensor):
-            if bool(bbox_valid[slot_idx, frame_idx, view_offset].item()):
+        if isinstance(bbox_present, torch.Tensor) and isinstance(bbox_model, torch.Tensor):
+            if bool(bbox_present[slot_idx, frame_idx, view_offset].item()):
                 bbox_model_view = bbox_model[slot_idx, frame_idx, view_offset].detach().cpu().float()
         center, size, rotation = _transform_track_box(
             sample["object_obj_to_world_selected"][slot_idx, frame_idx],
@@ -1984,18 +1984,18 @@ def _select_localization_view(
     frame_idx: int,
 ) -> tuple[int | None, torch.Tensor | None]:
     cam_ids = sample["cam_ids"]
-    bbox_valid = sample.get("object_bbox_valid_mask_selected")
+    bbox_present = sample["object_bbox_present_mask_selected"]
     bbox_model = sample.get("object_bbox_model_selected")
 
-    if isinstance(bbox_valid, torch.Tensor) and isinstance(bbox_model, torch.Tensor):
-        valid_view_offsets = torch.nonzero(bbox_valid[slot_idx, frame_idx], as_tuple=False).flatten()
+    if isinstance(bbox_present, torch.Tensor) and isinstance(bbox_model, torch.Tensor):
+        valid_view_offsets = torch.nonzero(bbox_present[slot_idx, frame_idx], as_tuple=False).flatten()
         if valid_view_offsets.numel() == 0:
             return None, None
 
         front_offsets = torch.nonzero(cam_ids == 0, as_tuple=False).flatten()
         if front_offsets.numel() > 0:
             front_offset = int(front_offsets[0].item())
-            if bool(bbox_valid[slot_idx, frame_idx, front_offset].item()):
+            if bool(bbox_present[slot_idx, frame_idx, front_offset].item()):
                 return (
                     front_offset,
                     bbox_model[slot_idx, frame_idx, front_offset].detach().cpu().float(),
@@ -2017,7 +2017,8 @@ def _select_localization_view(
 
     front_offsets = torch.nonzero(cam_ids == 0, as_tuple=False).flatten()
     front_offset = int(front_offsets[0].item()) if front_offsets.numel() > 0 else 0
-    if not bool(sample["object_front_bbox_valid_mask_selected"][slot_idx, frame_idx].item()):
+    front_bbox_present = sample["object_front_bbox_present_mask_selected"]
+    if not bool(front_bbox_present[slot_idx, frame_idx].item()):
         return None, None
     return (
         front_offset,

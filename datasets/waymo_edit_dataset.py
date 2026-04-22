@@ -178,15 +178,7 @@ def scene_name_from_base(scene_base):
 
 def resolve_default_manifest_path(processed_root, split, views):
     manifest_root = Path(processed_root) / "waymo_edit_cache" / "manifests" / split
-    candidates = [
-        manifest_root / f"{split}_mode_a_views{views}.jsonl",
-    ]
-    if views == 3:
-        candidates.append(manifest_root / f"{split}_mode_a.jsonl")
-    for path in candidates:
-        if path.is_file():
-            return path
-    return candidates[0]
+    return manifest_root / f"{split}_mode_a_views{views}.jsonl"
 
 
 def resolve_default_candidate_path(processed_root, split):
@@ -864,9 +856,29 @@ class WaymoEditDataset(Dataset):
             values = values[:expected_length]
         return torch.tensor([bool(v) for v in values], dtype=torch.bool)
 
+    def _resolve_object_bbox_editable_view_flags(self, object_record, cam_name, expected_length):
+        bbox_editable_by_view = object_record.get("bbox_editable_by_view", {})
+        return self._coerce_bool_sequence(bbox_editable_by_view.get(cam_name), expected_length)
+
+    def _resolve_object_bbox_present_view_flags(self, object_record, cam_name, expected_length):
+        bbox_present_by_view = object_record.get("bbox_present_by_view", {})
+        return self._coerce_bool_sequence(bbox_present_by_view.get(cam_name), expected_length)
+
+    def _resolve_record_frame_flags(self, record, key, expected_length):
+        return self._coerce_bool_sequence(record.get(key), expected_length)
+
+    def _build_editable_object_indices_by_frame(self, frame_editable_object_mask):
+        clip_len = int(frame_editable_object_mask.shape[1])
+        padded_indices = torch.full((clip_len, self.max_objects), -1, dtype=torch.long)
+        for frame_idx in range(clip_len):
+            editable_slots = torch.nonzero(frame_editable_object_mask[:, frame_idx], as_tuple=False).flatten()
+            if editable_slots.numel() > 0:
+                padded_indices[frame_idx, : editable_slots.numel()] = editable_slots
+        return padded_indices
+
     def _build_lightweight_sampling_flags(self, record):
         clip_len = len(record["scene_frame_indices"])
-        frame_has_visible_editable_object = torch.zeros((clip_len,), dtype=torch.bool)
+        frame_has_present_editable_object = torch.zeros((clip_len,), dtype=torch.bool)
 
         for object_record in record.get("objects", []):
             asset_object_id = str(object_record.get("asset_object_id", ""))
@@ -875,25 +887,27 @@ class WaymoEditDataset(Dataset):
             if not asset_path.is_file():
                 continue
 
-            object_visible = torch.zeros((clip_len,), dtype=torch.bool)
-            visibility_by_view = object_record.get("visibility_by_view", {})
+            object_present_editable = torch.zeros((clip_len,), dtype=torch.bool)
             for cam_id in self.camera_ids:
                 cam_name = CAM_ID_TO_NAME[cam_id]
-                view_flags = self._coerce_bool_sequence(visibility_by_view.get(cam_name), clip_len)
+                view_flags = self._resolve_object_bbox_editable_view_flags(object_record, cam_name, clip_len)
                 if view_flags is not None:
-                    object_visible |= view_flags
-            frame_has_visible_editable_object |= object_visible
+                    object_present_editable |= view_flags
+            frame_has_present_editable_object |= object_present_editable
 
-        if not bool(frame_has_visible_editable_object.any().item()):
-            top_level_key = "frame_has_front_visible_object" if self.views == 1 else "frame_has_front3_visible_object"
-            top_level_flags = self._coerce_bool_sequence(record.get(top_level_key), clip_len)
+        if not bool(frame_has_present_editable_object.any().item()):
+            top_level_flags = self._resolve_record_frame_flags(
+                record,
+                "frame_has_front_editable_object" if self.views == 1 else "frame_has_front3_editable_object",
+                clip_len,
+            )
             if top_level_flags is not None:
-                frame_has_visible_editable_object = top_level_flags
+                frame_has_present_editable_object = top_level_flags
 
-        frame_has_editable_object = frame_has_visible_editable_object.clone()
+        frame_has_editable_object = frame_has_present_editable_object.clone()
         if not bool(frame_has_editable_object.any().item()):
             frame_has_editable_object = torch.ones((clip_len,), dtype=torch.bool)
-        return frame_has_visible_editable_object, frame_has_editable_object
+        return frame_has_present_editable_object, frame_has_editable_object
 
     def _build_normalized_timestamps(self, local_indices):
         timestamps = np.array(local_indices, dtype=np.float32)
@@ -1033,7 +1047,8 @@ class WaymoEditDataset(Dataset):
 
         object_valid_mask = torch.zeros((self.max_objects,), dtype=torch.bool)
         object_track_valid_mask = torch.zeros((self.max_objects, clip_len), dtype=torch.bool)
-        object_bbox_valid_mask = torch.zeros((self.max_objects, clip_len, num_views), dtype=torch.bool)
+        object_bbox_present_mask = torch.zeros((self.max_objects, clip_len, num_views), dtype=torch.bool)
+        object_bbox_editable_mask = torch.zeros((self.max_objects, clip_len, num_views), dtype=torch.bool)
         object_contig_ids = torch.full((self.max_objects,), -1, dtype=torch.long)
         object_scene_match_scores = torch.zeros((self.max_objects,), dtype=torch.float32)
         object_track_range = torch.full((self.max_objects, 2), -1, dtype=torch.long)
@@ -1111,12 +1126,12 @@ class WaymoEditDataset(Dataset):
             )
 
             view_sequences = {}
-            transfer_boxes_by_view = object_record.get("boxes_by_view_transfer", object_record.get("boxes_by_view", {}))
+            transfer_boxes_by_view = object_record.get("boxes_by_view_transfer", {})
             raw_boxes_by_view = object_record.get("boxes_by_view_raw", {})
             model_boxes_by_view = object_record.get("boxes_by_view_model", {})
-            if len(raw_boxes_by_view) == 0 or len(model_boxes_by_view) == 0:
+            if len(transfer_boxes_by_view) == 0 or len(raw_boxes_by_view) == 0 or len(model_boxes_by_view) == 0:
                 raise KeyError(
-                    "Metadata record is missing boxes_by_view_raw/model. "
+                    "Metadata record is missing boxes_by_view_transfer/raw/model. "
                     "Regenerate metadata with datasets/tools/build_edit_metadata.py."
                 )
             for view_offset, cam_id in enumerate(self.camera_ids):
@@ -1133,6 +1148,13 @@ class WaymoEditDataset(Dataset):
                     model_boxes_by_view.get(cam_name),
                     expected_length=clip_len,
                 )
+                editable_flags = self._resolve_object_bbox_editable_view_flags(
+                    object_record,
+                    cam_name,
+                    clip_len,
+                )
+                if editable_flags is None:
+                    editable_flags = torch.zeros((clip_len,), dtype=torch.bool)
                 view_sequences[view_offset] = {
                     "cam_id": cam_id,
                     "transfer_boxes": transfer_boxes,
@@ -1141,6 +1163,7 @@ class WaymoEditDataset(Dataset):
                     "raw_valid_mask": raw_valid_mask,
                     "model_boxes": model_boxes,
                     "model_valid_mask": model_valid_mask,
+                    "editable_flags": editable_flags,
                 }
 
             for local_idx, scene_frame_idx in enumerate(clip_frame_indices):
@@ -1148,18 +1171,24 @@ class WaymoEditDataset(Dataset):
                     transfer_valid = bool(view_data["transfer_valid_mask"][local_idx])
                     raw_valid = bool(view_data["raw_valid_mask"][local_idx])
                     model_valid = bool(view_data["model_valid_mask"][local_idx])
+                    editable_here = bool(view_data["editable_flags"][local_idx].item())
+                    if editable_here and not transfer_valid:
+                        raise ValueError(
+                            f"Metadata editable flags refer to a missing bbox for object_slot={object_slot}, "
+                            f"frame={local_idx}, cam={view_data['cam_id']}. Regenerate metadata with "
+                            "datasets/tools/build_edit_metadata.py."
+                        )
                     if not transfer_valid:
                         continue
-                    transfer_box = view_data["transfer_boxes"][local_idx]
                     if not (raw_valid and model_valid):
                         raise ValueError(
                             f"Metadata boxes are invalid for object_slot={object_slot}, frame={local_idx}, cam={view_data['cam_id']}. "
                             "Regenerate metadata with datasets/tools/build_edit_metadata.py."
                         )
+                    transfer_box = view_data["transfer_boxes"][local_idx]
                     raw_box = view_data["raw_boxes"][local_idx]
                     model_box = view_data["model_boxes"][local_idx]
 
-                    object_bbox_valid_mask[object_slot, local_idx, view_offset] = True
                     object_bbox_transfer[object_slot, local_idx, view_offset] = numpy_like_to_torch(
                         transfer_box,
                         dtype=torch.float32,
@@ -1176,6 +1205,8 @@ class WaymoEditDataset(Dataset):
                         model_box / 14.0,
                         dtype=torch.float32,
                     )
+                    object_bbox_present_mask[object_slot, local_idx, view_offset] = True
+                    object_bbox_editable_mask[object_slot, local_idx, view_offset] = editable_here
 
                 if scene_frame_idx not in track_lookup:
                     continue
@@ -1211,35 +1242,51 @@ class WaymoEditDataset(Dataset):
                     )
 
         if front_view_offset is not None:
-            object_front_bbox_valid_mask = object_bbox_valid_mask[:, :, front_view_offset]
+            object_front_bbox_present_mask = object_bbox_present_mask[:, :, front_view_offset]
+            object_front_bbox_editable_mask = object_bbox_editable_mask[:, :, front_view_offset]
             object_front_bbox_transfer = object_bbox_transfer[:, :, front_view_offset]
             object_front_bbox_raw = object_bbox_raw[:, :, front_view_offset]
             object_front_bbox_model = object_bbox_model[:, :, front_view_offset]
             object_front_bbox_patch = object_bbox_patch[:, :, front_view_offset]
         else:
-            object_front_bbox_valid_mask = torch.zeros((self.max_objects, clip_len), dtype=torch.bool)
+            object_front_bbox_present_mask = torch.zeros((self.max_objects, clip_len), dtype=torch.bool)
+            object_front_bbox_editable_mask = torch.zeros((self.max_objects, clip_len), dtype=torch.bool)
             object_front_bbox_transfer = torch.zeros((self.max_objects, clip_len, 4), dtype=torch.float32)
             object_front_bbox_raw = torch.zeros((self.max_objects, clip_len, 4), dtype=torch.float32)
             object_front_bbox_model = torch.zeros((self.max_objects, clip_len, 4), dtype=torch.float32)
             object_front_bbox_patch = torch.zeros((self.max_objects, clip_len, 4), dtype=torch.float32)
 
-        object_visible_editable_mask = (
+        object_present_mask = (
             object_track_valid_mask[:, :, None]
-            & object_bbox_valid_mask
+            & object_bbox_present_mask
             & object_asset_valid_mask[:, None, None]
         )
-        object_projected_editable_mask = object_visible_editable_mask.clone()
+        object_present_editable_mask = object_present_mask & object_bbox_editable_mask
+        object_projected_mask = object_present_mask.clone()
+        object_projected_editable_mask = object_present_editable_mask.clone()
+        object_editable_mask = object_present_editable_mask.clone()
+        frame_present_object_mask = object_present_mask.any(dim=2)
+        frame_editable_object_mask = object_editable_mask.any(dim=2)
+        editable_object_count_by_frame = frame_editable_object_mask.sum(dim=0).to(torch.long)
+        editable_object_indices_by_frame = self._build_editable_object_indices_by_frame(frame_editable_object_mask)
         frame_has_editable_object = (
             object_track_valid_mask
             & object_asset_valid_mask[:, None]
         ).any(dim=0)
-        frame_has_visible_editable_object = object_visible_editable_mask.any(dim=(0, 2))
+        frame_has_present_object = frame_present_object_mask.any(dim=0)
+        frame_has_present_editable_object = frame_editable_object_mask.any(dim=0)
+        frame_has_projected_object = object_projected_mask.any(dim=(0, 2))
         frame_has_projected_editable_object = object_projected_editable_mask.any(dim=(0, 2))
-        frame_has_front_visible_editable_object = (
-            object_track_valid_mask
-            & object_front_bbox_valid_mask
-            & object_asset_valid_mask[:, None]
-        ).any(dim=0)
+        frame_has_front_present_object = (
+            object_present_mask[:, :, front_view_offset].any(dim=0)
+            if front_view_offset is not None
+            else torch.zeros((clip_len,), dtype=torch.bool)
+        )
+        frame_has_front_present_editable_object = (
+            object_editable_mask[:, :, front_view_offset].any(dim=0)
+            if front_view_offset is not None
+            else torch.zeros((clip_len,), dtype=torch.bool)
+        )
 
         reference_cam_id = 0 if 0 in scene_cache["image_size_by_cam"] else self.camera_ids[0]
         model_h, model_w = compute_resize_geometry(scene_cache["image_size_by_cam"][reference_cam_id])["out_hw"]
@@ -1247,7 +1294,8 @@ class WaymoEditDataset(Dataset):
         return {
             "object_valid_mask": object_valid_mask,
             "object_track_valid_mask": object_track_valid_mask,
-            "object_bbox_valid_mask": object_bbox_valid_mask,
+            "object_bbox_present_mask": object_bbox_present_mask,
+            "object_bbox_editable_mask": object_bbox_editable_mask,
             "object_contig_ids": object_contig_ids,
             "object_scene_match_scores": object_scene_match_scores,
             "object_track_range": object_track_range,
@@ -1260,7 +1308,8 @@ class WaymoEditDataset(Dataset):
             "object_bbox_raw": object_bbox_raw,
             "object_bbox_model": object_bbox_model,
             "object_bbox_patch": object_bbox_patch,
-            "object_front_bbox_valid_mask": object_front_bbox_valid_mask,
+            "object_front_bbox_present_mask": object_front_bbox_present_mask,
+            "object_front_bbox_editable_mask": object_front_bbox_editable_mask,
             "object_front_bbox_transfer": object_front_bbox_transfer,
             "object_front_bbox_raw": object_front_bbox_raw,
             "object_front_bbox_model": object_front_bbox_model,
@@ -1275,11 +1324,21 @@ class WaymoEditDataset(Dataset):
             "object_scene_raw_ids": object_scene_raw_ids,
             "object_class_names": object_class_names,
             "object_asset_paths": object_asset_paths,
-            "object_visible_editable_mask": object_visible_editable_mask,
+            "object_present_mask": object_present_mask,
+            "object_editable_mask": object_editable_mask,
+            "object_present_editable_mask": object_present_editable_mask,
+            "object_projected_mask": object_projected_mask,
             "object_projected_editable_mask": object_projected_editable_mask,
+            "frame_present_object_mask": frame_present_object_mask,
+            "frame_editable_object_mask": frame_editable_object_mask,
+            "editable_object_count_by_frame": editable_object_count_by_frame,
+            "editable_object_indices_by_frame": editable_object_indices_by_frame,
             "frame_has_editable_object": frame_has_editable_object,
-            "frame_has_visible_editable_object": frame_has_visible_editable_object,
-            "frame_has_front_visible_editable_object": frame_has_front_visible_editable_object,
+            "frame_has_present_object": frame_has_present_object,
+            "frame_has_present_editable_object": frame_has_present_editable_object,
+            "frame_has_front_present_object": frame_has_front_present_object,
+            "frame_has_front_present_editable_object": frame_has_front_present_editable_object,
+            "frame_has_projected_object": frame_has_projected_object,
             "frame_has_projected_editable_object": frame_has_projected_editable_object,
             "front_model_image_hw": torch.tensor([model_h, model_w], dtype=torch.long),
         }
@@ -1308,12 +1367,14 @@ class WaymoEditDataset(Dataset):
 
         for key in [
             "object_track_valid_mask",
-            "object_bbox_valid_mask",
+            "object_bbox_present_mask",
+            "object_bbox_editable_mask",
             "object_bbox_transfer",
             "object_bbox_raw",
             "object_bbox_model",
             "object_bbox_patch",
-            "object_front_bbox_valid_mask",
+            "object_front_bbox_present_mask",
+            "object_front_bbox_editable_mask",
             "object_front_bbox_transfer",
             "object_front_bbox_raw",
             "object_front_bbox_model",
@@ -1324,15 +1385,31 @@ class WaymoEditDataset(Dataset):
             "object_centers_world",
             "object_speed_mps",
             "object_is_moving_frame",
-            "object_visible_editable_mask",
+            "object_present_mask",
+            "object_editable_mask",
+            "object_present_editable_mask",
+            "object_projected_mask",
             "object_projected_editable_mask",
         ]:
             object_tensors[f"{key}_selected"] = object_data[key].index_select(1, selected_indices)
 
+        object_tensors["frame_present_object_mask_selected"] = object_data["frame_present_object_mask"].index_select(
+            1,
+            selected_indices,
+        )
+        object_tensors["frame_editable_object_mask_selected"] = object_data["frame_editable_object_mask"].index_select(
+            1,
+            selected_indices,
+        )
         for key in [
+            "editable_object_count_by_frame",
+            "editable_object_indices_by_frame",
             "frame_has_editable_object",
-            "frame_has_visible_editable_object",
-            "frame_has_front_visible_editable_object",
+            "frame_has_present_object",
+            "frame_has_present_editable_object",
+            "frame_has_front_present_object",
+            "frame_has_front_present_editable_object",
+            "frame_has_projected_object",
             "frame_has_projected_editable_object",
         ]:
             object_tensors[f"{key}_selected"] = object_data[key].index_select(0, selected_indices)
@@ -1340,7 +1417,7 @@ class WaymoEditDataset(Dataset):
         return object_tensors
 
     def _build_asset_metadata(self, object_tensors):
-        editable_object_mask = object_tensors["object_visible_editable_mask_selected"].any(dim=(1, 2))
+        editable_object_mask = object_tensors["frame_editable_object_mask_selected"].any(dim=1)
         editable_indices = torch.nonzero(editable_object_mask, as_tuple=False).flatten()
         editable_count = int(editable_indices.numel())
 
@@ -1407,11 +1484,11 @@ class WaymoEditDataset(Dataset):
         clip_frame_indices = [int(v) for v in record["scene_frame_indices"]]
 
         if self.clean_only:
-            frame_has_visible_editable_object, frame_has_editable_object = self._build_lightweight_sampling_flags(record)
+            frame_has_present_editable_object, frame_has_editable_object = self._build_lightweight_sampling_flags(record)
             local_indices, intervals = self._sample_local_indices(
                 0,
                 len(clip_frame_indices),
-                frame_has_visible_editable_object,
+                frame_has_present_editable_object,
                 frame_has_editable_object,
                 sample_num_frames=sample_num_frames,
             )
@@ -1457,7 +1534,7 @@ class WaymoEditDataset(Dataset):
         local_indices, intervals = self._sample_local_indices(
             0,
             len(clip_frame_indices),
-            object_data["frame_has_visible_editable_object"],
+            object_data["frame_has_present_editable_object"],
             object_data["frame_has_editable_object"],
             sample_num_frames=sample_num_frames,
         )
@@ -1618,7 +1695,7 @@ def save_debug_visuals(sample, output_dir):
         object_tag = sample["object_scene_raw_ids"][object_slot] or sample["object_asset_ids"][object_slot]
         for frame_idx in range(sample["frame_indices"].numel()):
             for view_offset, cam_id in enumerate(sample["cam_ids"].tolist()):
-                if not bool(sample["object_bbox_valid_mask_selected"][object_slot, frame_idx, view_offset].item()):
+                if not bool(sample["object_bbox_present_mask_selected"][object_slot, frame_idx, view_offset].item()):
                     continue
                 image_idx = frame_idx * num_views + view_offset
                 label = f"{object_tag[:8]} f{int(sample['frame_indices'][frame_idx].item())} c{cam_id}"
@@ -1638,10 +1715,14 @@ def save_debug_visuals(sample, output_dir):
         "cam_ids": sample["cam_ids"].tolist(),
         "editable_object_count": editable_count,
         "editable_object_indices": editable_slots,
+        "editable_object_count_by_frame": sample["editable_object_count_by_frame_selected"].tolist(),
+        "editable_object_indices_by_frame": sample["editable_object_indices_by_frame_selected"].tolist(),
         "editable_asset_object_ids": sample["asset_meta"]["editable_asset_object_ids"],
         "editable_scene_raw_object_ids": sample["asset_meta"]["editable_scene_raw_object_ids"],
-        "selected_visible_editable_frames": sample["frame_has_visible_editable_object_selected"].tolist(),
-        "selected_front_visible_frames": sample["frame_has_front_visible_editable_object_selected"].tolist(),
+        "selected_present_frames": sample["frame_has_present_object_selected"].tolist(),
+        "selected_present_editable_frames": sample["frame_has_present_editable_object_selected"].tolist(),
+        "selected_front_present_frames": sample["frame_has_front_present_object_selected"].tolist(),
+        "selected_front_present_editable_frames": sample["frame_has_front_present_editable_object_selected"].tolist(),
     }
     save_json(output_dir / "sample_summary.json", summary)
 
@@ -1654,8 +1735,11 @@ def print_sample_summary(sample):
     print(f"editable_object_count: {int(sample['editable_object_count'].item())}")
     print(f"editable_asset_object_ids: {sample['asset_meta']['editable_asset_object_ids']}")
     print(f"editable_scene_raw_object_ids: {sample['asset_meta']['editable_scene_raw_object_ids']}")
-    print(f"selected_visible_editable_frames: {sample['frame_has_visible_editable_object_selected'].tolist()}")
-    print(f"selected_front_visible_frames: {sample['frame_has_front_visible_editable_object_selected'].tolist()}")
+    print(f"editable_object_count_by_frame: {sample['editable_object_count_by_frame_selected'].tolist()}")
+    print(f"selected_present_frames: {sample['frame_has_present_object_selected'].tolist()}")
+    print(f"selected_present_editable_frames: {sample['frame_has_present_editable_object_selected'].tolist()}")
+    print(f"selected_front_present_frames: {sample['frame_has_front_present_object_selected'].tolist()}")
+    print(f"selected_front_present_editable_frames: {sample['frame_has_front_present_editable_object_selected'].tolist()}")
     print("key_shapes:")
     for key in [
         "images_clean",
@@ -1666,7 +1750,8 @@ def print_sample_summary(sample):
         "camera_to_world_corrected",
         "intrinsics",
         "object_bbox_model_selected",
-        "object_bbox_valid_mask_selected",
+        "object_bbox_present_mask_selected",
+        "object_bbox_editable_mask_selected",
         "object_obj_to_world_selected",
         "object_box_size_selected",
     ]:
