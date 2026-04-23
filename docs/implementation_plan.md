@@ -20,6 +20,7 @@
 | Token utilities | [dggt/utils/tokens.py](/home/dancer/code/dm/dggt/dggt/utils/tokens.py) — `select_patch_pyramid / reattach_special_tokens / replace_selected_levels / split_joint_channels / split_special_and_patch` | done |
 | 确定性 GS 编辑器基线 | [dggt/utils/gaussian_edit.py](/home/dancer/code/dm/dggt/dggt/utils/gaussian_edit.py) — `build_clean_scene_state / estimate_scene_alignment / localize_objects / apply_mode_a`（Sim3 对齐 / ObjectLocalizer / SceneBoxRefiner / AssetPoseRefiner 已内置） | done |
 | Mode-A 推理脚本（baseline） | [inference_mode_a.py](/home/dancer/code/dm/dggt/inference_mode_a.py) — Pass-1 → align → localize → yaw refine → apply_mode_a → 渲染 clean/deleted/asset/edited | done（**仅 views=1**；作为编辑正确性金标准保留） |
+| 离线特征缓存（计划路径） | `/data/flow_cache/{training,validation}/{scene}/{clip_start}.pt` | planned（Phase 4.5 产出） |
 
 **硬约束**：
 
@@ -69,27 +70,16 @@
 
 ### 0.5.4 Anchor Frame / Follower Frame 策略
 
-对一条 4 帧 inference / training sample，object-level 编辑资格与 frame-level 执行资格分开处理：
+> **Status: deprecated for T1+ training / FlowDGGT inference.** 仅 `inference_mode_a.py` baseline 保留旧行为以维持金标准。新训练 / 新推理（`train_scene_flow.py`、`inference_flow_edit.py`、离线特征缓存）统一采用简化规则：`per_frame_edit_mask[m, n] = bbox_present_mask[m, n] ∧ bbox_editable_mask[m, n]`，每帧每对象独立判定，详见 Phase 4.5。原规则记录在下方仅供回溯。
 
-1. object 是否进入 `editable_object_indices`
+~~对一条 4 帧 inference / training sample，object-level 编辑资格与 frame-level 执行资格分开处理：~~
 
-- 仍按 `editable` 语义决定
-- 只要该 object 在当前 sample 的任意一帧、任一视角存在 `bbox_editable=True`，它就进入本条样本的 editable object 集合
+1. ~~object 是否进入 `editable_object_indices`：仅凭 `editable` 语义——只要在该 sample 任意一帧有 `bbox_editable=True`，即入集。~~
+2. ~~某一帧是否对该 object 执行编辑：按 `present` 决定（非 editable），一旦入集则全 `present` 帧执行。~~
+3. ~~`bbox_editable=True` 的帧是 anchor frame，`bbox_present=True && bbox_editable=False` 的帧是 follower frame。~~
+4. ~~follower frame 不做"强制编辑"，语义/深度/几何不足时允许跳过。~~
 
-2. 某一帧是否对这个 object 执行删除/插入
-
-- 按 `present` 语义决定，而不是按 `editable`
-- 一旦 object 已经进入本条样本的 editable 集合，则对该 sample 内所有 `bbox_present=True` 的帧都尝试执行编辑
-
-3. 非锚点帧的角色
-
-- `bbox_editable=True` 的帧是 anchor frame：用于保证这个 object 在本条样本中“值得编辑”
-- `bbox_present=True && bbox_editable=False` 的帧是 follower frame：只要目标仍在画面中，就应该继续编辑，以保证时序一致性
-
-4. 安全约束
-
-- follower frame 不做“强制编辑”
-- 如果该帧虽然 `present=True`，但语义/深度/几何证据不足，允许该帧局部定位失败并跳过，不能为了追求全帧一致而盲删背景
+新规则的动机：Phase 4.5 离线缓存要求同一帧的编辑目标集合**只依赖该帧自身**（否则不同 4–8 帧子集选出同一帧时编辑目标会变），缓存的 per-object per-frame `I_asset/F_g_lut_asset/ptr_asset` 才能按帧维任意子集共享。
 
 ### 0.5.5 Inference 侧强制规则
 
@@ -114,6 +104,8 @@ P1 编辑器库化（views=3 扩展）
       ├── P3 SoftMaskBuilder + ScaffoldPacker
       │
       ├── P4 Asset Aggregator Pass（Waymo-coord, per-frame, per-object）
+      │
+      ├── P4.5 离线特征缓存（Offline Feature Cache）
       │
       ├── P5 T0.5 splatted-token 自一致训练（新脚本）
       │
@@ -333,6 +325,79 @@ class AssetAggregatorPass(nn.Module):
 
 ---
 
+### Phase 4.5: 离线特征缓存（Offline Feature Cache）
+
+**目标**：把 P1–P4 里"每个 epoch 都要重算一次"的确定性重计算全部搬到离线预处理脚本，训练时直接从磁盘读缓存，只保留梯度相关和随机相关的部分在线。Aggregator **永远不在线跑**。
+
+**输入状态**：P1–P4 全部可用，`WaymoEditDataset` 支持 `mode=2`（deterministic）。
+
+**输出状态**：
+- 每条 29 帧 clip 一份 `.pt` 缓存：`{cache_root}/{split}/{scene}/{clip_start}.pt`。
+- 训练 dataloader `WaymoFlowCacheDataset` 从缓存读取并在 dataloader 内部随机选 4–8 帧子集；`FlowFeatureAssembler` 只消费缓存张量，不再调用 VGGT。
+- 字段严格分层，参见 §3.9 的在线 / 离线切分表。
+
+#### 关键设计决策
+
+1. **Aggregator 全离线 + 29 帧一次性预计算**
+   - 对每个 clip，一次性把所有 29 帧图像喂给 VGGT，一次性得到 `image_tokens_list[[4,11,17,23]]`、`aggregated_tokens_list[[4,11,17,23]]`、`dino_tokens_list[[4,11,17,23]]`、全部 heads 输出（`gs_map / depth / dynamic_conf / gs_conf / pose_enc / semantic_logits`）和 `cameras_dggt`。
+   - Phase 4 asset 路径：对该 clip 的每个 editable 对象，把资产 rasterize 成 29 帧 Waymo-coord 渲染 `I_asset[k], A_asset[k]`，再对 `[K·29, 3, H, W]` 过一次 aggregator 得到 `F_g_lut_asset[k]`、`image_tokens_special_asset[k]`，并为每粒资产高斯计算每帧指针 `(patch_idx, visible_mask)`。
+   - 训练采样时，随机选 4–8 帧子集，直接按帧维索引 cached 张量即可；**cross-frame attention 上下文永远是 29 帧上下文**。这引入一个设计假设：训练 / 推理都保持"29 帧 aggregator 预算" 的语义一致，flow 对上下文粒度不敏感。推理脚本对不在 cache 里的样本会临时跑一次全量 aggregator，保持 trained-distribution 一致。
+
+2. **放弃 anchor-follower 规则**（相对 §0.5.4 的新约定）
+   - 新规则：每一帧对每个对象独立判定，`per_frame_edit_mask[m, n] = bbox_present_mask[m, n] ∧ bbox_editable_mask[m, n]`；一个对象在一帧中是否执行编辑**只看这一帧自己**。
+   - 效果：任何 4–8 帧子集下 `editable_object_indices = {m : any(n ∈ subset) per_frame_edit_mask[m, n]}` 与其他帧完全解耦，缓存可在任意子集选择下复用，不再出现"同一帧在不同帧组合里编辑目标集合不同"的矛盾。
+   - 代价：某些只在少数帧被判定可编辑的目标，在别的帧（被 present 但 editable=False）将不会被编辑，可能在时序上轻微不连续；已接受为 T1/T2 训练设定。
+   - §0.5.4 的旧规则标注为 **deprecated for T1+ training（仅 inference_mode_a 保留以维持 baseline 一致性）**。
+
+3. **特征压缩**
+   - `F_g_lut_scene [29, 1369, 4, 3072]` 与 `F_g_lut_asset[k]` 采用 **int8 对称量化**（per-(level, frame) 一个 `scale`）：相对 fp16 再 × 2 压缩，单 token 集 670 MB → 335 MB。
+   - 解压后做 cosine ≥ 0.999 校验（见 smoke test）。
+   - 其余 feature map 用 fp16；raw images 存 uint8（已经是 518×518 预处理后）；二值 mask 用 `torch.bool` 或 bit-pack。
+
+4. **Cache schema**（每 clip 一份 `.pt`，字段固定）
+   ```
+   meta:        scene_name / clip_start / cam_ids / frame_indices_scene / timestamps / raw_hw / patch_grid / patch_start_idx
+   raw:         images [29,3,518,518] uint8, sky_mask / dynamic_mask [29,1,518,518] bool
+   object_meta: per-(M, 29) bbox_present / bbox_editable / obj_to_world / box_size / target_bbox_model / ...
+                + per-object scene match scores / asset paths / speed statistics
+   asset_static: per asset_id → {means_raw, colors, opacities, scales, quats, vertex_count}  (跨 clip 去重)
+   pass1:       cameras_dggt.viewmats / .Ks [29,...] fp32
+                gs_map / depth / dynamic_conf / gs_conf [29,518,518,...] fp16
+                F_g_lut_scene [29,1369,4,3072] int8 + per-(level,frame) scale
+                image_tokens_special [29,4,5,3072] fp16
+                aggregated_tokens_patch [29,1369,4,2048] int8 + scale（camera / depth / point heads 需要）
+                aggregated_tokens_special [29,4,5,2048] fp16
+                dino_tokens [29,1369,4,1024] int8 + scale（instance / semantic heads 需要）
+   asset_pass:  per editable object_id m:
+                  I_asset [29,3,518,518] uint8, A_asset [29,1,518,518] uint8
+                  F_g_lut_asset [29,1369,4,3072] int8 + scale
+                  image_tokens_special_asset [29,4,5,3072] fp16
+                  ptr_asset: list[29] (patch_idx int32, visible_mask bool)
+                  obj_to_world_history [29,4,4] fp32 (冗余字段，方便 online reconstruction)
+   ```
+   单 clip 总大小 ≈ 2.2 GB（K=3 editable 对象，含全量 aggregator 特征 + heads + per-object 渲染），700 个训练 clip ≈ 1.5 TB。
+
+#### 要新建的文件
+
+- `tools/precompute_flow_features.py`：单 GPU CLI 预处理脚本，`--start/--end clip_idx`、`--force_overwrite`；幂等、可续跑；29 帧一次全量前向；进度条 + 每 clip timing / size 日志。
+- `datasets/waymo_flow_cache_dataset.py`：直接读缓存，返回和 `WaymoEditDataset` 同名字段的子集 + int8 反量化后的 `F_g_lut_scene / F_g_lut_asset`；随机采样 4–8 帧子集在 `__getitem__` 内完成。
+- `dggt/utils/feature_quant.py`：int8 symmetric quant / dequant（per-(level, frame) scale）+ cosine 校验工具。
+- `dggt/utils/edit_coverage.py::resolve_editable_subset`：在子集上应用简化规则 `present ∧ editable`，输出 `editable_indices + per_frame_edit_mask`。
+- `dggt/models/flow_feature_assembler.py`（来自 §3 计划）：只走 cached 路径；不再内置 `AssetAggregatorPass`／`GaussianSceneEditor` 的 aggregator 依赖。Phase 1 在线部分读 cached `gs_map / depth / cameras_dggt` 直接构造 `CleanSceneState`，绕过 VGGT heads。
+- `tests/test_offline_cache.py`：
+  - `test_quantization_roundtrip`：合成 LUT 的 int8 ↔ fp16 cosine ≥ 0.999。
+  - `test_resolve_editable_subset`：三组子集手算答案对齐（简化规则下）。
+  - `test_cache_roundtrip_shapes`：保存 + 加载后所有字段 shape / dtype 与 schema 一致。
+  - `test_cache_to_features_end_to_end`（CUDA, `slow`）：一个合成 clip 缓存 → `FlowFeatureAssembler` → 输出的 `z_clean / z_splat / soft_masks` 符合 shape 合同。
+
+#### smoke test / 通过标准
+
+- 单 clip 预处理：A100 单 GPU < 60 s（含 scene aggregator + K·29 asset aggregator + 全部 heads + 量化 + 写盘）。
+- int8 量化精度：解压后 `F_g_lut_scene` 与原 fp16 的 cosine ≥ 0.999。
+- 训练吞吐：`batch_size=1, views=1, N=4–8`，相对完全在线 baseline 吞吐提升 ≥ 40%（aggregator 不在线，数据加载 + splatter + decode 占主导）。
+
+---
+
 ### Phase 5: T0.5 Splatted-Token 自一致训练
 
 **目标**：让已训好的 T0 tokenizer 在 "splatted token" 分布上也不崩溃。这是 T1 flow 训练能稳住的必要前置。
@@ -515,6 +580,7 @@ class FlowDGGT(nn.Module):
 - **优化器**: AdamW, β=(0.9, 0.95), cosine decay。`scene_flow lr=2e-4`, `dense heads lr=5e-6`（默认关）。
 - **batch**: 4 clips × S=4 × views=3 on 8×A100 BF16。
 - **T0.5 warmup not reset**: 从 T0.5 checkpoint 加载 tokenizer，flow/bypass/splatter/mask_builder 从头训。
+- **离线缓存**: 默认加 `--cache_root /data/flow_cache --cache_level heavy`，T1 step 只在线跑 splatter/soft-mask/scaffold/tokenizer/flow/decode/heads/loss；命中率 < 90 % 时自动回退在线 aggregator（详见 Phase 4.5）。
 
 **smoke test**：
 - 16 Mode A 过拟合 1k 步：`L_render` 降 > 50%。
@@ -566,6 +632,42 @@ class FlowDGGT(nn.Module):
 
 ---
 
+## 3.9 在线 / 离线切分总表（对应 Phase 4.5）
+
+扩散模型训练（Phase 9 T1 / Phase 10 T2）步内的全部操作都被归为两类：
+
+| 步骤 | 离线 (precompute) | 在线 (per-step) | 说明 |
+|---|:-:|:-:|---|
+| 数据 IO + JPEG/PNG 解码 | ✓ | | raw images / sky / dynamic mask 存 uint8 |
+| 元数据（`bbox_present/editable / obj_to_world / box_size / target_bbox_model`）for 全 29 帧 | ✓ | | |
+| 资产静态 `means_raw/colors/opacities/scales/quats` | ✓（每 asset 一份，cross-clip 共享） | | |
+| `obj_to_world` 作用到资产得到 Waymo-coord Gaussian | ✓（per-object per-frame） | | 纯几何 |
+| 每对象每帧 `I_asset / A_asset` rasterize | ✓ 全 29 帧 | | GT Waymo cam，无网络 |
+| 每对象每帧 `ptr_asset (patch_idx, visible_mask)` | ✓ 全 29 帧 | | α+depth 遮挡测试，无网络 |
+| Pass-1 aggregator `image_tokens_list[[4,11,17,23]]` | ✓ 全 29 帧，int8 | **永不在线** | 主耗时源 |
+| Pass-1 heads `gs_map/depth/dynamic_conf/gs_conf/pose_enc/semantic_logits` | ✓ 全 29 帧，fp16 | **永不在线** | |
+| Phase 4 asset-aggregator `F_g_lut_asset[k]` | ✓ 全 29 帧，int8 | **永不在线** | per-object |
+| `editable_object_indices`（简化规则 `present ∧ editable`） | | ✓ | O(M·|subset|) 位运算 |
+| Phase 1 `GaussianSceneEditor`（align + localize + apply_mode_a） | | ✓ | 读 cached `gs_map/depth/cameras` 直接构造 `CleanSceneState`，绕过 VGGT heads |
+| `FeatureSplatter`（gsplat chunked 3072-d） | | ✓ | ~100 ms |
+| `SoftMaskBuilder`（K/D/I α 渲染 + 归一化） | | ✓ | ~100 ms |
+| `ScaffoldPacker`（MLP） | | ✓ | 可训练 |
+| `tokenizer.encode` → `z_clean/z_splat` | | ✓ | T1 冻结 encoder |
+| `PerTokenNoiseScheduler` → `z_init/t_tok` | | ✓ | 每 step 采样 |
+| `SceneFlowMatching` 前/后向 | | ✓ | 被训练 |
+| `tokenizer.decode` | | ✓ | T1 decoder 末层可训 |
+| Dense heads（gs_head/depth_head/instance_head） | | ✓ | T1 末层可微调 |
+| `L_render` 的 3DGS gsplat render | | ✓ | 需要 decode 后的新 gs_map |
+| `L_flow / L_preserve / L_asset_id / L_xview / L_lpips / ...` | | ✓ | |
+
+**核心原则**：凡是"给定 clip 样本后，值不依赖于当前 trainable 权重、也不依赖于 step 内随机"的量全部离线；凡是依赖 step 内随机（采样的 4–8 帧子集 / `base_t` / 噪声 ε）或依赖可训练参数的都保持在线。Aggregator 在训练阶段**永远不在线跑**。
+
+**帧随机性**：离线侧给每 clip 完整预计算全 29 帧的 aggregator 输出和 heads 输出；训练时随机采样 4–8 帧子集 = 直接按帧维索引 cached 张量。Cross-frame attention 上下文固定为 29 帧。
+
+**简化的编辑规则**：每帧每对象独立判定 `per_frame_edit_mask[m, n] = bbox_present_mask[m, n] ∧ bbox_editable_mask[m, n]`；不再使用 §0.5.4 的 anchor-follower 规则（在 T1+ 训练 / 推理里 deprecated，仅 `inference_mode_a.py` baseline 保留旧行为）。这确保同一帧的编辑目标集合只依赖该帧自身，缓存可在任意 4–8 帧子集下复用。
+
+---
+
 ## 4. 训练节奏总表
 
 | 阶段 | 数据 | 训练模块 | 冻结 | 步数 | lr |
@@ -611,6 +713,7 @@ class FlowDGGT(nn.Module):
 - [P7] `test_high_res_bypass.py`：τ≈0 / τ≈1 的极限情形。
 - [P8] `test_flow_dggt_forward_edit.py`：clean action 与 VGGT.forward 对齐。
 - [P9] `test_flow_losses.py`：损失 shape + backward。
+- [P4.5] `test_offline_cache.py`：int8 量化 roundtrip cosine ≥ 0.999；`resolve_editable_subset` 子集复现；在线 / 缓存路径 metadata 逐字段一致；命中窗口下 `F_g_lut_scene` 相对误差 < 1 %。
 - [P11] `test_inference_flow_edit.py`：端到端 action=replace 跑通。
 
 ---
