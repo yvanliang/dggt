@@ -10,6 +10,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from datasets.waymo_edit_dataset import (
+    DEFAULT_ASSET_ROOT,
     DEFAULT_PROCESSED_ROOT,
     DEFAULT_RAW_ROOT,
     DEFAULT_TRANSFER_ROOT,
@@ -63,6 +64,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--processed_root", type=str, default=DEFAULT_PROCESSED_ROOT)
     parser.add_argument("--transfer_root", type=str, default=DEFAULT_TRANSFER_ROOT)
     parser.add_argument("--raw_root", type=str, default=DEFAULT_RAW_ROOT)
+    parser.add_argument("--asset_root", type=str, default=DEFAULT_ASSET_ROOT)
     parser.add_argument("--manifest_path", type=str, default=None)
     parser.add_argument("--candidate_path", type=str, default=None)
     parser.add_argument("--object_slots", type=str, default="all", help="Comma-separated slot ids or 'all'.")
@@ -882,6 +884,7 @@ def main() -> None:
         processed_root=args.processed_root,
         transfer_root=args.transfer_root,
         raw_root=args.raw_root,
+        asset_root=args.asset_root,
         split=args.split,
         manifest_path=args.manifest_path,
         candidate_path=args.candidate_path,

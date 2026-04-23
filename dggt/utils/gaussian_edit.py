@@ -2815,7 +2815,7 @@ def localize_objects(
 
         scene_raw_object_id = str(sample["object_scene_raw_ids"][slot_idx])
         asset_path = sample["object_asset_paths"][slot_idx]
-        if asset_root and scene_raw_object_id:
+        if asset_root and scene_raw_object_id and (not asset_path or not Path(str(asset_path)).is_file()):
             self_asset_path = f"{asset_root}/{scene_raw_object_id}.ply"
             try:
                 import os

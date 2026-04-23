@@ -7,6 +7,7 @@ import torch
 from datasets.tools.build_edit_metadata import (
     MIN_EDIT_BOX_SIZE_PX,
     box_overlap_ratios_xyxy,
+    build_asset_index,
     choose_best_asset_match,
     is_transfer_box_large_enough,
     is_vehicle_related_class,
@@ -161,6 +162,31 @@ def test_choose_best_asset_match_prefers_same_view_then_clip_then_nearest_frame(
     )
 
     assert matched["path"] == "/tmp/front_left-clip_a-29.spz"
+
+
+def test_build_asset_index_supports_legacy_root_level_ply_assets(tmp_path):
+    asset_path = tmp_path / "object_a.ply"
+    asset_path.write_text("ply\n", encoding="ascii")
+
+    asset_index = build_asset_index(tmp_path)
+
+    assert asset_index["object_a"] == [
+        {
+            "asset_layout": "fixed",
+            "asset_format": "ply",
+            "view_name": None,
+            "clip_name": None,
+            "global_frame_idx": None,
+            "path": str(asset_path),
+        }
+    ]
+    matched = choose_best_asset_match(
+        asset_index["object_a"],
+        camera_name="pinhole_front_left",
+        clip_name="clip_a",
+        global_frame_idx=28,
+    )
+    assert matched["path"] == str(asset_path)
 
 
 def test_select_object_asset_image_paths_flattens_frame_major_view_minor():

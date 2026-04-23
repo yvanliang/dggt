@@ -28,7 +28,7 @@ DEFAULT_TRANSFER_HW = (704, 1280)
 DEFAULT_PROCESSED_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt"
 DEFAULT_TRANSFER_ROOT = "/data/disk2/lyy_dataset/waymo_transfer"
 DEFAULT_RAW_ROOT = "/data/disk2/lyy_dataset/waymo"
-DEFAULT_ASSET_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt/object_spz_transformed"
+DEFAULT_ASSET_ROOT = "/data/disk2/lyy_dataset/test_transfer/objects_ply_transformed"
 WAYMO_DYNAMIC_SPEED_THRESH_MPS = 1.0
 WAYMO_OPENCV2DATASET = np.array(
     [[0, 0, 1, 0], [-1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]],
@@ -1141,6 +1141,8 @@ class WaymoEditDataset(Dataset):
         object_scene_raw_ids = [""] * self.max_objects
         object_class_names = [""] * self.max_objects
         object_asset_paths = [""] * self.max_objects
+        object_asset_layouts = [""] * self.max_objects
+        object_asset_formats = [""] * self.max_objects
         object_asset_image_paths = [
             [[""] * num_views for _ in range(clip_len)]
             for _ in range(self.max_objects)
@@ -1157,6 +1159,8 @@ class WaymoEditDataset(Dataset):
             object_asset_ids[object_slot] = asset_object_id
             object_scene_raw_ids[object_slot] = scene_raw_id
             object_scene_match_scores[object_slot] = match_score
+            object_asset_layouts[object_slot] = str(object_record.get("asset_layout", ""))
+            object_asset_formats[object_slot] = str(object_record.get("asset_format", ""))
 
             instance_entry = scene_cache["raw_to_instance"].get(scene_raw_id)
             if instance_entry is None:
@@ -1422,6 +1426,8 @@ class WaymoEditDataset(Dataset):
             "object_scene_raw_ids": object_scene_raw_ids,
             "object_class_names": object_class_names,
             "object_asset_paths": object_asset_paths,
+            "object_asset_layouts": object_asset_layouts,
+            "object_asset_formats": object_asset_formats,
             "object_asset_image_paths": object_asset_image_paths,
             "object_present_mask": object_present_mask,
             "object_editable_mask": object_editable_mask,
@@ -1460,6 +1466,8 @@ class WaymoEditDataset(Dataset):
             "object_scene_raw_ids",
             "object_class_names",
             "object_asset_paths",
+            "object_asset_layouts",
+            "object_asset_formats",
             "front_model_image_hw",
         ]:
             object_tensors[key] = object_data[key]
@@ -1537,6 +1545,8 @@ class WaymoEditDataset(Dataset):
         editable_asset_object_ids = [object_tensors["object_asset_ids"][idx] for idx in editable_slots_list]
         editable_scene_raw_object_ids = [object_tensors["object_scene_raw_ids"][idx] for idx in editable_slots_list]
         editable_asset_paths = [object_tensors["object_asset_paths"][idx] for idx in editable_slots_list]
+        editable_asset_layouts = [object_tensors["object_asset_layouts"][idx] for idx in editable_slots_list]
+        editable_asset_formats = [object_tensors["object_asset_formats"][idx] for idx in editable_slots_list]
         editable_asset_image_paths = [
             object_tensors["object_asset_image_paths_selected"][idx]
             for idx in editable_slots_list
@@ -1589,6 +1599,8 @@ class WaymoEditDataset(Dataset):
                 "editable_asset_object_ids": editable_asset_object_ids,
                 "editable_scene_raw_object_ids": editable_scene_raw_object_ids,
                 "editable_asset_paths": editable_asset_paths,
+                "editable_asset_layouts": editable_asset_layouts,
+                "editable_asset_formats": editable_asset_formats,
                 "editable_asset_image_paths": editable_asset_image_paths,
                 "editable_scene_match_scores": editable_scene_match_scores,
                 "selected_asset_path": selected_asset_path,

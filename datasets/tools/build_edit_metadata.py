@@ -28,6 +28,7 @@ CAM_NAME_TO_ID = {
 }
 DEFAULT_CLIP_LENGTH = 29
 DEFAULT_FINAL_INFO_PATH = Path(__file__).resolve().parents[2] / "data" / "final_info.json"
+DEFAULT_ASSET_ROOT = Path("/data/disk2/lyy_dataset/test_transfer/objects_ply_transformed")
 DEFAULT_TRANSFER_HW = (704, 1280)
 TRANSFER_BOX_LONG_EDGE_PX = float(max(DEFAULT_TRANSFER_HW))
 MIN_EDIT_BOX_SIZE_PX = TRANSFER_BOX_LONG_EDGE_PX / 10.0
@@ -180,18 +181,51 @@ def parse_spz_asset_filename(path: Path):
     }
 
 
-def build_asset_index(asset_root: Path):
+def _make_fixed_asset_entry(path: Path):
+    return {
+        "asset_layout": "fixed",
+        "asset_format": path.suffix.lower().lstrip("."),
+        "view_name": None,
+        "clip_name": None,
+        "global_frame_idx": None,
+        "path": str(path),
+    }
+
+
+def build_asset_index(asset_root: Path, asset_format: str = "auto"):
     asset_index = {}
     if not asset_root.is_dir():
         raise FileNotFoundError(f"Asset root not found: {asset_root}")
+
+    asset_format = str(asset_format).lower()
+    if asset_format not in ("auto", "ply", "spz"):
+        raise ValueError(f"Unsupported asset_format={asset_format}; expected auto, ply, or spz")
+
+    if asset_format in ("auto", "ply"):
+        for ply_path in sorted(asset_root.glob("*.ply")):
+            if ply_path.is_file():
+                asset_index[ply_path.stem] = [_make_fixed_asset_entry(ply_path)]
+
     for object_dir in sorted(asset_root.iterdir()):
         if not object_dir.is_dir():
             continue
+
+        if asset_format in ("auto", "ply"):
+            ply_assets = sorted(path for path in object_dir.glob("*.ply") if path.is_file())
+            if ply_assets:
+                asset_index[object_dir.name] = [_make_fixed_asset_entry(ply_assets[0])]
+                continue
+
+        if asset_format == "ply":
+            continue
+
         parsed_assets = []
         for spz_path in sorted(object_dir.glob("*.spz")):
             parsed = parse_spz_asset_filename(spz_path)
             if parsed is None:
                 continue
+            parsed["asset_layout"] = "frame_matched"
+            parsed["asset_format"] = "spz"
             parsed_assets.append(parsed)
         if parsed_assets:
             asset_index[object_dir.name] = parsed_assets
@@ -201,6 +235,10 @@ def build_asset_index(asset_root: Path):
 def choose_best_asset_match(asset_entries, camera_name: str, clip_name: str, global_frame_idx: int):
     if len(asset_entries) == 0:
         return None
+
+    fixed_entries = [entry for entry in asset_entries if entry.get("asset_layout") == "fixed"]
+    if len(fixed_entries) > 0:
+        return min(fixed_entries, key=lambda entry: str(entry["path"]))
 
     target_view = CAMERA_NAME_TO_ASSET_VIEW.get(camera_name, "")
     candidate_a = [entry for entry in asset_entries if entry["view_name"] == target_view]
@@ -628,7 +666,8 @@ def build_clip_candidate(
                     continue
                 matched_paths.append(str(matched_asset["path"]))
                 matched_valid.append(True)
-                matched_global_frames.append(int(matched_asset["global_frame_idx"]))
+                matched_frame = matched_asset.get("global_frame_idx")
+                matched_global_frames.append(None if matched_frame is None else int(matched_frame))
             boxes_by_view_transfer[camera_name] = transfer_sequence
             boxes_by_view_raw[camera_name] = raw_sequence
             boxes_by_view_model[camera_name] = model_sequence
@@ -655,6 +694,8 @@ def build_clip_candidate(
                 "scene_raw_object_id": asset_object_id,
                 "asset_dir": str(Path(object_asset_entries[0]["path"]).parent),
                 "asset_path": str(representative_asset_path),
+                "asset_layout": str(object_asset_entries[0].get("asset_layout", "frame_matched")),
+                "asset_format": str(object_asset_entries[0].get("asset_format", Path(representative_asset_path).suffix.lower().lstrip("."))),
                 "contig_instance_id": int(scene_object["contig_instance_id"]),
                 "class_name": str(scene_object["class_name"]),
                 "match_score": 1.0,
@@ -818,7 +859,17 @@ def parse_args():
     )
     parser.add_argument("--split", type=str, required=True, choices=["training", "validation"])
     parser.add_argument("--final_info_path", type=str, default=str(DEFAULT_FINAL_INFO_PATH))
-    parser.add_argument("--asset_root", type=str, required=True)
+    parser.add_argument("--asset_root", type=str, default=str(DEFAULT_ASSET_ROOT))
+    parser.add_argument(
+        "--asset_format",
+        type=str,
+        default="auto",
+        choices=["auto", "ply", "spz"],
+        help=(
+            "Asset discovery mode. Default auto keeps legacy root-level object_id.ply "
+            "assets when present and also supports object_id/*.spz frame-matched assets."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -837,7 +888,7 @@ def main():
         raise ValueError(f"{final_info_path} does not contain a list")
 
     scene_index = load_scene_index(processed_root, args.split)
-    asset_index = build_asset_index(asset_root)
+    asset_index = build_asset_index(asset_root, asset_format=args.asset_format)
     scene_context_cache = {}
 
     scene_name_to_index = {}
@@ -852,6 +903,7 @@ def main():
         "split": args.split,
         "final_info_path": str(final_info_path),
         "asset_root": str(asset_root),
+        "asset_format": str(args.asset_format),
         "processed_root": str(processed_root),
         "box_coordinate_space": f"transfer_{DEFAULT_TRANSFER_HW[0]}x{DEFAULT_TRANSFER_HW[1]}",
         "transfer_image_size_hw": list(DEFAULT_TRANSFER_HW),
