@@ -1,0 +1,609 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
+
+from datasets.waymo_edit_dataset import (
+    DEFAULT_ASSET_ROOT,
+    DEFAULT_PROCESSED_ROOT,
+    DEFAULT_RAW_ROOT,
+    DEFAULT_TRANSFER_ROOT,
+    WaymoEditDataset,
+)
+from dggt.models.gaussian_scene_editor import GaussianSceneEditor
+from dggt.utils.gs import concat_list
+from dggt.utils.mode_b_planner import ModeBPlanner, apply_mode_b
+from inference_scene_editor import (
+    _load_model,
+    _make_pil_grid,
+    _predict_camera_mats,
+    _render_background,
+    _render_clean_with_dggt,
+    _repeat_timestamps_for_views,
+    _rasterize_scene,
+    _save_grid,
+    _tensor_to_pil_rgb,
+    alpha_t,
+)
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Single-sample Mode B pseudo deletion debug runner.")
+    parser.add_argument("--index", type=int, required=True, help="WaymoEditDataset sample index.")
+    parser.add_argument("--output_dir", type=str, required=True, help="Where to write debug outputs.")
+    parser.add_argument(
+        "--ckpt_path",
+        type=str,
+        default="/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt",
+        help="DGGT checkpoint path.",
+    )
+    parser.add_argument("--split", type=str, default="training")
+    parser.add_argument("--views", type=int, default=1, choices=[1, 3])
+    parser.add_argument("--dataset_mode", type=int, default=2)
+    parser.add_argument("--sequence_length", type=int, default=29)
+    parser.add_argument("--processed_root", type=str, default=DEFAULT_PROCESSED_ROOT)
+    parser.add_argument("--transfer_root", type=str, default=DEFAULT_TRANSFER_ROOT)
+    parser.add_argument("--raw_root", type=str, default=DEFAULT_RAW_ROOT)
+    parser.add_argument("--asset_root", type=str, default=DEFAULT_ASSET_ROOT)
+    parser.add_argument("--mode_b_manifest", type=str, default=None)
+    parser.add_argument("--mode_b_candidate_path", type=str, default=None)
+    parser.add_argument("--render_max_points", type=int, default=250000)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--planner_seed", type=int, default=None)
+    parser.add_argument("--num_objects_target", type=int, default=None)
+    parser.add_argument("--max_trials_per_object", type=int, default=80)
+    parser.add_argument("--min_visible_frames", type=int, default=15)
+    parser.add_argument("--max_semantic_overlap_px", type=int, default=50)
+    parser.add_argument("--min_projected_transfer_size_px", type=float, default=128.0)
+    parser.add_argument("--max_projected_area_ratio", type=float, default=0.12)
+    parser.add_argument("--max_projected_width_ratio", type=float, default=0.45)
+    parser.add_argument("--max_projected_height_ratio", type=float, default=0.52)
+    parser.add_argument("--min_projected_top_y_ratio", type=float, default=0.20)
+    parser.add_argument("--min_projected_center_y_ratio", type=float, default=0.35)
+    parser.add_argument("--min_projected_bottom_y_ratio", type=float, default=0.50)
+    parser.add_argument("--max_projected_bottom_y_ratio", type=float, default=0.92)
+    parser.add_argument("--min_ground_support_ratio", type=float, default=0.18)
+    parser.add_argument("--fast_camera_step_ratio", type=float, default=0.018)
+    parser.add_argument("--slow_camera_step_ratio", type=float, default=0.006)
+    parser.add_argument("--skip_render_payload", action="store_true")
+    parser.add_argument("--allow_empty_plan", action="store_true")
+    parser.add_argument("--plan_only", action="store_true")
+    return parser
+
+
+def _default_mode_b_manifest(processed_root: str, split: str, views: int) -> Path:
+    return Path(processed_root) / "waymo_edit_cache" / "manifests" / split / f"{split}_mode_b_views{views}.jsonl"
+
+
+def _default_mode_b_candidates(processed_root: str, split: str) -> Path:
+    return Path(processed_root) / "waymo_edit_cache" / "metadata" / split / "mode_b_candidates.jsonl"
+
+
+def _collect_existing_objects_dggt(sample: dict[str, Any], alignment) -> list[dict[str, Any]]:
+    if "object_valid_mask" not in sample or "object_track_valid_mask_selected" not in sample:
+        return []
+    object_valid = sample["object_valid_mask"].detach().cpu().bool()
+    if object_valid.numel() == 0:
+        return []
+
+    track_valid = sample["object_track_valid_mask_selected"].detach().cpu().bool()
+    obj_to_world = sample["object_obj_to_world_selected"].detach().cpu().float()
+    box_size = sample["object_box_size_selected"].detach().cpu().float()
+    objects = []
+    for slot_idx in range(int(object_valid.shape[0])):
+        if not bool(object_valid[slot_idx].item()):
+            continue
+        present = track_valid[slot_idx]
+        if not bool(present.any().item()):
+            continue
+        centers = []
+        rotations = []
+        sizes = []
+        for frame_idx in range(int(present.shape[0])):
+            if bool(present[frame_idx].item()):
+                transform = obj_to_world[slot_idx, frame_idx]
+                center_waymo = transform[:3, 3].view(1, 3)
+                centers.append(alignment.apply_points(center_waymo)[0])
+                rotations.append(alignment.rotation @ transform[:3, :3])
+                sizes.append(box_size[slot_idx, frame_idx] * float(alignment.scale))
+            else:
+                centers.append(torch.zeros(3, dtype=torch.float32))
+                rotations.append(torch.eye(3, dtype=torch.float32))
+                sizes.append(torch.zeros(3, dtype=torch.float32))
+        first_valid = int(torch.nonzero(present, as_tuple=False).flatten()[0].item())
+        objects.append(
+            {
+                "slot": int(slot_idx),
+                "scene_raw_object_id": str(sample["object_scene_raw_ids"][slot_idx])
+                if "object_scene_raw_ids" in sample
+                else str(slot_idx),
+                "center_dggt_per_frame": torch.stack(centers, dim=0).tolist(),
+                "rotation_dggt_per_frame": torch.stack(rotations, dim=0).tolist(),
+                "size_dggt": sizes[first_valid].tolist(),
+                "present_mask": present.tolist(),
+            }
+        )
+    return objects
+
+
+def _convert_waymo_existing_objects_to_dggt(raw_objects: list[dict[str, Any]], alignment) -> list[dict[str, Any]]:
+    objects = []
+    for obj in raw_objects:
+        obj_to_world_seq = list(obj.get("obj_to_world_waymo", []))
+        box_size_seq = list(obj.get("box_size_waymo", []))
+        present_mask = [bool(v) for v in obj.get("present_mask", [])]
+        if not obj_to_world_seq or not box_size_seq:
+            continue
+        num_frames = min(len(obj_to_world_seq), len(box_size_seq))
+        if not present_mask:
+            present_mask = [True] * num_frames
+        centers = []
+        rotations = []
+        sizes = []
+        for frame_idx in range(num_frames):
+            present = bool(present_mask[frame_idx]) if frame_idx < len(present_mask) else False
+            if present:
+                transform = torch.tensor(obj_to_world_seq[frame_idx], dtype=torch.float32)
+                center_waymo = transform[:3, 3].view(1, 3)
+                centers.append(alignment.apply_points(center_waymo)[0])
+                rotations.append(alignment.rotation @ transform[:3, :3])
+                sizes.append(torch.tensor(box_size_seq[frame_idx], dtype=torch.float32) * float(alignment.scale))
+            else:
+                centers.append(torch.zeros(3, dtype=torch.float32))
+                rotations.append(torch.eye(3, dtype=torch.float32))
+                sizes.append(torch.zeros(3, dtype=torch.float32))
+        objects.append(
+            {
+                "scene_raw_object_id": str(obj.get("scene_raw_object_id", "")),
+                "center_dggt_per_frame": torch.stack(centers, dim=0).tolist(),
+                "rotation_dggt_per_frame": torch.stack(rotations, dim=0).tolist(),
+                "size_dggt_per_frame": torch.stack(sizes, dim=0).tolist(),
+                "present_mask": present_mask[:num_frames],
+            }
+        )
+    return objects
+
+
+def _delete_mask_for_image(
+    delete_mask_per_frame: torch.Tensor,
+    image_idx: int,
+    num_views: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if delete_mask_per_frame.numel() == 0:
+        return torch.zeros((delete_mask_per_frame.shape[-1],), dtype=torch.bool, device=device)
+    frame_idx = min(int(image_idx) // max(int(num_views), 1), delete_mask_per_frame.shape[0] - 1)
+    return delete_mask_per_frame[frame_idx].to(device).bool()
+
+
+def _render_edited_sequence_with_frame_masks(
+    model,
+    sample: dict[str, Any],
+    predictions: dict[str, torch.Tensor],
+    clean_state,
+    delete_mask_per_frame: torch.Tensor,
+    device: torch.device,
+    *,
+    return_aux: bool = False,
+) -> torch.Tensor | dict[str, torch.Tensor]:
+    images = sample["images_clean"].unsqueeze(0).to(device)
+    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
+    extrinsic, intrinsic = _predict_camera_mats(predictions, image_hw, device)
+    bg_render = _render_background(model, images, extrinsic, intrinsic)
+    timestamps = _repeat_timestamps_for_views(sample, clean_state.images.shape[0]).to(device)
+
+    means = clean_state.means.to(device).float()
+    colors = clean_state.colors.to(device).float()
+    opacities = clean_state.opacities.to(device).float().view(-1)
+    scales = clean_state.scales.to(device).float()
+    quats = clean_state.quats.to(device).float()
+    gs_conf = clean_state.gs_conf.to(device).float()
+    dynamic_prob = clean_state.dynamic_prob.to(device).float()
+    source_image_ids = clean_state.source_image_ids.to(device)
+    num_views = int(sample["cam_ids"].numel())
+
+    render_chunks = []
+    alpha_chunks = []
+    depth_chunks = []
+    for image_idx in range(clean_state.images.shape[0]):
+        delete_mask = _delete_mask_for_image(delete_mask_per_frame, image_idx, num_views, device)
+        keep_mask = ~delete_mask
+
+        static_mask = keep_mask & (dynamic_prob < 0.5)
+        static_points = means[static_mask]
+        static_rgbs = colors[static_mask]
+        static_opacity = opacities[static_mask] * (1.0 - dynamic_prob[static_mask])
+        static_scales = scales[static_mask]
+        static_rotations = quats[static_mask]
+        static_gs_conf = gs_conf[static_mask]
+        gs_timestamps = (
+            timestamps[source_image_ids[static_mask]]
+            if static_mask.any()
+            else torch.zeros((0,), dtype=torch.float32, device=device)
+        )
+
+        dynamic_mask = keep_mask & (source_image_ids == image_idx)
+        dynamic_points = means[dynamic_mask]
+        dynamic_rgbs = colors[dynamic_mask]
+        dynamic_opacity = opacities[dynamic_mask] * dynamic_prob[dynamic_mask]
+        dynamic_scales = scales[dynamic_mask]
+        dynamic_rotations = quats[dynamic_mask]
+
+        if static_points.numel() > 0:
+            t0 = timestamps[image_idx]
+            static_opacity_t = alpha_t(gs_timestamps, t0, static_opacity, gamma0=static_gs_conf)
+            world_points, rgbs, opacity, scales_t, rotation = concat_list(
+                [static_points, static_rgbs, static_opacity_t, static_scales, static_rotations],
+                [dynamic_points, dynamic_rgbs, dynamic_opacity, dynamic_scales, dynamic_rotations],
+            )
+        else:
+            world_points, rgbs, opacity, scales_t, rotation = (
+                dynamic_points,
+                dynamic_rgbs,
+                dynamic_opacity,
+                dynamic_scales,
+                dynamic_rotations,
+            )
+        renders_chunk, alphas = _rasterize_scene(
+            means=world_points,
+            rgbs=rgbs,
+            opacity=opacity,
+            scales=scales_t,
+            rotation=rotation,
+            viewmat=extrinsic[image_idx : image_idx + 1],
+            intrinsic=intrinsic[image_idx : image_idx + 1],
+            height=image_hw[0],
+            width=image_hw[1],
+        )
+        render_chunks.append(renders_chunk[..., :-1])
+        alpha_chunks.append(alphas[..., 0])
+        depth_chunks.append(renders_chunk[..., -1])
+
+    foreground = torch.cat(render_chunks, dim=0)
+    alphas = torch.cat(alpha_chunks, dim=0).unsqueeze(-1)
+    renders = alphas * foreground + (1.0 - alphas) * bg_render
+    renders_chw = renders.permute(0, 3, 1, 2).detach().cpu().float().clamp(0.0, 1.0)
+    if not return_aux:
+        return renders_chw
+    return {
+        "composed": renders_chw,
+        "foreground": foreground.permute(0, 3, 1, 2).detach().cpu().float().clamp(0.0, 1.0),
+        "alpha": alphas[..., 0].detach().cpu().float().clamp(0.0, 1.0),
+        "depth": torch.cat(depth_chunks, dim=0).detach().cpu().float(),
+    }
+
+
+def _render_deleted_alpha_sequence(
+    sample: dict[str, Any],
+    predictions: dict[str, torch.Tensor],
+    clean_state,
+    delete_mask_per_frame: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
+    extrinsic, intrinsic = _predict_camera_mats(predictions, image_hw, device)
+    timestamps = _repeat_timestamps_for_views(sample, clean_state.images.shape[0]).to(device)
+
+    means = clean_state.means.to(device).float()
+    colors = clean_state.colors.to(device).float()
+    opacities = clean_state.opacities.to(device).float().view(-1)
+    scales = clean_state.scales.to(device).float()
+    quats = clean_state.quats.to(device).float()
+    gs_conf = clean_state.gs_conf.to(device).float()
+    dynamic_prob = clean_state.dynamic_prob.to(device).float()
+    source_image_ids = clean_state.source_image_ids.to(device)
+    num_views = int(sample["cam_ids"].numel())
+
+    alpha_chunks = []
+    for image_idx in range(clean_state.images.shape[0]):
+        selected_mask = _delete_mask_for_image(delete_mask_per_frame, image_idx, num_views, device)
+
+        static_mask = selected_mask & (dynamic_prob < 0.5)
+        static_points = means[static_mask]
+        static_rgbs = colors[static_mask]
+        static_opacity = opacities[static_mask] * (1.0 - dynamic_prob[static_mask])
+        static_scales = scales[static_mask]
+        static_rotations = quats[static_mask]
+        static_gs_conf = gs_conf[static_mask]
+        gs_timestamps = (
+            timestamps[source_image_ids[static_mask]]
+            if static_mask.any()
+            else torch.zeros((0,), dtype=torch.float32, device=device)
+        )
+
+        dynamic_mask = selected_mask & (source_image_ids == image_idx)
+        dynamic_points = means[dynamic_mask]
+        dynamic_rgbs = colors[dynamic_mask]
+        dynamic_opacity = opacities[dynamic_mask] * dynamic_prob[dynamic_mask]
+        dynamic_scales = scales[dynamic_mask]
+        dynamic_rotations = quats[dynamic_mask]
+
+        if static_points.numel() > 0:
+            t0 = timestamps[image_idx]
+            static_opacity_t = alpha_t(gs_timestamps, t0, static_opacity, gamma0=static_gs_conf)
+            world_points, rgbs, opacity, scales_t, rotation = concat_list(
+                [static_points, static_rgbs, static_opacity_t, static_scales, static_rotations],
+                [dynamic_points, dynamic_rgbs, dynamic_opacity, dynamic_scales, dynamic_rotations],
+            )
+        else:
+            world_points, rgbs, opacity, scales_t, rotation = (
+                dynamic_points,
+                dynamic_rgbs,
+                dynamic_opacity,
+                dynamic_scales,
+                dynamic_rotations,
+            )
+        _, alphas = _rasterize_scene(
+            means=world_points,
+            rgbs=rgbs,
+            opacity=opacity,
+            scales=scales_t,
+            rotation=rotation,
+            viewmat=extrinsic[image_idx : image_idx + 1],
+            intrinsic=intrinsic[image_idx : image_idx + 1],
+            height=image_hw[0],
+            width=image_hw[1],
+        )
+        alpha_chunks.append(alphas[..., 0])
+    return torch.cat(alpha_chunks, dim=0).detach().cpu().float().clamp(0.0, 1.0)
+
+
+def _alpha_heatmap(alpha: torch.Tensor) -> torch.Tensor:
+    alpha = alpha.detach().cpu().float().clamp(0.0, 1.0)
+    return torch.stack([alpha, alpha * 0.55, torch.zeros_like(alpha)], dim=1).clamp(0.0, 1.0)
+
+
+def _save_imagined_boxes_overlay(
+    clean_images: torch.Tensor,
+    plan,
+    output_path: Path,
+    *,
+    semantic_mask=None,
+    nrow: int | None = None,
+) -> None:
+    pil_images = [_tensor_to_pil_rgb(image) for image in clean_images]
+    num_views = int(plan.views)
+    colors = [(255, 64, 64), (255, 200, 0), (0, 200, 255), (255, 0, 255), (80, 255, 120)]
+
+    if semantic_mask is not None:
+        semantic = semantic_mask.detach().cpu().bool()
+        for idx, image in enumerate(pil_images):
+            if idx >= semantic.shape[0]:
+                continue
+            mask = semantic[idx]
+            if not bool(mask.any().item()):
+                continue
+            mask_img = Image.fromarray(mask.numpy().astype(np.uint8) * 255, mode="L")
+            color_img = image.copy()
+            ImageDraw.Draw(color_img).rectangle((0, 0, image.size[0], image.size[1]), fill=(0, 190, 80))
+            blended = Image.blend(image, color_img, 0.35)
+            pil_images[idx] = Image.composite(blended, image, mask_img)
+
+    for obj in plan.imagined_objects:
+        color = colors[int(obj.slot) % len(colors)]
+        for frame_idx in range(obj.bbox_2d_per_view.shape[0]):
+            for view_idx in range(obj.bbox_2d_per_view.shape[1]):
+                if not bool(obj.visible_in_frame_per_view[view_idx, frame_idx].item()):
+                    continue
+                image_idx = frame_idx * num_views + view_idx
+                if image_idx >= len(pil_images):
+                    continue
+                box = obj.bbox_2d_per_view[frame_idx, view_idx].tolist()
+                draw = ImageDraw.Draw(pil_images[image_idx])
+                draw.rectangle([float(box[0]), float(box[1]), float(box[2]), float(box[3])], outline=color, width=2)
+    if nrow is None:
+        nrow = num_views if num_views > 1 else min(4, len(pil_images))
+    _make_pil_grid(pil_images, nrow=nrow).save(output_path)
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    torch.manual_seed(args.seed)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = Path(args.mode_b_manifest) if args.mode_b_manifest else _default_mode_b_manifest(
+        args.processed_root,
+        args.split,
+        args.views,
+    )
+    candidate_path = Path(args.mode_b_candidate_path) if args.mode_b_candidate_path else _default_mode_b_candidates(
+        args.processed_root,
+        args.split,
+    )
+
+    print("[mode_b] loading dataset sample", flush=True)
+    dataset = WaymoEditDataset(
+        processed_root=args.processed_root,
+        transfer_root=args.transfer_root,
+        raw_root=args.raw_root,
+        asset_root=args.asset_root,
+        split=args.split,
+        manifest_path=manifest_path,
+        candidate_path=candidate_path,
+        views=args.views,
+        mode=args.dataset_mode,
+        sequence_length=args.sequence_length,
+    )
+    sample = dataset[args.index]
+    record = dataset.samples[args.index]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[mode_b] loading model on {device}", flush=True)
+    model = _load_model(args.ckpt_path, device)
+    images = sample["images_clean"].unsqueeze(0).to(device)
+    print("[mode_b] running VGGT forward", flush=True)
+    with torch.no_grad():
+        predictions = model(images)
+
+    print("[mode_b] building clean scene", flush=True)
+    editor = GaussianSceneEditor()
+    clean_state = editor.build_clean_bundle(sample, predictions)
+    alignment = editor.align(sample, clean_state)
+    existing_objects = _collect_existing_objects_dggt(sample, alignment)
+    existing_objects.extend(_convert_waymo_existing_objects_to_dggt(record.get("existing_objects", []), alignment))
+    existing_objects.extend(record.get("existing_objects_dggt", []))
+
+    planner_seed = args.planner_seed if args.planner_seed is not None else args.seed + args.index * 1009
+    planner = ModeBPlanner(
+        min_visible_frames=args.min_visible_frames,
+        max_semantic_overlap_px=args.max_semantic_overlap_px,
+        max_trials_per_object=args.max_trials_per_object,
+        min_projected_transfer_size_px=args.min_projected_transfer_size_px,
+        max_projected_area_ratio=args.max_projected_area_ratio,
+        max_projected_width_ratio=args.max_projected_width_ratio,
+        max_projected_height_ratio=args.max_projected_height_ratio,
+        min_projected_top_y_ratio=args.min_projected_top_y_ratio,
+        min_projected_center_y_ratio=args.min_projected_center_y_ratio,
+        min_projected_bottom_y_ratio=args.min_projected_bottom_y_ratio,
+        max_projected_bottom_y_ratio=args.max_projected_bottom_y_ratio,
+        min_ground_support_ratio=args.min_ground_support_ratio,
+        fast_camera_step_ratio=args.fast_camera_step_ratio,
+        slow_camera_step_ratio=args.slow_camera_step_ratio,
+        rng_seed=planner_seed,
+    )
+    print("[mode_b] planning imagined objects", flush=True)
+    plan = planner.plan(
+        clean_state,
+        existing_objects=existing_objects,
+        num_objects_target=args.num_objects_target,
+        views=args.views,
+        scene_name=str(sample["scene_name"]),
+        clip_name=str(sample["clip_name"]),
+        clip_index=int(sample["clip_index"].item() if torch.is_tensor(sample["clip_index"]) else sample["clip_index"]),
+    )
+    if plan.num_imagined_objects == 0 and not args.allow_empty_plan:
+        summary = plan.to_dict()
+        summary.update(
+            {
+                "sample_index": int(args.index),
+                "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
+                "cam_ids": [int(v) for v in sample["cam_ids"].tolist()],
+                "clean_gaussian_count": int(clean_state.means.shape[0]),
+                "deleted_gaussian_count": 0,
+                "delete_core_count": 0,
+                "delete_shell_count": 0,
+                "mode_b_manifest": str(manifest_path),
+                "mode_b_candidate_path": str(candidate_path),
+            }
+        )
+        _write_json(output_dir / "mode_b_summary.json", summary)
+        raise RuntimeError(
+            "Mode B planner accepted zero imagined objects. "
+            "Try a different --index/--planner_seed or relax --min_visible_frames/--max_semantic_overlap_px. "
+            f"Summary written to {output_dir / 'mode_b_summary.json'}."
+        )
+    print(f"[mode_b] accepted {plan.num_imagined_objects} imagined objects", flush=True)
+    if args.plan_only:
+        summary = plan.to_dict()
+        summary.update(
+            {
+                "sample_index": int(args.index),
+                "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
+                "cam_ids": [int(v) for v in sample["cam_ids"].tolist()],
+                "clean_gaussian_count": int(clean_state.means.shape[0]),
+                "deleted_gaussian_count": 0,
+                "delete_core_count": 0,
+                "delete_shell_count": 0,
+                "mode_b_manifest": str(manifest_path),
+                "mode_b_candidate_path": str(candidate_path),
+                "plan_only": True,
+            }
+        )
+        grid_nrow = args.views if args.views > 1 else min(4, int(clean_state.images.shape[0]))
+        _save_grid(clean_state.images, output_dir / "input_images_grid.jpg", nrow=grid_nrow)
+        _save_imagined_boxes_overlay(clean_state.images, plan, output_dir / "imagined_boxes_overlay.jpg", nrow=grid_nrow)
+        _write_json(output_dir / "mode_b_summary.json", summary)
+        print(json.dumps(summary, indent=2), flush=True)
+        return
+    deletion = apply_mode_b(clean_state, plan)
+
+    print("[mode_b] rendering clean/deleted/D_map outputs", flush=True)
+    clean_render = _render_clean_with_dggt(model, sample, predictions, device)
+    deleted_bundle = _render_edited_sequence_with_frame_masks(
+        model,
+        sample,
+        predictions,
+        clean_state,
+        deletion.delete_mask_per_frame,
+        device,
+        return_aux=True,
+    )
+    deleted_render = deleted_bundle["composed"]
+    d_map = _render_deleted_alpha_sequence(sample, predictions, clean_state, deletion.delete_mask_per_frame, device)
+
+    grid_nrow = args.views if args.views > 1 else min(4, int(clean_state.images.shape[0]))
+    _save_grid(clean_state.images, output_dir / "input_images_grid.jpg", nrow=grid_nrow)
+    _save_grid(clean_render, output_dir / "clean_render_grid.jpg", nrow=grid_nrow)
+    _save_grid(deleted_render, output_dir / "deleted_render_grid.jpg", nrow=grid_nrow)
+    _save_grid(_alpha_heatmap(d_map), output_dir / "d_map_grid.jpg", nrow=grid_nrow)
+    _save_imagined_boxes_overlay(clean_state.images, plan, output_dir / "imagined_boxes_overlay.jpg", nrow=grid_nrow)
+    _save_imagined_boxes_overlay(
+        clean_state.images,
+        plan,
+        output_dir / "semantic_vehicle_mask_overlay.jpg",
+        semantic_mask=clean_state.semantic_vehicle_mask,
+        nrow=grid_nrow,
+    )
+
+    num_images, height, width = d_map.shape
+    num_views = int(args.views)
+    num_frames = num_images // num_views if num_images % num_views == 0 else num_images
+    d_map_view = d_map.view(num_frames, num_views, height, width) if num_frames * num_views == num_images else d_map
+    d_map_low37 = F.interpolate(
+        d_map.view(num_images, 1, height, width),
+        size=(37, 37),
+        mode="bilinear",
+        align_corners=False,
+    ).view(num_frames, num_views, 37, 37) if num_frames * num_views == num_images else torch.empty(0)
+
+    payload = {
+        "config": plan.to_dict(),
+        "delete_mask_per_frame": deletion.delete_mask_per_frame,
+        "delete_core_indices": deletion.delete_core_indices.to(torch.int32),
+        "delete_shell_indices": deletion.delete_shell_indices.to(torch.int32),
+        "D_map": d_map_view.half(),
+        "D_map_low37": d_map_low37.half(),
+    }
+    if not args.skip_render_payload:
+        payload["pseudo_deleted_render"] = (
+            deleted_render.view(num_frames, num_views, 3, height, width).mul(255.0).clamp(0, 255).to(torch.uint8)
+            if num_frames * num_views == num_images
+            else deleted_render.mul(255.0).clamp(0, 255).to(torch.uint8)
+        )
+    torch.save(payload, output_dir / "mode_b_dmap.pt")
+
+    summary = plan.to_dict()
+    summary.update(
+        {
+            "sample_index": int(args.index),
+            "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
+            "cam_ids": [int(v) for v in sample["cam_ids"].tolist()],
+            "clean_gaussian_count": int(clean_state.means.shape[0]),
+            "deleted_gaussian_count": int(deletion.delete_mask.sum().item()),
+            "delete_core_count": int(deletion.delete_core_indices.numel()),
+            "delete_shell_count": int(deletion.delete_shell_indices.numel()),
+            "mode_b_manifest": str(manifest_path),
+            "mode_b_candidate_path": str(candidate_path),
+        }
+    )
+    _write_json(output_dir / "mode_b_summary.json", summary)
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()

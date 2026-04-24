@@ -458,7 +458,7 @@ def _score_projected_bbox(box_pred: torch.Tensor, box_target: torch.Tensor) -> f
     return iou - 0.35 * center_penalty - 0.35 * size_penalty
 
 
-def _points_in_box(
+def points_in_box(
     points: torch.Tensor,
     center: torch.Tensor,
     rotation: torch.Tensor,
@@ -468,6 +468,16 @@ def _points_in_box(
     local = (points - center) @ rotation
     half = size * (0.5 * scale)
     return (local.abs() <= (half + 1e-5)).all(dim=-1)
+
+
+def _points_in_box(
+    points: torch.Tensor,
+    center: torch.Tensor,
+    rotation: torch.Tensor,
+    size: torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    return points_in_box(points, center, rotation, size, scale=scale)
 
 
 def _transform_track_box(

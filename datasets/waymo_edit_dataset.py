@@ -1508,11 +1508,17 @@ class WaymoEditDataset(Dataset):
             1,
             selected_indices,
         )
-        object_tensors["object_asset_image_valid_mask_selected"] = (
-            object_data["object_asset_image_valid_mask"]
-            .index_select(1, selected_indices)
-            .reshape(self.max_objects, -1)
-        )
+        selected_asset_valid = object_data["object_asset_image_valid_mask"].index_select(1, selected_indices)
+        if self.max_objects == 0:
+            object_tensors["object_asset_image_valid_mask_selected"] = selected_asset_valid.reshape(
+                0,
+                int(selected_indices.numel()) * len(self.camera_ids),
+            )
+        else:
+            object_tensors["object_asset_image_valid_mask_selected"] = selected_asset_valid.reshape(
+                self.max_objects,
+                -1,
+            )
         object_tensors["object_asset_image_paths_selected"] = self._select_object_asset_image_paths(
             object_data["object_asset_image_paths"],
             selected_indices,
