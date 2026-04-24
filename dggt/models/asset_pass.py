@@ -148,33 +148,40 @@ def apply_pointer_fallback(
 
         frame_i = int(image_to_frame[image_idx].item())
         view_i = int(image_to_view[image_idx].item())
-        invisible_ids = torch.nonzero(~visible, as_tuple=False).flatten().tolist()
-        for gauss_idx in invisible_ids:
-            best_key: tuple[int, int, int, int] | None = None
-            best_image_idx: int | None = None
-            for cand_idx in range(num_images):
-                cand_visible = visible_mask_per_image[cand_idx].detach().cpu().bool()
-                cand_patch = patch_idx_per_image[cand_idx].detach().cpu().long()
-                if cand_visible.shape[0] != patch_idx.shape[0] or cand_patch.shape[0] != patch_idx.shape[0]:
-                    continue
-                if not bool(cand_visible[gauss_idx].item()):
-                    continue
-                frame_c = int(image_to_frame[cand_idx].item())
-                view_c = int(image_to_view[cand_idx].item())
-                cand_key = (
-                    abs(frame_i - frame_c),
-                    0 if view_i == view_c else 1,
-                    abs(image_idx - cand_idx),
-                    cand_idx,
-                )
-                if best_key is None or cand_key < best_key:
-                    best_key = cand_key
-                    best_image_idx = cand_idx
-            if best_image_idx is not None:
-                view_n[gauss_idx] = int(best_image_idx)
-                patch_idx[gauss_idx] = int(
-                    patch_idx_per_image[best_image_idx].detach().cpu().long()[gauss_idx].item()
-                )
+        best_rank = torch.full_like(patch_idx, torch.iinfo(torch.long).max)
+        best_image_idx = torch.full_like(patch_idx, -1)
+        for cand_idx in range(num_images):
+            cand_visible = visible_mask_per_image[cand_idx].detach().cpu().bool()
+            cand_patch = patch_idx_per_image[cand_idx].detach().cpu().long()
+            if cand_visible.shape[0] != patch_idx.shape[0] or cand_patch.shape[0] != patch_idx.shape[0]:
+                continue
+            frame_c = int(image_to_frame[cand_idx].item())
+            view_c = int(image_to_view[cand_idx].item())
+            rank = (
+                abs(frame_i - frame_c) * 1_000_000
+                + (0 if view_i == view_c else 1) * 10_000
+                + abs(image_idx - cand_idx) * 100
+                + cand_idx
+            )
+            update = cand_visible & (rank < best_rank)
+            best_rank[update] = int(rank)
+            best_image_idx[update] = int(cand_idx)
+
+        fallback_mask = (~visible) & (best_image_idx >= 0)
+        if bool(fallback_mask.any().item()):
+            fallback_ids = torch.nonzero(fallback_mask, as_tuple=False).flatten()
+            fallback_images = best_image_idx[fallback_ids]
+            patch_bank = torch.stack(
+                [
+                    patch_idx_per_image[cand_idx].detach().cpu().long()
+                    if patch_idx_per_image[cand_idx].shape[0] == patch_idx.shape[0]
+                    else torch.zeros_like(patch_idx)
+                    for cand_idx in range(num_images)
+                ],
+                dim=0,
+            )
+            view_n[fallback_ids] = fallback_images
+            patch_idx[fallback_ids] = patch_bank[fallback_images, fallback_ids]
         adjusted_view_n.append(view_n)
         adjusted_patch_idx.append(patch_idx)
 
@@ -204,6 +211,7 @@ class AssetAggregatorPass(nn.Module):
         alignment: Sim3Transform | None = None,
         asset_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         occlusion_test: bool = True,
+        aggregator_batch_size: int = 0,
     ) -> AssetPassResult:
         images_clean = sample["images_clean"]
         if images_clean.dim() != 4:
@@ -219,10 +227,87 @@ class AssetAggregatorPass(nn.Module):
         cache = {} if asset_cache is None else asset_cache
 
         object_keys: list[int] = []
-        object_renders: list[torch.Tensor] = []
-        object_alpha_renders: list[torch.Tensor] = []
-        object_depth_renders: list[torch.Tensor] = []
         G_asset_waymo: dict[int, list[dict[str, torch.Tensor]]] = {}
+        patch_start_idx = int(getattr(self.aggregator, "patch_start_idx", 0))
+
+        F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
+        I_asset: dict[int, torch.Tensor] = {}
+        A_asset: dict[int, torch.Tensor] = {}
+        ptr_asset: dict[int, list[GaussianPointers]] = {}
+        G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] | None = {} if alignment is not None else None
+
+        batch_size = int(aggregator_batch_size)
+        if batch_size <= 0:
+            batch_size = max(1, len(candidate_slots))
+        patch_start_idx_out = int(patch_start_idx)
+
+        pending_keys: list[int] = []
+        pending_renders: list[torch.Tensor] = []
+        pending_alpha_renders: list[torch.Tensor] = []
+        pending_depth_renders: list[torch.Tensor] = []
+        pending_gaussians: list[list[dict[str, torch.Tensor]]] = []
+
+        def _to_cpu_gaussian_sequence(
+            gauss_seq: Sequence[dict[str, torch.Tensor]],
+        ) -> list[dict[str, torch.Tensor]]:
+            return [
+                {name: value.detach().cpu().contiguous() for name, value in gauss.items()}
+                for gauss in gauss_seq
+            ]
+
+        def _flush_pending() -> None:
+            nonlocal patch_start_idx_out
+            if len(pending_keys) == 0:
+                return
+
+            render_batch = torch.stack(pending_renders, dim=0)
+            _, image_tokens_all, _, _, patch_start_idx = self.aggregator(render_batch)
+            patch_tokens = select_patch_pyramid(image_tokens_all, self.levels, patch_start_idx)
+            patch_start_idx_out = int(patch_start_idx)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+            for object_batch_idx, slot_idx in enumerate(pending_keys):
+                F_g_lut_asset[int(slot_idx)] = [
+                    level_tokens[object_batch_idx : object_batch_idx + 1].detach().cpu().contiguous()
+                    for level_tokens in patch_tokens
+                ]
+
+            for object_batch_idx, slot_idx in enumerate(pending_keys):
+                alpha_seq = pending_alpha_renders[object_batch_idx]
+                depth_seq = pending_depth_renders[object_batch_idx]
+                gauss_seq = pending_gaussians[object_batch_idx]
+                ptr_asset[int(slot_idx)] = self._annotate_object_pointers(
+                    object_id=int(slot_idx),
+                    gaussians_seq=gauss_seq,
+                    cameras_waymo=cameras_waymo,
+                    patch_grid=patch_grid,
+                    alpha_seq=alpha_seq,
+                    depth_seq=depth_seq,
+                    occlusion_test=occlusion_test,
+                )
+                gauss_seq_cpu = _to_cpu_gaussian_sequence(gauss_seq)
+                G_asset_waymo[int(slot_idx)] = gauss_seq_cpu
+                if G_asset_dggt is not None:
+                    G_asset_dggt[int(slot_idx)] = [
+                        apply_sim3_to_gaussian_dict(gauss, alignment)
+                        for gauss in gauss_seq_cpu
+                    ]
+                I_asset[int(slot_idx)] = (
+                    pending_renders[object_batch_idx].detach().cpu().unsqueeze(0).contiguous()
+                )
+                A_asset[int(slot_idx)] = (
+                    alpha_seq.detach().cpu().unsqueeze(0).contiguous()
+                )
+
+            del image_tokens_all, patch_tokens, render_batch
+            pending_keys.clear()
+            pending_renders.clear()
+            pending_alpha_renders.clear()
+            pending_depth_renders.clear()
+            pending_gaussians.clear()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         for slot_idx in candidate_slots:
             if not self._is_valid_asset_slot(sample, slot_idx):
@@ -241,63 +326,21 @@ class AssetAggregatorPass(nn.Module):
                 continue
 
             object_keys.append(int(slot_idx))
-            G_asset_waymo[int(slot_idx)] = gauss_seq
-            object_renders.append(torch.stack(rgb_seq, dim=0))
-            object_alpha_renders.append(torch.stack(alpha_seq, dim=0))
-            object_depth_renders.append(torch.stack(depth_seq, dim=0))
+            pending_keys.append(int(slot_idx))
+            pending_gaussians.append(gauss_seq)
+            pending_renders.append(torch.stack(rgb_seq, dim=0))
+            pending_alpha_renders.append(torch.stack(alpha_seq, dim=0))
+            pending_depth_renders.append(torch.stack(depth_seq, dim=0))
+            if len(pending_keys) >= batch_size:
+                _flush_pending()
 
-        patch_start_idx = int(getattr(self.aggregator, "patch_start_idx", 0))
-        if len(object_keys) == 0:
-            return AssetPassResult(
-                patch_grid=patch_grid,
-                patch_start_idx=patch_start_idx,
-                object_keys=[],
-                cameras_waymo=cameras_waymo,
-                F_g_lut_asset={},
-                ptr_asset={},
-                G_asset_waymo={},
-                G_asset_dggt={} if alignment is not None else None,
-                I_asset={},
-                A_asset={},
-            )
-
-        render_batch = torch.stack(object_renders, dim=0)
-        _, image_tokens_all, _, _, patch_start_idx = self.aggregator(render_batch)
-        patch_tokens = select_patch_pyramid(image_tokens_all, self.levels, patch_start_idx)
-
-        F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
-        I_asset: dict[int, torch.Tensor] = {}
-        A_asset: dict[int, torch.Tensor] = {}
-        ptr_asset: dict[int, list[GaussianPointers]] = {}
-        G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] | None = {} if alignment is not None else None
-
-        for object_batch_idx, slot_idx in enumerate(object_keys):
-            F_g_lut_asset[int(slot_idx)] = [
-                level_tokens[object_batch_idx : object_batch_idx + 1].contiguous()
-                for level_tokens in patch_tokens
-            ]
-            I_asset[int(slot_idx)] = object_renders[object_batch_idx].unsqueeze(0).contiguous()
-            A_asset[int(slot_idx)] = object_alpha_renders[object_batch_idx].unsqueeze(0).contiguous()
-            ptr_asset[int(slot_idx)] = self._annotate_object_pointers(
-                object_id=int(slot_idx),
-                gaussians_seq=G_asset_waymo[int(slot_idx)],
-                cameras_waymo=cameras_waymo,
-                patch_grid=patch_grid,
-                alpha_seq=object_alpha_renders[object_batch_idx],
-                depth_seq=object_depth_renders[object_batch_idx],
-                occlusion_test=occlusion_test,
-            )
-            if G_asset_dggt is not None:
-                G_asset_dggt[int(slot_idx)] = [
-                    apply_sim3_to_gaussian_dict(gauss, alignment)
-                    for gauss in G_asset_waymo[int(slot_idx)]
-                ]
+        _flush_pending()
 
         return AssetPassResult(
             patch_grid=patch_grid,
-            patch_start_idx=int(patch_start_idx),
+            patch_start_idx=patch_start_idx_out,
             object_keys=object_keys,
-            cameras_waymo=cameras_waymo,
+            cameras_waymo={k: v.detach().cpu() for k, v in cameras_waymo.items()},
             F_g_lut_asset=F_g_lut_asset,
             ptr_asset=ptr_asset,
             G_asset_waymo=G_asset_waymo,

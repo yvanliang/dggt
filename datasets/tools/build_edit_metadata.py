@@ -834,6 +834,7 @@ def build_manifest_entry(candidate: dict, *, views: int):
         else candidate["num_front3_present_frames"]
     )
     return {
+        "index": -1,
         "record_index": int(candidate["record_index"]),
         "scene_id": int(candidate["scene_id"]),
         "scene_dir": str(candidate["scene_dir"]),
@@ -844,6 +845,12 @@ def build_manifest_entry(candidate: dict, *, views: int):
         "editable_frames": int(editable_frames),
         "present_frames": int(present_frames),
     }
+
+
+def assign_manifest_indices(records: list[dict]) -> list[dict]:
+    for idx, record in enumerate(records):
+        record["index"] = int(idx)
+    return records
 
 
 def parse_args():
@@ -1009,8 +1016,8 @@ def main():
     write_jsonl(metadata_root / "mode_a_candidates.jsonl", mode_a_candidates)
     write_json(metadata_root / "metadata_summary.json", summary)
 
-    write_jsonl(manifest_root / f"{args.split}_mode_a_views1.jsonl", manifest_views1)
-    write_jsonl(manifest_root / f"{args.split}_mode_a_views3.jsonl", manifest_views3)
+    write_jsonl(manifest_root / f"{args.split}_mode_a_views1.jsonl", assign_manifest_indices(manifest_views1))
+    write_jsonl(manifest_root / f"{args.split}_mode_a_views3.jsonl", assign_manifest_indices(manifest_views3))
     write_json(
         manifest_root / "manifest_summary.json",
         {

@@ -110,12 +110,12 @@ class SoftMaskBuilder(nn.Module):
         K_map: torch.Tensor,
         D_map: torch.Tensor,
         I_map: torch.Tensor,
-        target_grid: int = 37,
+        target_grid: int | tuple[int, int] = 37,
         eps: float = 1e-4,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Area-pool coverage maps to `target_grid` and normalize to soft masks.
 
-        Inputs shape `[B, S, H, W, 1]`; outputs shape `[B, S, target_grid**2, 1]`.
+        Inputs shape `[B, S, H, W, 1]`; outputs shape `[B, S, grid_h*grid_w, 1]`.
         `M_preserve + M_source + M_dest` sums to `1 - eps/(K+D+I+eps)`
         (≈ 1 where coverage exists, 0 where nothing was rendered).
         """
@@ -127,14 +127,15 @@ class SoftMaskBuilder(nn.Module):
         B, S, H, W, C = K_map.shape
         if C != 1:
             raise ValueError(f"Expected trailing dim=1 (alpha), got {C}")
-        if H % target_grid != 0 or W % target_grid != 0:
+        grid_h, grid_w = self._normalize_grid(target_grid)
+        if H % grid_h != 0 or W % grid_w != 0:
             raise ValueError(
-                f"H ({H}) and W ({W}) must be divisible by target_grid ({target_grid})"
+                f"H ({H}) and W ({W}) must be divisible by target_grid ({(grid_h, grid_w)})"
             )
 
-        K_pool = self._area_pool_to_grid(K_map, target_grid)  # [B, S, P, 1]
-        D_pool = self._area_pool_to_grid(D_map, target_grid)
-        I_pool = self._area_pool_to_grid(I_map, target_grid)
+        K_pool = self._area_pool_to_grid(K_map, (grid_h, grid_w))  # [B, S, P, 1]
+        D_pool = self._area_pool_to_grid(D_map, (grid_h, grid_w))
+        I_pool = self._area_pool_to_grid(I_map, (grid_h, grid_w))
 
         total = K_pool + D_pool + I_pool + eps
         M_preserve = K_pool / total
@@ -185,15 +186,22 @@ class SoftMaskBuilder(nn.Module):
         return alphas.clamp(0.0, 1.0)
 
     @staticmethod
-    def _area_pool_to_grid(x: torch.Tensor, target_grid: int) -> torch.Tensor:
-        """Area-pool `[B, S, H, W, 1]` → `[B, S, target_grid**2, 1]`."""
+    def _normalize_grid(grid: int | tuple[int, int]) -> tuple[int, int]:
+        if isinstance(grid, int):
+            return int(grid), int(grid)
+        return int(grid[0]), int(grid[1])
+
+    @staticmethod
+    def _area_pool_to_grid(x: torch.Tensor, target_grid: int | tuple[int, int]) -> torch.Tensor:
+        """Area-pool `[B, S, H, W, 1]` to `[B, S, grid_h*grid_w, 1]`."""
         B, S, H, W, C = x.shape
-        k_h = H // target_grid
-        k_w = W // target_grid
+        grid_h, grid_w = SoftMaskBuilder._normalize_grid(target_grid)
+        k_h = H // grid_h
+        k_w = W // grid_w
         y = x.reshape(B * S, H, W, C).permute(0, 3, 1, 2)  # [B*S, C, H, W]
         y = F.avg_pool2d(y, kernel_size=(k_h, k_w), stride=(k_h, k_w))
-        # y: [B*S, C, target_grid, target_grid]
-        y = y.permute(0, 2, 3, 1).reshape(B, S, target_grid * target_grid, C)
+        # y: [B*S, C, grid_h, grid_w]
+        y = y.permute(0, 2, 3, 1).reshape(B, S, grid_h * grid_w, C)
         return y
 
     @staticmethod

@@ -11,7 +11,7 @@ scene flow. Channels (per the implementation plan):
     5 : dynamic_prior   — Pass-1 dynamic_conf sigmoided, per pixel
     6 : time_index      — normalized frame index in [0, 1]
 
-`ScaffoldPacker.forward` area-pools to the 37x37 patch grid and runs a shared
+`ScaffoldPacker.forward` area-pools to the patch grid and runs a shared
 MLP to 768-d. `build_scaffold_hires` is a convenience constructor that fills
 out all 7 channels from their natural sources.
 """
@@ -42,8 +42,8 @@ class ScaffoldPacker(nn.Module):
             nn.Linear(hidden_dim, out_dim),
         )
 
-    def forward(self, scaffold_hires: torch.Tensor, target_grid: int = 37) -> torch.Tensor:
-        """Pool `[B, S, H, W, C]` to `[B, S, target_grid**2, out_dim]`."""
+    def forward(self, scaffold_hires: torch.Tensor, target_grid: int | tuple[int, int] = 37) -> torch.Tensor:
+        """Pool `[B, S, H, W, C]` to `[B, S, grid_h*grid_w, out_dim]`."""
         if scaffold_hires.dim() != 5:
             raise ValueError(
                 f"scaffold_hires must be 5D [B,S,H,W,C], got {tuple(scaffold_hires.shape)}"
@@ -53,16 +53,23 @@ class ScaffoldPacker(nn.Module):
             raise ValueError(
                 f"scaffold_hires last dim {C} != in_channels {self.in_channels}"
             )
-        if H % target_grid != 0 or W % target_grid != 0:
+        grid_h, grid_w = self._normalize_grid(target_grid)
+        if H % grid_h != 0 or W % grid_w != 0:
             raise ValueError(
-                f"H ({H}) and W ({W}) must be divisible by target_grid ({target_grid})"
+                f"H ({H}) and W ({W}) must be divisible by target_grid ({(grid_h, grid_w)})"
             )
-        k_h = H // target_grid
-        k_w = W // target_grid
+        k_h = H // grid_h
+        k_w = W // grid_w
         x = scaffold_hires.reshape(B * S, H, W, C).permute(0, 3, 1, 2)   # [B*S, C, H, W]
-        x = F.avg_pool2d(x, kernel_size=(k_h, k_w), stride=(k_h, k_w))    # [B*S, C, g, g]
-        x = x.permute(0, 2, 3, 1).reshape(B, S, target_grid * target_grid, C)
+        x = F.avg_pool2d(x, kernel_size=(k_h, k_w), stride=(k_h, k_w))    # [B*S, C, gh, gw]
+        x = x.permute(0, 2, 3, 1).reshape(B, S, grid_h * grid_w, C)
         return self.mlp(x)                                                # [B, S, P, out_dim]
+
+    @staticmethod
+    def _normalize_grid(grid: int | tuple[int, int]) -> tuple[int, int]:
+        if isinstance(grid, int):
+            return int(grid), int(grid)
+        return int(grid[0]), int(grid[1])
 
     @staticmethod
     def build_scaffold_hires(

@@ -205,3 +205,33 @@ def test_select_object_asset_image_paths_flattens_frame_major_view_minor():
     )
 
     assert selected == [["f2v0", "f2v1", "f0v0", "f0v1"]]
+
+
+def test_base_sample_carries_manifest_index():
+    dataset = object.__new__(WaymoEditDataset)
+    dataset.camera_ids = [0]
+
+    sample = dataset._build_base_sample(
+        record={
+            "manifest_index": 42,
+            "scene_id": 1,
+            "scene_name": "scene",
+            "scene_dir": "001",
+            "scene_base": "scene",
+            "clip_name": "scene_0",
+            "clip_index": 0,
+            "edit_mode": "replace",
+        },
+        sample_index=3,
+        sample_num_frames=2,
+        clip_frame_indices=[10, 11],
+        local_indices=[0, 1],
+        scene_frame_indices=[10, 11],
+        image_paths=["a.jpg", "b.jpg"],
+        images=torch.zeros(2, 3, 4, 4),
+        timestamps=[0.0, 1.0],
+        intervals=[0, 1],
+    )
+
+    assert sample["manifest_index"] == 42
+    assert sample["edit_spec"]["manifest_index"] == 42

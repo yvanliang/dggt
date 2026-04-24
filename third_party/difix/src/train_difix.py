@@ -272,7 +272,6 @@ def main(args):
                         for k in log_dict:
                             logs[k] = log_dict[k]
                         gc.collect()
-                        torch.cuda.empty_cache()
                     accelerator.log(logs, step=global_step)
 
 

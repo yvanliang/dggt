@@ -98,14 +98,14 @@ class FeatureSplatter(nn.Module):
             Full rasterization resolution (e.g. 148 or 296). Must satisfy
             `H % pool_to == 0`, `W % pool_to == 0` when `pool_to` is set.
         pool_to
-            Target side length of the patch grid (37 for low-res splat).
+            Target patch grid, either an int for square grids or `(H, W)`.
             `None` skips pooling and returns full resolution.
 
         Returns
         -------
         list[Tensor]
             Length `num_levels`. Each tensor has shape
-            `[B, S, pool_to * pool_to, C]` when pool_to is set, otherwise
+            `[B, S, grid_h * grid_w, C]` when pool_to is set, otherwise
             `[B, S, H, W, C]`.
         """
         self._validate_inputs(gaussians_dggt, pointers, lut_scene, lut_asset_dict, cameras_dggt)
@@ -116,9 +116,10 @@ class FeatureSplatter(nn.Module):
         S = viewmats.shape[1]
 
         if pool_to is not None:
-            if H % pool_to != 0 or W % pool_to != 0:
+            pool_h, pool_w = self._normalize_grid(pool_to)
+            if H % pool_h != 0 or W % pool_w != 0:
                 raise ValueError(
-                    f"H ({H}) and W ({W}) must be divisible by pool_to ({pool_to})"
+                    f"H ({H}) and W ({W}) must be divisible by pool_to ({(pool_h, pool_w)})"
                 )
 
         outputs_per_level: list[list[torch.Tensor]] = [[] for _ in range(self.num_levels)]
@@ -143,13 +144,11 @@ class FeatureSplatter(nn.Module):
                 Ks=Ks_b,
                 H=H,
                 W=W,
+                pool_to=pool_to,
             )
 
             for l in range(self.num_levels):
-                rendered = rendered_per_level[l]  # [S, H, W, C]
-                if pool_to is not None:
-                    rendered = self._area_pool(rendered, pool_to)  # [S, pool_to*pool_to, C]
-                outputs_per_level[l].append(rendered)
+                outputs_per_level[l].append(rendered_per_level[l])
 
         stacked = [torch.stack(outs, dim=0) for outs in outputs_per_level]  # each [B, S, ...]
         return stacked
@@ -167,6 +166,7 @@ class FeatureSplatter(nn.Module):
         Ks: torch.Tensor,                              # [S, 3, 3]
         H: int,
         W: int,
+        pool_to: int | tuple[int, int] | None,
     ) -> list[torch.Tensor]:
         device = viewmats.device
 
@@ -190,12 +190,14 @@ class FeatureSplatter(nn.Module):
                 if lut_asset_per_level_dict is None
                 else {k: lut_asset_per_level_dict[k][level_idx] for k in lut_asset_per_level_dict},
             )
-            # Gather colors keeps gradient on flat_lut → original LUT tensors.
-            colors_full = flat_lut.index_select(0, global_idx)  # [N_g, C]
-
             if means.numel() == 0:
+                if pool_to is None:
+                    empty_shape = (S, H, W, self.channels)
+                else:
+                    pool_h, pool_w = self._normalize_grid(pool_to)
+                    empty_shape = (S, pool_h * pool_w, self.channels)
                 rendered_levels.append(
-                    torch.zeros((S, H, W, self.channels), dtype=colors_full.dtype, device=device)
+                    torch.zeros(empty_shape, dtype=flat_lut.dtype, device=device)
                 )
                 continue
 
@@ -204,11 +206,13 @@ class FeatureSplatter(nn.Module):
                 quats=quats,
                 scales=scales,
                 opacities=opacities,
-                colors=colors_full,
+                flat_lut=flat_lut,
+                global_idx=global_idx,
                 viewmats=viewmats,
                 Ks=Ks,
                 H=H,
                 W=W,
+                pool_to=pool_to,
             )
             rendered_levels.append(rendered)
 
@@ -220,6 +224,8 @@ class FeatureSplatter(nn.Module):
         lut_scene: torch.Tensor,                         # [N_scene, P, C]
         lut_asset_dict: dict[int, torch.Tensor] | None,  # each [N_asset_k, P, C]
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = pointers.src_kind.device
+        lut_scene = lut_scene.to(device)
         N_scene, P, C = lut_scene.shape
         if P != self.num_patches:
             raise ValueError(f"lut patch count {P} != num_patches {self.num_patches}")
@@ -233,7 +239,7 @@ class FeatureSplatter(nn.Module):
 
         if lut_asset_dict is not None:
             for obj_key in sorted(lut_asset_dict.keys()):
-                asset_lut = lut_asset_dict[obj_key]   # [N_asset, P, C]
+                asset_lut = lut_asset_dict[obj_key].to(device)   # [N_asset, P, C]
                 N_asset, P_a, C_a = asset_lut.shape
                 if P_a != P or C_a != C:
                     raise ValueError(
@@ -269,18 +275,21 @@ class FeatureSplatter(nn.Module):
         quats: torch.Tensor,
         scales: torch.Tensor,
         opacities: torch.Tensor,
-        colors: torch.Tensor,      # [N_g, C]
+        flat_lut: torch.Tensor,    # [N_total, C]
+        global_idx: torch.Tensor,  # [N_g]
         viewmats: torch.Tensor,    # [S, 4, 4]
         Ks: torch.Tensor,          # [S, 3, 3]
         H: int,
         W: int,
+        pool_to: int | tuple[int, int] | None,
     ) -> torch.Tensor:
-        C = colors.shape[-1]
-        S = viewmats.shape[0]
+        C = flat_lut.shape[-1]
         chunks: list[torch.Tensor] = []
         for start in range(0, C, self.chunk_channels):
             end = min(start + self.chunk_channels, C)
-            colors_chunk = colors[:, start:end].contiguous()
+            # Gather only the channel slice currently being rasterized. This avoids
+            # materializing [N_gaussians, 3072], which is the dominant memory spike.
+            colors_chunk = flat_lut[:, start:end].index_select(0, global_idx).contiguous()
             rendered_chunk, _, _ = rasterization(
                 means=means,
                 quats=quats,
@@ -293,20 +302,30 @@ class FeatureSplatter(nn.Module):
                 height=int(H),
                 render_mode="RGB",
             )  # [S, H, W, end-start]
+            if pool_to is not None:
+                rendered_chunk = self._area_pool(rendered_chunk, pool_to)
             chunks.append(rendered_chunk)
-        return torch.cat(chunks, dim=-1)  # [S, H, W, C]
+            del colors_chunk
+        return torch.cat(chunks, dim=-1)  # [S, H, W, C] or [S, P, C]
 
     @staticmethod
-    def _area_pool(rendered: torch.Tensor, pool_to: int) -> torch.Tensor:
-        """Area-pool `[S, H, W, C]` down to `[S, pool_to*pool_to, C]`."""
+    def _normalize_grid(grid: int | tuple[int, int]) -> tuple[int, int]:
+        if isinstance(grid, int):
+            return int(grid), int(grid)
+        return int(grid[0]), int(grid[1])
+
+    @staticmethod
+    def _area_pool(rendered: torch.Tensor, pool_to: int | tuple[int, int]) -> torch.Tensor:
+        """Area-pool `[S, H, W, C]` down to `[S, grid_h*grid_w, C]`."""
         S, H, W, C = rendered.shape
-        k_h = H // pool_to
-        k_w = W // pool_to
+        pool_h, pool_w = FeatureSplatter._normalize_grid(pool_to)
+        k_h = H // pool_h
+        k_w = W // pool_w
         x = rendered.permute(0, 3, 1, 2).contiguous()        # [S, C, H, W]
         x = F.avg_pool2d(x, kernel_size=(k_h, k_w), stride=(k_h, k_w))
-        # x: [S, C, pool_to, pool_to]
-        x = x.permute(0, 2, 3, 1).contiguous()               # [S, pool_to, pool_to, C]
-        return x.reshape(S, pool_to * pool_to, C)
+        # x: [S, C, pool_h, pool_w]
+        x = x.permute(0, 2, 3, 1).contiguous()               # [S, pool_h, pool_w, C]
+        return x.reshape(S, pool_h * pool_w, C)
 
     def _validate_inputs(
         self,

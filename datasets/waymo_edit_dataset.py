@@ -651,11 +651,15 @@ class WaymoEditDataset(Dataset):
             int(record["record_index"]): record for record in candidate_records
         }
         self.samples = []
-        for entry in manifest_entries:
+        for row_idx, entry in enumerate(manifest_entries):
             record_index = int(entry["record_index"])
             record = candidate_by_record_index.get(record_index)
             if record is not None:
-                self.samples.append(record)
+                merged_record = dict(record)
+                merged_record["manifest_index"] = int(entry.get("index", row_idx))
+                merged_record["manifest_record_index"] = int(record_index)
+                merged_record["manifest_entry"] = dict(entry)
+                self.samples.append(merged_record)
         if len(self.samples) == 0:
             raise ValueError(f"No samples found in {self.manifest_path}")
 
@@ -1003,6 +1007,7 @@ class WaymoEditDataset(Dataset):
     ):
         return {
             "sample_index": int(sample_index),
+            "manifest_index": int(record.get("manifest_index", sample_index)),
             "num_frames": torch.tensor(int(sample_num_frames), dtype=torch.long),
             "images": images,
             "images_clean": images,
@@ -1024,6 +1029,7 @@ class WaymoEditDataset(Dataset):
                 "clip_name": str(record["clip_name"]),
                 "scene_base": str(record["scene_base"]),
                 "clip_index": int(record["clip_index"]),
+                "manifest_index": int(record.get("manifest_index", sample_index)),
                 "scene_frame_indices": clip_frame_indices,
                 "selected_scene_frame_indices": scene_frame_indices,
                 "selected_local_indices": local_indices,

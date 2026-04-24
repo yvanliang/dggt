@@ -7,7 +7,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 from datasets.waymo_edit_dataset import (
@@ -35,8 +34,13 @@ from inference_scene_editor import (
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Single-sample Mode B pseudo deletion debug runner.")
-    parser.add_argument("--index", type=int, required=True, help="WaymoEditDataset sample index.")
+    parser = argparse.ArgumentParser(description="Mode B pseudo deletion debug runner.")
+    parser.add_argument(
+        "--index",
+        type=int,
+        default=None,
+        help="WaymoEditDataset sample index. If omitted, process every sample.",
+    )
     parser.add_argument("--output_dir", type=str, required=True, help="Where to write debug outputs.")
     parser.add_argument(
         "--ckpt_path",
@@ -56,11 +60,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--mode_b_candidate_path", type=str, default=None)
     parser.add_argument("--render_max_points", type=int, default=250000)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--planner_seed", type=int, default=None)
+    parser.add_argument(
+        "--planner_seed",
+        type=int,
+        default=0,
+        help="Base planner seed. Per-sample seed is base + 1009 * dataset_index, matching precompute_flow_features.py.",
+    )
     parser.add_argument("--num_objects_target", type=int, default=None)
     parser.add_argument("--max_trials_per_object", type=int, default=80)
     parser.add_argument("--min_visible_frames", type=int, default=15)
-    parser.add_argument("--max_semantic_overlap_px", type=int, default=50)
+    parser.add_argument("--max_semantic_overlap_px", type=int, default=0)
     parser.add_argument("--min_projected_transfer_size_px", type=float, default=128.0)
     parser.add_argument("--max_projected_area_ratio", type=float, default=0.12)
     parser.add_argument("--max_projected_width_ratio", type=float, default=0.45)
@@ -68,11 +77,10 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--min_projected_top_y_ratio", type=float, default=0.20)
     parser.add_argument("--min_projected_center_y_ratio", type=float, default=0.35)
     parser.add_argument("--min_projected_bottom_y_ratio", type=float, default=0.50)
-    parser.add_argument("--max_projected_bottom_y_ratio", type=float, default=0.92)
+    parser.add_argument("--max_projected_bottom_y_ratio", type=float, default=1.0)
     parser.add_argument("--min_ground_support_ratio", type=float, default=0.18)
     parser.add_argument("--fast_camera_step_ratio", type=float, default=0.018)
     parser.add_argument("--slow_camera_step_ratio", type=float, default=0.006)
-    parser.add_argument("--skip_render_payload", action="store_true")
     parser.add_argument("--allow_empty_plan", action="store_true")
     parser.add_argument("--plan_only", action="store_true")
     return parser
@@ -409,48 +417,31 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, f, indent=2)
 
 
-def main() -> None:
-    args = build_argparser().parse_args()
-    torch.manual_seed(args.seed)
+def _planner_seed_for_index(base_seed: int, sample_index: int) -> int:
+    return int(base_seed) + 1009 * int(sample_index)
 
-    output_dir = Path(args.output_dir)
+
+def _run_one_sample(
+    *,
+    args: argparse.Namespace,
+    dataset: WaymoEditDataset,
+    model,
+    device: torch.device,
+    sample_index: int,
+    output_dir: Path,
+    manifest_path: Path,
+    candidate_path: Path,
+) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest_path = Path(args.mode_b_manifest) if args.mode_b_manifest else _default_mode_b_manifest(
-        args.processed_root,
-        args.split,
-        args.views,
-    )
-    candidate_path = Path(args.mode_b_candidate_path) if args.mode_b_candidate_path else _default_mode_b_candidates(
-        args.processed_root,
-        args.split,
-    )
-
-    print("[mode_b] loading dataset sample", flush=True)
-    dataset = WaymoEditDataset(
-        processed_root=args.processed_root,
-        transfer_root=args.transfer_root,
-        raw_root=args.raw_root,
-        asset_root=args.asset_root,
-        split=args.split,
-        manifest_path=manifest_path,
-        candidate_path=candidate_path,
-        views=args.views,
-        mode=args.dataset_mode,
-        sequence_length=args.sequence_length,
-    )
-    sample = dataset[args.index]
-    record = dataset.samples[args.index]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[mode_b] loading model on {device}", flush=True)
-    model = _load_model(args.ckpt_path, device)
+    sample = dataset[sample_index]
+    record = dataset.samples[sample_index]
     images = sample["images_clean"].unsqueeze(0).to(device)
-    print("[mode_b] running VGGT forward", flush=True)
+    print(f"[mode_b] sample {sample_index}: running VGGT forward", flush=True)
     with torch.no_grad():
         predictions = model(images)
 
-    print("[mode_b] building clean scene", flush=True)
+    print(f"[mode_b] sample {sample_index}: building clean scene", flush=True)
     editor = GaussianSceneEditor()
     clean_state = editor.build_clean_bundle(sample, predictions)
     alignment = editor.align(sample, clean_state)
@@ -458,7 +449,7 @@ def main() -> None:
     existing_objects.extend(_convert_waymo_existing_objects_to_dggt(record.get("existing_objects", []), alignment))
     existing_objects.extend(record.get("existing_objects_dggt", []))
 
-    planner_seed = args.planner_seed if args.planner_seed is not None else args.seed + args.index * 1009
+    planner_seed = _planner_seed_for_index(args.planner_seed, sample_index)
     planner = ModeBPlanner(
         min_visible_frames=args.min_visible_frames,
         max_semantic_overlap_px=args.max_semantic_overlap_px,
@@ -476,7 +467,7 @@ def main() -> None:
         slow_camera_step_ratio=args.slow_camera_step_ratio,
         rng_seed=planner_seed,
     )
-    print("[mode_b] planning imagined objects", flush=True)
+    print(f"[mode_b] sample {sample_index}: planning imagined objects with seed {planner_seed}", flush=True)
     plan = planner.plan(
         clean_state,
         existing_objects=existing_objects,
@@ -490,7 +481,13 @@ def main() -> None:
         summary = plan.to_dict()
         summary.update(
             {
-                "sample_index": int(args.index),
+                "sample_index": int(sample_index),
+                "status": "skipped_empty_plan",
+                "skip_reason": (
+                    "Mode B planner accepted zero imagined objects. "
+                    "Try a different --index/--planner_seed or relax "
+                    "--min_visible_frames/--max_semantic_overlap_px."
+                ),
                 "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
                 "cam_ids": [int(v) for v in sample["cam_ids"].tolist()],
                 "clean_gaussian_count": int(clean_state.means.shape[0]),
@@ -501,18 +498,23 @@ def main() -> None:
                 "mode_b_candidate_path": str(candidate_path),
             }
         )
+        grid_nrow = args.views if args.views > 1 else min(4, int(clean_state.images.shape[0]))
+        _save_grid(clean_state.images, output_dir / "input_images_grid.jpg", nrow=grid_nrow)
+        _save_imagined_boxes_overlay(clean_state.images, plan, output_dir / "imagined_boxes_overlay.jpg", nrow=grid_nrow)
         _write_json(output_dir / "mode_b_summary.json", summary)
-        raise RuntimeError(
-            "Mode B planner accepted zero imagined objects. "
-            "Try a different --index/--planner_seed or relax --min_visible_frames/--max_semantic_overlap_px. "
-            f"Summary written to {output_dir / 'mode_b_summary.json'}."
+        print(
+            f"[mode_b] sample {sample_index}: accepted zero imagined objects; "
+            f"wrote summary to {output_dir / 'mode_b_summary.json'} and continuing",
+            flush=True,
         )
-    print(f"[mode_b] accepted {plan.num_imagined_objects} imagined objects", flush=True)
+        print(json.dumps(summary, indent=2), flush=True)
+        return summary
+    print(f"[mode_b] sample {sample_index}: accepted {plan.num_imagined_objects} imagined objects", flush=True)
     if args.plan_only:
         summary = plan.to_dict()
         summary.update(
             {
-                "sample_index": int(args.index),
+                "sample_index": int(sample_index),
                 "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
                 "cam_ids": [int(v) for v in sample["cam_ids"].tolist()],
                 "clean_gaussian_count": int(clean_state.means.shape[0]),
@@ -521,6 +523,7 @@ def main() -> None:
                 "delete_shell_count": 0,
                 "mode_b_manifest": str(manifest_path),
                 "mode_b_candidate_path": str(candidate_path),
+                "status": "plan_only",
                 "plan_only": True,
             }
         )
@@ -529,10 +532,10 @@ def main() -> None:
         _save_imagined_boxes_overlay(clean_state.images, plan, output_dir / "imagined_boxes_overlay.jpg", nrow=grid_nrow)
         _write_json(output_dir / "mode_b_summary.json", summary)
         print(json.dumps(summary, indent=2), flush=True)
-        return
+        return summary
     deletion = apply_mode_b(clean_state, plan)
 
-    print("[mode_b] rendering clean/deleted/D_map outputs", flush=True)
+    print(f"[mode_b] sample {sample_index}: rendering clean/deleted/D_map outputs", flush=True)
     clean_render = _render_clean_with_dggt(model, sample, predictions, device)
     deleted_bundle = _render_edited_sequence_with_frame_masks(
         model,
@@ -560,37 +563,10 @@ def main() -> None:
         nrow=grid_nrow,
     )
 
-    num_images, height, width = d_map.shape
-    num_views = int(args.views)
-    num_frames = num_images // num_views if num_images % num_views == 0 else num_images
-    d_map_view = d_map.view(num_frames, num_views, height, width) if num_frames * num_views == num_images else d_map
-    d_map_low37 = F.interpolate(
-        d_map.view(num_images, 1, height, width),
-        size=(37, 37),
-        mode="bilinear",
-        align_corners=False,
-    ).view(num_frames, num_views, 37, 37) if num_frames * num_views == num_images else torch.empty(0)
-
-    payload = {
-        "config": plan.to_dict(),
-        "delete_mask_per_frame": deletion.delete_mask_per_frame,
-        "delete_core_indices": deletion.delete_core_indices.to(torch.int32),
-        "delete_shell_indices": deletion.delete_shell_indices.to(torch.int32),
-        "D_map": d_map_view.half(),
-        "D_map_low37": d_map_low37.half(),
-    }
-    if not args.skip_render_payload:
-        payload["pseudo_deleted_render"] = (
-            deleted_render.view(num_frames, num_views, 3, height, width).mul(255.0).clamp(0, 255).to(torch.uint8)
-            if num_frames * num_views == num_images
-            else deleted_render.mul(255.0).clamp(0, 255).to(torch.uint8)
-        )
-    torch.save(payload, output_dir / "mode_b_dmap.pt")
-
     summary = plan.to_dict()
     summary.update(
         {
-            "sample_index": int(args.index),
+            "sample_index": int(sample_index),
             "selected_scene_frame_indices": [int(v) for v in sample["frame_indices"].tolist()],
             "cam_ids": [int(v) for v in sample["cam_ids"].tolist()],
             "clean_gaussian_count": int(clean_state.means.shape[0]),
@@ -599,10 +575,99 @@ def main() -> None:
             "delete_shell_count": int(deletion.delete_shell_indices.numel()),
             "mode_b_manifest": str(manifest_path),
             "mode_b_candidate_path": str(candidate_path),
+            "status": "completed",
         }
     )
     _write_json(output_dir / "mode_b_summary.json", summary)
     print(json.dumps(summary, indent=2))
+    return summary
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    torch.manual_seed(args.seed)
+
+    root_output_dir = Path(args.output_dir)
+    root_output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = Path(args.mode_b_manifest) if args.mode_b_manifest else _default_mode_b_manifest(
+        args.processed_root,
+        args.split,
+        args.views,
+    )
+    candidate_path = Path(args.mode_b_candidate_path) if args.mode_b_candidate_path else _default_mode_b_candidates(
+        args.processed_root,
+        args.split,
+    )
+
+    print("[mode_b] loading dataset", flush=True)
+    dataset = WaymoEditDataset(
+        processed_root=args.processed_root,
+        transfer_root=args.transfer_root,
+        raw_root=args.raw_root,
+        asset_root=args.asset_root,
+        split=args.split,
+        manifest_path=manifest_path,
+        candidate_path=candidate_path,
+        views=args.views,
+        mode=args.dataset_mode,
+        sequence_length=args.sequence_length,
+        sample_window=args.sequence_length,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[mode_b] loading model on {device}", flush=True)
+    model = _load_model(args.ckpt_path, device)
+
+    if args.index is None:
+        indices = list(range(len(dataset)))
+        multi_sample = True
+    else:
+        if args.index < 0 or args.index >= len(dataset):
+            raise IndexError(f"--index {args.index} is out of range for dataset length {len(dataset)}")
+        indices = [int(args.index)]
+        multi_sample = False
+
+    all_summaries = []
+    for position, sample_index in enumerate(indices, start=1):
+        sample_output_dir = root_output_dir / f"sample_{sample_index:06d}" if multi_sample else root_output_dir
+        print(f"[mode_b] [{position}/{len(indices)}] sample {sample_index} -> {sample_output_dir}", flush=True)
+        summary = _run_one_sample(
+            args=args,
+            dataset=dataset,
+            model=model,
+            device=device,
+            sample_index=sample_index,
+            output_dir=sample_output_dir,
+            manifest_path=manifest_path,
+            candidate_path=candidate_path,
+        )
+        all_summaries.append(
+            {
+                "sample_index": int(sample_index),
+                "output_dir": str(sample_output_dir),
+                "scene_name": summary.get("scene_name"),
+                "clip_name": summary.get("clip_name"),
+                "rng_seed": summary.get("rng_seed"),
+                "num_imagined_objects": summary.get("num_imagined_objects"),
+                "status": summary.get("status", "completed"),
+                "skip_reason": summary.get("skip_reason"),
+            }
+        )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if multi_sample:
+        run_summary = {
+            "num_samples": len(all_summaries),
+            "sample_outputs": all_summaries,
+            "planner_seed_rule": "base_planner_seed + 1009 * dataset_index",
+            "base_planner_seed": int(args.planner_seed),
+            "num_completed": sum(1 for item in all_summaries if item.get("status") in {"completed", "plan_only"}),
+            "num_skipped": sum(1 for item in all_summaries if str(item.get("status", "")).startswith("skipped_")),
+        }
+        _write_json(root_output_dir / "all_samples_summary.json", run_summary)
+        print(json.dumps(run_summary, indent=2))
 
 
 if __name__ == "__main__":

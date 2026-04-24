@@ -49,7 +49,12 @@ def build_argparser() -> argparse.ArgumentParser:
             "up one-to-one with deletions."
         )
     )
-    parser.add_argument("--index", type=int, required=True, help="WaymoEditDataset sample index.")
+    parser.add_argument(
+        "--index",
+        type=int,
+        default=None,
+        help="WaymoEditDataset sample index. If omitted, process every sample.",
+    )
     parser.add_argument("--output_dir", type=str, required=True, help="Where to write renders and PLY files.")
     parser.add_argument(
         "--ckpt_path",
@@ -79,13 +84,31 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--render_max_points", type=int, default=250000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--clean_only", action="store_true", help="Only run clean-pass render and GT 3D box overlay.")
-    parser.add_argument("--skip_ply", action="store_true", help="Skip writing PLY outputs during debug runs.")
+    parser.add_argument(
+        "--skip_ply",
+        action="store_true",
+        default=True,
+        help="Skip writing PLY outputs during debug runs. PLY writing is disabled by default.",
+    )
     parser.add_argument(
         "--pose_refine",
         type=str,
         choices=["on", "off"],
         default="on",
         help="Enable (on) or bypass (off) the 3D-box pose refinement before semantic-mask deletion.",
+    )
+    parser.add_argument(
+        "--dump_features",
+        action="store_true",
+        help=(
+            "Run the FlowFeatureAssembler (Phase 2/3/5/6 input composition) and dump "
+            "mask / coverage / scaffold grids under flow_features/."
+        ),
+    )
+    parser.add_argument(
+        "--splat_pca",
+        action="store_true",
+        help="When --dump_features is set, also dump PCA-RGB of splatted_tok per level.",
     )
     return parser
 
@@ -770,44 +793,6 @@ def _save_asset_pass_outputs(
                     asset_pass_dir / f"slot{slot_idx:02d}_frame{frame_i:02d}_waymo_gaussians.ply",
                 )
 
-    feature_pack = {
-        "patch_grid": result.patch_grid,
-        "patch_start_idx": int(result.patch_start_idx),
-        "object_keys": [int(k) for k in result.object_keys],
-        "cameras_waymo": {k: v.detach().cpu() for k, v in result.cameras_waymo.items()},
-        "F_g_lut_asset": {
-            int(k): [lvl.detach().cpu() for lvl in v] for k, v in result.F_g_lut_asset.items()
-        },
-        "ptr_asset": {
-            int(k): [
-                {
-                    "src_kind": p.src_kind.detach().cpu(),
-                    "object_id": p.object_id.detach().cpu(),
-                    "view_n": p.view_n.detach().cpu(),
-                    "patch_idx": p.patch_idx.detach().cpu(),
-                    "visible_mask": p.visible_mask.detach().cpu(),
-                }
-                for p in v
-            ]
-            for k, v in result.ptr_asset.items()
-        },
-        "G_asset_waymo": {
-            int(k): [{kk: vv.detach().cpu() for kk, vv in g.items()} for g in v]
-            for k, v in result.G_asset_waymo.items()
-        },
-        "G_asset_dggt": (
-            None
-            if result.G_asset_dggt is None
-            else {
-                int(k): [{kk: vv.detach().cpu() for kk, vv in g.items()} for g in v]
-                for k, v in result.G_asset_dggt.items()
-            }
-        ),
-        "I_asset": {int(k): v.detach().cpu() for k, v in result.I_asset.items()},
-        "A_asset": {int(k): v.detach().cpu() for k, v in result.A_asset.items()},
-    }
-    torch.save(feature_pack, asset_pass_dir / "asset_pass.pt")
-
     return {
         "num_objects": len(result.object_keys),
         "object_keys": [int(k) for k in result.object_keys],
@@ -869,37 +854,38 @@ def _build_summary(args, sample, alignment, edited_state) -> dict:
     }
 
 
-def main() -> None:
-    args = build_argparser().parse_args()
-    if args.views != 1:
-        raise NotImplementedError(
-            f"inference_scene_editor.py currently supports --views 1 only; got --views {args.views}"
-        )
-    torch.manual_seed(args.seed)
+def _as_homogeneous_viewmats(world_to_camera: torch.Tensor) -> torch.Tensor:
+    """Normalize predicted world-to-camera matrices to [S, 4, 4]."""
+    if world_to_camera.dim() != 3:
+        raise ValueError(f"Expected world_to_camera [S,3,4] or [S,4,4], got {tuple(world_to_camera.shape)}")
+    if world_to_camera.shape[-2:] == (4, 4):
+        return world_to_camera
+    if world_to_camera.shape[-2:] != (3, 4):
+        raise ValueError(f"Expected world_to_camera [S,3,4] or [S,4,4], got {tuple(world_to_camera.shape)}")
+    bottom = torch.tensor(
+        [0.0, 0.0, 0.0, 1.0],
+        dtype=world_to_camera.dtype,
+        device=world_to_camera.device,
+    ).view(1, 1, 4)
+    return torch.cat([world_to_camera, bottom.expand(world_to_camera.shape[0], -1, -1)], dim=1)
 
-    output_dir = Path(args.output_dir)
+
+def _run_one_sample(
+    *,
+    args: argparse.Namespace,
+    dataset: WaymoEditDataset,
+    model,
+    device: torch.device,
+    sample_index: int,
+    output_dir: Path,
+) -> dict:
+    args.index = int(sample_index)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    dataset = WaymoEditDataset(
-        processed_root=args.processed_root,
-        transfer_root=args.transfer_root,
-        raw_root=args.raw_root,
-        asset_root=args.asset_root,
-        split=args.split,
-        manifest_path=args.manifest_path,
-        candidate_path=args.candidate_path,
-        views=args.views,
-        mode=args.dataset_mode,
-        sequence_length=args.sequence_length,
-    )
-    sample = dataset[args.index]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _load_model(args.ckpt_path, device)
+    sample = dataset[sample_index]
 
     images = sample["images_clean"].unsqueeze(0).to(device)
     with torch.no_grad():
-        predictions = model(images)
+        predictions = model(images, return_tokens=args.dump_features)
 
     editor = GaussianSceneEditor(
         min_match_score=args.min_match_score,
@@ -964,7 +950,7 @@ def main() -> None:
         with open(output_dir / "edit_summary.json", "w") as f:
             json.dump(summary, f, indent=2)
         print(json.dumps(summary, indent=2))
-        return
+        return summary
 
     alignment = editor.align(sample, clean_state)
 
@@ -1039,10 +1025,156 @@ def main() -> None:
     summary = _build_summary(args, sample, alignment, edited_state)
     summary["semantic_summary"] = semantic_summary
     summary["asset_pass_summary"] = asset_pass_summary
+
+    if args.dump_features:
+        flow_summary = _run_flow_feature_dump(
+            sample=phase4_sample,
+            predictions=predictions,
+            asset_pass_result=asset_pass_result,
+            clean_state=clean_state,
+            model=model,
+            args=args,
+            output_dir=output_dir,
+            device=device,
+        )
+        summary["flow_features_summary"] = flow_summary
+
     with open(output_dir / "edit_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
 
     print(json.dumps(summary, indent=2))
+    return summary
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    if args.views != 1:
+        raise NotImplementedError(
+            f"inference_scene_editor.py currently supports --views 1 only; got --views {args.views}"
+        )
+    torch.manual_seed(args.seed)
+
+    root_output_dir = Path(args.output_dir)
+    root_output_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset = WaymoEditDataset(
+        processed_root=args.processed_root,
+        transfer_root=args.transfer_root,
+        raw_root=args.raw_root,
+        asset_root=args.asset_root,
+        split=args.split,
+        manifest_path=args.manifest_path,
+        candidate_path=args.candidate_path,
+        views=args.views,
+        mode=args.dataset_mode,
+        sequence_length=args.sequence_length,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = _load_model(args.ckpt_path, device)
+
+    if args.index is None:
+        indices = list(range(len(dataset)))
+        multi_sample = True
+    else:
+        if args.index < 0 or args.index >= len(dataset):
+            raise IndexError(f"--index {args.index} is out of range for dataset length {len(dataset)}")
+        indices = [int(args.index)]
+        multi_sample = False
+
+    all_summaries = []
+    for position, sample_index in enumerate(indices, start=1):
+        sample_output_dir = (
+            root_output_dir / f"sample_{sample_index:06d}" if multi_sample else root_output_dir
+        )
+        print(f"[{position}/{len(indices)}] Processing sample index {sample_index} -> {sample_output_dir}")
+        summary = _run_one_sample(
+            args=args,
+            dataset=dataset,
+            model=model,
+            device=device,
+            sample_index=sample_index,
+            output_dir=sample_output_dir,
+        )
+        all_summaries.append(
+            {
+                "sample_index": int(sample_index),
+                "output_dir": str(sample_output_dir),
+                "scene_name": summary.get("scene_name"),
+                "clip_name": summary.get("clip_name"),
+            }
+        )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    if multi_sample:
+        run_summary = {
+            "num_samples": len(all_summaries),
+            "sample_outputs": all_summaries,
+        }
+        with open(root_output_dir / "all_samples_summary.json", "w") as f:
+            json.dump(run_summary, f, indent=2)
+        print(json.dumps(run_summary, indent=2))
+
+
+def _run_flow_feature_dump(
+    sample: dict,
+    predictions: dict,
+    asset_pass_result,
+    clean_state,
+    model,
+    args,
+    output_dir: Path,
+    device: torch.device,
+) -> dict:
+    """Assemble Phase 2/3/5/6 inputs and write flow_features/ artifacts."""
+    from dggt.models.flow_feature_assembler import FlowFeatureAssembler
+    from dggt.utils.flow_viz import dump_flow_features
+
+    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
+    patch_grid = (image_hw[0] // 14, image_hw[1] // 14)
+    assembler = FlowFeatureAssembler(
+        scene_tokenizer=getattr(model, "scene_tokenizer", None),
+        patch_grid=patch_grid,
+        H_splat=patch_grid[0] * 4,
+        W_splat=patch_grid[1] * 4,
+        editor_kwargs={
+            "min_match_score": args.min_match_score,
+            "dynamic_thresh": args.dynamic_thresh,
+            "core_scale": args.core_scale,
+            "shell_scale": args.shell_scale,
+            "proposal_scale": args.proposal_scale,
+            "motion_speed_thresh": args.motion_speed_thresh,
+            "dynamic_prob_thresh": args.dynamic_prob_thresh,
+            "dynamic_ratio_thresh": args.dynamic_ratio_thresh,
+            "use_pose_refine": (args.pose_refine == "on"),
+        },
+    ).to(device)
+
+    viewmats = _as_homogeneous_viewmats(clean_state.world_to_camera).unsqueeze(0).to(device)
+    Ks = clean_state.intrinsics.unsqueeze(0).to(device)
+    cameras_dggt = {"viewmats": viewmats, "Ks": Ks}
+
+    with torch.no_grad():
+        bundle = assembler(
+            sample=sample,
+            predictions=predictions,
+            asset_pass_result=asset_pass_result,
+            cameras_dggt=cameras_dggt,
+            object_slots_spec=args.object_slots,
+            base_t=None,
+            device=device,
+        )
+
+    return dump_flow_features(
+        bundle,
+        output_dir,
+        save_tensors=False,
+        save_masks=True,
+        save_coverage=True,
+        save_scaffold=True,
+        save_splat_pca=args.splat_pca,
+    )
 
 
 if __name__ == "__main__":

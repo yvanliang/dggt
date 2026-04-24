@@ -278,7 +278,7 @@ class ModeBPlanner:
         self,
         *,
         min_visible_frames: int = 15,
-        max_semantic_overlap_px: int = 50,
+        max_semantic_overlap_px: int = 0,
         max_trials_per_object: int = 80,
         canonical_size: tuple[float, float, float] = (4.5, 1.9, 1.6),
         canonical_size_jitter: float = 0.15,

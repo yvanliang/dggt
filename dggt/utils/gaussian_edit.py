@@ -1298,33 +1298,39 @@ def _solve_proposal_pose_from_target_bbox(
     best_rotation = base_rotation.clone()
 
     for depth_init in depth_candidates:
-        center_xy_init = _unproject_center_xy(target_bbox_model, depth_init, intrinsics)
-        center_xy = center_xy_init.clone().detach().requires_grad_(True)
-        log_depth = depth_init.log().clone().detach().requires_grad_(True)
-        yaw_param = torch.zeros((), dtype=object_center.dtype, requires_grad=True)
-        optimizer = torch.optim.Adam([center_xy, log_depth, yaw_param], lr=0.05)
-
-        for _ in range(60):
-            optimizer.zero_grad()
-            depth = torch.exp(log_depth).clamp_min(1e-3)
-            center_cam = torch.cat([center_xy, depth.view(1)], dim=0)
-            yaw = math.pi * torch.tanh(yaw_param)
-            rotation = base_rotation @ _rotation_z_tensor(yaw, dtype=object_center.dtype)
-            center_world = _camera_to_world_points(center_cam.view(1, 3), camera_to_world)[0]
-            pred_bbox, invalid_penalty = _project_box_bbox_soft(
-                center_world,
-                object_size,
-                rotation,
-                camera_to_world,
-                intrinsics,
-                image_hw,
+        with torch.enable_grad():
+            center_xy_init = _unproject_center_xy(target_bbox_model, depth_init, intrinsics)
+            center_xy = center_xy_init.clone().detach().requires_grad_(True)
+            log_depth = depth_init.log().clone().detach().requires_grad_(True)
+            yaw_param = torch.zeros(
+                (),
+                dtype=object_center.dtype,
+                device=object_center.device,
+                requires_grad=True,
             )
-            loss = _bbox_alignment_loss(pred_bbox, target_bbox_model)
-            loss = loss + 2.0 * invalid_penalty
-            loss = loss + 0.02 * (log_depth - depth_prior.log()).pow(2)
-            loss = loss + 0.01 * yaw.pow(2)
-            loss.backward()
-            optimizer.step()
+            optimizer = torch.optim.Adam([center_xy, log_depth, yaw_param], lr=0.05)
+
+            for _ in range(60):
+                optimizer.zero_grad()
+                depth = torch.exp(log_depth).clamp_min(1e-3)
+                center_cam = torch.cat([center_xy, depth.view(1)], dim=0)
+                yaw = math.pi * torch.tanh(yaw_param)
+                rotation = base_rotation @ _rotation_z_tensor(yaw, dtype=object_center.dtype)
+                center_world = _camera_to_world_points(center_cam.view(1, 3), camera_to_world)[0]
+                pred_bbox, invalid_penalty = _project_box_bbox_soft(
+                    center_world,
+                    object_size,
+                    rotation,
+                    camera_to_world,
+                    intrinsics,
+                    image_hw,
+                )
+                loss = _bbox_alignment_loss(pred_bbox, target_bbox_model)
+                loss = loss + 2.0 * invalid_penalty
+                loss = loss + 0.02 * (log_depth - depth_prior.log()).pow(2)
+                loss = loss + 0.01 * yaw.pow(2)
+                loss.backward()
+                optimizer.step()
 
         with torch.no_grad():
             depth = torch.exp(log_depth).clamp_min(1e-3)
@@ -1372,29 +1378,30 @@ def _solve_proposal_center_with_fixed_rotation(
     best_center = object_center.clone()
 
     for depth_init in depth_candidates:
-        center_xy_init = _unproject_center_xy(target_bbox_model, depth_init, intrinsics)
-        center_xy = center_xy_init.clone().detach().requires_grad_(True)
-        log_depth = depth_init.log().clone().detach().requires_grad_(True)
-        optimizer = torch.optim.Adam([center_xy, log_depth], lr=0.05)
+        with torch.enable_grad():
+            center_xy_init = _unproject_center_xy(target_bbox_model, depth_init, intrinsics)
+            center_xy = center_xy_init.clone().detach().requires_grad_(True)
+            log_depth = depth_init.log().clone().detach().requires_grad_(True)
+            optimizer = torch.optim.Adam([center_xy, log_depth], lr=0.05)
 
-        for _ in range(50):
-            optimizer.zero_grad()
-            depth = torch.exp(log_depth).clamp_min(1e-3)
-            center_cam = torch.cat([center_xy, depth.view(1)], dim=0)
-            center_world = _camera_to_world_points(center_cam.view(1, 3), camera_to_world)[0]
-            pred_bbox, invalid_penalty = _project_box_bbox_soft(
-                center_world,
-                object_size,
-                object_rotation,
-                camera_to_world,
-                intrinsics,
-                image_hw,
-            )
-            loss = _bbox_alignment_loss(pred_bbox, target_bbox_model)
-            loss = loss + 2.0 * invalid_penalty
-            loss = loss + 0.02 * (log_depth - depth_prior.log()).pow(2)
-            loss.backward()
-            optimizer.step()
+            for _ in range(50):
+                optimizer.zero_grad()
+                depth = torch.exp(log_depth).clamp_min(1e-3)
+                center_cam = torch.cat([center_xy, depth.view(1)], dim=0)
+                center_world = _camera_to_world_points(center_cam.view(1, 3), camera_to_world)[0]
+                pred_bbox, invalid_penalty = _project_box_bbox_soft(
+                    center_world,
+                    object_size,
+                    object_rotation,
+                    camera_to_world,
+                    intrinsics,
+                    image_hw,
+                )
+                loss = _bbox_alignment_loss(pred_bbox, target_bbox_model)
+                loss = loss + 2.0 * invalid_penalty
+                loss = loss + 0.02 * (log_depth - depth_prior.log()).pow(2)
+                loss.backward()
+                optimizer.step()
 
         with torch.no_grad():
             depth = torch.exp(log_depth).clamp_min(1e-3)

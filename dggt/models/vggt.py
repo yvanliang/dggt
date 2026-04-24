@@ -85,6 +85,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self,
         images: torch.Tensor,
         query_points: torch.Tensor = None,
+        return_tokens: bool = False,
     ):
         images, query_points = self._prepare_inputs(images, query_points)
 
@@ -93,6 +94,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         predictions = {}
 
         predictions["image_feature"] = image_feature
+        if return_tokens:
+            predictions["aggregated_tokens_list"] = aggregated_tokens_list
+            predictions["image_tokens_list"] = image_tokens_list
+            predictions["dino_token_list"] = dino_token_list
+            predictions["patch_start_idx"] = patch_start_idx
 
         with torch.cuda.amp.autocast(enabled=False):
             if self.camera_head is not None:
@@ -139,6 +145,5 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         predictions["images"] = images
 
         return predictions
-
 
 

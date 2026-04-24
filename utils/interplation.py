@@ -394,12 +394,6 @@ def interp_all(extrinsics, intrinsics, point_map, gs_map, dy_map, gs_conf, bg_ma
                                     )
                         except Exception as e_last:
                             raise
-                finally:
-                    try:
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    except Exception:
-                        pass
                 if coords_out is not None:
                     try:
                         coords_all = coords_out.detach().cpu().numpy()
