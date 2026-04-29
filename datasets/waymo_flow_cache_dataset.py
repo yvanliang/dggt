@@ -203,8 +203,10 @@ class WaymoFlowCacheDataset(Dataset):
             "object_asset_image_valid_mask_selected",
             "object_bbox_present_mask_selected",
             "object_bbox_editable_mask_selected",
+            "object_bbox_model_selected",
             "object_front_bbox_present_mask_selected",
             "object_front_bbox_editable_mask_selected",
+            "object_front_bbox_model_selected",
         ):
             if key in obj:
                 out[key] = obj[key].index_select(1, subset)

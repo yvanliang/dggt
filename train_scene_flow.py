@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 
 from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
+from dggt.utils.flow_cache_io import load_flow_cache
 
 
 # ---------------------------------------------------------------------- #
@@ -81,6 +82,37 @@ def autocast_context(args, device: torch.device):
     if args.precision == "bf16" and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     return nullcontext()
+
+
+def _infer_cache_patch_grid(dataset: WaymoFlowCacheDataset) -> tuple[int, int]:
+    if len(dataset.entries) == 0:
+        raise RuntimeError("Cannot infer patch grid from an empty cache dataset.")
+    entry = dataset.entries[0]
+    cache_path = entry.get("cache_path")
+    if cache_path is None:
+        raise KeyError("Cache dataset entry is missing 'cache_path'.")
+    payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
+    patch_grid = payload.get("meta", {}).get("patch_grid")
+    if patch_grid is None or len(patch_grid) != 2:
+        raise KeyError(f"Cache payload {cache_path} is missing meta.patch_grid=(H,W).")
+    out = (int(patch_grid[0]), int(patch_grid[1]))
+    if out[0] <= 0 or out[1] <= 0:
+        raise ValueError(f"Invalid cache patch_grid {out} in {cache_path}.")
+    return out
+
+
+def _validate_item_patch_grid(
+    asset_pass_result,
+    assembler: FlowFeatureAssembler,
+    cache_path: str | None = None,
+) -> None:
+    item_grid = tuple(int(v) for v in asset_pass_result.patch_grid)
+    if item_grid != assembler.patch_grid:
+        where = f" for {cache_path}" if cache_path else ""
+        raise ValueError(
+            f"Cache patch_grid{where} is {item_grid}, but assembler was initialized "
+            f"with {assembler.patch_grid}. Use one training run per image geometry."
+        )
 
 
 # ---------------------------------------------------------------------- #
@@ -215,6 +247,7 @@ def train_step(
     sample = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item["sample"].items()}
     predictions = _move_predictions(item["predictions"], device)
     asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
+    _validate_item_patch_grid(asset_pass_result, assembler, item.get("cache_path"))
     cameras_dggt = {k: v.to(device) for k, v in item["cameras_dggt"].items()}
     mode_kind = str(item.get("mode_kind", sample.get("mode_kind", "mode_a")))
     mode_b_payload = item.get("mode_b")
@@ -314,8 +347,34 @@ def main() -> None:
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
+    if args.manifest_path is None and args.cache_root is None:
+        raise ValueError("Provide either --cache_root or --manifest_path.")
+
+    mode_filter = (
+        [m.strip() for m in args.mode_filter.split(",") if m.strip()]
+        if args.mode_filter else None
+    )
+    train_ds = WaymoFlowCacheDataset(
+        cache_root=args.cache_root,
+        manifest_path=args.manifest_path,
+        mode_filter=mode_filter,
+        split=args.split,
+        min_frames=args.min_frames,
+        max_frames=args.max_frames,
+        seed=args.seed,
+    )
+    patch_grid = _infer_cache_patch_grid(train_ds)
+    h_splat = patch_grid[0] * 4
+    w_splat = patch_grid[1] * 4
+    args.patch_grid = list(patch_grid)
+    args.H_splat = int(h_splat)
+    args.W_splat = int(w_splat)
     if is_main_process():
         (log_dir / "config.json").write_text(json.dumps(vars(args), indent=2))
+        print(
+            f"[train] cache patch_grid={patch_grid}, H_splat={h_splat}, W_splat={w_splat}",
+            flush=True,
+        )
 
     tokenizer = _load_tokenizer(args.ckpt_path, device)
     freeze_module(tokenizer)  # T1: encoder frozen; decoder layer_heads/local_refine can be unfrozen later.
@@ -323,6 +382,9 @@ def main() -> None:
     # Assembler: scaffold_packer + feature_splatter + soft_mask + noise_scheduler trainable.
     assembler = FlowFeatureAssembler(
         scene_tokenizer=tokenizer,
+        patch_grid=patch_grid,
+        H_splat=h_splat,
+        W_splat=w_splat,
         editor_kwargs={"use_pose_refine": True},
     ).to(device)
     # Freeze inner editor / soft_mask (no params), scaffold packer trainable.
@@ -340,21 +402,6 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
-    if args.manifest_path is None and args.cache_root is None:
-        raise ValueError("Provide either --cache_root or --manifest_path.")
-    mode_filter = (
-        [m.strip() for m in args.mode_filter.split(",") if m.strip()]
-        if args.mode_filter else None
-    )
-    train_ds = WaymoFlowCacheDataset(
-        cache_root=args.cache_root,
-        manifest_path=args.manifest_path,
-        mode_filter=mode_filter,
-        split=args.split,
-        min_frames=args.min_frames,
-        max_frames=args.max_frames,
-        seed=args.seed,
-    )
     loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
@@ -422,6 +469,7 @@ def _dump_vis(
         sample = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item["sample"].items()}
         predictions = _move_predictions(item["predictions"], device)
         apr = _move_asset_pass(item["asset_pass_result"], device)
+        _validate_item_patch_grid(apr, assembler, item.get("cache_path"))
         cams = {k: v.to(device) for k, v in item["cameras_dggt"].items()}
         mode_kind = str(item.get("mode_kind", sample.get("mode_kind", "mode_a")))
         mode_b_payload = item.get("mode_b")

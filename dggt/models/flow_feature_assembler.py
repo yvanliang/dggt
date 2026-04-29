@@ -189,6 +189,7 @@ class FlowFeatureAssembler(nn.Module):
         gamma_dest: float = 0.4,
         eps_floor: float = 0.05,
         sigma_partial: float = 0.3,
+        preserve_token_bypass: bool = True,
         editor_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
@@ -199,6 +200,7 @@ class FlowFeatureAssembler(nn.Module):
         self.patch_start_idx = int(patch_start_idx)
         self.H_splat = int(H_splat)
         self.W_splat = int(W_splat)
+        self.preserve_token_bypass = bool(preserve_token_bypass)
 
         self.editor = GaussianSceneEditor(**(editor_kwargs or {}))
         self.feature_splatter = FeatureSplatter(
@@ -440,6 +442,11 @@ class FlowFeatureAssembler(nn.Module):
         M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=self.patch_grid
         )
+        splatted_tok_low = self._blend_preserve_tokens(
+            clean_levels=F_g_lut_scene,
+            splatted_levels=splatted_tok_low,
+            M_preserve=M_preserve,
+        )
 
         # Scaffold precursors
         D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
@@ -626,6 +633,11 @@ class FlowFeatureAssembler(nn.Module):
         M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=self.patch_grid
         )
+        splatted_tok_low = self._blend_preserve_tokens(
+            clean_levels=F_g_lut_scene,
+            splatted_levels=splatted_tok_low,
+            M_preserve=M_preserve,
+        )
 
         # Scaffold (D_edited not meaningful for mode B — pass zeros).
         B = int(F_g_lut_scene[0].shape[0])
@@ -761,6 +773,45 @@ class FlowFeatureAssembler(nn.Module):
     # ------------------------------------------------------------------ #
     # Internal helpers                                                    #
     # ------------------------------------------------------------------ #
+    def _blend_preserve_tokens(
+        self,
+        clean_levels: Sequence[torch.Tensor],
+        splatted_levels: Sequence[torch.Tensor],
+        M_preserve: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        """Use clean tokens in confidently preserved regions.
+
+        Feature splatting is useful where geometry changes, but unchanged
+        background should not be forced through a lossy GS reprojection.  The
+        soft preserve mask gives a conservative per-token bypass that keeps
+        clean features exact where no source/destination edit footprint exists.
+        """
+        if not self.preserve_token_bypass:
+            return list(splatted_levels)
+        if len(clean_levels) != len(splatted_levels):
+            raise ValueError(
+                f"clean/splatted level count mismatch: {len(clean_levels)} vs {len(splatted_levels)}"
+            )
+        if M_preserve.dim() != 4 or M_preserve.shape[-1] != 1:
+            raise ValueError(f"M_preserve must be [B,S,P,1], got {tuple(M_preserve.shape)}")
+
+        out: list[torch.Tensor] = []
+        for level_idx, (clean, splatted) in enumerate(zip(clean_levels, splatted_levels)):
+            if clean.shape != splatted.shape:
+                raise ValueError(
+                    f"Level {level_idx} clean/splatted shape mismatch: "
+                    f"{tuple(clean.shape)} vs {tuple(splatted.shape)}"
+                )
+            if clean.shape[:-1] != M_preserve.shape[:-1]:
+                raise ValueError(
+                    f"Level {level_idx} token axes {tuple(clean.shape[:-1])} do not match "
+                    f"M_preserve {tuple(M_preserve.shape[:-1])}"
+                )
+            preserve = M_preserve.to(device=splatted.device, dtype=splatted.dtype).clamp(0.0, 1.0)
+            clean = clean.to(device=splatted.device, dtype=splatted.dtype)
+            out.append(preserve * clean + (1.0 - preserve) * splatted)
+        return out
+
     def _select_lut_scene(self, predictions: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         """Return 4-level patch-token LUT for scene Gaussians.
 

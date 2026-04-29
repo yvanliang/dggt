@@ -102,10 +102,10 @@ CUDA_VISIBLE_DEVICES=3 python inference_mode_b.py --output_dir runs/mode_a_all_v
 
 ```bash
 python tools/build_flow_train_manifest.py \
-    --cache_root /data/flow_cache_mode_a:mode_a \
-    --cache_root /data/flow_cache_mode_b:mode_b \
+    --cache_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a:mode_a \
+    --cache_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_b:mode_b \
     --split training \
-    --out_path /data/flow_cache/training_manifest.jsonl
+    --out_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl
 ```
 
 `--cache_root` 可以重复指定。可选的 `:mode_a` / `:mode_b` 后缀会固定模式，不需要打开任何 `.pt`（低成本路径）；`:auto` 或不加后缀会强制脚本查看每个文件的 `mode_kind`（更慢，在 NVMe 上约为 1 s/clip）。
