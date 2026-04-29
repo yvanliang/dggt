@@ -740,16 +740,15 @@ class ModeBPlanner:
     def _semantic_overlap(
         self,
         clean_state: CleanSceneState,
-        projection: dict[str, Any],
+        bbox: torch.Tensor,
         image_idx: int,
         image_hw: tuple[int, int],
+        *,
+        profile: dict[str, float | str] | None = None,
     ) -> int:
-        if not projection["visible"]:
-            return 0
         if clean_state.semantic_vehicle_mask.numel() == 0 or image_idx >= clean_state.semantic_vehicle_mask.shape[0]:
             return 0
-        poly_points = projection["uv"][projection["valid"]]
-        poly_mask = _polygon_to_mask(poly_points, image_hw)
+        poly_mask = _vehicle_occluder_mask_for_image_box(bbox, image_hw, profile=profile)
         semantic = clean_state.semantic_vehicle_mask[image_idx].detach().cpu().bool()
         if semantic.shape != poly_mask.shape:
             return 0
@@ -902,7 +901,14 @@ class ModeBPlanner:
                     continue
                 bboxes[frame_idx, view_idx] = bbox
                 visible[frame_idx, view_idx] = True
-                semantic_overlap += self._semantic_overlap(clean_state, projection, image_idx, image_hw)
+                overlap_bbox = _scale_box_xyxy(bbox, self.shell_scale, image_hw)
+                semantic_overlap += self._semantic_overlap(
+                    clean_state,
+                    overlap_bbox,
+                    image_idx,
+                    image_hw,
+                    profile=occluder_profile,
+                )
                 if semantic_overlap > self.max_semantic_overlap_px:
                     return False, {
                         "reason": "semantic_overlap",
@@ -1100,7 +1106,9 @@ def apply_mode_b(
     num_images = int(clean_state.images.shape[0])
 
     for frame_idx in range(num_frames):
-        frame_mask = torch.zeros((num_points,), dtype=torch.bool)
+        frame_core_mask = torch.zeros((num_points,), dtype=torch.bool)
+        frame_shell_mask = torch.zeros((num_points,), dtype=torch.bool)
+        frame_protected_mask = torch.zeros((num_points,), dtype=torch.bool)
         projection_cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         for obj in objects:
             local_frame_idx = min(frame_idx, obj.center_dggt_per_frame.shape[0] - 1)
@@ -1132,6 +1140,7 @@ def apply_mode_b(
                     )
                     projection_cache[int(image_idx)] = cached
                 uv, depths, valid = cached
+                frame_protected_mask |= _points_on_semantic_vehicle_mask(clean_state, uv, valid, image_idx)
                 _, corner_depths, corner_valid = project_world_points(
                     box_corners,
                     clean_state.camera_to_world[image_idx],
@@ -1157,9 +1166,13 @@ def apply_mode_b(
                 core_here = _points_in_vehicle_occluder(uv, valid, core_bbox, profile)
                 shell_full = _points_in_vehicle_occluder(uv, valid & shell_depth_keep, shell_bbox, profile)
                 shell_here = shell_full & ~core_here
-                core_mask |= core_here
-                shell_mask |= shell_here
-                frame_mask |= core_here | shell_here
+                frame_core_mask |= core_here
+                frame_shell_mask |= shell_here
+        frame_core_mask &= ~frame_protected_mask
+        frame_shell_mask &= ~frame_protected_mask
+        core_mask |= frame_core_mask
+        shell_mask |= frame_shell_mask
+        frame_mask = frame_core_mask | frame_shell_mask
         delete_mask_per_frame[frame_idx] = frame_mask
 
     delete_mask = core_mask | shell_mask
@@ -1291,6 +1304,28 @@ def _points_in_image_box(uv: torch.Tensor, valid: torch.Tensor, box: torch.Tenso
     )
 
 
+def _points_on_semantic_vehicle_mask(
+    clean_state: CleanSceneState,
+    uv: torch.Tensor,
+    valid: torch.Tensor,
+    image_idx: int,
+) -> torch.Tensor:
+    protected = torch.zeros((uv.shape[0],), dtype=torch.bool)
+    if clean_state.semantic_vehicle_mask.numel() == 0 or image_idx >= clean_state.semantic_vehicle_mask.shape[0]:
+        return protected
+    semantic = clean_state.semantic_vehicle_mask[image_idx].detach().cpu().bool()
+    if semantic.numel() == 0:
+        return protected
+    height, width = semantic.shape
+    finite = valid.detach().cpu().bool() & torch.isfinite(uv.detach().cpu()).all(dim=-1)
+    if int(finite.sum().item()) == 0:
+        return protected
+    xs = uv.detach().cpu()[:, 0].round().long().clamp(0, width - 1)
+    ys = uv.detach().cpu()[:, 1].round().long().clamp(0, height - 1)
+    protected[finite] = semantic[ys[finite], xs[finite]]
+    return protected
+
+
 def _longest_visible_run(visible_by_frame: torch.Tensor) -> torch.Tensor:
     visible_list = [bool(v) for v in visible_by_frame.detach().cpu().bool().tolist()]
     best_start = 0
@@ -1311,6 +1346,22 @@ def _longest_visible_run(visible_by_frame: torch.Tensor) -> torch.Tensor:
     if best_len > 0:
         keep[best_start : best_start + best_len] = True
     return keep
+
+
+def _vehicle_occluder_mask_for_image_box(
+    box: torch.Tensor,
+    image_hw: tuple[int, int],
+    profile: dict[str, float | str] | None = None,
+) -> torch.Tensor:
+    height, width = image_hw
+    yy, xx = torch.meshgrid(
+        torch.arange(height, dtype=torch.float32),
+        torch.arange(width, dtype=torch.float32),
+        indexing="ij",
+    )
+    uv = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=-1)
+    valid = torch.ones((height * width,), dtype=torch.bool)
+    return _points_in_vehicle_occluder(uv, valid, box.detach().cpu().float(), profile).view(height, width)
 
 
 def _points_in_vehicle_occluder(

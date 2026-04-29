@@ -43,7 +43,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Single-sample Mode A inference: runs GaussianSceneEditor (Phase 1 "
-            "deletion) and AssetAggregatorPass (Phase 4 Waymo-coord per-object "
+            "deletion) and AssetAggregatorPass (Phase 4 DGGT-fitted per-object "
             "render) on the same sample, with Phase 4 gated by Phase 1's "
             "(slot, frame) deletion coverage so per-frame asset renders line "
             "up one-to-one with deletions."
@@ -96,6 +96,18 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["on", "off"],
         default="on",
         help="Enable (on) or bypass (off) the 3D-box pose refinement before semantic-mask deletion.",
+    )
+    parser.add_argument(
+        "--max_pose_refine_yaw_deg",
+        type=float,
+        default=15.0,
+        help="Clamp the shared per-track yaw update around the Waymo 3D-box heading.",
+    )
+    parser.add_argument(
+        "--asset_yaw_correction_deg",
+        type=float,
+        default=180.0,
+        help="Fixed local yaw mapping from canonical asset Gaussians into the Waymo 3D-box frame.",
     )
     parser.add_argument(
         "--dump_features",
@@ -748,6 +760,11 @@ def _save_asset_pass_outputs(
 
     per_object_info: list[dict] = []
     for slot_idx in result.object_keys:
+        if result.G_asset_dggt is None or int(slot_idx) not in result.G_asset_dggt:
+            raise RuntimeError(
+                "inference_scene_editor requires DGGT-fitted asset pass outputs; "
+                f"missing G_asset_dggt for slot {int(slot_idx)}"
+            )
         i_asset = result.I_asset[slot_idx][0]
         a_asset = result.A_asset[slot_idx][0]
         nrow = max(1, num_views)
@@ -761,7 +778,7 @@ def _save_asset_pass_outputs(
             {
                 "slot_idx": int(slot_idx),
                 "num_gauss_per_frame": [
-                    int(g["means"].shape[0]) for g in result.G_asset_waymo[slot_idx]
+                    int(g["means"].shape[0]) for g in result.G_asset_dggt[slot_idx]
                 ],
                 "num_visible_pointers_per_frame": [
                     int(p.visible_mask.sum().item()) for p in result.ptr_asset[slot_idx]
@@ -779,7 +796,9 @@ def _save_asset_pass_outputs(
 
     if not skip_ply:
         for slot_idx in result.object_keys:
-            for frame_i, gauss in enumerate(result.G_asset_waymo[slot_idx]):
+            if result.G_asset_dggt is None or int(slot_idx) not in result.G_asset_dggt:
+                continue
+            for frame_i, gauss in enumerate(result.G_asset_dggt[slot_idx]):
                 if gauss["means"].numel() == 0:
                     continue
                 write_gaussian_ply(
@@ -790,12 +809,13 @@ def _save_asset_pass_outputs(
                         "scales": gauss["scales"],
                         "quats": gauss["quats"],
                     },
-                    asset_pass_dir / f"slot{slot_idx:02d}_frame{frame_i:02d}_waymo_gaussians.ply",
+                    asset_pass_dir / f"slot{slot_idx:02d}_frame{frame_i:02d}_dggt_gaussians.ply",
                 )
 
     return {
         "num_objects": len(result.object_keys),
         "object_keys": [int(k) for k in result.object_keys],
+        "asset_pass_space": str(result.asset_pass_space),
         "patch_grid": list(result.patch_grid),
         "patch_start_idx": int(result.patch_start_idx),
         "per_object": per_object_info,
@@ -897,6 +917,8 @@ def _run_one_sample(
         dynamic_prob_thresh=args.dynamic_prob_thresh,
         dynamic_ratio_thresh=args.dynamic_ratio_thresh,
         use_pose_refine=(args.pose_refine == "on"),
+        max_pose_refine_yaw_deg=args.max_pose_refine_yaw_deg,
+        asset_yaw_correction_deg=args.asset_yaw_correction_deg,
     )
 
     semantic_summary = _save_vehicle_semantic_outputs(
@@ -954,13 +976,16 @@ def _run_one_sample(
 
     alignment = editor.align(sample, clean_state)
 
+    asset_bank = AssetBank()
+    asset_cache = asset_bank.as_raw_cache()
     selected_slots = parse_object_slots(sample, args.object_slots)
     localized_objects = editor.localize(
         sample,
         clean_state,
         alignment,
         selected_slots,
-        load_asset=False,
+        asset_cache=asset_cache,
+        load_asset=True,
     )
     _save_target_boxes(
         clean_state.images,
@@ -998,15 +1023,21 @@ def _run_one_sample(
         sample["object_asset_image_valid_mask_selected"].bool() & phase1_coverage
     )
 
-    asset_bank = AssetBank()
     asset_pass = AssetAggregatorPass(model.aggregator).to(device)
+    cameras_dggt_for_asset = {
+        "viewmats": _as_homogeneous_viewmats(clean_state.world_to_camera).to(device),
+        "Ks": clean_state.intrinsics.to(device),
+    }
     with torch.no_grad():
         asset_pass_result = asset_pass(
             phase4_sample,
             selected_object_slots=phase4_slots,
             alignment=alignment,
-            asset_cache=asset_bank.as_raw_cache(),
+            asset_cache=asset_cache,
             occlusion_test=True,
+            localized_objects=localized_objects,
+            cameras_dggt=cameras_dggt_for_asset,
+            render_space="dggt_fitted",
         )
 
     num_views = int(sample["cam_ids"].numel())
@@ -1148,6 +1179,8 @@ def _run_flow_feature_dump(
             "dynamic_prob_thresh": args.dynamic_prob_thresh,
             "dynamic_ratio_thresh": args.dynamic_ratio_thresh,
             "use_pose_refine": (args.pose_refine == "on"),
+            "max_pose_refine_yaw_deg": args.max_pose_refine_yaw_deg,
+            "asset_yaw_correction_deg": args.asset_yaw_correction_deg,
         },
     ).to(device)
 

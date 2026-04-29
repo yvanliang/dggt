@@ -140,6 +140,8 @@ class GaussianSceneEditor(nn.Module):
         dynamic_prob_thresh: float = 0.55,
         dynamic_ratio_thresh: float = 0.35,
         use_pose_refine: bool = True,
+        max_pose_refine_yaw_deg: float = 15.0,
+        asset_yaw_correction_deg: float = 180.0,
     ) -> None:
         super().__init__()
         self.min_match_score = float(min_match_score)
@@ -151,6 +153,8 @@ class GaussianSceneEditor(nn.Module):
         self.dynamic_prob_thresh = float(dynamic_prob_thresh)
         self.dynamic_ratio_thresh = float(dynamic_ratio_thresh)
         self.use_pose_refine = bool(use_pose_refine)
+        self.max_pose_refine_yaw_deg = float(max_pose_refine_yaw_deg)
+        self.asset_yaw_correction_deg = float(asset_yaw_correction_deg)
 
     def build_clean_bundle(
         self,
@@ -189,6 +193,8 @@ class GaussianSceneEditor(nn.Module):
             dynamic_prob_thresh=self.dynamic_prob_thresh,
             dynamic_ratio_thresh=self.dynamic_ratio_thresh,
             use_pose_refine=self.use_pose_refine,
+            max_pose_refine_yaw_deg=self.max_pose_refine_yaw_deg,
+            asset_yaw_correction_deg=self.asset_yaw_correction_deg,
             asset_cache=asset_cache,
             load_asset=load_asset,
         )

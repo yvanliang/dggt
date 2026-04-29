@@ -17,6 +17,7 @@ _GS_LWH_TO_XYZ_SCALE = (0.90, 0.90, 0.88)
 WAYMO_DYNAMIC_SPEED_THRESH_MPS = 1.0
 _DYNAMIC_VOXEL_SCALE = (0.10, 0.10, 0.20)
 _STATIC_VOXEL_SCALE = (0.08, 0.08, 0.16)
+_MAX_POSE_REFINE_YAW_DEG = 15.0
 
 
 @dataclass
@@ -308,6 +309,50 @@ def _estimate_sim3_umeyama(source: torch.Tensor, target: torch.Tensor) -> Sim3Tr
     )
 
 
+def _estimate_rotation_wahba(source_vectors: torch.Tensor, target_vectors: torch.Tensor) -> torch.Tensor:
+    if source_vectors.shape != target_vectors.shape or source_vectors.shape[-1] != 3:
+        raise ValueError(
+            f"Expected matched Nx3 direction vectors, got {tuple(source_vectors.shape)} and {tuple(target_vectors.shape)}"
+        )
+    finite = torch.isfinite(source_vectors).all(dim=-1) & torch.isfinite(target_vectors).all(dim=-1)
+    source_vectors = source_vectors[finite].float()
+    target_vectors = target_vectors[finite].float()
+    if source_vectors.shape[0] < 2:
+        return torch.eye(3, dtype=torch.float32)
+
+    source_vectors = source_vectors / source_vectors.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    target_vectors = target_vectors / target_vectors.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    covariance = target_vectors.T @ source_vectors / float(source_vectors.shape[0])
+    u, _, vh = torch.linalg.svd(covariance)
+    diag = torch.eye(3, dtype=torch.float32)
+    if torch.det(u @ vh) < 0:
+        diag[-1, -1] = -1.0
+    return (u @ diag @ vh).float()
+
+
+def _robust_scale_from_camera_centers(source_centers: torch.Tensor, target_centers: torch.Tensor) -> float:
+    if source_centers.shape[0] < 2:
+        return 1.0
+
+    pair_i, pair_j = torch.triu_indices(source_centers.shape[0], source_centers.shape[0], offset=1)
+    source_dist = (source_centers[pair_i] - source_centers[pair_j]).norm(dim=-1)
+    target_dist = (target_centers[pair_i] - target_centers[pair_j]).norm(dim=-1)
+    finite = torch.isfinite(source_dist) & torch.isfinite(target_dist)
+    valid = finite & (source_dist > 1e-4) & (target_dist > 1e-6)
+    ratios = target_dist[valid] / source_dist[valid].clamp_min(1e-6)
+    if ratios.numel() > 0:
+        scale = float(torch.median(ratios).item())
+        if math.isfinite(scale) and scale > 0.0:
+            return scale
+
+    source_var = ((source_centers - source_centers.mean(0)) ** 2).sum()
+    target_var = ((target_centers - target_centers.mean(0)) ** 2).sum()
+    scale_fallback = torch.sqrt(target_var / source_var.clamp_min(1e-6))
+    if torch.isfinite(scale_fallback) and float(scale_fallback.item()) > 0.0:
+        return float(scale_fallback.item())
+    return 1.0
+
+
 def estimate_scene_alignment(sample: dict[str, Any], clean_state: CleanSceneState) -> Sim3Transform:
     gt_camera_to_world = sample["camera_to_world_corrected"].detach().cpu().float().view(-1, 4, 4)
     pred_camera_to_world = clean_state.camera_to_world.detach().cpu().float().view(-1, 4, 4)
@@ -319,37 +364,32 @@ def estimate_scene_alignment(sample: dict[str, Any], clean_state: CleanSceneStat
 
     gt_centers = gt_camera_to_world[:, :3, 3]
     pred_centers = pred_camera_to_world[:, :3, 3]
-    gt_right = gt_camera_to_world[:, :3, 0]
-    pred_right = pred_camera_to_world[:, :3, 0]
-    gt_forward = gt_camera_to_world[:, :3, 2]
-    pred_forward = pred_camera_to_world[:, :3, 2]
-
-    # Pre-estimate scale from centers to avoid corrupting Umeyama scale with fixed-length anchors
     if gt_centers.shape[0] > 1:
         gt_var = ((gt_centers - gt_centers.mean(0)) ** 2).sum()
         pred_var = ((pred_centers - pred_centers.mean(0)) ** 2).sum()
-        pre_scale = torch.sqrt(pred_var / gt_var.clamp_min(1e-6))
-        if not torch.isfinite(pre_scale) or pre_scale == 0:
-            pre_scale = 1.0
+        scale_t = torch.sqrt(pred_var / gt_var.clamp_min(1e-6))
+        if not torch.isfinite(scale_t) or float(scale_t.item()) <= 0.0:
+            scale_t = torch.tensor(1.0, dtype=torch.float32)
     else:
-        pre_scale = 1.0
+        scale_t = torch.tensor(1.0, dtype=torch.float32)
+    scale = float(scale_t.item())
 
-    # Instead of Umeyama which compromises between noisy trajectories and orientation,
-    # deterministically align the first frame to establish the absolute coordinate mapping.
-    # This ensures that the initial orientation and position are perfectly aligned.
+    # DGGT's reconstructed world gauge is anchored by the input view order.  In
+    # practice, averaging camera rotations across the clip can rotate the whole
+    # scene away from the first-frame gauge and visibly bias object headings.
     R_gt = gt_camera_to_world[0, :3, :3]
     R_pred = pred_camera_to_world[0, :3, :3]
-    rotation = R_pred @ R_gt.T
+    rotation = _orthonormalize_rotation(R_pred @ R_gt.T)
 
-    t_gt = gt_centers[0]
-    t_pred = pred_centers[0]
-    translation = t_pred - pre_scale * (rotation @ t_gt)
+    translation = pred_centers[0] - scale * (rotation @ gt_centers[0])
+    aligned = scale * (gt_centers @ rotation.T) + translation
+    error = float((aligned - pred_centers).norm(dim=1).mean().item())
 
     return Sim3Transform(
-        scale=pre_scale,
+        scale=scale,
         rotation=rotation,
         translation=translation,
-        mean_alignment_error=torch.tensor(0.0)
+        mean_alignment_error=error,
     )
 
 
@@ -1053,13 +1093,6 @@ def _rotation_z_tensor(angle_rad: torch.Tensor, dtype: torch.dtype = torch.float
     )
 
 
-def _rotation_fix_z_180(dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    return torch.tensor(
-        [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
-        dtype=dtype,
-    )
-
-
 def _build_upright_rotation(front_dir: torch.Tensor, up_dir: torch.Tensor) -> torch.Tensor:
     up = up_dir / up_dir.norm().clamp_min(1e-6)
     front = front_dir - up * torch.dot(front_dir, up)
@@ -1139,6 +1172,38 @@ def _shared_track_rotation_candidate(
     best_local = int(torch.tensor(scores, dtype=torch.float32)[inlier_indices].argmax().item())
     best_index = int(inlier_indices[best_local].item())
     return rotations[best_index].clone()
+
+
+def _shared_track_yaw_delta(
+    yaw_deltas: list[float],
+    scores: list[float],
+    max_yaw_rad: float,
+    max_spread_deg: float = 18.0,
+) -> float:
+    if max_yaw_rad <= 0.0 or len(yaw_deltas) == 0:
+        return 0.0
+    finite_items = [
+        (float(yaw), float(score))
+        for yaw, score in zip(yaw_deltas, scores)
+        if math.isfinite(float(yaw)) and math.isfinite(float(score))
+    ]
+    if len(finite_items) == 0:
+        return 0.0
+    if len(finite_items) == 1:
+        yaw = finite_items[0][0]
+        return max(-max_yaw_rad, min(max_yaw_rad, yaw))
+
+    yaws = [item[0] for item in finite_items]
+    finite_scores = [item[1] for item in finite_items]
+    shared = _robust_shared_yaw_delta(yaws, finite_scores)
+    angles = _wrap_angle_rad(torch.tensor(yaws, dtype=torch.float32))
+    diffs = _wrap_angle_rad(angles - float(shared)).abs()
+    inlier_thresh = math.radians(float(max_spread_deg))
+    inlier_count = int((diffs <= inlier_thresh).sum().item())
+    min_inliers = max(2, math.ceil(0.5 * len(yaws)))
+    if inlier_count < min_inliers:
+        return 0.0
+    return max(-max_yaw_rad, min(max_yaw_rad, float(shared)))
 
 
 def _world_to_camera_points(points_world: torch.Tensor, camera_to_world: torch.Tensor) -> torch.Tensor:
@@ -1550,10 +1615,15 @@ def _transform_asset_gaussians_simple(
     target_lwh: torch.Tensor,
     object_rotation: torch.Tensor,
     object_center: torch.Tensor,
-    opacity_threshold: float = 0.01
+    opacity_threshold: float = 0.01,
+    asset_yaw_correction_deg: float = 180.0,
 ) -> dict[str, torch.Tensor]:
     scale_factors = _compute_asset_scale_factors(asset_local, target_lwh, opacity_threshold=opacity_threshold)
-    world_rot = object_rotation @ _rotation_fix_z_180(dtype=object_rotation.dtype).to(object_rotation.device)
+    asset_yaw = _rotation_z(
+        math.radians(float(asset_yaw_correction_deg)),
+        dtype=object_rotation.dtype,
+    ).to(object_rotation.device)
+    world_rot = object_rotation @ asset_yaw
 
     means_scaled = asset_local["means_raw"].to(target_lwh.device) * scale_factors.view(1, 3)
     means_world = means_scaled @ world_rot.T + object_center
@@ -1583,6 +1653,7 @@ def _project_asset_bbox_simple(
     intrinsics: torch.Tensor,
     image_hw: tuple[int, int],
     opacity_threshold: float = 0.01,
+    asset_yaw_correction_deg: float = 180.0,
 ) -> torch.Tensor | None:
     opacities = asset_local["opacities"].squeeze(-1)
     visible = opacities > opacity_threshold
@@ -1595,7 +1666,11 @@ def _project_asset_bbox_simple(
         visible_xyz = visible_xyz[::stride]
 
     scale_factors = _compute_asset_scale_factors(asset_local, target_lwh, opacity_threshold=opacity_threshold)
-    world_rot = object_rotation @ _rotation_fix_z_180(dtype=object_rotation.dtype).to(object_rotation.device)
+    asset_yaw = _rotation_z(
+        math.radians(float(asset_yaw_correction_deg)),
+        dtype=object_rotation.dtype,
+    ).to(object_rotation.device)
+    world_rot = object_rotation @ asset_yaw
     means_world = visible_xyz.to(target_lwh.device) * scale_factors.view(1, 3)
     means_world = means_world @ world_rot.T + object_center
     uv, _, valid = project_world_points(means_world, camera_to_world, intrinsics, image_hw)
@@ -1648,6 +1723,7 @@ def transform_asset_gaussians(
     object_rotation: torch.Tensor,
     object_center: torch.Tensor,
     opacity_threshold: float = 0.01,
+    asset_yaw_correction_deg: float = 180.0,
 ) -> dict[str, torch.Tensor]:
     return _transform_asset_gaussians_simple(
         asset_local,
@@ -1655,6 +1731,7 @@ def transform_asset_gaussians(
         object_rotation,
         object_center,
         opacity_threshold=opacity_threshold,
+        asset_yaw_correction_deg=asset_yaw_correction_deg,
     )
 
 
@@ -2793,6 +2870,8 @@ def localize_objects(
     dynamic_prob_thresh: float | None = None,
     dynamic_ratio_thresh: float = 0.35,
     use_pose_refine: bool = True,
+    max_pose_refine_yaw_deg: float = _MAX_POSE_REFINE_YAW_DEG,
+    asset_yaw_correction_deg: float = 180.0,
     asset_cache: dict[str, dict[str, torch.Tensor]] | None = None,
     load_asset: bool = True,
 ) -> list[LocalizedFrameObject]:
@@ -2875,7 +2954,11 @@ def localize_objects(
             source_front_index = frame_idx * num_views + int(view_offset)
             proposal_rotation_base = _build_label_track_rotation(gt_rotation, scene_up)
 
-            if use_pose_refine:
+            max_yaw_rad = max(0.0, math.radians(float(max_pose_refine_yaw_deg)))
+            if use_pose_refine and max_yaw_rad > 0.0:
+                # Axis-aligned 2D boxes are a weak yaw constraint.  This branch is
+                # retained only for explicit experiments with a non-zero yaw budget;
+                # the robust default keeps the Waymo 3D-box heading fixed.
                 proposal_center_init, proposal_rotation_init, proposal_bbox = _solve_proposal_pose_from_target_bbox(
                     object_center=gt_center,
                     object_size=gt_size,
@@ -2888,11 +2971,24 @@ def localize_objects(
                     depth_map=clean_state.depth[source_front_index],
                     valid_mask=clean_state.valid_mask[source_front_index],
                 )
+                proposal_yaw_delta = _yaw_delta_between_rotations(
+                    proposal_rotation_base,
+                    proposal_rotation_init,
+                )
                 proposal_score = -1e9 if proposal_bbox is None else _score_projected_bbox(proposal_bbox, target_bbox_model)
             else:
                 proposal_center_init = gt_center.clone()
                 proposal_rotation_init = proposal_rotation_base.clone()
-                proposal_score = 0.0
+                proposal_yaw_delta = 0.0
+                proposal_bbox = _project_box_bbox(
+                    gt_center,
+                    gt_size,
+                    proposal_rotation_base,
+                    clean_state.camera_to_world[source_front_index],
+                    clean_state.intrinsics[source_front_index],
+                    image_hw,
+                )
+                proposal_score = -1e9 if proposal_bbox is None else _score_projected_bbox(proposal_bbox, target_bbox_model)
 
             waymo_frame_dynamic = (
                 bool(object_is_moving_frame[slot_idx, frame_idx].item())
@@ -2915,6 +3011,7 @@ def localize_objects(
                     "proposal_rotation_base": proposal_rotation_base,
                     "proposal_center_initial": proposal_center_init,
                     "proposal_rotation_initial": proposal_rotation_init,
+                    "proposal_yaw_delta": float(proposal_yaw_delta),
                     "proposal_score_initial": proposal_score,
                     "waymo_frame_dynamic": bool(waymo_frame_dynamic),
                     "waymo_frame_speed": waymo_frame_speed,
@@ -2925,21 +3022,11 @@ def localize_objects(
         if len(frame_specs) == 0:
             continue
 
-        if use_pose_refine:
-            shared_yaw_delta = _robust_shared_yaw_delta(
-                [
-                    _yaw_delta_between_rotations(spec["proposal_rotation_base"], spec["proposal_rotation_initial"])
-                    for spec in frame_specs
-                ],
-                [float(spec["proposal_score_initial"]) for spec in frame_specs],
-            )
-            shared_track_rotation = _shared_track_rotation_candidate(
-                [spec["proposal_rotation_initial"] for spec in frame_specs],
-                [float(spec["proposal_score_initial"]) for spec in frame_specs],
-            )
-        else:
-            shared_yaw_delta = 0.0
-            shared_track_rotation = None
+        shared_yaw_delta = _shared_track_yaw_delta(
+            [float(spec["proposal_yaw_delta"]) for spec in frame_specs],
+            [float(spec["proposal_score_initial"]) for spec in frame_specs],
+            max(0.0, math.radians(float(max_pose_refine_yaw_deg))),
+        )
 
         slot_meta[int(slot_idx)] = {
             "match_score": match_score,
@@ -2948,6 +3035,7 @@ def localize_objects(
             "asset_local": asset_local,
             "waymo_max_speed": waymo_max_speed,
             "waymo_mean_speed": waymo_mean_speed,
+            "shared_yaw_delta": shared_yaw_delta,
         }
         frame_geom: dict[int, dict[str, Any]] = {}
         for frame_spec in frame_specs:
@@ -2957,13 +3045,12 @@ def localize_objects(
             gt_size = frame_spec["gt_size"]
 
             if use_pose_refine:
-                if shared_track_rotation is not None:
-                    proposal_rotation = shared_track_rotation.clone()
-                else:
-                    shared_yaw_tensor = torch.tensor(shared_yaw_delta, dtype=gt_center.dtype)
-                    proposal_rotation = _orthonormalize_rotation(
-                        frame_spec["proposal_rotation_base"] @ _rotation_z_tensor(shared_yaw_tensor, dtype=gt_center.dtype)
-                    )
+                max_yaw = max(0.0, math.radians(float(max_pose_refine_yaw_deg)))
+                yaw_delta = max(-max_yaw, min(max_yaw, float(shared_yaw_delta)))
+                yaw_tensor = torch.tensor(yaw_delta, dtype=gt_center.dtype)
+                proposal_rotation = _orthonormalize_rotation(
+                    frame_spec["proposal_rotation_base"] @ _rotation_z_tensor(yaw_tensor, dtype=gt_center.dtype)
+                )
                 proposal_center, _ = _solve_proposal_center_with_fixed_rotation(
                     object_center=frame_spec["proposal_center_initial"],
                     object_size=gt_size,
@@ -2986,10 +3073,26 @@ def localize_objects(
             frame_geom[int(frame_idx)] = {
                 **frame_spec,
                 "proposal_center": proposal_center,
+                "proposal_center_raw": proposal_center.clone(),
                 "proposal_rotation": proposal_rotation,
                 "proposal_size": proposal_size,
                 "target_bbox_2d": target_bbox_2d,
+                "shared_yaw_delta": float(shared_yaw_delta),
             }
+        if use_pose_refine and len(frame_geom) > 1:
+            # The 2D bbox can correct a residual global offset, but solving each
+            # frame independently introduces visible track jitter.  Use a robust
+            # per-track median center residual and keep the Waymo 3D trajectory.
+            deltas = torch.stack(
+                [geom["proposal_center_raw"] - geom["gt_center"] for geom in frame_geom.values()],
+                dim=0,
+            )
+            finite_delta = torch.isfinite(deltas).all(dim=-1)
+            if bool(finite_delta.any().item()):
+                shared_delta = torch.median(deltas[finite_delta], dim=0).values
+                for geom in frame_geom.values():
+                    geom["proposal_center"] = geom["gt_center"] + shared_delta.to(geom["gt_center"].dtype)
+                    geom["proposal_center_shared_delta"] = shared_delta.clone()
         slot_frame_geom[int(slot_idx)] = frame_geom
 
     if not slot_frame_geom:
@@ -3027,6 +3130,7 @@ def localize_objects(
             proposal_size = geom["proposal_size"]
             target_bbox_model = geom["target_bbox_model"]
             target_bbox_2d = geom["target_bbox_2d"]
+            shared_yaw_delta = float(geom.get("shared_yaw_delta", 0.0))
             waymo_frame_dynamic = bool(geom["waymo_frame_dynamic"])
             waymo_frame_speed = float(geom["waymo_frame_speed"])
 
@@ -3146,6 +3250,7 @@ def localize_objects(
                     insert_size,
                     frame_rotation,
                     asset_center,
+                    asset_yaw_correction_deg=asset_yaw_correction_deg,
                 )
                 projected_asset_bbox = _project_asset_bbox_simple(
                     asset_local=asset_local,
@@ -3155,6 +3260,7 @@ def localize_objects(
                     camera_to_world=clean_state.camera_to_world[source_front_index],
                     intrinsics=clean_state.intrinsics[source_front_index],
                     image_hw=image_hw,
+                    asset_yaw_correction_deg=asset_yaw_correction_deg,
                 )
                 asset_scale = float(
                     torch.mean(
@@ -3231,6 +3337,7 @@ def localize_objects(
                     asset_quats_local=asset_quats_local,
                     asset_scale_factors=asset_scale_factors,
                     asset_object_to_world=asset_object_to_world,
+                    asset_local_yaw_deg=float(asset_yaw_correction_deg) + float(math.degrees(shared_yaw_delta)),
                 )
             )
 

@@ -58,6 +58,7 @@ from dggt.models.asset_pass import AssetAggregatorPass
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.feature_quant import quantize_tokens
 from dggt.utils.flow_cache_io import save_flow_cache
+from dggt.utils.gaussian_edit import parse_object_slots
 from dggt.utils.tokens import select_patch_pyramid
 
 
@@ -97,6 +98,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="mode_a only: skip Phase 4 (debug).")
     p.add_argument("--asset_batch_size", type=int, default=1,
                    help="mode_a only: number of editable object renders per asset aggregator forward.")
+    p.add_argument("--save_fit_metrics", action="store_true",
+                   help="mode_a only: store per-frame asset bbox fit diagnostics in the cache.")
+    p.add_argument("--max_pose_refine_yaw_deg", type=float, default=15.0,
+                   help="Clamp the shared per-track Mode-A yaw update around the Waymo heading.")
+    p.add_argument("--asset_yaw_correction_deg", type=float, default=180.0,
+                   help="Fixed local yaw mapping from canonical asset Gaussians into the Waymo 3D-box frame.")
     # Mode B planner knobs (mirroring inference_mode_b.py defaults)
     p.add_argument(
         "--planner_seed",
@@ -518,18 +525,16 @@ def _pack_mode_a_asset_pass_result(
         F_k = F_k.permute(0, 2, 1, 3).contiguous()                          # [S, P, L, C]
         F_k_q = quantize_tokens(F_k, layout="NPLC").save_dict()
         del F_k
-        payload[k] = {
+        if asset_result.G_asset_dggt is None or k not in asset_result.G_asset_dggt:
+            raise RuntimeError(
+                f"Mode-A DGGT-fitted asset result missing G_asset_dggt for object {k}"
+            )
+        entry = {
             "I_asset": I_k,
             "A_asset": A_k,
             "F_g_lut_asset_int8": F_k_q["data"].cpu(),
             "F_g_lut_asset_scale": F_k_q["scale"].cpu(),
-            "G_asset_waymo_per_frame": [
-                {kk: vv.cpu() for kk, vv in g.items()}
-                for g in asset_result.G_asset_waymo[k]
-            ],
-            "G_asset_dggt_per_frame": None
-            if asset_result.G_asset_dggt is None
-            else [
+            "G_asset_dggt_per_frame": [
                 {kk: vv.cpu() for kk, vv in g.items()}
                 for g in asset_result.G_asset_dggt[k]
             ],
@@ -537,25 +542,51 @@ def _pack_mode_a_asset_pass_result(
             "ptr_visible_mask": [p.visible_mask.cpu() for p in asset_result.ptr_asset[k]],
             "ptr_view_n": [p.view_n.cpu() for p in asset_result.ptr_asset[k]],
         }
+        if asset_result.fit_metrics is not None:
+            entry["fit_metrics"] = asset_result.fit_metrics.get(k)
+        payload[k] = entry
     return payload
 
 
 def _run_mode_a_asset_pass(
     sample: dict[str, Any],
     asset_pass: AssetAggregatorPass,
+    editor: GaussianSceneEditor,
+    clean_state,
     alignment,
+    cameras_dggt: dict[str, torch.Tensor],
     args,
 ) -> Any:
-    """Run Phase 4 on all editable objects × all S frames."""
+    """Run Phase 4 on all editable objects × all S frames in fitted DGGT space."""
     with torch.no_grad():
+        object_slots = parse_object_slots(sample, "all")
+        asset_cache: dict[str, dict[str, torch.Tensor]] = {}
+        localized_objects = editor.localize(
+            sample,
+            clean_state,
+            alignment,
+            object_slots,
+            asset_cache=asset_cache,
+            load_asset=True,
+        )
         asset_result = asset_pass(
             sample,
             selected_object_slots=None,  # None → derive from editable_object_indices
             alignment=alignment,
-            asset_cache={},
+            asset_cache=asset_cache,
             occlusion_test=True,
             aggregator_batch_size=int(getattr(args, "asset_batch_size", 1)),
+            localized_objects=localized_objects,
+            cameras_dggt=cameras_dggt,
+            render_space="dggt_fitted",
+            collect_fit_metrics=bool(getattr(args, "save_fit_metrics", False)),
         )
+        editable_count = int(sample.get("editable_object_count", torch.tensor(0)).item())
+        if editable_count > 0 and len(asset_result.object_keys) == 0:
+            raise RuntimeError(
+                "Mode-A DGGT-fitted asset pass produced no objects. "
+                "This usually means localization failed; inspect bbox/depth/semantic masks."
+            )
     return asset_result
 
 
@@ -614,7 +645,10 @@ def precompute_one_clip(
             asset_pass_result = _run_mode_a_asset_pass(
                 sample,
                 asset_pass,
+                editor,
+                clean_state,
                 alignment,
+                cameras_dggt,
                 args,
             )
             asset_pass_payload = _pack_mode_a_asset_pass_result(asset_pass_result)
@@ -631,7 +665,7 @@ def precompute_one_clip(
     object_meta = _build_object_meta(sample)
 
     payload: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 4,
         "mode_kind": args.edit_mode,
         "meta": {
             "manifest_index": _sample_manifest_index(sample, int(sample.get("sample_index", 0))),
@@ -647,6 +681,19 @@ def precompute_one_clip(
             "raw_image_size_hw": sample["raw_image_size_hw"].cpu().to(torch.long),
             "num_frames": int(S),
             "asset_meta": sample.get("asset_meta", {}),
+            "asset_pass_space": "none"
+            if args.edit_mode != "mode_a"
+            else (
+                "skipped"
+                if asset_pass_result is None
+                else str(asset_pass_result.asset_pass_space)
+            ),
+            "editor_config": {
+                "use_pose_refine": True,
+                "max_pose_refine_yaw_deg": float(args.max_pose_refine_yaw_deg),
+                "asset_yaw_correction_deg": float(args.asset_yaw_correction_deg),
+                "pose_policy": "first_frame_sim3_shared_track_yaw_track_median_center",
+            },
         },
         "raw": {
             "images_u8": images_u8,
@@ -693,7 +740,11 @@ def main() -> None:
     asset_pass = (
         AssetAggregatorPass(model.aggregator).to(device) if args.edit_mode == "mode_a" else None
     )
-    editor = GaussianSceneEditor(use_pose_refine=True)
+    editor = GaussianSceneEditor(
+        use_pose_refine=True,
+        max_pose_refine_yaw_deg=args.max_pose_refine_yaw_deg,
+        asset_yaw_correction_deg=args.asset_yaw_correction_deg,
+    )
 
     dataset_kwargs = dict(
         processed_root=args.processed_root,

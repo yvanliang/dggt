@@ -334,6 +334,8 @@ def _move_asset_pass(apr, device: torch.device):
         },
         I_asset={k: v.to(device) for k, v in apr.I_asset.items()},
         A_asset={k: v.to(device) for k, v in apr.A_asset.items()},
+        asset_pass_space=apr.asset_pass_space,
+        fit_metrics=apr.fit_metrics,
     )
 
 

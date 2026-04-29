@@ -65,10 +65,12 @@ def concat_pointers(pointer_list: list[GaussianPointers]) -> GaussianPointers:
             patch_idx=torch.zeros((0,), dtype=torch.int32),
             visible_mask=torch.zeros((0,), dtype=torch.bool),
         )
+    target_device = pointer_list[0].src_kind.device
+    aligned = [p.to(target_device) for p in pointer_list]
     return GaussianPointers(
-        src_kind=torch.cat([p.src_kind for p in pointer_list], dim=0),
-        object_id=torch.cat([p.object_id for p in pointer_list], dim=0),
-        view_n=torch.cat([p.view_n for p in pointer_list], dim=0),
-        patch_idx=torch.cat([p.patch_idx for p in pointer_list], dim=0),
-        visible_mask=torch.cat([p.visible_mask for p in pointer_list], dim=0),
+        src_kind=torch.cat([p.src_kind for p in aligned], dim=0),
+        object_id=torch.cat([p.object_id for p in aligned], dim=0),
+        view_n=torch.cat([p.view_n for p in aligned], dim=0),
+        patch_idx=torch.cat([p.patch_idx for p in aligned], dim=0),
+        visible_mask=torch.cat([p.visible_mask for p in aligned], dim=0),
     )

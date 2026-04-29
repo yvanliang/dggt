@@ -71,6 +71,8 @@ def _empty_asset_pass(patch_grid: tuple[int, int], patch_start_idx: int) -> Asse
         G_asset_dggt={},
         I_asset={},
         A_asset={},
+        asset_pass_space="empty",
+        fit_metrics={},
     )
 
 
@@ -330,17 +332,27 @@ class WaymoFlowCacheDataset(Dataset):
         object_keys = sorted(int(k) for k in asset.keys())
         if len(object_keys) == 0:
             return _empty_asset_pass(patch_grid, patch_start_idx)
+        schema_version = int(payload.get("schema_version", 0))
+        if schema_version < 4:
+            raise RuntimeError(
+                "Mode-A cache asset_pass must use schema_version >= 4 with DGGT-only asset geometry. "
+                f"Got schema_version={schema_version}. Re-run tools/precompute_flow_features.py."
+            )
+        asset_pass_space = str(meta.get("asset_pass_space", ""))
+        if asset_pass_space != "dggt_fitted":
+            raise RuntimeError(
+                "Mode-A cache asset_pass must be regenerated with fitted DGGT asset geometry. "
+                f"Expected meta.asset_pass_space='dggt_fitted', got {asset_pass_space!r}."
+            )
 
         cameras_waymo: dict[str, torch.Tensor] = {}
 
         F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
         ptr_asset: dict[int, list[GaussianPointers]] = {}
-        G_asset_waymo: dict[int, list[dict[str, torch.Tensor]]] = {}
-        G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] | None = None
-        if asset[object_keys[0]].get("G_asset_dggt_per_frame") is not None:
-            G_asset_dggt = {}
+        G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] = {}
         I_asset: dict[int, torch.Tensor] = {}
         A_asset: dict[int, torch.Tensor] = {}
+        fit_metrics: dict[int, list[dict[str, Any]]] = {}
 
         for k in object_keys:
             entry = asset[k]
@@ -379,9 +391,16 @@ class WaymoFlowCacheDataset(Dataset):
                 )
             ptr_asset[k] = ptr_list
 
-            G_asset_waymo[k] = [entry["G_asset_waymo_per_frame"][n] for n in subset_list]
-            if G_asset_dggt is not None and entry.get("G_asset_dggt_per_frame") is not None:
-                G_asset_dggt[k] = [entry["G_asset_dggt_per_frame"][n] for n in subset_list]
+            dggt_frames = entry.get("G_asset_dggt_per_frame")
+            if dggt_frames is None:
+                raise RuntimeError(
+                    f"Mode-A schema {schema_version} cache object {k} lacks G_asset_dggt_per_frame. "
+                    "Re-run tools/precompute_flow_features.py."
+                )
+            G_asset_dggt[k] = [dggt_frames[n] for n in subset_list]
+            fit_full = entry.get("fit_metrics")
+            if fit_full is not None:
+                fit_metrics[k] = [fit_full[n] for n in subset_list]
 
             I_asset[k] = entry["I_asset"].index_select(0, subset).to(torch.float32).div(255.0).unsqueeze(0)
             A_asset[k] = entry["A_asset"].index_select(0, subset).to(torch.float32).div(255.0).unsqueeze(0)
@@ -393,10 +412,12 @@ class WaymoFlowCacheDataset(Dataset):
             cameras_waymo=cameras_waymo,
             F_g_lut_asset=F_g_lut_asset,
             ptr_asset=ptr_asset,
-            G_asset_waymo=G_asset_waymo,
+            G_asset_waymo={},
             G_asset_dggt=G_asset_dggt,
             I_asset=I_asset,
             A_asset=A_asset,
+            asset_pass_space=asset_pass_space,
+            fit_metrics=fit_metrics,
         )
 
     # ------------------------------------------------------------------ #

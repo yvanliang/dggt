@@ -190,6 +190,8 @@ class FlowFeatureAssembler(nn.Module):
         eps_floor: float = 0.05,
         sigma_partial: float = 0.3,
         preserve_token_bypass: bool = True,
+        asset_token_direct_blend: bool = True,
+        asset_token_full_alpha: float = 0.5,
         editor_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
@@ -201,6 +203,8 @@ class FlowFeatureAssembler(nn.Module):
         self.H_splat = int(H_splat)
         self.W_splat = int(W_splat)
         self.preserve_token_bypass = bool(preserve_token_bypass)
+        self.asset_token_direct_blend = bool(asset_token_direct_blend)
+        self.asset_token_full_alpha = float(asset_token_full_alpha)
 
         self.editor = GaussianSceneEditor(**(editor_kwargs or {}))
         self.feature_splatter = FeatureSplatter(
@@ -248,8 +252,8 @@ class FlowFeatureAssembler(nn.Module):
             at least the 4 levels we need as `image_tokens_levels`, keyed in
             order `DEFAULT_LEVELS`).
         asset_pass_result
-            `AssetPassResult` reconstructed from cache. Uses DGGT-coord asset
-            Gaussians via `alignment` applied during offline precompute.
+            `AssetPassResult` reconstructed from cache. Mode A requires fitted
+            DGGT-coordinate asset Gaussians produced during offline precompute.
         cameras_dggt
             `{"viewmats": [B,S,4,4], "Ks": [B,S,3,3]}` in DGGT coords. Taken
             from the cache's `pass1_cameras_dggt` unchanged.
@@ -283,6 +287,7 @@ class FlowFeatureAssembler(nn.Module):
             )
 
         # ----- Mode A path ----- #
+        self._validate_mode_a_asset_pass(asset_pass_result)
         # Phase 1: build clean state + align + localize (load_asset=False) + apply
         clean_state = self.editor.build_clean_bundle(sample, predictions)
         alignment = self.editor.align(sample, clean_state)
@@ -357,17 +362,13 @@ class FlowFeatureAssembler(nn.Module):
             clean_state.source_x,
             patch_size=int(H_img // self.patch_grid[0]),
             patch_grid=self.patch_grid,
-        )
+        ).to(device)
         pointers_asset_by_obj: dict[int, GaussianPointers] = {}
         asset_gauss_chunks: list[dict[str, torch.Tensor]] = []
         ptr_chunks: list[GaussianPointers] = [ptr_scene]
         for obj_key in asset_pass_result.object_keys:
             obj_ptrs = asset_pass_result.ptr_asset[int(obj_key)]
-            obj_gauss_frames = (
-                asset_pass_result.G_asset_dggt[int(obj_key)]
-                if asset_pass_result.G_asset_dggt is not None
-                else asset_pass_result.G_asset_waymo[int(obj_key)]
-            )
+            obj_gauss_frames = asset_pass_result.G_asset_dggt[int(obj_key)]
             # Concat per-frame Gaussians → per-object Gaussian cloud (for splatter).
             # Pointers are per-frame (each frame's Gaussians have view_n=image_idx already)
             # so just concat along N dim.
@@ -392,11 +393,11 @@ class FlowFeatureAssembler(nn.Module):
         # Filter scene pointers by the kept mask
         keep_mask = (~edit_state.delete_mask).to(device)
         ptr_scene_kept = GaussianPointers(
-            src_kind=ptr_scene.src_kind[keep_mask.cpu()],
-            object_id=ptr_scene.object_id[keep_mask.cpu()],
-            view_n=ptr_scene.view_n[keep_mask.cpu()],
-            patch_idx=ptr_scene.patch_idx[keep_mask.cpu()],
-            visible_mask=ptr_scene.visible_mask[keep_mask.cpu()],
+            src_kind=ptr_scene.src_kind[keep_mask],
+            object_id=ptr_scene.object_id[keep_mask],
+            view_n=ptr_scene.view_n[keep_mask],
+            patch_idx=ptr_scene.patch_idx[keep_mask],
+            visible_mask=ptr_scene.visible_mask[keep_mask],
         )
         ptr_chunks[0] = ptr_scene_kept
         pointers_all = concat_pointers(ptr_chunks)
@@ -446,6 +447,11 @@ class FlowFeatureAssembler(nn.Module):
             clean_levels=F_g_lut_scene,
             splatted_levels=splatted_tok_low,
             M_preserve=M_preserve,
+        )
+        splatted_tok_low = self._blend_asset_tokens(
+            splatted_levels=splatted_tok_low,
+            F_g_lut_asset=F_g_lut_asset,
+            I_map_per_obj=I_per_obj,
         )
 
         # Scaffold precursors
@@ -586,14 +592,13 @@ class FlowFeatureAssembler(nn.Module):
             clean_state.source_x,
             patch_size=int(H_img // self.patch_grid[0]),
             patch_grid=self.patch_grid,
-        )
-        keep_mask_cpu = keep_mask_dev.cpu()
+        ).to(device)
         ptr_scene_kept = GaussianPointers(
-            src_kind=ptr_scene.src_kind[keep_mask_cpu],
-            object_id=ptr_scene.object_id[keep_mask_cpu],
-            view_n=ptr_scene.view_n[keep_mask_cpu],
-            patch_idx=ptr_scene.patch_idx[keep_mask_cpu],
-            visible_mask=ptr_scene.visible_mask[keep_mask_cpu],
+            src_kind=ptr_scene.src_kind[keep_mask_dev],
+            object_id=ptr_scene.object_id[keep_mask_dev],
+            view_n=ptr_scene.view_n[keep_mask_dev],
+            patch_idx=ptr_scene.patch_idx[keep_mask_dev],
+            visible_mask=ptr_scene.visible_mask[keep_mask_dev],
         )
         pointers_all = ptr_scene_kept
 
@@ -693,6 +698,8 @@ class FlowFeatureAssembler(nn.Module):
             G_asset_dggt={},
             I_asset={},
             A_asset={},
+            asset_pass_space="mode_b_empty",
+            fit_metrics={},
         )
         from dggt.utils.gaussian_edit import EditedSceneState
 
@@ -812,6 +819,97 @@ class FlowFeatureAssembler(nn.Module):
             out.append(preserve * clean + (1.0 - preserve) * splatted)
         return out
 
+    def _blend_asset_tokens(
+        self,
+        splatted_levels: Sequence[torch.Tensor],
+        F_g_lut_asset: dict[int, list[torch.Tensor]],
+        I_map_per_obj: list[dict[int, torch.Tensor]],
+    ) -> list[torch.Tensor]:
+        """Use the aligned asset-pass LUT in confidently covered asset patches.
+
+        Asset RGB/alpha placement is already rendered in the DGGT camera space
+        during the asset pass.  Re-splatting 3072-D asset tokens through one
+        patch pointer per Gaussian is lossy, especially for small objects where
+        a patch mixes several projected Gaussian footprints.  This blend keeps
+        FeatureSplatter for geometry-changing low-coverage boundaries, while
+        directly using the asset LUT where the asset owns most of the token.
+        """
+        if not self.asset_token_direct_blend or len(F_g_lut_asset) == 0:
+            return list(splatted_levels)
+        if len(I_map_per_obj) == 0:
+            return list(splatted_levels)
+        if self.asset_token_full_alpha <= 0.0:
+            raise ValueError("asset_token_full_alpha must be positive")
+
+        out: list[torch.Tensor] = []
+        for level_idx, splatted in enumerate(splatted_levels):
+            device = splatted.device
+            dtype = splatted.dtype
+            B, S, P, C = splatted.shape
+            token_sum = torch.zeros_like(splatted)
+            weight_sum = torch.zeros((B, S, P, 1), dtype=dtype, device=device)
+
+            for b, per_obj in enumerate(I_map_per_obj):
+                if b >= B:
+                    break
+                for obj_key, alpha_hires in per_obj.items():
+                    obj_key = int(obj_key)
+                    if obj_key not in F_g_lut_asset:
+                        continue
+                    asset_levels = F_g_lut_asset[obj_key]
+                    if level_idx >= len(asset_levels):
+                        continue
+                    asset_lut = asset_levels[level_idx].to(device=device, dtype=dtype)
+                    if asset_lut.shape != splatted.shape:
+                        raise ValueError(
+                            f"asset LUT[{obj_key}][{level_idx}] shape {tuple(asset_lut.shape)} "
+                            f"does not match splatted level {tuple(splatted.shape)}"
+                        )
+                    alpha = alpha_hires.to(device=device, dtype=dtype)
+                    if alpha.dim() != 4 or alpha.shape[-1] != 1:
+                        raise ValueError(
+                            f"I_map_per_obj[{b}][{obj_key}] must be [S,H,W,1], got {tuple(alpha.shape)}"
+                        )
+                    alpha_tok = SoftMaskBuilder._area_pool_to_grid(
+                        alpha.unsqueeze(0), self.patch_grid
+                    ).clamp(0.0, 1.0)
+                    if alpha_tok.shape[1:] != splatted.shape[1:-1] + (1,):
+                        raise ValueError(
+                            f"pooled asset alpha shape {tuple(alpha_tok.shape)} is incompatible "
+                            f"with splatted level {tuple(splatted.shape)}"
+                        )
+                    w = alpha_tok[0:1]
+                    token_sum[b : b + 1] = token_sum[b : b + 1] + w * asset_lut[b : b + 1]
+                    weight_sum[b : b + 1] = weight_sum[b : b + 1] + w
+
+            asset_ref = token_sum / weight_sum.clamp_min(1e-6)
+            blend = (weight_sum / float(self.asset_token_full_alpha)).clamp(0.0, 1.0)
+            out.append(blend * asset_ref + (1.0 - blend) * splatted)
+        return out
+
+    @staticmethod
+    def _validate_mode_a_asset_pass(asset_pass_result: AssetPassResult) -> None:
+        if len(asset_pass_result.object_keys) == 0:
+            return
+        if str(asset_pass_result.asset_pass_space) != "dggt_fitted":
+            raise RuntimeError(
+                "Mode-A FlowFeatureAssembler requires fitted DGGT asset-pass cache. "
+                f"Expected asset_pass_space='dggt_fitted', got {asset_pass_result.asset_pass_space!r}. "
+                "Regenerate the .pt files with tools/precompute_flow_features.py."
+            )
+        if asset_pass_result.G_asset_dggt is None:
+            raise RuntimeError(
+                "Mode-A fitted asset pass is missing G_asset_dggt. "
+                "Regenerate the .pt files with tools/precompute_flow_features.py."
+            )
+        missing = [
+            int(k)
+            for k in asset_pass_result.object_keys
+            if int(k) not in asset_pass_result.G_asset_dggt
+        ]
+        if missing:
+            raise RuntimeError(f"Mode-A fitted asset pass missing DGGT gaussians for object keys: {missing}")
+
     def _select_lut_scene(self, predictions: dict[str, torch.Tensor]) -> list[torch.Tensor]:
         """Return 4-level patch-token LUT for scene Gaussians.
 
@@ -898,11 +996,12 @@ class FlowFeatureAssembler(nn.Module):
                 G_asset_dggt={} if asset_pass_result.G_asset_dggt is not None else None,
                 I_asset={},
                 A_asset={},
+                asset_pass_space=asset_pass_result.asset_pass_space,
+                fit_metrics={},
             )
 
         F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
         ptr_asset: dict[int, list[GaussianPointers]] = {}
-        G_asset_waymo: dict[int, list[dict[str, torch.Tensor]]] = {}
         G_asset_dggt_out: dict[int, list[dict[str, torch.Tensor]]] | None = (
             {} if asset_pass_result.G_asset_dggt is not None else None
         )
@@ -923,26 +1022,26 @@ class FlowFeatureAssembler(nn.Module):
                     new_ptrs.append(ptr)
                 else:
                     n = int(ptr.patch_idx.numel())
+                    ptr_device = ptr.patch_idx.device
                     new_ptrs.append(
                         GaussianPointers(
-                            src_kind=torch.full((n,), SRC_KIND_ASSET, dtype=torch.int32),
-                            object_id=torch.full((n,), int(k), dtype=torch.int32),
+                            src_kind=torch.full((n,), SRC_KIND_ASSET, dtype=torch.int32, device=ptr_device),
+                            object_id=torch.full((n,), int(k), dtype=torch.int32, device=ptr_device),
                             view_n=ptr.view_n,
                             patch_idx=ptr.patch_idx,
-                            visible_mask=torch.zeros((n,), dtype=torch.bool),
+                            visible_mask=torch.zeros((n,), dtype=torch.bool, device=ptr_device),
                         )
                     )
             ptr_asset[k] = new_ptrs
-            # Per-frame Gaussian dicts: replace non-covered frames with empties.
-            G_asset_waymo[k] = []
+            # Per-frame DGGT Gaussian dicts: replace non-covered frames with empties.
             dggt_frames: list[dict[str, torch.Tensor]] = []
-            for s in range(len(asset_pass_result.G_asset_waymo[k])):
+            if asset_pass_result.G_asset_dggt is None:
+                raise RuntimeError("Mode-A asset pass lost DGGT gaussians during coverage masking")
+            for s in range(len(asset_pass_result.G_asset_dggt[k])):
                 if bool(cov_k[s].item()):
-                    G_asset_waymo[k].append(asset_pass_result.G_asset_waymo[k][s])
                     if G_asset_dggt_out is not None:
                         dggt_frames.append(asset_pass_result.G_asset_dggt[k][s])
                 else:
-                    G_asset_waymo[k].append(_empty_gauss_dict(device))
                     if G_asset_dggt_out is not None:
                         dggt_frames.append(_empty_gauss_dict(device))
             if G_asset_dggt_out is not None:
@@ -960,8 +1059,12 @@ class FlowFeatureAssembler(nn.Module):
             cameras_waymo=asset_pass_result.cameras_waymo,
             F_g_lut_asset=F_g_lut_asset,
             ptr_asset=ptr_asset,
-            G_asset_waymo=G_asset_waymo,
+            G_asset_waymo={},
             G_asset_dggt=G_asset_dggt_out,
             I_asset=I_asset,
             A_asset=A_asset,
+            asset_pass_space=asset_pass_result.asset_pass_space,
+            fit_metrics=None
+            if asset_pass_result.fit_metrics is None
+            else {k: asset_pass_result.fit_metrics.get(k, []) for k in kept_keys},
         )
