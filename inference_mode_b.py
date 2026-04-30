@@ -422,6 +422,22 @@ def _planner_seed_for_index(base_seed: int, sample_index: int) -> int:
     return int(base_seed) + 1009 * int(sample_index)
 
 
+def _mode_b_record_meta(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "mode_b_source": str(record.get("source", "")),
+        "mode_b_source_views1": str(record.get("source_views1", "")),
+        "mode_b_source_views3": str(record.get("source_views3", "")),
+        "mode_b_in_mode_a_views1": bool(record.get("in_mode_a_views1", False)),
+        "mode_b_in_mode_a_views3": bool(record.get("in_mode_a_views3", False)),
+        "front_editable_count_mean": float(
+            sum(record.get("front_editable_count_per_frame", [])) / max(len(record.get("front_editable_count_per_frame", [])), 1)
+        ),
+        "front3_editable_count_mean": float(
+            sum(record.get("front3_editable_count_per_frame", [])) / max(len(record.get("front3_editable_count_per_frame", [])), 1)
+        ),
+    }
+
+
 def _run_one_sample(
     *,
     args: argparse.Namespace,
@@ -498,6 +514,7 @@ def _run_one_sample(
                 "delete_shell_count": 0,
                 "mode_b_manifest": str(manifest_path),
                 "mode_b_candidate_path": str(candidate_path),
+                **_mode_b_record_meta(record),
             }
         )
         grid_nrow = args.views if args.views > 1 else min(4, int(clean_state.images.shape[0]))
@@ -527,6 +544,7 @@ def _run_one_sample(
                 "mode_b_candidate_path": str(candidate_path),
                 "status": "plan_only",
                 "plan_only": True,
+                **_mode_b_record_meta(record),
             }
         )
         grid_nrow = args.views if args.views > 1 else min(4, int(clean_state.images.shape[0]))
@@ -578,6 +596,7 @@ def _run_one_sample(
             "mode_b_manifest": str(manifest_path),
             "mode_b_candidate_path": str(candidate_path),
             "status": "completed",
+            **_mode_b_record_meta(record),
         }
     )
     _write_json(output_dir / "mode_b_summary.json", summary)
@@ -654,6 +673,9 @@ def main() -> None:
                 "num_imagined_objects": summary.get("num_imagined_objects"),
                 "status": summary.get("status", "completed"),
                 "skip_reason": summary.get("skip_reason"),
+                "mode_b_source": summary.get("mode_b_source"),
+                "mode_b_in_mode_a_views1": summary.get("mode_b_in_mode_a_views1"),
+                "mode_b_in_mode_a_views3": summary.get("mode_b_in_mode_a_views3"),
             }
         )
         if device.type == "cuda":

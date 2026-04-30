@@ -1025,6 +1025,11 @@ class WaymoEditDataset(Dataset):
             "local_frame_indices": torch.tensor(local_indices, dtype=torch.long),
             "clip_frame_indices": torch.tensor(clip_frame_indices, dtype=torch.long),
             "edit_mode": str(record.get("edit_mode", "replace")),
+            "mode_b_source": str(record.get("source", "")),
+            "mode_b_source_views1": str(record.get("source_views1", "")),
+            "mode_b_source_views3": str(record.get("source_views3", "")),
+            "mode_b_in_mode_a_views1": bool(record.get("in_mode_a_views1", False)),
+            "mode_b_in_mode_a_views3": bool(record.get("in_mode_a_views3", False)),
             "edit_spec": {
                 "clip_name": str(record["clip_name"]),
                 "scene_base": str(record["scene_base"]),
@@ -1034,6 +1039,11 @@ class WaymoEditDataset(Dataset):
                 "selected_scene_frame_indices": scene_frame_indices,
                 "selected_local_indices": local_indices,
                 "sample_num_frames": int(sample_num_frames),
+                "mode_b_source": str(record.get("source", "")),
+                "mode_b_source_views1": str(record.get("source_views1", "")),
+                "mode_b_source_views3": str(record.get("source_views3", "")),
+                "mode_b_in_mode_a_views1": bool(record.get("in_mode_a_views1", False)),
+                "mode_b_in_mode_a_views3": bool(record.get("in_mode_a_views3", False)),
             },
         }
 
