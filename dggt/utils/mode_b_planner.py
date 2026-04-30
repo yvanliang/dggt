@@ -280,7 +280,7 @@ class ModeBPlanner:
         min_visible_frames: int = 15,
         max_semantic_overlap_px: int = 0,
         max_trials_per_object: int = 80,
-        canonical_size: tuple[float, float, float] = (4.5, 1.9, 1.6),
+        canonical_size: tuple[float, float, float] = (4.05, 1.71, 1.44),
         canonical_size_jitter: float = 0.15,
         yaw_jitter_deg: float = 30.0,
         motion_probs: tuple[float, float, float] = (0.5, 0.3, 0.2),
@@ -297,6 +297,7 @@ class ModeBPlanner:
         min_projected_bottom_y_ratio: float = 0.50,
         max_projected_bottom_y_ratio: float = 0.92,
         min_ground_support_ratio: float = 0.18,
+        require_first_frame_visible: bool = False,
         fast_camera_step_ratio: float = 0.018,
         slow_camera_step_ratio: float = 0.006,
         rng_seed: int = 0,
@@ -321,6 +322,7 @@ class ModeBPlanner:
         self.min_projected_bottom_y_ratio = float(min_projected_bottom_y_ratio)
         self.max_projected_bottom_y_ratio = float(max_projected_bottom_y_ratio)
         self.min_ground_support_ratio = float(min_ground_support_ratio)
+        self.require_first_frame_visible = bool(require_first_frame_visible)
         self.fast_camera_step_ratio = float(fast_camera_step_ratio)
         self.slow_camera_step_ratio = float(slow_camera_step_ratio)
         self.rng_seed = int(rng_seed)
@@ -377,8 +379,8 @@ class ModeBPlanner:
         if variant == "wide":
             profile: dict[str, float | str] = {
                 "variant": variant,
-                "bbox_width_mult": self.rng.uniform(2.45, 3.10),
-                "bbox_height_mult": self.rng.uniform(1.65, 2.05),
+                "bbox_width_mult": self.rng.uniform(2.205, 2.790),
+                "bbox_height_mult": self.rng.uniform(1.485, 1.845),
                 "shape_width_scale": self.rng.uniform(1.00, 1.08),
                 "shape_height_scale": self.rng.uniform(0.92, 1.00),
                 "shape_center_y": self.rng.uniform(0.48, 0.52),
@@ -389,8 +391,8 @@ class ModeBPlanner:
         elif variant == "tall":
             profile = {
                 "variant": variant,
-                "bbox_width_mult": self.rng.uniform(1.95, 2.45),
-                "bbox_height_mult": self.rng.uniform(2.10, 2.55),
+                "bbox_width_mult": self.rng.uniform(1.755, 2.205),
+                "bbox_height_mult": self.rng.uniform(1.890, 2.295),
                 "shape_width_scale": self.rng.uniform(0.88, 0.98),
                 "shape_height_scale": self.rng.uniform(1.00, 1.08),
                 "shape_center_y": self.rng.uniform(0.46, 0.50),
@@ -401,8 +403,8 @@ class ModeBPlanner:
         else:
             profile = {
                 "variant": variant,
-                "bbox_width_mult": self.rng.uniform(2.20, 2.75),
-                "bbox_height_mult": self.rng.uniform(1.85, 2.25),
+                "bbox_width_mult": self.rng.uniform(1.980, 2.475),
+                "bbox_height_mult": self.rng.uniform(1.665, 2.025),
                 "shape_width_scale": self.rng.uniform(0.96, 1.04),
                 "shape_height_scale": self.rng.uniform(0.96, 1.04),
                 "shape_center_y": self.rng.uniform(0.47, 0.51),
@@ -531,30 +533,29 @@ class ModeBPlanner:
         if int(candidate_mask.sum().item()) == 0:
             return None
 
-        y_lo = int(round(float(height) * 0.54))
-        y_hi = int(round(float(height) * 0.76))
-        x_lo = int(round(float(width) * 0.28))
-        x_hi = int(round(float(width) * 0.72))
-        if y_hi <= y_lo or x_hi <= x_lo:
-            return None
-
-        for _ in range(32):
-            target_x = self.rng.randint(x_lo, max(x_lo, x_hi - 1))
-            target_y = self.rng.randint(y_lo, max(y_lo, y_hi - 1))
-            radius = max(8, int(round(min(height, width) * 0.035)))
-            px1 = max(0, target_x - radius)
-            px2 = min(width, target_x + radius + 1)
-            py1 = max(0, target_y - radius)
-            py2 = min(height, target_y + radius + 1)
-            patch = candidate_mask[py1:py2, px1:px2]
-            if int(patch.sum().item()) == 0:
+        search_regions = (
+            (0.54, 0.76, 0.28, 0.72),
+            (0.50, 0.82, 0.18, 0.82),
+            (0.44, 0.88, 0.08, 0.92),
+            (0.36, 0.92, 0.02, 0.98),
+        )
+        for y0, y1, x0, x1 in search_regions:
+            y_lo = int(round(float(height) * y0))
+            y_hi = int(round(float(height) * y1))
+            x_lo = int(round(float(width) * x0))
+            x_hi = int(round(float(width) * x1))
+            if y_hi <= y_lo or x_hi <= x_lo:
                 continue
-            ys, xs = torch.nonzero(patch, as_tuple=True)
-            xs_full = xs + px1
-            ys_full = ys + py1
-            dist2 = (xs_full.float() - float(target_x)).pow(2) + (ys_full.float() - float(target_y)).pow(2)
-            pick = int(torch.argmin(dist2).item())
-            ground_point = point_map[int(ys_full[pick].item()), int(xs_full[pick].item())].clone()
+            region = candidate_mask[y_lo:y_hi, x_lo:x_hi]
+            if int(region.sum().item()) == 0:
+                continue
+            ys, xs = torch.nonzero(region, as_tuple=True)
+            if ys.numel() == 0:
+                continue
+            pick = self.rng.randrange(int(ys.numel()))
+            y_full = int((ys[pick] + y_lo).item())
+            x_full = int((xs[pick] + x_lo).item())
+            ground_point = point_map[y_full, x_full].clone()
             if not bool(torch.isfinite(ground_point).all().item()):
                 continue
             center = ground_point
@@ -795,6 +796,7 @@ class ModeBPlanner:
         visible = torch.zeros((num_frames, num_views), dtype=torch.bool)
         bboxes = torch.zeros((num_frames, num_views, 4), dtype=torch.float32)
         semantic_overlap = 0
+        max_frame_semantic_overlap = 0
         max_existing_iou = 0.0
         length = float(size[0].item())
         frame_skip_counts: dict[str, int] = {}
@@ -901,23 +903,33 @@ class ModeBPlanner:
                     continue
                 bboxes[frame_idx, view_idx] = bbox
                 visible[frame_idx, view_idx] = True
-                overlap_bbox = _scale_box_xyxy(bbox, self.shell_scale, image_hw)
-                semantic_overlap += self._semantic_overlap(
+                overlap_bbox = _scale_box_xyxy(bbox, 0.90, image_hw)
+                frame_semantic_overlap = self._semantic_overlap(
                     clean_state,
                     overlap_bbox,
                     image_idx,
                     image_hw,
                     profile=occluder_profile,
                 )
+                semantic_overlap += frame_semantic_overlap
+                max_frame_semantic_overlap = max(max_frame_semantic_overlap, int(frame_semantic_overlap))
                 if semantic_overlap > self.max_semantic_overlap_px:
                     return False, {
                         "reason": "semantic_overlap",
                         "semantic_overlap_px": int(semantic_overlap),
+                        "max_frame_semantic_overlap_px": int(max_frame_semantic_overlap),
                         "existing_box_iou_3d": max_existing_iou,
                     }
 
         keep_frames = _longest_visible_run(visible.any(dim=1))
-        if keep_frames.numel() == 0 or not bool(keep_frames[0].item()):
+        if keep_frames.numel() == 0 or not bool(keep_frames.any().item()):
+            return False, {
+                "reason": "no_visible_frames",
+                "visible_frames": 0,
+                "frame_skip_counts": frame_skip_counts,
+                "existing_box_iou_3d": max_existing_iou,
+            }
+        if self.require_first_frame_visible and not bool(keep_frames[0].item()):
             return False, {
                 "reason": "first_frame_not_visible",
                 "visible_frames": int(keep_frames.sum().item()),
@@ -939,6 +951,7 @@ class ModeBPlanner:
             "visible": visible,
             "bboxes": bboxes,
             "semantic_overlap_px": int(semantic_overlap),
+            "max_frame_semantic_overlap_px": int(max_frame_semantic_overlap),
             "existing_box_iou_3d": float(max_existing_iou),
             "visible_frames": visible_frames,
         }
@@ -974,11 +987,16 @@ class ModeBPlanner:
 
         accepted: list[ImaginedObject] = []
         rejection_counts: dict[str, int] = {}
+        rejection_counts_by_shrink: dict[str, dict[str, int]] = {}
+        frame_skip_counts_by_rejection: dict[str, dict[str, int]] = {}
         best_too_few_visible_frames = 0
         best_too_few_skip_counts: dict[str, int] = {}
+        shrink_factors = (1.0, 0.7, 0.5, 0.35, 0.25, 0.18)
         for slot in range(target_count):
             accepted_obj = None
-            for shrink in (1.0, 0.7, 0.5, 0.35, 0.25, 0.18):
+            for shrink in shrink_factors:
+                shrink_key = f"{shrink:.2f}"
+                rejection_counts_by_shrink.setdefault(shrink_key, {})
                 for trial in range(self.max_trials_per_object):
                     size = self._sample_size(existing_objects) * float(shrink)
                     base_center, base_frame_idx, image_idx = self._sample_base_center(
@@ -1020,6 +1038,14 @@ class ModeBPlanner:
                     if not ok:
                         reason = str(info.get("reason", "unknown"))
                         rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                        shrink_counts = rejection_counts_by_shrink[shrink_key]
+                        shrink_counts[reason] = shrink_counts.get(reason, 0) + 1
+                        frame_skip_counts = info.get("frame_skip_counts", {})
+                        if isinstance(frame_skip_counts, dict):
+                            reason_frame_counts = frame_skip_counts_by_rejection.setdefault(reason, {})
+                            for skip_reason, count in frame_skip_counts.items():
+                                skip_key = str(skip_reason)
+                                reason_frame_counts[skip_key] = reason_frame_counts.get(skip_key, 0) + int(count)
                         if reason == "too_few_visible_frames":
                             visible_frames = int(info.get("visible_frames", 0))
                             if visible_frames >= best_too_few_visible_frames:
@@ -1067,6 +1093,7 @@ class ModeBPlanner:
                 "camera_motion": camera_motion,
                 "min_visible_frames": int(self.min_visible_frames),
                 "max_semantic_overlap_px": int(self.max_semantic_overlap_px),
+                "require_first_frame_visible": bool(self.require_first_frame_visible),
                 "min_projected_transfer_size_px": float(self.min_projected_transfer_size_px),
                 "transfer_image_hw": [int(v) for v in self.transfer_image_hw],
                 "max_projected_area_ratio": float(self.max_projected_area_ratio),
@@ -1081,6 +1108,8 @@ class ModeBPlanner:
                 "slow_camera_step_ratio": float(self.slow_camera_step_ratio),
                 "best_rejected_visible_frames": int(best_too_few_visible_frames),
                 "best_rejected_frame_skip_counts": best_too_few_skip_counts,
+                "rejection_counts_by_shrink": rejection_counts_by_shrink,
+                "frame_skip_counts_by_rejection": frame_skip_counts_by_rejection,
             },
         )
 

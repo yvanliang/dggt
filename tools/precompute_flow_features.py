@@ -124,6 +124,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--min_projected_bottom_y_ratio", type=float, default=0.50)
     p.add_argument("--max_projected_bottom_y_ratio", type=float, default=1.0)
     p.add_argument("--min_ground_support_ratio", type=float, default=0.18)
+    p.add_argument("--require_first_frame_visible", action="store_true")
     p.add_argument("--fast_camera_step_ratio", type=float, default=0.018)
     p.add_argument("--slow_camera_step_ratio", type=float, default=0.006)
     p.add_argument("--allow_empty_plan", action="store_true",
@@ -434,6 +435,7 @@ def _run_mode_b_planner(
         min_projected_bottom_y_ratio=float(args.min_projected_bottom_y_ratio),
         max_projected_bottom_y_ratio=float(args.max_projected_bottom_y_ratio),
         min_ground_support_ratio=float(args.min_ground_support_ratio),
+        require_first_frame_visible=bool(args.require_first_frame_visible),
         fast_camera_step_ratio=float(args.fast_camera_step_ratio),
         slow_camera_step_ratio=float(args.slow_camera_step_ratio),
         rng_seed=_planner_seed_for_index(int(args.planner_seed), int(sample.get("sample_index", 0))),
@@ -692,7 +694,7 @@ def precompute_one_clip(
                 "use_pose_refine": True,
                 "max_pose_refine_yaw_deg": float(args.max_pose_refine_yaw_deg),
                 "asset_yaw_correction_deg": float(args.asset_yaw_correction_deg),
-                "pose_policy": "first_frame_sim3_shared_track_yaw_track_median_center",
+                "pose_policy": "waymo_dggt_corner_projection_refine_v1",
             },
         },
         "raw": {

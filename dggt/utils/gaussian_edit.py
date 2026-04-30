@@ -18,6 +18,20 @@ WAYMO_DYNAMIC_SPEED_THRESH_MPS = 1.0
 _DYNAMIC_VOXEL_SCALE = (0.10, 0.10, 0.20)
 _STATIC_VOXEL_SCALE = (0.08, 0.08, 0.16)
 _MAX_POSE_REFINE_YAW_DEG = 15.0
+_BOX_EDGES: tuple[tuple[int, int], ...] = (
+    (0, 1),
+    (0, 2),
+    (0, 4),
+    (1, 3),
+    (1, 5),
+    (2, 3),
+    (2, 6),
+    (3, 7),
+    (4, 5),
+    (4, 6),
+    (5, 7),
+    (6, 7),
+)
 
 
 @dataclass
@@ -113,6 +127,13 @@ class LocalizedFrameObject:
     asset_scale_factors: torch.Tensor
     asset_object_to_world: torch.Tensor
     asset_local_yaw_deg: float = 0.0
+    pose_refine_diagnostics: dict[str, Any] | None = None
+    waymo_box_corners_model: torch.Tensor | None = None
+    waymo_box_corners_valid: torch.Tensor | None = None
+    initial_box_corners_model: torch.Tensor | None = None
+    initial_box_corners_valid: torch.Tensor | None = None
+    refined_box_corners_model: torch.Tensor | None = None
+    refined_box_corners_valid: torch.Tensor | None = None
 
 
 @dataclass
@@ -407,6 +428,7 @@ def build_box_corners(center: torch.Tensor, size: torch.Tensor, rotation: torch.
             [1.0, 1.0, 1.0],
         ],
         dtype=center.dtype,
+        device=center.device,
     )
     local = local * half
     return local @ rotation.T + center
@@ -446,6 +468,104 @@ def project_world_points(
     return torch.stack([u, v], dim=-1), depths, valid
 
 
+def _project_world_points_unclipped(
+    points_world: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    eps: float = 1e-4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    points_cam = _world_to_camera_points(points_world, camera_to_world)
+    depths = points_cam[:, 2]
+    fx = intrinsics[0, 0]
+    fy = intrinsics[1, 1]
+    cx = intrinsics[0, 2]
+    cy = intrinsics[1, 2]
+    z = depths.clamp_min(1e-6)
+    u = fx * points_cam[:, 0] / z + cx
+    v = fy * points_cam[:, 1] / z + cy
+    valid = torch.isfinite(u) & torch.isfinite(v) & torch.isfinite(depths) & (depths > eps)
+    return torch.stack([u, v], dim=-1), depths, valid
+
+
+def _model_resize_geometry(
+    raw_hw: tuple[int, int],
+    model_hw: tuple[int, int],
+    target_width: int | None = None,
+) -> dict[str, int | float]:
+    raw_h, raw_w = int(raw_hw[0]), int(raw_hw[1])
+    model_h, model_w = int(model_hw[0]), int(model_hw[1])
+    if raw_h <= 0 or raw_w <= 0 or model_h <= 0 or model_w <= 0:
+        raise ValueError(f"Invalid resize geometry raw_hw={raw_hw}, model_hw={model_hw}")
+    new_w = int(model_w if target_width is None else target_width)
+    new_h = round(raw_h * (new_w / float(raw_w)) / 14.0) * 14
+    crop_top = max((new_h - new_w) // 2, 0) if new_h > new_w else 0
+    out_h = new_w if new_h > new_w else new_h
+    out_w = new_w
+    pad_top = max((model_h - out_h) // 2, 0)
+    pad_left = max((model_w - out_w) // 2, 0)
+    return {
+        "scale_x": new_w / float(raw_w),
+        "scale_y": new_h / float(raw_h),
+        "crop_top": int(crop_top),
+        "out_h": int(out_h),
+        "out_w": int(out_w),
+        "pad_top": int(pad_top),
+        "pad_left": int(pad_left),
+    }
+
+
+def _raw_intrinsics_to_model(
+    intrinsics_raw: torch.Tensor,
+    raw_hw: tuple[int, int],
+    model_hw: tuple[int, int],
+) -> torch.Tensor:
+    intrinsics_raw = intrinsics_raw.detach().float()
+    geom = _model_resize_geometry(raw_hw, model_hw, target_width=int(model_hw[1]))
+    intrinsics_model = intrinsics_raw.clone()
+    intrinsics_model[0, 0] = intrinsics_raw[0, 0] * float(geom["scale_x"])
+    intrinsics_model[1, 1] = intrinsics_raw[1, 1] * float(geom["scale_y"])
+    intrinsics_model[0, 2] = intrinsics_raw[0, 2] * float(geom["scale_x"]) + float(geom["pad_left"])
+    intrinsics_model[1, 2] = (
+        intrinsics_raw[1, 2] * float(geom["scale_y"])
+        - float(geom["crop_top"])
+        + float(geom["pad_top"])
+    )
+    return intrinsics_model
+
+
+def project_waymo_box_corners_model(
+    box_corners_world: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics_raw: torch.Tensor,
+    raw_image_size_hw: torch.Tensor | tuple[int, int] | list[int],
+    model_image_hw: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    raw_hw_tensor = torch.as_tensor(raw_image_size_hw).view(-1)
+    raw_hw = (int(raw_hw_tensor[0].item()), int(raw_hw_tensor[1].item()))
+    intrinsics_model = _raw_intrinsics_to_model(intrinsics_raw, raw_hw, model_image_hw)
+    return _project_world_points_unclipped(
+        box_corners_world.detach().to(device=intrinsics_model.device, dtype=intrinsics_model.dtype),
+        camera_to_world.detach().to(device=intrinsics_model.device, dtype=intrinsics_model.dtype),
+        intrinsics_model,
+    )
+
+
+def project_dggt_box_corners_model(
+    object_center: torch.Tensor,
+    object_size: torch.Tensor,
+    object_rotation: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    corners = build_box_corners(object_center, object_size, object_rotation)
+    return _project_world_points_unclipped(corners, camera_to_world, intrinsics)
+
+
+def _edge_midpoints(points: torch.Tensor) -> torch.Tensor:
+    edge_indices = torch.tensor(_BOX_EDGES, dtype=torch.long, device=points.device)
+    return 0.5 * (points.index_select(0, edge_indices[:, 0]) + points.index_select(0, edge_indices[:, 1]))
+
+
 def project_world_box_corners(
     box_corners_world: torch.Tensor,
     camera_to_world: torch.Tensor,
@@ -460,13 +580,13 @@ def compute_bbox_from_projected_points(uv: torch.Tensor, valid: torch.Tensor) ->
     if valid.sum().item() == 0:
         return None
     valid_uv = uv[valid]
-    x1 = float(valid_uv[:, 0].min())
-    y1 = float(valid_uv[:, 1].min())
-    x2 = float(valid_uv[:, 0].max())
-    y2 = float(valid_uv[:, 1].max())
-    if x2 <= x1 or y2 <= y1:
+    x1 = valid_uv[:, 0].min()
+    y1 = valid_uv[:, 1].min()
+    x2 = valid_uv[:, 0].max()
+    y2 = valid_uv[:, 1].max()
+    if bool((x2 <= x1).item()) or bool((y2 <= y1).item()):
         return None
-    return torch.tensor([x1, y1, x2, y2], dtype=torch.float32)
+    return torch.stack([x1, y1, x2, y2], dim=0).detach().float()
 
 
 def box_iou_xyxy(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
@@ -1093,6 +1213,33 @@ def _rotation_z_tensor(angle_rad: torch.Tensor, dtype: torch.dtype = torch.float
     )
 
 
+def _so3_exp_map(rotvec: torch.Tensor) -> torch.Tensor:
+    dtype = rotvec.dtype
+    device = rotvec.device
+    theta = torch.linalg.norm(rotvec).clamp_min(1e-8)
+    wx, wy, wz = rotvec[0], rotvec[1], rotvec[2]
+    zero = torch.zeros((), dtype=dtype, device=device)
+    skew = torch.stack(
+        [
+            torch.stack([zero, -wz, wy]),
+            torch.stack([wz, zero, -wx]),
+            torch.stack([-wy, wx, zero]),
+        ],
+        dim=0,
+    )
+    identity = torch.eye(3, dtype=dtype, device=device)
+    a = torch.sin(theta) / theta
+    b = (1.0 - torch.cos(theta)) / theta.pow(2)
+    return identity + a * skew + b * (skew @ skew)
+
+
+def _rotation_delta_magnitude_rad(base_rotation: torch.Tensor, rotation: torch.Tensor) -> float:
+    relative = base_rotation.T @ rotation
+    trace = torch.trace(relative)
+    cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0)
+    return float(torch.acos(cos_theta).item())
+
+
 def _build_upright_rotation(front_dir: torch.Tensor, up_dir: torch.Tensor) -> torch.Tensor:
     up = up_dir / up_dir.norm().clamp_min(1e-6)
     front = front_dir - up * torch.dot(front_dir, up)
@@ -1285,6 +1432,853 @@ def _project_box_bbox(
         image_hw,
     )
     return compute_bbox_from_projected_points(projected_corners, projected_valid)
+
+
+def _project_box_edge_midpoints_model(
+    object_center: torch.Tensor,
+    object_size: torch.Tensor,
+    object_rotation: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    corners = build_box_corners(object_center, object_size, object_rotation)
+    return _project_world_points_unclipped(_edge_midpoints(corners), camera_to_world, intrinsics)
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        value_f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value_f):
+        return None
+    return value_f
+
+
+def _box_area_xyxy(box: torch.Tensor | None) -> float | None:
+    if box is None:
+        return None
+    width = max(0.0, float((box[2] - box[0]).item()))
+    height = max(0.0, float((box[3] - box[1]).item()))
+    return width * height
+
+
+def _box_size_xyxy(box: torch.Tensor | None) -> tuple[float, float] | None:
+    if box is None:
+        return None
+    return (
+        max(0.0, float((box[2] - box[0]).item())),
+        max(0.0, float((box[3] - box[1]).item())),
+    )
+
+
+def _corner_projection_rms(
+    pred_uv: torch.Tensor,
+    pred_valid: torch.Tensor,
+    target_uv: torch.Tensor,
+    target_valid: torch.Tensor,
+    min_count: int = 4,
+) -> tuple[float, int]:
+    common = pred_valid.bool() & target_valid.bool() & torch.isfinite(pred_uv).all(dim=-1) & torch.isfinite(target_uv).all(dim=-1)
+    count = int(common.sum().item())
+    if count < min_count:
+        return float("inf"), count
+    residual = pred_uv[common] - target_uv[common]
+    return float(torch.sqrt(residual.pow(2).sum(dim=-1).mean()).item()), count
+
+
+def _view_half_extent(
+    view_dir_world: torch.Tensor,
+    object_size: torch.Tensor,
+    object_rotation: torch.Tensor,
+) -> torch.Tensor:
+    view_dir = view_dir_world / view_dir_world.norm().clamp_min(1e-6)
+    view_local = torch.matmul(view_dir.view(1, 3), object_rotation).view(3)
+    return torch.sum(view_local.abs() * (0.5 * object_size)).clamp_min(1e-4)
+
+
+def _delete_support_depth_prior(
+    support_points_world: torch.Tensor | None,
+    object_center: torch.Tensor,
+    object_size: torch.Tensor,
+    object_rotation: torch.Tensor,
+    camera_to_world: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    center_cam = _world_to_camera_points(object_center.view(1, 3), camera_to_world)[0]
+    fallback = center_cam[2].clamp_min(1e-3)
+    if support_points_world is None or support_points_world.shape[0] < 8:
+        return fallback, None
+
+    support = support_points_world.detach().to(device=object_center.device, dtype=object_center.dtype)
+    support_cam = _world_to_camera_points(support, camera_to_world)
+    finite = torch.isfinite(support_cam).all(dim=-1) & (support_cam[:, 2] > 1e-4)
+    if int(finite.sum().item()) < 8:
+        return fallback, None
+
+    support = support[finite]
+    support_cam = support_cam[finite]
+    visible_depth = torch.median(support_cam[:, 2]).clamp_min(1e-3)
+    support_mean = support.mean(dim=0)
+    camera_origin = camera_to_world[:3, 3]
+    view_dir = support_mean - camera_origin
+    half_extent = _view_half_extent(view_dir, object_size, object_rotation)
+    center_depth_prior = (visible_depth + half_extent).clamp_min(1e-3)
+    support_center_prior = support_mean + view_dir / view_dir.norm().clamp_min(1e-6) * half_extent
+    return center_depth_prior, support_center_prior
+
+
+def _corner_pose_metrics(
+    object_center: torch.Tensor,
+    object_size: torch.Tensor,
+    object_rotation: torch.Tensor,
+    waymo_corner_uv: torch.Tensor,
+    waymo_corner_valid: torch.Tensor,
+    waymo_edge_uv: torch.Tensor,
+    waymo_edge_valid: torch.Tensor,
+    target_bbox_model: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> dict[str, Any]:
+    corner_uv, corner_depths, corner_valid = project_dggt_box_corners_model(
+        object_center,
+        object_size,
+        object_rotation,
+        camera_to_world,
+        intrinsics,
+    )
+    edge_uv, edge_depths, edge_valid = _project_box_edge_midpoints_model(
+        object_center,
+        object_size,
+        object_rotation,
+        camera_to_world,
+        intrinsics,
+    )
+    corner_rms, corner_count = _corner_projection_rms(
+        corner_uv,
+        corner_valid,
+        waymo_corner_uv,
+        waymo_corner_valid,
+        min_count=4,
+    )
+    edge_rms, edge_count = _corner_projection_rms(
+        edge_uv,
+        edge_valid,
+        waymo_edge_uv,
+        waymo_edge_valid,
+        min_count=4,
+    )
+    bbox = compute_bbox_from_projected_points(corner_uv, corner_valid)
+    bbox_iou = 0.0 if bbox is None else box_iou_xyxy(bbox, target_bbox_model)
+    center_depth = _world_to_camera_points(object_center.view(1, 3), camera_to_world)[0, 2]
+    return {
+        "corner_uv": corner_uv,
+        "corner_depths": corner_depths,
+        "corner_valid": corner_valid,
+        "edge_uv": edge_uv,
+        "edge_depths": edge_depths,
+        "edge_valid": edge_valid,
+        "target_corner_uv": waymo_corner_uv,
+        "target_corner_valid": waymo_corner_valid,
+        "corner_rms": corner_rms,
+        "corner_count": corner_count,
+        "edge_rms": edge_rms,
+        "edge_count": edge_count,
+        "bbox": bbox,
+        "bbox_iou": float(bbox_iou),
+        "center_depth": float(center_depth.item()),
+    }
+
+
+def _serialize_corner_pose_diagnostics(
+    *,
+    status: str,
+    accepted: bool,
+    reason: str,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    candidate_yaw_delta: float,
+    used_yaw_delta: float,
+    base_center: torch.Tensor,
+    used_center: torch.Tensor,
+    candidate_center: torch.Tensor,
+    base_size: torch.Tensor | None = None,
+    used_size: torch.Tensor | None = None,
+    candidate_size: torch.Tensor | None = None,
+    shared_yaw_delta: float | None = None,
+) -> dict[str, Any]:
+    depth_before = _safe_float(before.get("center_depth"))
+    depth_after = _safe_float(after.get("center_depth"))
+    depth_ratio = None
+    if depth_before is not None and depth_after is not None and abs(depth_before) > 1e-6:
+        depth_ratio = depth_after / depth_before
+    center_shift = float((used_center - base_center).norm().item())
+    candidate_center_shift = float((candidate_center - base_center).norm().item())
+    bbox_area_before = _box_area_xyxy(before.get("bbox"))
+    bbox_area_after = _box_area_xyxy(after.get("bbox"))
+    bbox_area_ratio = None
+    if bbox_area_before is not None and bbox_area_after is not None and bbox_area_before > 1e-6:
+        bbox_area_ratio = bbox_area_after / bbox_area_before
+    diagnostics = {
+        "corner_refine_status": status,
+        "corner_refine_accepted": bool(accepted),
+        "corner_refine_reason": reason,
+        "corner_rms_before": _safe_float(before.get("corner_rms")),
+        "corner_rms_after": _safe_float(after.get("corner_rms")),
+        "edge_rms_before": _safe_float(before.get("edge_rms")),
+        "edge_rms_after": _safe_float(after.get("edge_rms")),
+        "bbox_iou_before": _safe_float(before.get("bbox_iou")),
+        "bbox_iou_after": _safe_float(after.get("bbox_iou")),
+        "yaw_delta_rad": float(used_yaw_delta),
+        "yaw_delta_deg": float(math.degrees(used_yaw_delta)),
+        "candidate_yaw_delta_rad": float(candidate_yaw_delta),
+        "candidate_yaw_delta_deg": float(math.degrees(candidate_yaw_delta)),
+        "center_shift": center_shift,
+        "candidate_center_shift": candidate_center_shift,
+        "depth_before": depth_before,
+        "depth_after": depth_after,
+        "depth_ratio": depth_ratio,
+        "bbox_area_before": bbox_area_before,
+        "bbox_area_after": bbox_area_after,
+        "bbox_area_ratio": bbox_area_ratio,
+        "valid_corner_count": int(after.get("corner_count", 0)),
+        "valid_edge_count": int(after.get("edge_count", 0)),
+    }
+    before_corner_uv = before.get("corner_uv")
+    after_corner_uv = after.get("corner_uv")
+    waymo_corner_uv = after.get("target_corner_uv")
+    before_corner_valid = before.get("corner_valid")
+    after_corner_valid = after.get("corner_valid")
+    waymo_corner_valid = after.get("target_corner_valid")
+    if (
+        isinstance(before_corner_uv, torch.Tensor)
+        and isinstance(after_corner_uv, torch.Tensor)
+        and isinstance(waymo_corner_uv, torch.Tensor)
+        and isinstance(before_corner_valid, torch.Tensor)
+        and isinstance(after_corner_valid, torch.Tensor)
+        and isinstance(waymo_corner_valid, torch.Tensor)
+    ):
+        before_common = before_corner_valid.bool() & waymo_corner_valid.bool()
+        after_common = after_corner_valid.bool() & waymo_corner_valid.bool()
+        before_residual = before_corner_uv.detach().cpu().float() - waymo_corner_uv.detach().cpu().float()
+        after_residual = after_corner_uv.detach().cpu().float() - waymo_corner_uv.detach().cpu().float()
+        before_err = torch.linalg.norm(before_residual, dim=-1)
+        after_err = torch.linalg.norm(after_residual, dim=-1)
+        if bool(before_common.any().item()):
+            diagnostics["corner_residual_max_before"] = float(before_err[before_common.cpu()].max().item())
+            diagnostics["corner_residual_mean_xy_before"] = [
+                float(v) for v in before_residual[before_common.cpu()].mean(dim=0).tolist()
+            ]
+        if bool(after_common.any().item()):
+            diagnostics["corner_residual_max_after"] = float(after_err[after_common.cpu()].max().item())
+            diagnostics["corner_residual_mean_xy_after"] = [
+                float(v) for v in after_residual[after_common.cpu()].mean(dim=0).tolist()
+            ]
+            diagnostics["corner_residual_px_after"] = [float(v) for v in after_err.tolist()]
+            diagnostics["corner_residual_xy_after"] = [
+                [float(x), float(y)] for x, y in after_residual.tolist()
+            ]
+    if shared_yaw_delta is not None:
+        diagnostics["shared_yaw_delta_rad"] = float(shared_yaw_delta)
+        diagnostics["shared_yaw_delta_deg"] = float(math.degrees(shared_yaw_delta))
+    if base_size is not None and used_size is not None and candidate_size is not None:
+        base_size_cpu = base_size.detach().cpu().float().clamp_min(1e-6)
+        used_size_cpu = used_size.detach().cpu().float()
+        candidate_size_cpu = candidate_size.detach().cpu().float()
+        diagnostics["size_scale"] = [float(v) for v in (used_size_cpu / base_size_cpu).tolist()]
+        diagnostics["candidate_size_scale"] = [float(v) for v in (candidate_size_cpu / base_size_cpu).tolist()]
+    return diagnostics
+
+
+def _solve_corner_projection_pose(
+    *,
+    base_center: torch.Tensor,
+    initial_center: torch.Tensor,
+    object_size: torch.Tensor,
+    base_rotation: torch.Tensor,
+    waymo_corner_uv: torch.Tensor,
+    waymo_corner_depths: torch.Tensor,
+    waymo_corner_valid: torch.Tensor,
+    waymo_edge_uv: torch.Tensor,
+    waymo_edge_depths: torch.Tensor,
+    waymo_edge_valid: torch.Tensor,
+    target_bbox_model: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    image_hw: tuple[int, int],
+    support_points_world: torch.Tensor | None,
+    max_yaw_rad: float,
+    optimize_yaw: bool,
+    fixed_yaw_delta: float = 0.0,
+    iterations: int = 96,
+) -> dict[str, Any]:
+    del waymo_corner_depths, waymo_edge_depths, image_hw, initial_center, fixed_yaw_delta
+
+    device = camera_to_world.device
+    dtype = camera_to_world.dtype
+    base_center = base_center.to(device=device, dtype=dtype)
+    object_size = object_size.to(device=device, dtype=dtype)
+    base_rotation = base_rotation.to(device=device, dtype=dtype)
+    waymo_corner_uv = waymo_corner_uv.to(device=device, dtype=dtype)
+    waymo_corner_valid = waymo_corner_valid.to(device=device)
+    waymo_edge_uv = waymo_edge_uv.to(device=device, dtype=dtype)
+    waymo_edge_valid = waymo_edge_valid.to(device=device)
+    target_bbox_model = target_bbox_model.to(device=device, dtype=dtype)
+    camera_to_world = camera_to_world.to(device=device, dtype=dtype)
+    intrinsics = intrinsics.to(device=device, dtype=dtype)
+
+    target_corner_valid = waymo_corner_valid.bool() & torch.isfinite(waymo_corner_uv).all(dim=-1)
+    target_edge_valid = waymo_edge_valid.bool() & torch.isfinite(waymo_edge_uv).all(dim=-1)
+
+    before = _corner_pose_metrics(
+        base_center,
+        object_size,
+        base_rotation,
+        waymo_corner_uv,
+        target_corner_valid,
+        waymo_edge_uv,
+        target_edge_valid,
+        target_bbox_model,
+        camera_to_world,
+        intrinsics,
+    )
+    if int(target_corner_valid.sum().item()) < 4:
+        diagnostics = _serialize_corner_pose_diagnostics(
+            status="insufficient_corners",
+            accepted=False,
+            reason="fewer_than_four_valid_waymo_corners",
+            before=before,
+            after=before,
+            candidate_yaw_delta=0.0,
+            used_yaw_delta=0.0,
+            base_center=base_center,
+            used_center=base_center,
+            candidate_center=base_center,
+            base_size=object_size,
+            used_size=object_size,
+            candidate_size=object_size,
+        )
+        return {
+            "center": base_center.clone(),
+            "size": object_size.clone(),
+            "rotation": base_rotation.clone(),
+            "bbox": before["bbox"],
+            "yaw_delta": 0.0,
+            "candidate_yaw_delta": 0.0,
+            "accepted": False,
+            "diagnostics": diagnostics,
+            "waymo_uv": waymo_corner_uv.detach().cpu().float(),
+            "waymo_valid": target_corner_valid.detach().cpu(),
+            "initial_uv": before["corner_uv"].detach().cpu().float(),
+            "initial_valid": before["corner_valid"].detach().cpu(),
+            "refined_uv": before["corner_uv"].detach().cpu().float(),
+            "refined_valid": before["corner_valid"].detach().cpu(),
+        }
+
+    rot_limit = max(0.0, float(max_yaw_rad))
+    optimize_rotation_eff = bool(optimize_yaw and rot_limit > 1e-7)
+    target_bbox_size = (target_bbox_model[2:] - target_bbox_model[:2]).clamp_min(1.0)
+    uv_scale = torch.linalg.norm(target_bbox_size).clamp_min(16.0)
+    size_norm = torch.linalg.norm(object_size).clamp_min(1e-3)
+    base_center_cam = _world_to_camera_points(base_center.view(1, 3), camera_to_world)[0]
+    base_depth = base_center_cam[2].clamp_min(1e-3)
+    max_lateral_shift = max(0.35, float(size_norm.item()) * 0.35)
+    max_depth_shift = max(0.75, float(size_norm.item()) * 0.80)
+    delta_cam_limits = torch.tensor(
+        [max_lateral_shift, max_lateral_shift, max_depth_shift],
+        dtype=dtype,
+        device=device,
+    )
+
+    support_depth_prior, support_center_prior = _delete_support_depth_prior(
+        support_points_world,
+        base_center,
+        object_size,
+        base_rotation,
+        camera_to_world,
+    )
+    support_depth_prior = support_depth_prior.to(device=device, dtype=dtype)
+    if support_center_prior is not None:
+        support_center_prior = support_center_prior.to(device=device, dtype=dtype)
+
+    center_param = torch.zeros((3,), dtype=dtype, device=device, requires_grad=True)
+    rot_param = torch.zeros((3,), dtype=dtype, device=device, requires_grad=optimize_rotation_eff)
+    size_param = torch.zeros((3,), dtype=dtype, device=device, requires_grad=True)
+    max_log_size_delta = math.log(1.35)
+    params = [center_param, size_param]
+    if optimize_rotation_eff:
+        params.append(rot_param)
+
+    optimizer = torch.optim.Adam(params, lr=0.045)
+
+    def build_candidate() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        delta_cam = delta_cam_limits * torch.tanh(center_param)
+        delta_world = delta_cam @ camera_to_world[:3, :3].T
+        center_world = base_center + delta_world
+        log_size_delta = max_log_size_delta * torch.tanh(size_param)
+        size = object_size * torch.exp(log_size_delta)
+        if optimize_rotation_eff:
+            rotvec = rot_limit * torch.tanh(rot_param)
+            rotation = base_rotation @ _so3_exp_map(rotvec)
+        else:
+            rotvec = torch.zeros((3,), dtype=dtype, device=device)
+            rotation = base_rotation
+        return center_world, size, rotation, delta_cam, rotvec, log_size_delta
+
+    with torch.enable_grad():
+        for _ in range(max(1, int(iterations))):
+            optimizer.zero_grad(set_to_none=True)
+            center_world, candidate_size, rotation, delta_cam, rotvec, log_size_delta = build_candidate()
+            corners = build_box_corners(center_world, candidate_size, rotation)
+            corner_uv, corner_depths, corner_valid = _project_world_points_unclipped(
+                corners,
+                camera_to_world,
+                intrinsics,
+            )
+            common = target_corner_valid & corner_valid & torch.isfinite(corner_uv).all(dim=-1)
+            corner_weight = common.to(dtype)
+            corner_loss_raw = F.huber_loss(
+                corner_uv / uv_scale,
+                waymo_corner_uv / uv_scale,
+                reduction="none",
+                delta=0.14,
+            ).sum(dim=-1)
+            corner_l2_raw = ((corner_uv - waymo_corner_uv) / uv_scale).pow(2).sum(dim=-1)
+            corner_loss = (
+                (corner_loss_raw * corner_weight).sum()
+                / corner_weight.sum().clamp_min(1.0)
+                + 0.18 * (corner_l2_raw * corner_weight).sum() / corner_weight.sum().clamp_min(1.0)
+            )
+
+            edges_world = _edge_midpoints(corners)
+            edge_uv, edge_depths, edge_valid = _project_world_points_unclipped(
+                edges_world,
+                camera_to_world,
+                intrinsics,
+            )
+            edge_common = target_edge_valid & edge_valid & torch.isfinite(edge_uv).all(dim=-1)
+            edge_weight = edge_common.to(dtype)
+            edge_loss_raw = F.huber_loss(
+                edge_uv / uv_scale,
+                waymo_edge_uv / uv_scale,
+                reduction="none",
+                delta=0.12,
+            ).sum(dim=-1)
+            edge_l2_raw = ((edge_uv - waymo_edge_uv) / uv_scale).pow(2).sum(dim=-1)
+            edge_loss = (
+                (edge_loss_raw * edge_weight).sum()
+                / edge_weight.sum().clamp_min(1.0)
+                + 0.12 * (edge_l2_raw * edge_weight).sum() / edge_weight.sum().clamp_min(1.0)
+            )
+
+            bbox_common = target_corner_valid & torch.isfinite(corner_uv).all(dim=-1)
+            large = torch.tensor(1.0e6, dtype=dtype, device=device)
+            small = torch.tensor(-1.0e6, dtype=dtype, device=device)
+            uv_min = torch.where(bbox_common[:, None], corner_uv, large).min(dim=0).values
+            uv_max = torch.where(bbox_common[:, None], corner_uv, small).max(dim=0).values
+            pred_bbox = torch.stack([uv_min[0], uv_min[1], uv_max[0], uv_max[1]], dim=0)
+            bbox_loss = _bbox_alignment_loss(pred_bbox, target_bbox_model)
+
+            center_cam = _world_to_camera_points(center_world.view(1, 3), camera_to_world)[0]
+            depth_scale = base_depth.clamp_min(1.0)
+            base_depth_loss = F.huber_loss(
+                center_cam[2:3] / depth_scale,
+                base_depth.view(1) / depth_scale,
+                reduction="mean",
+                delta=0.15,
+            )
+            support_depth_loss = F.huber_loss(
+                center_cam[2:3] / support_depth_prior.clamp_min(1.0),
+                support_depth_prior.view(1) / support_depth_prior.clamp_min(1.0),
+                reduction="mean",
+                delta=0.12,
+            )
+            support_center_loss = torch.tensor(0.0, dtype=dtype, device=device)
+            if support_center_prior is not None:
+                support_center_loss = F.huber_loss(
+                    (center_world - support_center_prior) / size_norm,
+                    torch.zeros((3,), dtype=dtype, device=device),
+                    reduction="mean",
+                    delta=0.35,
+                )
+            center_prior_loss = (delta_cam / delta_cam_limits).pow(2).mean()
+            rotation_prior_loss = (rotvec / max(rot_limit, 1e-6)).pow(2).mean() if optimize_rotation_eff else torch.tensor(0.0, dtype=dtype, device=device)
+            size_prior_loss = (log_size_delta / max_log_size_delta).pow(2).mean()
+            invalid_loss = F.relu(1e-4 - corner_depths).mean() + 0.5 * F.relu(1e-4 - edge_depths).mean()
+
+            loss = (
+                corner_loss
+                + 0.35 * edge_loss
+                + 0.08 * bbox_loss
+                + 0.025 * center_prior_loss
+                + 0.018 * base_depth_loss
+                + 0.035 * support_depth_loss
+                + 0.018 * support_center_loss
+                + 0.006 * rotation_prior_loss
+                + 0.004 * size_prior_loss
+                + 3.0 * invalid_loss
+            )
+            loss.backward()
+            optimizer.step()
+
+    with torch.no_grad():
+        best_center, best_size, best_rotation, best_delta_cam, best_rotvec, best_log_size_delta = build_candidate()
+        best_rotation = _orthonormalize_rotation(best_rotation)
+        best_yaw_delta = _yaw_delta_between_rotations(base_rotation, best_rotation)
+        rotation_delta_mag = _rotation_delta_magnitude_rad(base_rotation, best_rotation)
+
+    del optimizer, center_param, rot_param, size_param, params
+
+    after_candidate = _corner_pose_metrics(
+        best_center,
+        best_size,
+        best_rotation,
+        waymo_corner_uv,
+        target_corner_valid,
+        waymo_edge_uv,
+        target_edge_valid,
+        target_bbox_model,
+        camera_to_world,
+        intrinsics,
+    )
+    before_rms = _safe_float(before.get("corner_rms"))
+    after_rms = _safe_float(after_candidate.get("corner_rms"))
+    before_iou = _safe_float(before.get("bbox_iou")) or 0.0
+    after_iou = _safe_float(after_candidate.get("bbox_iou")) or 0.0
+    base_depth = _safe_float(before.get("center_depth"))
+    after_depth = _safe_float(after_candidate.get("center_depth"))
+    depth_ratio = None
+    if base_depth is not None and after_depth is not None and abs(base_depth) > 1e-6:
+        depth_ratio = after_depth / base_depth
+    center_shift = float((best_center - base_center).norm().item())
+    support_depth = _safe_float(support_depth_prior)
+    support_depth_ratio = None
+    if support_depth is not None and after_depth is not None and abs(support_depth) > 1e-6:
+        support_depth_ratio = after_depth / support_depth
+    target_area = _box_area_xyxy(target_bbox_model)
+    after_area = _box_area_xyxy(after_candidate.get("bbox"))
+    target_box_size = _box_size_xyxy(target_bbox_model)
+    after_box_size = _box_size_xyxy(after_candidate.get("bbox"))
+    target_area_ratio = None
+    target_width_ratio = None
+    target_height_ratio = None
+    if target_area is not None and after_area is not None and target_area > 1e-6:
+        target_area_ratio = after_area / target_area
+    if target_box_size is not None and after_box_size is not None:
+        target_w_diag, target_h_diag = target_box_size
+        after_w_diag, after_h_diag = after_box_size
+        if target_w_diag > 1e-6:
+            target_width_ratio = after_w_diag / target_w_diag
+        if target_h_diag > 1e-6:
+            target_height_ratio = after_h_diag / target_h_diag
+
+    accepted = True
+    reason = "accepted"
+    if after_rms is None:
+        accepted = False
+        reason = "corner_rms_not_finite"
+    elif before_rms is not None:
+        min_drop = max(1.0, 0.08 * before_rms)
+        if after_rms > before_rms - min_drop:
+            accepted = False
+            reason = "corner_rms_not_improved"
+    if accepted and before_iou > 0.02 and after_iou + 0.04 < before_iou:
+        accepted = False
+        reason = "bbox_iou_degraded"
+    if accepted and (depth_ratio is None or depth_ratio < 0.78 or depth_ratio > 1.28):
+        accepted = False
+        reason = "depth_ratio_out_of_bounds"
+    support_depth_outlier = (
+        support_depth_ratio is not None
+        and (support_depth_ratio < 0.55 or support_depth_ratio > 2.20)
+    )
+    max_shift = float(torch.linalg.norm(delta_cam_limits).item())
+    if accepted and center_shift > max_shift:
+        accepted = False
+        reason = "center_shift_out_of_bounds"
+    if accepted and optimize_rotation_eff and rotation_delta_mag > max(0.10, rot_limit * 1.45):
+        accepted = False
+        reason = "rotation_delta_out_of_bounds"
+    if accepted and target_area is not None and after_area is not None and target_area > 1e-6:
+        if after_area / target_area > 1.22:
+            accepted = False
+            reason = "projected_box_too_large"
+    if accepted and target_box_size is not None and after_box_size is not None:
+        target_w, target_h = target_box_size
+        after_w, after_h = after_box_size
+        if target_w > 1e-6 and after_w / target_w > 1.18:
+            accepted = False
+            reason = "projected_box_width_too_large"
+        if accepted and target_h > 1e-6 and after_h / target_h > 1.18:
+            accepted = False
+            reason = "projected_box_height_too_large"
+
+    used_center = best_center if accepted else base_center.clone()
+    used_rotation = best_rotation if accepted else base_rotation.clone()
+    used_yaw_delta = best_yaw_delta if accepted else 0.0
+    used_metrics = after_candidate if accepted else before
+    status = "accepted" if accepted else "rejected"
+    diagnostics = _serialize_corner_pose_diagnostics(
+        status=status,
+        accepted=accepted,
+        reason=reason,
+        before=before,
+        after=after_candidate,
+        candidate_yaw_delta=best_yaw_delta,
+        used_yaw_delta=used_yaw_delta,
+        base_center=base_center,
+            used_center=used_center,
+            candidate_center=best_center,
+            base_size=object_size,
+            used_size=best_size if accepted else object_size,
+            candidate_size=best_size,
+        )
+    diagnostics["support_depth_prior"] = support_depth
+    diagnostics["support_depth_ratio"] = support_depth_ratio
+    diagnostics["support_depth_outlier"] = bool(support_depth_outlier)
+    diagnostics["max_center_shift"] = float(max_shift)
+    diagnostics["rotation_delta_rad"] = float(rotation_delta_mag)
+    diagnostics["rotation_delta_deg"] = float(math.degrees(rotation_delta_mag))
+    diagnostics["center_delta_cam"] = [float(v) for v in best_delta_cam.detach().cpu().tolist()]
+    diagnostics["log_size_delta"] = [float(v) for v in best_log_size_delta.detach().cpu().tolist()]
+    diagnostics["target_bbox_area_ratio"] = target_area_ratio
+    diagnostics["target_bbox_width_ratio"] = target_width_ratio
+    diagnostics["target_bbox_height_ratio"] = target_height_ratio
+    diagnostics["solver_iterations"] = int(iterations)
+    diagnostics["solver_loss_profile"] = "corner_l2_v2_support_soft"
+    return {
+        "center": used_center.clone(),
+        "size": (best_size if accepted else object_size).clone(),
+        "rotation": _orthonormalize_rotation(used_rotation),
+        "bbox": used_metrics["bbox"],
+        "yaw_delta": float(used_yaw_delta),
+        "candidate_yaw_delta": float(best_yaw_delta),
+        "accepted": bool(accepted),
+        "diagnostics": diagnostics,
+        "waymo_uv": waymo_corner_uv.detach().cpu().float(),
+        "waymo_valid": target_corner_valid.detach().cpu(),
+        "initial_uv": before["corner_uv"].detach().cpu().float(),
+        "initial_valid": before["corner_valid"].detach().cpu(),
+        "refined_uv": used_metrics["corner_uv"].detach().cpu().float(),
+        "refined_valid": used_metrics["corner_valid"].detach().cpu(),
+    }
+
+
+def _base_corner_projection_result(
+    *,
+    base_center: torch.Tensor,
+    object_size: torch.Tensor,
+    base_rotation: torch.Tensor,
+    waymo_corner_uv: torch.Tensor,
+    waymo_corner_valid: torch.Tensor,
+    waymo_edge_uv: torch.Tensor,
+    waymo_edge_valid: torch.Tensor,
+    target_bbox_model: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    status: str,
+    reason: str,
+    shared_yaw_delta: float | None = None,
+) -> dict[str, Any]:
+    metrics = _corner_pose_metrics(
+        base_center,
+        object_size,
+        base_rotation,
+        waymo_corner_uv,
+        waymo_corner_valid,
+        waymo_edge_uv,
+        waymo_edge_valid,
+        target_bbox_model,
+        camera_to_world,
+        intrinsics,
+    )
+    diagnostics = _serialize_corner_pose_diagnostics(
+        status=status,
+        accepted=False,
+        reason=reason,
+        before=metrics,
+        after=metrics,
+        candidate_yaw_delta=0.0,
+        used_yaw_delta=0.0,
+        base_center=base_center,
+        used_center=base_center,
+        candidate_center=base_center,
+        base_size=object_size,
+        used_size=object_size,
+        candidate_size=object_size,
+        shared_yaw_delta=shared_yaw_delta,
+    )
+    return {
+        "center": base_center.clone(),
+        "size": object_size.clone(),
+        "rotation": base_rotation.clone(),
+        "bbox": metrics["bbox"],
+        "yaw_delta": 0.0,
+        "candidate_yaw_delta": 0.0,
+        "accepted": False,
+        "diagnostics": diagnostics,
+        "waymo_uv": waymo_corner_uv.detach().cpu().float(),
+        "waymo_valid": waymo_corner_valid.detach().cpu(),
+        "initial_uv": metrics["corner_uv"].detach().cpu().float(),
+        "initial_valid": metrics["corner_valid"].detach().cpu(),
+        "refined_uv": metrics["corner_uv"].detach().cpu().float(),
+        "refined_valid": metrics["corner_valid"].detach().cpu(),
+    }
+
+
+def _corner_projection_result_for_pose(
+    *,
+    initial_center: torch.Tensor,
+    initial_rotation: torch.Tensor,
+    refined_center: torch.Tensor,
+    refined_rotation: torch.Tensor,
+    object_size: torch.Tensor,
+    waymo_corner_uv: torch.Tensor,
+    waymo_corner_valid: torch.Tensor,
+    waymo_edge_uv: torch.Tensor,
+    waymo_edge_valid: torch.Tensor,
+    target_bbox_model: torch.Tensor,
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    status: str,
+    reason: str,
+    accepted: bool,
+    shared_yaw_delta: float,
+    track_yaw_candidate_count: int,
+) -> dict[str, Any]:
+    target_corner_valid = waymo_corner_valid.bool() & torch.isfinite(waymo_corner_uv).all(dim=-1)
+    target_edge_valid = waymo_edge_valid.bool() & torch.isfinite(waymo_edge_uv).all(dim=-1)
+    before = _corner_pose_metrics(
+        initial_center,
+        object_size,
+        initial_rotation,
+        waymo_corner_uv,
+        target_corner_valid,
+        waymo_edge_uv,
+        target_edge_valid,
+        target_bbox_model,
+        camera_to_world,
+        intrinsics,
+    )
+    after = _corner_pose_metrics(
+        refined_center,
+        object_size,
+        refined_rotation,
+        waymo_corner_uv,
+        target_corner_valid,
+        waymo_edge_uv,
+        target_edge_valid,
+        target_bbox_model,
+        camera_to_world,
+        intrinsics,
+    )
+    diagnostics = _serialize_corner_pose_diagnostics(
+        status=status,
+        accepted=accepted,
+        reason=reason,
+        before=before,
+        after=after,
+        candidate_yaw_delta=shared_yaw_delta,
+        used_yaw_delta=shared_yaw_delta,
+        base_center=initial_center,
+        used_center=refined_center,
+        candidate_center=refined_center,
+        base_size=object_size,
+        used_size=object_size,
+        candidate_size=object_size,
+        shared_yaw_delta=shared_yaw_delta,
+    )
+    diagnostics["track_yaw_candidate_count"] = int(track_yaw_candidate_count)
+    return {
+        "center": refined_center.clone(),
+        "size": object_size.clone(),
+        "rotation": _orthonormalize_rotation(refined_rotation),
+        "bbox": after["bbox"],
+        "yaw_delta": float(shared_yaw_delta),
+        "candidate_yaw_delta": float(shared_yaw_delta),
+        "accepted": bool(accepted),
+        "diagnostics": diagnostics,
+        "waymo_uv": waymo_corner_uv.detach().cpu().float(),
+        "waymo_valid": target_corner_valid.detach().cpu(),
+        "initial_uv": before["corner_uv"].detach().cpu().float(),
+        "initial_valid": before["corner_valid"].detach().cpu(),
+        "refined_uv": after["corner_uv"].detach().cpu().float(),
+        "refined_valid": after["corner_valid"].detach().cpu(),
+    }
+
+
+def _shared_corner_yaw_gate(
+    frame_specs: list[dict[str, Any]],
+    shared_yaw_delta: float,
+    clean_state: CleanSceneState,
+) -> tuple[bool, str]:
+    if len(frame_specs) == 0 or abs(float(shared_yaw_delta)) < 1e-7:
+        return False, "zero_shared_yaw"
+    before_values: list[float] = []
+    after_values: list[float] = []
+    iou_deltas: list[float] = []
+    improved_count = 0
+    evaluated_count = 0
+
+    for frame_spec in frame_specs:
+        target_corner_bbox = frame_spec.get("waymo_bbox_model")
+        if target_corner_bbox is None:
+            target_corner_bbox = frame_spec["target_bbox_model"]
+        source_front_index = int(frame_spec["source_front_index"])
+        yaw_tensor = torch.tensor(float(shared_yaw_delta), dtype=frame_spec["gt_size"].dtype)
+        after_rotation = _orthonormalize_rotation(
+            frame_spec["proposal_rotation_base"] @ _rotation_z_tensor(yaw_tensor, dtype=frame_spec["gt_size"].dtype)
+        )
+        before = _corner_pose_metrics(
+            frame_spec["proposal_center_initial"],
+            frame_spec["gt_size"],
+            frame_spec["proposal_rotation_base"],
+            frame_spec["waymo_corner_uv"],
+            frame_spec["waymo_corner_valid"],
+            frame_spec["waymo_edge_uv"],
+            frame_spec["waymo_edge_valid"],
+            target_corner_bbox,
+            clean_state.camera_to_world[source_front_index],
+            clean_state.intrinsics[source_front_index],
+        )
+        after = _corner_pose_metrics(
+            frame_spec["proposal_center_initial"],
+            frame_spec["gt_size"],
+            after_rotation,
+            frame_spec["waymo_corner_uv"],
+            frame_spec["waymo_corner_valid"],
+            frame_spec["waymo_edge_uv"],
+            frame_spec["waymo_edge_valid"],
+            target_corner_bbox,
+            clean_state.camera_to_world[source_front_index],
+            clean_state.intrinsics[source_front_index],
+        )
+        before_rms = _safe_float(before.get("corner_rms"))
+        after_rms = _safe_float(after.get("corner_rms"))
+        if before_rms is None or after_rms is None:
+            continue
+        evaluated_count += 1
+        before_values.append(before_rms)
+        after_values.append(after_rms)
+        iou_deltas.append(float(after.get("bbox_iou", 0.0)) - float(before.get("bbox_iou", 0.0)))
+        if after_rms < before_rms - max(0.5, 0.03 * before_rms):
+            improved_count += 1
+        if after_rms > before_rms + max(1.0, 0.10 * before_rms):
+            return False, "shared_yaw_degrades_frame_corner_rms"
+        if iou_deltas[-1] < -0.04:
+            return False, "shared_yaw_degrades_frame_bbox_iou"
+
+    if evaluated_count == 0:
+        return False, "shared_yaw_no_evaluable_frames"
+    before_t = torch.tensor(before_values, dtype=torch.float32)
+    after_t = torch.tensor(after_values, dtype=torch.float32)
+    median_before = float(torch.median(before_t).item())
+    median_after = float(torch.median(after_t).item())
+    if median_after > median_before - max(0.5, 0.05 * median_before):
+        return False, "shared_yaw_track_corner_rms_not_improved"
+    min_improved = max(1, math.ceil(0.75 * evaluated_count))
+    if improved_count < min_improved:
+        return False, "shared_yaw_too_few_improved_frames"
+    return True, "accepted"
 
 
 def _wrap_angle_rad(angle_rad: torch.Tensor) -> torch.Tensor:
@@ -2855,6 +3849,35 @@ def _gaussian_indices_from_pixel_mask(
     return result
 
 
+def _sample_camera_to_world_view(sample: dict[str, Any], frame_idx: int, view_offset: int) -> torch.Tensor:
+    camera_to_world = sample["camera_to_world_corrected"].detach().cpu().float()
+    if camera_to_world.dim() == 4:
+        return camera_to_world[frame_idx, view_offset]
+    return camera_to_world[frame_idx]
+
+
+def _sample_intrinsics_view(sample: dict[str, Any], frame_idx: int, view_offset: int) -> torch.Tensor:
+    intrinsics = sample["intrinsics"].detach().cpu().float()
+    if intrinsics.dim() == 4:
+        return intrinsics[frame_idx, view_offset]
+    if intrinsics.dim() == 3:
+        if intrinsics.shape[0] == int(sample["cam_ids"].numel()):
+            return intrinsics[view_offset]
+        return intrinsics[frame_idx]
+    return intrinsics
+
+
+def _sample_raw_hw_view(sample: dict[str, Any], frame_idx: int, view_offset: int) -> torch.Tensor:
+    raw_hw = sample["raw_image_size_hw"].detach().cpu().long()
+    if raw_hw.dim() == 3:
+        return raw_hw[frame_idx, view_offset]
+    if raw_hw.dim() == 2:
+        if raw_hw.shape[0] == int(sample["cam_ids"].numel()):
+            return raw_hw[view_offset]
+        return raw_hw[frame_idx]
+    return raw_hw.view(2)
+
+
 def localize_objects(
     sample: dict[str, Any],
     clean_state: CleanSceneState,
@@ -2889,6 +3912,7 @@ def localize_objects(
     track_valid = sample["object_track_valid_mask_selected"]
     object_obj_to_world = sample["object_obj_to_world_selected"]
     object_box_size = sample["object_box_size_selected"]
+    object_box_corners_world = sample.get("object_box_corners_world_selected")
     object_max_speed_mps = sample.get("object_max_speed_mps")
     object_mean_speed_mps = sample.get("object_mean_speed_mps")
     object_is_moving_track = sample.get("object_is_moving_track")
@@ -2952,14 +3976,25 @@ def localize_objects(
                 alignment,
             )
             source_front_index = frame_idx * num_views + int(view_offset)
-            proposal_rotation_base = _build_label_track_rotation(gt_rotation, scene_up)
+            label_track_rotation = _build_label_track_rotation(gt_rotation, scene_up)
+            # Use the exact Sim3-transformed Waymo box rotation for projection
+            # matching. Rebuilding an upright label rotation changes the cuboid's
+            # projected shape and can make the DGGT/Waymo 3D boxes disagree even
+            # before any yaw refinement is applied.
+            proposal_rotation_base = _orthonormalize_rotation(gt_rotation)
 
-            max_yaw_rad = max(0.0, math.radians(float(max_pose_refine_yaw_deg)))
-            if use_pose_refine and max_yaw_rad > 0.0:
-                # Axis-aligned 2D boxes are a weak yaw constraint.  This branch is
-                # retained only for explicit experiments with a non-zero yaw budget;
-                # the robust default keeps the Waymo 3D-box heading fixed.
-                proposal_center_init, proposal_rotation_init, proposal_bbox = _solve_proposal_pose_from_target_bbox(
+            proposal_rotation_init = proposal_rotation_base.clone()
+            proposal_center_init = gt_center.clone()
+            proposal_bbox = _project_box_bbox(
+                gt_center,
+                gt_size,
+                proposal_rotation_base,
+                clean_state.camera_to_world[source_front_index],
+                clean_state.intrinsics[source_front_index],
+                image_hw,
+            )
+            if use_pose_refine:
+                proposal_center_init, proposal_bbox = _solve_proposal_center_with_fixed_rotation(
                     object_center=gt_center,
                     object_size=gt_size,
                     object_rotation=proposal_rotation_base,
@@ -2971,24 +4006,51 @@ def localize_objects(
                     depth_map=clean_state.depth[source_front_index],
                     valid_mask=clean_state.valid_mask[source_front_index],
                 )
-                proposal_yaw_delta = _yaw_delta_between_rotations(
-                    proposal_rotation_base,
-                    proposal_rotation_init,
+            proposal_yaw_delta = 0.0
+            proposal_score = -1e9 if proposal_bbox is None else _score_projected_bbox(proposal_bbox, target_bbox_model)
+
+            waymo_corner_uv = torch.zeros((8, 2), dtype=torch.float32)
+            waymo_corner_depths = torch.zeros((8,), dtype=torch.float32)
+            waymo_corner_valid = torch.zeros((8,), dtype=torch.bool)
+            waymo_edge_uv = torch.zeros((len(_BOX_EDGES), 2), dtype=torch.float32)
+            waymo_edge_depths = torch.zeros((len(_BOX_EDGES),), dtype=torch.float32)
+            waymo_edge_valid = torch.zeros((len(_BOX_EDGES),), dtype=torch.bool)
+            waymo_bbox_model = None
+            if isinstance(object_box_corners_world, torch.Tensor):
+                projection_device = clean_state.camera_to_world[source_front_index].device
+                projection_dtype = clean_state.camera_to_world[source_front_index].dtype
+                corners_waymo_world = object_box_corners_world[slot_idx, frame_idx].detach().to(
+                    device=projection_device,
+                    dtype=projection_dtype,
                 )
-                proposal_score = -1e9 if proposal_bbox is None else _score_projected_bbox(proposal_bbox, target_bbox_model)
-            else:
-                proposal_center_init = gt_center.clone()
-                proposal_rotation_init = proposal_rotation_base.clone()
-                proposal_yaw_delta = 0.0
-                proposal_bbox = _project_box_bbox(
-                    gt_center,
-                    gt_size,
-                    proposal_rotation_base,
-                    clean_state.camera_to_world[source_front_index],
-                    clean_state.intrinsics[source_front_index],
-                    image_hw,
-                )
-                proposal_score = -1e9 if proposal_bbox is None else _score_projected_bbox(proposal_bbox, target_bbox_model)
+                if corners_waymo_world.shape == (8, 3) and torch.isfinite(corners_waymo_world).all():
+                    camera_waymo = _sample_camera_to_world_view(sample, int(frame_idx), int(view_offset)).to(
+                        device=projection_device,
+                        dtype=projection_dtype,
+                    )
+                    intrinsics_waymo = _sample_intrinsics_view(sample, int(frame_idx), int(view_offset)).to(
+                        device=projection_device,
+                        dtype=projection_dtype,
+                    )
+                    raw_hw_waymo = _sample_raw_hw_view(sample, int(frame_idx), int(view_offset))
+                    waymo_corner_uv, waymo_corner_depths, waymo_corner_valid = project_waymo_box_corners_model(
+                        corners_waymo_world,
+                        camera_waymo,
+                        intrinsics_waymo,
+                        raw_hw_waymo,
+                        image_hw,
+                    )
+                    waymo_bbox_model = compute_bbox_from_projected_points(
+                        waymo_corner_uv,
+                        waymo_corner_valid,
+                    )
+                    waymo_edge_uv, waymo_edge_depths, waymo_edge_valid = project_waymo_box_corners_model(
+                        _edge_midpoints(corners_waymo_world),
+                        camera_waymo,
+                        intrinsics_waymo,
+                        raw_hw_waymo,
+                        image_hw,
+                    )
 
             waymo_frame_dynamic = (
                 bool(object_is_moving_frame[slot_idx, frame_idx].item())
@@ -3008,6 +4070,7 @@ def localize_objects(
                     "gt_center": gt_center,
                     "gt_size": gt_size,
                     "gt_rotation": gt_rotation,
+                    "label_track_rotation": label_track_rotation,
                     "proposal_rotation_base": proposal_rotation_base,
                     "proposal_center_initial": proposal_center_init,
                     "proposal_rotation_initial": proposal_rotation_init,
@@ -3016,17 +4079,25 @@ def localize_objects(
                     "waymo_frame_dynamic": bool(waymo_frame_dynamic),
                     "waymo_frame_speed": waymo_frame_speed,
                     "target_bbox_model": target_bbox_model,
+                    "waymo_corner_uv": waymo_corner_uv,
+                    "waymo_corner_depths": waymo_corner_depths,
+                    "waymo_corner_valid": waymo_corner_valid,
+                    "waymo_edge_uv": waymo_edge_uv,
+                    "waymo_edge_depths": waymo_edge_depths,
+                    "waymo_edge_valid": waymo_edge_valid,
+                    "waymo_bbox_model": waymo_bbox_model,
                 }
             )
 
         if len(frame_specs) == 0:
             continue
 
-        shared_yaw_delta = _shared_track_yaw_delta(
-            [float(spec["proposal_yaw_delta"]) for spec in frame_specs],
-            [float(spec["proposal_score_initial"]) for spec in frame_specs],
-            max(0.0, math.radians(float(max_pose_refine_yaw_deg))),
-        )
+        corner_yaw_deltas: list[float] = []
+        corner_yaw_scores: list[float] = []
+        max_yaw_rad = max(0.0, math.radians(float(max_pose_refine_yaw_deg)))
+        shared_yaw_delta = 0.0
+        shared_yaw_ok = False
+        shared_yaw_reason = "corner_refine_deferred_until_delete_support"
 
         slot_meta[int(slot_idx)] = {
             "match_score": match_score,
@@ -3036,6 +4107,8 @@ def localize_objects(
             "waymo_max_speed": waymo_max_speed,
             "waymo_mean_speed": waymo_mean_speed,
             "shared_yaw_delta": shared_yaw_delta,
+            "corner_yaw_candidate_count": len(corner_yaw_deltas),
+            "corner_yaw_refine_reason": shared_yaw_reason,
         }
         frame_geom: dict[int, dict[str, Any]] = {}
         for frame_spec in frame_specs:
@@ -3043,10 +4116,8 @@ def localize_objects(
             source_front_index = frame_spec["source_front_index"]
             gt_center = frame_spec["gt_center"]
             gt_size = frame_spec["gt_size"]
-
             if use_pose_refine:
-                max_yaw = max(0.0, math.radians(float(max_pose_refine_yaw_deg)))
-                yaw_delta = max(-max_yaw, min(max_yaw, float(shared_yaw_delta)))
+                yaw_delta = float(shared_yaw_delta)
                 yaw_tensor = torch.tensor(yaw_delta, dtype=gt_center.dtype)
                 proposal_rotation = _orthonormalize_rotation(
                     frame_spec["proposal_rotation_base"] @ _rotation_z_tensor(yaw_tensor, dtype=gt_center.dtype)
@@ -3066,9 +4137,32 @@ def localize_objects(
             else:
                 proposal_rotation = frame_spec["proposal_rotation_base"].clone()
                 proposal_center = gt_center.clone()
-
             proposal_size = gt_size.clone()
             target_bbox_2d = frame_spec["target_bbox_model"].clone()
+            target_corner_bbox = frame_spec.get("waymo_bbox_model")
+            if target_corner_bbox is None:
+                target_corner_bbox = frame_spec["target_bbox_model"]
+            corner_pose_result = _corner_projection_result_for_pose(
+                initial_center=frame_spec["proposal_center_initial"],
+                initial_rotation=frame_spec["proposal_rotation_base"],
+                refined_center=proposal_center,
+                refined_rotation=proposal_rotation,
+                object_size=gt_size,
+                waymo_corner_uv=frame_spec["waymo_corner_uv"],
+                waymo_corner_valid=frame_spec["waymo_corner_valid"],
+                waymo_edge_uv=frame_spec["waymo_edge_uv"],
+                waymo_edge_valid=frame_spec["waymo_edge_valid"],
+                target_bbox_model=target_corner_bbox,
+                camera_to_world=clean_state.camera_to_world[source_front_index],
+                intrinsics=clean_state.intrinsics[source_front_index],
+                status="accepted"
+                if shared_yaw_ok
+                else ("rejected" if len(corner_yaw_deltas) > 0 else "no_track_yaw_inliers"),
+                reason=shared_yaw_reason if len(corner_yaw_deltas) > 0 else "corner_refine_had_no_accepted_track_yaw_candidates",
+                accepted=shared_yaw_ok,
+                shared_yaw_delta=float(shared_yaw_delta),
+                track_yaw_candidate_count=len(corner_yaw_deltas),
+            )
 
             frame_geom[int(frame_idx)] = {
                 **frame_spec,
@@ -3078,11 +4172,9 @@ def localize_objects(
                 "proposal_size": proposal_size,
                 "target_bbox_2d": target_bbox_2d,
                 "shared_yaw_delta": float(shared_yaw_delta),
+                "corner_pose_result": corner_pose_result,
             }
         if use_pose_refine and len(frame_geom) > 1:
-            # The 2D bbox can correct a residual global offset, but solving each
-            # frame independently introduces visible track jitter.  Use a robust
-            # per-track median center residual and keep the Waymo 3D trajectory.
             deltas = torch.stack(
                 [geom["proposal_center_raw"] - geom["gt_center"] for geom in frame_geom.values()],
                 dim=0,
@@ -3093,6 +4185,30 @@ def localize_objects(
                 for geom in frame_geom.values():
                     geom["proposal_center"] = geom["gt_center"] + shared_delta.to(geom["gt_center"].dtype)
                     geom["proposal_center_shared_delta"] = shared_delta.clone()
+                    target_corner_bbox = geom.get("waymo_bbox_model")
+                    if target_corner_bbox is None:
+                        target_corner_bbox = geom["target_bbox_model"]
+                    geom["corner_pose_result"] = _corner_projection_result_for_pose(
+                        initial_center=geom["proposal_center_initial"],
+                        initial_rotation=geom["proposal_rotation_base"],
+                        refined_center=geom["proposal_center"],
+                        refined_rotation=geom["proposal_rotation"],
+                        object_size=geom["gt_size"],
+                        waymo_corner_uv=geom["waymo_corner_uv"],
+                        waymo_corner_valid=geom["waymo_corner_valid"],
+                        waymo_edge_uv=geom["waymo_edge_uv"],
+                        waymo_edge_valid=geom["waymo_edge_valid"],
+                        target_bbox_model=target_corner_bbox,
+                        camera_to_world=clean_state.camera_to_world[geom["source_front_index"]],
+                        intrinsics=clean_state.intrinsics[geom["source_front_index"]],
+                        status="accepted"
+                        if shared_yaw_ok
+                        else ("rejected" if len(corner_yaw_deltas) > 0 else "no_track_yaw_inliers"),
+                        reason=shared_yaw_reason if len(corner_yaw_deltas) > 0 else "corner_refine_had_no_accepted_track_yaw_candidates",
+                        accepted=shared_yaw_ok,
+                        shared_yaw_delta=float(shared_yaw_delta),
+                        track_yaw_candidate_count=len(corner_yaw_deltas),
+                    )
         slot_frame_geom[int(slot_idx)] = frame_geom
 
     if not slot_frame_geom:
@@ -3119,6 +4235,10 @@ def localize_objects(
         waymo_max_speed = meta["waymo_max_speed"]
         waymo_mean_speed = meta["waymo_mean_speed"]
 
+        frame_records: list[dict[str, Any]] = []
+        shared_yaw_delta = float(meta.get("shared_yaw_delta", 0.0))
+        corner_yaw_candidate_count = int(meta.get("corner_yaw_candidate_count", 0))
+
         for frame_idx, geom in frames.items():
             source_front_index = int(geom["source_front_index"])
             view_offset = int(geom["view_offset"])
@@ -3130,7 +4250,6 @@ def localize_objects(
             proposal_size = geom["proposal_size"]
             target_bbox_model = geom["target_bbox_model"]
             target_bbox_2d = geom["target_bbox_2d"]
-            shared_yaw_delta = float(geom.get("shared_yaw_delta", 0.0))
             waymo_frame_dynamic = bool(geom["waymo_frame_dynamic"])
             waymo_frame_speed = float(geom["waymo_frame_speed"])
 
@@ -3227,6 +4346,93 @@ def localize_objects(
             if int(scene_delete_info["cluster_kept_count"]) == 0:
                 continue
 
+            frame_records.append(
+                {
+                    "frame_idx": int(frame_idx),
+                    "geom": geom,
+                    "matched_mask": matched_mask,
+                    "matched_points": matched_points,
+                    "matched_pixel_count": matched_pixel_count,
+                    "visible_seed_indices": visible_seed_indices,
+                    "scene_delete_info": scene_delete_info,
+                    "refined_center": refined_center,
+                    "refined_size": refined_size,
+                    "waymo_frame_speed": waymo_frame_speed,
+                }
+            )
+
+        if len(frame_records) == 0:
+            continue
+
+        for record in frame_records:
+            frame_idx = int(record["frame_idx"])
+            geom = record["geom"]
+            source_front_index = int(geom["source_front_index"])
+            gt_center = geom["gt_center"]
+            gt_size = geom["gt_size"]
+            gt_rotation = geom["gt_rotation"]
+            proposal_rotation_final = geom["proposal_rotation"]
+            proposal_center_final = geom["proposal_center"]
+            proposal_size_final = geom["proposal_size"]
+            target_bbox_model = geom["target_bbox_model"]
+            matched_mask = record["matched_mask"]
+            matched_points = record["matched_points"]
+            matched_pixel_count = int(record["matched_pixel_count"])
+            visible_seed_indices = record["visible_seed_indices"]
+            scene_delete_info = record["scene_delete_info"]
+            refined_center = record["refined_center"]
+            refined_size = record["refined_size"]
+            waymo_frame_speed = float(record["waymo_frame_speed"])
+
+            pose_result = geom.get("corner_pose_result")
+            target_corner_bbox = geom.get("waymo_bbox_model")
+            if target_corner_bbox is None:
+                target_corner_bbox = target_bbox_model
+            if use_pose_refine and max_yaw_rad > 0.0:
+                pose_result = _solve_corner_projection_pose(
+                    base_center=proposal_center_final,
+                    initial_center=proposal_center_final,
+                    object_size=proposal_size_final,
+                    base_rotation=proposal_rotation_final,
+                    waymo_corner_uv=geom["waymo_corner_uv"],
+                    waymo_corner_depths=geom["waymo_corner_depths"],
+                    waymo_corner_valid=geom["waymo_corner_valid"],
+                    waymo_edge_uv=geom["waymo_edge_uv"],
+                    waymo_edge_depths=geom["waymo_edge_depths"],
+                    waymo_edge_valid=geom["waymo_edge_valid"],
+                    target_bbox_model=target_corner_bbox,
+                    camera_to_world=clean_state.camera_to_world[source_front_index],
+                    intrinsics=clean_state.intrinsics[source_front_index],
+                    image_hw=image_hw,
+                    support_points_world=matched_points,
+                    max_yaw_rad=max_yaw_rad,
+                    optimize_yaw=True,
+                )
+                geom["corner_pose_result"] = pose_result
+                if bool(pose_result.get("accepted", False)):
+                    proposal_center_final = pose_result["center"].to(device=gt_center.device, dtype=gt_center.dtype)
+                    proposal_size_final = pose_result["size"].to(device=gt_size.device, dtype=gt_size.dtype)
+                    proposal_rotation_final = pose_result["rotation"].to(device=gt_rotation.device, dtype=gt_rotation.dtype)
+                    geom["proposal_center"] = proposal_center_final
+                    geom["proposal_size"] = proposal_size_final
+                    geom["proposal_rotation"] = proposal_rotation_final
+            if pose_result is None:
+                pose_result = _base_corner_projection_result(
+                    base_center=proposal_center_final,
+                    object_size=gt_size,
+                    base_rotation=proposal_rotation_final,
+                    waymo_corner_uv=geom["waymo_corner_uv"],
+                    waymo_corner_valid=geom["waymo_corner_valid"],
+                    waymo_edge_uv=geom["waymo_edge_uv"],
+                    waymo_edge_valid=geom["waymo_edge_valid"],
+                    target_bbox_model=target_bbox_model,
+                    camera_to_world=clean_state.camera_to_world[source_front_index],
+                    intrinsics=clean_state.intrinsics[source_front_index],
+                    status="disabled",
+                    reason="pose_refine_disabled",
+                )
+            pose_result["diagnostics"]["track_yaw_candidate_count"] = corner_yaw_candidate_count
+
             delete_core_indices = scene_delete_info["delete_core_indices"]
             delete_shell_indices = scene_delete_info["delete_shell_indices"]
             candidate_count = int(scene_delete_info["candidate_pool_count"])
@@ -3239,9 +4445,13 @@ def localize_objects(
             else:
                 render_dynamic_ratio = 0.0
 
-            frame_rotation = proposal_rotation
-            insert_size = gt_size.clone()
-            asset_center = proposal_center.clone()
+            frame_rotation = proposal_rotation_final
+            insert_size = proposal_size_final.clone()
+            asset_center = proposal_center_final.clone()
+            proposal_center = asset_center.clone()
+            proposal_rotation = frame_rotation.clone()
+            proposal_size = insert_size.clone()
+            used_yaw_delta = float(pose_result.get("yaw_delta", 0.0))
             asset_object_to_world = _asset_object_to_world_matrix(frame_rotation, asset_center)
             if asset_local is not None:
                 asset_scale_factors = _compute_asset_scale_factors(asset_local, insert_size)
@@ -3337,7 +4547,14 @@ def localize_objects(
                     asset_quats_local=asset_quats_local,
                     asset_scale_factors=asset_scale_factors,
                     asset_object_to_world=asset_object_to_world,
-                    asset_local_yaw_deg=float(asset_yaw_correction_deg) + float(math.degrees(shared_yaw_delta)),
+                    asset_local_yaw_deg=float(asset_yaw_correction_deg) + float(math.degrees(used_yaw_delta)),
+                    pose_refine_diagnostics=pose_result["diagnostics"],
+                    waymo_box_corners_model=pose_result["waymo_uv"],
+                    waymo_box_corners_valid=pose_result["waymo_valid"],
+                    initial_box_corners_model=pose_result["initial_uv"],
+                    initial_box_corners_valid=pose_result["initial_valid"],
+                    refined_box_corners_model=pose_result["refined_uv"],
+                    refined_box_corners_valid=pose_result["refined_valid"],
                 )
             )
 

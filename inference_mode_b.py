@@ -79,6 +79,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--min_projected_bottom_y_ratio", type=float, default=0.50)
     parser.add_argument("--max_projected_bottom_y_ratio", type=float, default=1.0)
     parser.add_argument("--min_ground_support_ratio", type=float, default=0.18)
+    parser.add_argument("--require_first_frame_visible", action="store_true")
     parser.add_argument("--fast_camera_step_ratio", type=float, default=0.018)
     parser.add_argument("--slow_camera_step_ratio", type=float, default=0.006)
     parser.add_argument("--allow_empty_plan", action="store_true")
@@ -463,6 +464,7 @@ def _run_one_sample(
         min_projected_bottom_y_ratio=args.min_projected_bottom_y_ratio,
         max_projected_bottom_y_ratio=args.max_projected_bottom_y_ratio,
         min_ground_support_ratio=args.min_ground_support_ratio,
+        require_first_frame_visible=args.require_first_frame_visible,
         fast_camera_step_ratio=args.fast_camera_step_ratio,
         slow_camera_step_ratio=args.slow_camera_step_ratio,
         rng_seed=planner_seed,

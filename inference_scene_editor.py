@@ -388,6 +388,78 @@ def _save_target_boxes(clean_images: torch.Tensor, localized_objects, output_pat
     _make_pil_grid(pil_images, nrow=min(4, len(pil_images))).save(output_path)
 
 
+def _save_corner_projection_overlay_grid(clean_images: torch.Tensor, localized_objects, output_path: Path) -> None:
+    overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in clean_images]
+    layers = [
+        ("waymo_box_corners_model", "waymo_box_corners_valid", (0, 255, 0), "waymo"),
+        ("initial_box_corners_model", "initial_box_corners_valid", (255, 200, 0), "dggt init"),
+        ("refined_box_corners_model", "refined_box_corners_valid", (255, 0, 80), "dggt refined"),
+    ]
+    for item in localized_objects:
+        image_idx = int(getattr(item, "source_front_index", getattr(item, "frame_idx", -1)))
+        if image_idx < 0 or image_idx >= len(overlay_images):
+            continue
+        for corners_attr, valid_attr, color, label_prefix in layers:
+            corners = getattr(item, corners_attr, None)
+            valid = getattr(item, valid_attr, None)
+            if corners is None or valid is None:
+                continue
+            corners_np = corners.detach().cpu().float().numpy()
+            valid_np = valid.detach().cpu().bool().numpy()
+            if corners_np.shape != (8, 2) or not valid_np.any():
+                continue
+            label = f"{label_prefix} s{int(item.slot_idx)} f{int(item.frame_idx)}"
+            overlay_images[image_idx] = draw_projected_3d_box(
+                overlay_images[image_idx],
+                corners_np,
+                valid_np,
+                color=color,
+                label=label,
+                thickness=2,
+            )
+
+    pil_images = [Image.fromarray(image) for image in overlay_images]
+    _make_pil_grid(pil_images, nrow=min(4, len(pil_images))).save(output_path)
+
+
+def _save_bbox_overlay_on_asset_clean_grid(
+    asset_clean_images: torch.Tensor,
+    localized_objects,
+    output_path: Path,
+    num_views: int,
+) -> None:
+    overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in asset_clean_images]
+    layers = [
+        ("waymo_box_corners_model", "waymo_box_corners_valid", (0, 255, 0), "waymo"),
+        ("initial_box_corners_model", "initial_box_corners_valid", (255, 200, 0), "dggt init"),
+        ("refined_box_corners_model", "refined_box_corners_valid", (255, 0, 80), "dggt"),
+    ]
+    for item in localized_objects:
+        image_idx = int(getattr(item, "source_front_index", getattr(item, "frame_idx", -1)))
+        if image_idx < 0 or image_idx >= len(overlay_images):
+            continue
+
+        for corners_attr, valid_attr, color, label_prefix in layers:
+            corners = getattr(item, corners_attr, None)
+            valid = getattr(item, valid_attr, None)
+            if corners is None or valid is None:
+                continue
+            corners_np = corners.detach().cpu().float().numpy()
+            valid_np = valid.detach().cpu().bool().numpy()
+            if corners_np.shape == (8, 2) and valid_np.any():
+                overlay_images[image_idx] = draw_projected_3d_box(
+                    overlay_images[image_idx],
+                    corners_np,
+                    valid_np,
+                    color=color,
+                    label=f"{label_prefix} s{int(item.slot_idx)}",
+                    thickness=2,
+                )
+
+    pil_images = [Image.fromarray(image) for image in overlay_images]
+    _make_pil_grid(pil_images, nrow=max(1, int(num_views))).save(output_path)
+
+
 def _save_mask_overlay_grid(clean_images: torch.Tensor, localized_objects, output_path: Path, mask_attr: str) -> None:
     overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in clean_images]
     colors = [
@@ -754,6 +826,7 @@ def _save_asset_pass_outputs(
     output_dir: Path,
     num_views: int,
     skip_ply: bool,
+    localized_objects=None,
 ) -> dict:
     asset_pass_dir = output_dir / "asset_pass"
     asset_pass_dir.mkdir(parents=True, exist_ok=True)
@@ -793,6 +866,13 @@ def _save_asset_pass_outputs(
         a_asset_per_slot=result.A_asset,
     )
     _save_grid(composite, asset_pass_dir / "asset_pass_over_clean_grid.jpg", nrow=max(1, num_views))
+    if localized_objects is not None:
+        _save_bbox_overlay_on_asset_clean_grid(
+            composite,
+            localized_objects,
+            asset_pass_dir / "bbox_over_asset_clean_grid.jpg",
+            num_views=num_views,
+        )
 
     if not skip_ply:
         for slot_idx in result.object_keys:
@@ -818,6 +898,9 @@ def _save_asset_pass_outputs(
         "asset_pass_space": str(result.asset_pass_space),
         "patch_grid": list(result.patch_grid),
         "patch_start_idx": int(result.patch_start_idx),
+        "bbox_overlay_path": "asset_pass/bbox_over_asset_clean_grid.jpg"
+        if localized_objects is not None
+        else None,
         "per_object": per_object_info,
     }
 
@@ -856,6 +939,7 @@ def _build_summary(args, sample, alignment, edited_state) -> dict:
                 "target_bbox_model": None
                 if item.target_bbox_model is None
                 else [float(v) for v in item.target_bbox_model.tolist()],
+                "pose_refine": getattr(item, "pose_refine_diagnostics", None),
             }
         )
 
@@ -992,6 +1076,11 @@ def _run_one_sample(
         localized_objects,
         output_dir / "target_boxes.jpg",
     )
+    _save_corner_projection_overlay_grid(
+        clean_state.images,
+        localized_objects,
+        output_dir / "corner_projection_refine_overlay.jpg",
+    )
     _save_mask_overlay_grid(
         clean_state.images,
         localized_objects,
@@ -1047,6 +1136,7 @@ def _run_one_sample(
         output_dir=output_dir,
         num_views=num_views,
         skip_ply=args.skip_ply,
+        localized_objects=localized_objects,
     )
     asset_pass_summary["phase1_coverage_per_slot"] = {
         int(slot_idx): [int(i) for i in torch.nonzero(phase1_coverage[slot_idx], as_tuple=False).flatten().tolist()]

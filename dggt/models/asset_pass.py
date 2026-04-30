@@ -744,26 +744,41 @@ class AssetAggregatorPass(nn.Module):
             target_bbox = getattr(item, "target_bbox_model", None)
             projected_bbox = getattr(item, "projected_asset_bbox", None)
             alpha_bbox = self._alpha_bbox(alpha_seq[image_idx], threshold=self.alpha_thresh)
-            metrics.append(
-                {
-                    "image_idx": int(image_idx),
-                    "frame_idx": int(getattr(item, "frame_idx")),
-                    "localized": True,
-                    "target_bbox_model": None
-                    if target_bbox is None
-                    else [float(v) for v in target_bbox.detach().cpu().reshape(-1).tolist()],
-                    "projected_asset_bbox": None
-                    if projected_bbox is None
-                    else [float(v) for v in projected_bbox.detach().cpu().reshape(-1).tolist()],
-                    "alpha_bbox": None
-                    if alpha_bbox is None
-                    else [float(v) for v in alpha_bbox.reshape(-1).tolist()],
-                    "projected_iou": self._box_iou_xyxy(projected_bbox, target_bbox),
-                    "projected_center_error": self._box_center_error(projected_bbox, target_bbox),
-                    "alpha_iou": self._box_iou_xyxy(alpha_bbox, target_bbox),
-                    "alpha_center_error": self._box_center_error(alpha_bbox, target_bbox),
-                }
-            )
+            row = {
+                "image_idx": int(image_idx),
+                "frame_idx": int(getattr(item, "frame_idx")),
+                "localized": True,
+                "target_bbox_model": None
+                if target_bbox is None
+                else [float(v) for v in target_bbox.detach().cpu().reshape(-1).tolist()],
+                "projected_asset_bbox": None
+                if projected_bbox is None
+                else [float(v) for v in projected_bbox.detach().cpu().reshape(-1).tolist()],
+                "alpha_bbox": None
+                if alpha_bbox is None
+                else [float(v) for v in alpha_bbox.reshape(-1).tolist()],
+                "projected_iou": self._box_iou_xyxy(projected_bbox, target_bbox),
+                "projected_center_error": self._box_center_error(projected_bbox, target_bbox),
+                "alpha_iou": self._box_iou_xyxy(alpha_bbox, target_bbox),
+                "alpha_center_error": self._box_center_error(alpha_bbox, target_bbox),
+            }
+            pose_diag = getattr(item, "pose_refine_diagnostics", None)
+            if isinstance(pose_diag, dict):
+                row["corner_refine"] = dict(pose_diag)
+                for key in (
+                    "corner_refine_status",
+                    "corner_refine_accepted",
+                    "corner_refine_reason",
+                    "corner_rms_before",
+                    "corner_rms_after",
+                    "bbox_iou_before",
+                    "bbox_iou_after",
+                    "yaw_delta_deg",
+                    "center_shift",
+                    "depth_ratio",
+                ):
+                    row[key] = pose_diag.get(key)
+            metrics.append(row)
         return metrics
 
     def _resolve_asset_path_for_image(
