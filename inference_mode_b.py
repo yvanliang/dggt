@@ -41,6 +41,8 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="WaymoEditDataset sample index. If omitted, process every sample.",
     )
+    parser.add_argument("--start", type=int, default=0, help="Start dataset index, inclusive, used when --index is omitted.")
+    parser.add_argument("--end", type=int, default=None, help="End dataset index, exclusive, used when --index is omitted.")
     parser.add_argument("--output_dir", type=str, required=True, help="Where to write debug outputs.")
     parser.add_argument(
         "--ckpt_path",
@@ -640,12 +642,17 @@ def main() -> None:
     print(f"[mode_b] loading model on {device}", flush=True)
     model = _load_model(args.ckpt_path, device)
 
+    dataset_len = len(dataset)
     if args.index is None:
-        indices = list(range(len(dataset)))
+        start_idx = max(0, int(args.start))
+        end_idx = dataset_len if args.end is None else min(int(args.end), dataset_len)
+        if end_idx < start_idx:
+            raise ValueError(f"Invalid range: start={start_idx} end={end_idx} for dataset length {dataset_len}")
+        indices = list(range(start_idx, end_idx))
         multi_sample = True
     else:
-        if args.index < 0 or args.index >= len(dataset):
-            raise IndexError(f"--index {args.index} is out of range for dataset length {len(dataset)}")
+        if args.index < 0 or args.index >= dataset_len:
+            raise IndexError(f"--index {args.index} is out of range for dataset length {dataset_len}")
         indices = [int(args.index)]
         multi_sample = False
 
@@ -684,6 +691,8 @@ def main() -> None:
     if multi_sample:
         run_summary = {
             "num_samples": len(all_summaries),
+            "range_start": int(indices[0]) if indices else None,
+            "range_end": int(indices[-1] + 1) if indices else None,
             "sample_outputs": all_summaries,
             "planner_seed_rule": "base_planner_seed + 1009 * dataset_index",
             "base_planner_seed": int(args.planner_seed),

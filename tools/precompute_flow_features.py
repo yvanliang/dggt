@@ -81,6 +81,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--split", default="training")
     p.add_argument("--out_root", required=True)
     p.add_argument("--views", type=int, default=1)
+    p.add_argument("--start", type=int, default=None, help="Start dataset index, inclusive. Defaults to 0.")
+    p.add_argument("--end", type=int, default=None, help="End dataset index, exclusive. Defaults to dataset length.")
     p.add_argument("--start_clip_idx", type=int, default=0)
     p.add_argument("--end_clip_idx", type=int, default=-1, help="-1 for all")
     p.add_argument("--force_overwrite", action="store_true")
@@ -769,8 +771,13 @@ def main() -> None:
         dataset_kwargs["asset_root"] = args.asset_root
     dataset = WaymoEditDataset(**dataset_kwargs)
     total = len(dataset)
-    end_idx = total if args.end_clip_idx < 0 else min(args.end_clip_idx, total)
-    print(f"[init] dataset size={total}, range=[{args.start_clip_idx},{end_idx})")
+    start_idx = int(args.start) if args.start is not None else int(args.start_clip_idx)
+    end_idx = int(args.end) if args.end is not None else (total if args.end_clip_idx < 0 else int(args.end_clip_idx))
+    start_idx = max(0, start_idx)
+    end_idx = min(total, end_idx)
+    if end_idx < start_idx:
+        raise ValueError(f"Invalid range: start={start_idx} end={end_idx} for dataset length {total}")
+    print(f"[init] dataset size={total}, range=[{start_idx},{end_idx})")
 
     done_count = 0
     saved_count = 0
@@ -783,7 +790,7 @@ def main() -> None:
         max_threads=int(args.max_save_threads),
     )
     progress = tqdm(
-        range(args.start_clip_idx, end_idx),
+        range(start_idx, end_idx),
         desc=f"precompute {args.edit_mode}/{args.split}",
         unit="clip",
         dynamic_ncols=True,

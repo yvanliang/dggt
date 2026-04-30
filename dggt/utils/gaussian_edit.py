@@ -32,6 +32,40 @@ _BOX_EDGES: tuple[tuple[int, int], ...] = (
     (5, 7),
     (6, 7),
 )
+_BOX_CORNER_SIGNS = torch.tensor(
+    [
+        [-1.0, -1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, 1.0, 1.0],
+        [1.0, -1.0, -1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, 1.0, -1.0],
+        [1.0, 1.0, 1.0],
+    ],
+    dtype=torch.float32,
+)
+_BOX_EDGES_TENSOR = torch.tensor(_BOX_EDGES, dtype=torch.long)
+_BOX_CORNER_SIGNS_CACHE: dict[tuple[str, torch.dtype], torch.Tensor] = {}
+_BOX_EDGES_CACHE: dict[str, torch.Tensor] = {}
+
+
+def _box_corner_signs_like(ref: torch.Tensor) -> torch.Tensor:
+    key = (str(ref.device), ref.dtype)
+    cached = _BOX_CORNER_SIGNS_CACHE.get(key)
+    if cached is None:
+        cached = _BOX_CORNER_SIGNS.to(device=ref.device, dtype=ref.dtype)
+        _BOX_CORNER_SIGNS_CACHE[key] = cached
+    return cached
+
+
+def _box_edges_for_device(device: torch.device) -> torch.Tensor:
+    key = str(device)
+    cached = _BOX_EDGES_CACHE.get(key)
+    if cached is None:
+        cached = _BOX_EDGES_TENSOR.to(device=device)
+        _BOX_EDGES_CACHE[key] = cached
+    return cached
 
 
 @dataclass
@@ -417,21 +451,7 @@ def estimate_scene_alignment(sample: dict[str, Any], clean_state: CleanSceneStat
 
 def build_box_corners(center: torch.Tensor, size: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
     half = size * 0.5
-    local = torch.tensor(
-        [
-            [-1.0, -1.0, -1.0],
-            [-1.0, -1.0, 1.0],
-            [-1.0, 1.0, -1.0],
-            [-1.0, 1.0, 1.0],
-            [1.0, -1.0, -1.0],
-            [1.0, -1.0, 1.0],
-            [1.0, 1.0, -1.0],
-            [1.0, 1.0, 1.0],
-        ],
-        dtype=center.dtype,
-        device=center.device,
-    )
-    local = local * half
+    local = _box_corner_signs_like(center) * half
     return local @ rotation.T + center
 
 
@@ -563,7 +583,7 @@ def project_dggt_box_corners_model(
 
 
 def _edge_midpoints(points: torch.Tensor) -> torch.Tensor:
-    edge_indices = torch.tensor(_BOX_EDGES, dtype=torch.long, device=points.device)
+    edge_indices = _box_edges_for_device(points.device)
     return 0.5 * (points.index_select(0, edge_indices[:, 0]) + points.index_select(0, edge_indices[:, 1]))
 
 
@@ -1805,6 +1825,10 @@ def _solve_corner_projection_pose(
     rot_param = torch.zeros((3,), dtype=dtype, device=device, requires_grad=optimize_rotation_eff)
     size_param = torch.zeros((3,), dtype=dtype, device=device, requires_grad=True)
     max_log_size_delta = math.log(1.35)
+    zero3 = torch.zeros((3,), dtype=dtype, device=device)
+    zero_loss = torch.zeros((), dtype=dtype, device=device)
+    bbox_large = torch.tensor(1.0e6, dtype=dtype, device=device)
+    bbox_small = torch.tensor(-1.0e6, dtype=dtype, device=device)
     params = [center_param, size_param]
     if optimize_rotation_eff:
         params.append(rot_param)
@@ -1821,7 +1845,7 @@ def _solve_corner_projection_pose(
             rotvec = rot_limit * torch.tanh(rot_param)
             rotation = base_rotation @ _so3_exp_map(rotvec)
         else:
-            rotvec = torch.zeros((3,), dtype=dtype, device=device)
+            rotvec = zero3
             rotation = base_rotation
         return center_world, size, rotation, delta_cam, rotvec, log_size_delta
 
@@ -1844,10 +1868,10 @@ def _solve_corner_projection_pose(
                 delta=0.14,
             ).sum(dim=-1)
             corner_l2_raw = ((corner_uv - waymo_corner_uv) / uv_scale).pow(2).sum(dim=-1)
+            corner_weight_sum = corner_weight.sum().clamp_min(1.0)
             corner_loss = (
-                (corner_loss_raw * corner_weight).sum()
-                / corner_weight.sum().clamp_min(1.0)
-                + 0.18 * (corner_l2_raw * corner_weight).sum() / corner_weight.sum().clamp_min(1.0)
+                (corner_loss_raw * corner_weight).sum() / corner_weight_sum
+                + 0.18 * (corner_l2_raw * corner_weight).sum() / corner_weight_sum
             )
 
             edges_world = _edge_midpoints(corners)
@@ -1865,17 +1889,15 @@ def _solve_corner_projection_pose(
                 delta=0.12,
             ).sum(dim=-1)
             edge_l2_raw = ((edge_uv - waymo_edge_uv) / uv_scale).pow(2).sum(dim=-1)
+            edge_weight_sum = edge_weight.sum().clamp_min(1.0)
             edge_loss = (
-                (edge_loss_raw * edge_weight).sum()
-                / edge_weight.sum().clamp_min(1.0)
-                + 0.12 * (edge_l2_raw * edge_weight).sum() / edge_weight.sum().clamp_min(1.0)
+                (edge_loss_raw * edge_weight).sum() / edge_weight_sum
+                + 0.12 * (edge_l2_raw * edge_weight).sum() / edge_weight_sum
             )
 
             bbox_common = target_corner_valid & torch.isfinite(corner_uv).all(dim=-1)
-            large = torch.tensor(1.0e6, dtype=dtype, device=device)
-            small = torch.tensor(-1.0e6, dtype=dtype, device=device)
-            uv_min = torch.where(bbox_common[:, None], corner_uv, large).min(dim=0).values
-            uv_max = torch.where(bbox_common[:, None], corner_uv, small).max(dim=0).values
+            uv_min = torch.where(bbox_common[:, None], corner_uv, bbox_large).min(dim=0).values
+            uv_max = torch.where(bbox_common[:, None], corner_uv, bbox_small).max(dim=0).values
             pred_bbox = torch.stack([uv_min[0], uv_min[1], uv_max[0], uv_max[1]], dim=0)
             bbox_loss = _bbox_alignment_loss(pred_bbox, target_bbox_model)
 
@@ -1893,16 +1915,16 @@ def _solve_corner_projection_pose(
                 reduction="mean",
                 delta=0.12,
             )
-            support_center_loss = torch.tensor(0.0, dtype=dtype, device=device)
+            support_center_loss = zero_loss
             if support_center_prior is not None:
                 support_center_loss = F.huber_loss(
                     (center_world - support_center_prior) / size_norm,
-                    torch.zeros((3,), dtype=dtype, device=device),
+                    zero3,
                     reduction="mean",
                     delta=0.35,
                 )
             center_prior_loss = (delta_cam / delta_cam_limits).pow(2).mean()
-            rotation_prior_loss = (rotvec / max(rot_limit, 1e-6)).pow(2).mean() if optimize_rotation_eff else torch.tensor(0.0, dtype=dtype, device=device)
+            rotation_prior_loss = (rotvec / max(rot_limit, 1e-6)).pow(2).mean() if optimize_rotation_eff else zero_loss
             size_prior_loss = (log_size_delta / max_log_size_delta).pow(2).mean()
             invalid_loss = F.relu(1e-4 - corner_depths).mean() + 0.5 * F.relu(1e-4 - edge_depths).mean()
 
@@ -2649,6 +2671,7 @@ def _project_asset_bbox_simple(
     image_hw: tuple[int, int],
     opacity_threshold: float = 0.01,
     asset_yaw_correction_deg: float = 180.0,
+    scale_factors: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     opacities = asset_local["opacities"].squeeze(-1)
     visible = opacities > opacity_threshold
@@ -2660,7 +2683,10 @@ def _project_asset_bbox_simple(
         stride = max(1, visible_xyz.shape[0] // 4096)
         visible_xyz = visible_xyz[::stride]
 
-    scale_factors = _compute_asset_scale_factors(asset_local, target_lwh, opacity_threshold=opacity_threshold)
+    if scale_factors is None:
+        scale_factors = _compute_asset_scale_factors(asset_local, target_lwh, opacity_threshold=opacity_threshold)
+    else:
+        scale_factors = scale_factors.to(device=target_lwh.device, dtype=target_lwh.dtype)
     asset_yaw = _rotation_z(
         math.radians(float(asset_yaw_correction_deg)),
         dtype=object_rotation.dtype,
@@ -2740,6 +2766,9 @@ def _update_localized_item_static_pose(
     clean_state: CleanSceneState,
     image_hw: tuple[int, int],
     asset_yaw_correction_deg: float,
+    precomputed_asset_world: dict[str, torch.Tensor] | None = None,
+    precomputed_asset_scale_factors: torch.Tensor | None = None,
+    precomputed_asset_scale: float | None = None,
 ) -> None:
     center = center.to(dtype=item.proposal_center.dtype)
     size = size.to(dtype=item.proposal_size.dtype)
@@ -2757,25 +2786,37 @@ def _update_localized_item_static_pose(
 
     asset_local = _localized_asset_local_payload(item)
     if asset_local is not None:
-        item.asset_scale_factors = _compute_asset_scale_factors(asset_local, size)
-        asset_world = _transform_asset_gaussians_simple(
-            asset_local,
-            size,
-            rotation,
-            center,
-            asset_yaw_correction_deg=asset_yaw_correction_deg,
-        )
+        if precomputed_asset_scale_factors is None:
+            item.asset_scale_factors = _compute_asset_scale_factors(asset_local, size)
+        else:
+            item.asset_scale_factors = precomputed_asset_scale_factors.to(
+                device=size.device,
+                dtype=size.dtype,
+            )
+        if precomputed_asset_world is None:
+            asset_world = _transform_asset_gaussians_simple(
+                asset_local,
+                size,
+                rotation,
+                center,
+                asset_yaw_correction_deg=asset_yaw_correction_deg,
+            )
+        else:
+            asset_world = precomputed_asset_world
         item.asset_means_world = asset_world["means"]
         item.asset_colors = asset_world["colors"]
         item.asset_opacities = asset_world["opacities"]
         item.asset_scales = asset_world["scales"]
         item.asset_quats = asset_world["quats"]
-        item.asset_scale = float(
-            torch.mean(
-                size
-                / (asset_local["means_raw"].max(dim=0).values - asset_local["means_raw"].min(dim=0).values).clamp_min(1e-6)
-            ).item()
-        )
+        if precomputed_asset_scale is None:
+            item.asset_scale = float(
+                torch.mean(
+                    size
+                    / (asset_local["means_raw"].max(dim=0).values - asset_local["means_raw"].min(dim=0).values).clamp_min(1e-6)
+                ).item()
+            )
+        else:
+            item.asset_scale = float(precomputed_asset_scale)
         item.projected_asset_bbox = _project_asset_bbox_simple(
             asset_local=asset_local,
             target_lwh=size,
@@ -2785,6 +2826,7 @@ def _update_localized_item_static_pose(
             intrinsics=intrinsics,
             image_hw=image_hw,
             asset_yaw_correction_deg=asset_yaw_correction_deg,
+            scale_factors=item.asset_scale_factors,
         )
 
     uv, _, valid = project_dggt_box_corners_model(
@@ -2860,6 +2902,25 @@ def _stabilize_static_localized_segments(
         shared_rotation = _choose_shared_static_rotation(segment)
         start_frame = min(int(item.frame_idx) for item in segment)
         end_frame = max(int(item.frame_idx) for item in segment)
+        asset_local = _localized_asset_local_payload(segment[0])
+        precomputed_asset_world = None
+        precomputed_asset_scale_factors = None
+        precomputed_asset_scale = None
+        if asset_local is not None:
+            precomputed_asset_scale_factors = _compute_asset_scale_factors(asset_local, shared_size)
+            precomputed_asset_world = _transform_asset_gaussians_simple(
+                asset_local,
+                shared_size,
+                shared_rotation,
+                shared_center,
+                asset_yaw_correction_deg=asset_yaw_correction_deg,
+            )
+            precomputed_asset_scale = float(
+                torch.mean(
+                    shared_size
+                    / (asset_local["means_raw"].max(dim=0).values - asset_local["means_raw"].min(dim=0).values).clamp_min(1e-6)
+                ).item()
+            )
         for item in segment:
             _update_localized_item_static_pose(
                 item,
@@ -2872,7 +2933,37 @@ def _stabilize_static_localized_segments(
                 clean_state=clean_state,
                 image_hw=image_hw,
                 asset_yaw_correction_deg=asset_yaw_correction_deg,
+                precomputed_asset_world=precomputed_asset_world,
+                precomputed_asset_scale_factors=precomputed_asset_scale_factors,
+                precomputed_asset_scale=precomputed_asset_scale,
             )
+
+
+def _static_record_frame_indices(
+    records: list[dict[str, Any]],
+    motion_speed_thresh: float,
+) -> set[int]:
+    ordered = sorted(records, key=lambda record: int(record["frame_idx"]))
+    static_frames: set[int] = set()
+    current: list[int] = []
+    prev_frame: int | None = None
+    for record in ordered:
+        frame_idx = int(record["frame_idx"])
+        geom = record["geom"]
+        is_static = (
+            not bool(geom.get("waymo_frame_dynamic", False))
+            or float(record.get("waymo_frame_speed", geom.get("waymo_frame_speed", 0.0))) <= float(motion_speed_thresh)
+        )
+        if is_static and (prev_frame is None or frame_idx == prev_frame + 1):
+            current.append(frame_idx)
+        else:
+            if len(current) >= 2:
+                static_frames.update(current)
+            current = [frame_idx] if is_static else []
+        prev_frame = frame_idx if is_static else None
+    if len(current) >= 2:
+        static_frames.update(current)
+    return static_frames
 
 
 def _empty_gaussian_dict() -> dict[str, torch.Tensor]:
@@ -4122,6 +4213,9 @@ def localize_objects(
     object_is_moving_track = sample.get("object_is_moving_track")
     object_speed_mps = sample.get("object_speed_mps_selected")
     object_is_moving_frame = sample.get("object_is_moving_frame_selected")
+    sample_camera_to_world = sample["camera_to_world_corrected"].detach().cpu().float()
+    sample_intrinsics = sample["intrinsics"].detach().cpu().float()
+    sample_raw_hw = sample["raw_image_size_hw"].detach().cpu()
     scene_up = alignment.rotation @ torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32)
     scene_up = scene_up / scene_up.norm().clamp_min(1e-6)
 
@@ -4228,15 +4322,34 @@ def localize_objects(
                     dtype=projection_dtype,
                 )
                 if corners_waymo_world.shape == (8, 3) and torch.isfinite(corners_waymo_world).all():
-                    camera_waymo = _sample_camera_to_world_view(sample, int(frame_idx), int(view_offset)).to(
+                    if sample_camera_to_world.dim() == 4:
+                        camera_waymo_src = sample_camera_to_world[frame_idx, view_offset]
+                    else:
+                        camera_waymo_src = sample_camera_to_world[frame_idx]
+                    if sample_intrinsics.dim() == 4:
+                        intrinsics_waymo_src = sample_intrinsics[frame_idx, view_offset]
+                    elif sample_intrinsics.dim() == 3 and sample_intrinsics.shape[0] == num_views:
+                        intrinsics_waymo_src = sample_intrinsics[view_offset]
+                    elif sample_intrinsics.dim() == 3:
+                        intrinsics_waymo_src = sample_intrinsics[frame_idx]
+                    else:
+                        intrinsics_waymo_src = sample_intrinsics
+                    if sample_raw_hw.dim() == 3:
+                        raw_hw_waymo = sample_raw_hw[frame_idx, view_offset]
+                    elif sample_raw_hw.dim() == 2 and sample_raw_hw.shape[0] == num_views:
+                        raw_hw_waymo = sample_raw_hw[view_offset]
+                    elif sample_raw_hw.dim() == 2:
+                        raw_hw_waymo = sample_raw_hw[frame_idx]
+                    else:
+                        raw_hw_waymo = sample_raw_hw.view(2)
+                    camera_waymo = camera_waymo_src.to(
                         device=projection_device,
                         dtype=projection_dtype,
                     )
-                    intrinsics_waymo = _sample_intrinsics_view(sample, int(frame_idx), int(view_offset)).to(
+                    intrinsics_waymo = intrinsics_waymo_src.to(
                         device=projection_device,
                         dtype=projection_dtype,
                     )
-                    raw_hw_waymo = _sample_raw_hw_view(sample, int(frame_idx), int(view_offset))
                     waymo_corner_uv, waymo_corner_depths, waymo_corner_valid = project_waymo_box_corners_model(
                         corners_waymo_world,
                         camera_waymo,
@@ -4315,6 +4428,7 @@ def localize_objects(
             "corner_yaw_refine_reason": shared_yaw_reason,
         }
         frame_geom: dict[int, dict[str, Any]] = {}
+        defer_corner_pose_result = bool(use_pose_refine and max_yaw_rad > 0.0)
         for frame_spec in frame_specs:
             frame_idx = frame_spec["frame_idx"]
             source_front_index = frame_spec["source_front_index"]
@@ -4346,27 +4460,29 @@ def localize_objects(
             target_corner_bbox = frame_spec.get("waymo_bbox_model")
             if target_corner_bbox is None:
                 target_corner_bbox = frame_spec["target_bbox_model"]
-            corner_pose_result = _corner_projection_result_for_pose(
-                initial_center=frame_spec["proposal_center_initial"],
-                initial_rotation=frame_spec["proposal_rotation_base"],
-                refined_center=proposal_center,
-                refined_rotation=proposal_rotation,
-                object_size=gt_size,
-                waymo_corner_uv=frame_spec["waymo_corner_uv"],
-                waymo_corner_valid=frame_spec["waymo_corner_valid"],
-                waymo_edge_uv=frame_spec["waymo_edge_uv"],
-                waymo_edge_valid=frame_spec["waymo_edge_valid"],
-                target_bbox_model=target_corner_bbox,
-                camera_to_world=clean_state.camera_to_world[source_front_index],
-                intrinsics=clean_state.intrinsics[source_front_index],
-                status="accepted"
-                if shared_yaw_ok
-                else ("rejected" if len(corner_yaw_deltas) > 0 else "no_track_yaw_inliers"),
-                reason=shared_yaw_reason if len(corner_yaw_deltas) > 0 else "corner_refine_had_no_accepted_track_yaw_candidates",
-                accepted=shared_yaw_ok,
-                shared_yaw_delta=float(shared_yaw_delta),
-                track_yaw_candidate_count=len(corner_yaw_deltas),
-            )
+            corner_pose_result = None
+            if not defer_corner_pose_result:
+                corner_pose_result = _corner_projection_result_for_pose(
+                    initial_center=frame_spec["proposal_center_initial"],
+                    initial_rotation=frame_spec["proposal_rotation_base"],
+                    refined_center=proposal_center,
+                    refined_rotation=proposal_rotation,
+                    object_size=gt_size,
+                    waymo_corner_uv=frame_spec["waymo_corner_uv"],
+                    waymo_corner_valid=frame_spec["waymo_corner_valid"],
+                    waymo_edge_uv=frame_spec["waymo_edge_uv"],
+                    waymo_edge_valid=frame_spec["waymo_edge_valid"],
+                    target_bbox_model=target_corner_bbox,
+                    camera_to_world=clean_state.camera_to_world[source_front_index],
+                    intrinsics=clean_state.intrinsics[source_front_index],
+                    status="accepted"
+                    if shared_yaw_ok
+                    else ("rejected" if len(corner_yaw_deltas) > 0 else "no_track_yaw_inliers"),
+                    reason=shared_yaw_reason if len(corner_yaw_deltas) > 0 else "corner_refine_had_no_accepted_track_yaw_candidates",
+                    accepted=shared_yaw_ok,
+                    shared_yaw_delta=float(shared_yaw_delta),
+                    track_yaw_candidate_count=len(corner_yaw_deltas),
+                )
 
             frame_geom[int(frame_idx)] = {
                 **frame_spec,
@@ -4389,6 +4505,8 @@ def localize_objects(
                 for geom in frame_geom.values():
                     geom["proposal_center"] = geom["gt_center"] + shared_delta.to(geom["gt_center"].dtype)
                     geom["proposal_center_shared_delta"] = shared_delta.clone()
+                    if defer_corner_pose_result:
+                        continue
                     target_corner_bbox = geom.get("waymo_bbox_model")
                     if target_corner_bbox is None:
                         target_corner_bbox = geom["target_bbox_model"]
@@ -4417,16 +4535,6 @@ def localize_objects(
 
     if not slot_frame_geom:
         return []
-
-    per_frame_components: dict[int, list[dict[str, Any]]] = {}
-    total_frames = clean_state.semantic_vehicle_mask.shape[0]
-    for img_idx in range(total_frames):
-        raw_mask = clean_state.semantic_vehicle_mask[img_idx]
-        if int(raw_mask.sum().item()) == 0:
-            per_frame_components[img_idx] = []
-            continue
-        clean_mask = _morphology_opening(raw_mask, radius=1)
-        per_frame_components[img_idx] = _connected_components_4(clean_mask)
 
     localized: list[LocalizedFrameObject] = []
 
@@ -4568,6 +4676,10 @@ def localize_objects(
         if len(frame_records) == 0:
             continue
 
+        defer_static_asset_frames = _static_record_frame_indices(
+            frame_records,
+            motion_speed_thresh=motion_speed_thresh,
+        )
         localized_start = len(localized)
         for record in frame_records:
             frame_idx = int(record["frame_idx"])
@@ -4659,38 +4771,47 @@ def localize_objects(
             used_yaw_delta = float(pose_result.get("yaw_delta", 0.0))
             asset_object_to_world = _asset_object_to_world_matrix(frame_rotation, asset_center)
             if asset_local is not None:
-                asset_scale_factors = _compute_asset_scale_factors(asset_local, insert_size)
-                asset_world = _transform_asset_gaussians_simple(
-                    asset_local,
-                    insert_size,
-                    frame_rotation,
-                    asset_center,
-                    asset_yaw_correction_deg=asset_yaw_correction_deg,
-                )
-                projected_asset_bbox = _project_asset_bbox_simple(
-                    asset_local=asset_local,
-                    target_lwh=insert_size,
-                    object_rotation=frame_rotation,
-                    object_center=asset_center,
-                    camera_to_world=clean_state.camera_to_world[source_front_index],
-                    intrinsics=clean_state.intrinsics[source_front_index],
-                    image_hw=image_hw,
-                    asset_yaw_correction_deg=asset_yaw_correction_deg,
-                )
-                asset_scale = float(
-                    torch.mean(
-                        insert_size
-                        / (asset_local["means_raw"].max(dim=0).values - asset_local["means_raw"].min(dim=0).values).clamp_min(1e-6)
-                    ).item()
-                )
-                asset_means_world = asset_world["means"]
-                asset_colors = asset_world["colors"]
-                asset_opacities = asset_world["opacities"]
-                asset_scales_world = asset_world["scales"]
-                asset_quats_world = asset_world["quats"]
                 asset_means_local = asset_local["means_raw"]
                 asset_scales_local = asset_local["scales"]
                 asset_quats_local = asset_local["quats"]
+                asset_colors = asset_local["colors"]
+                asset_opacities = asset_local["opacities"]
+                if int(frame_idx) in defer_static_asset_frames:
+                    asset_scale_factors = torch.ones(3, dtype=torch.float32)
+                    projected_asset_bbox = None
+                    asset_scale = 1.0
+                    asset_means_world = torch.zeros((0, 3), dtype=torch.float32)
+                    asset_scales_world = torch.zeros((0, 3), dtype=torch.float32)
+                    asset_quats_world = torch.zeros((0, 4), dtype=torch.float32)
+                else:
+                    asset_scale_factors = _compute_asset_scale_factors(asset_local, insert_size)
+                    asset_world = _transform_asset_gaussians_simple(
+                        asset_local,
+                        insert_size,
+                        frame_rotation,
+                        asset_center,
+                        asset_yaw_correction_deg=asset_yaw_correction_deg,
+                    )
+                    projected_asset_bbox = _project_asset_bbox_simple(
+                        asset_local=asset_local,
+                        target_lwh=insert_size,
+                        object_rotation=frame_rotation,
+                        object_center=asset_center,
+                        camera_to_world=clean_state.camera_to_world[source_front_index],
+                        intrinsics=clean_state.intrinsics[source_front_index],
+                        image_hw=image_hw,
+                        asset_yaw_correction_deg=asset_yaw_correction_deg,
+                        scale_factors=asset_scale_factors,
+                    )
+                    asset_scale = float(
+                        torch.mean(
+                            insert_size
+                            / (asset_local["means_raw"].max(dim=0).values - asset_local["means_raw"].min(dim=0).values).clamp_min(1e-6)
+                        ).item()
+                    )
+                    asset_means_world = asset_world["means"]
+                    asset_scales_world = asset_world["scales"]
+                    asset_quats_world = asset_world["quats"]
             else:
                 asset_scale_factors = torch.ones(3, dtype=torch.float32)
                 projected_asset_bbox = None
