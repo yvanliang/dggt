@@ -88,6 +88,7 @@ class LocalizedFrameObject:
     asset_path: str
     match_score: float
     delete_motion_mode: str
+    waymo_frame_dynamic: bool
     waymo_frame_speed_mps: float
     waymo_max_speed_mps: float
     waymo_mean_speed_mps: float
@@ -2671,6 +2672,209 @@ def _project_asset_bbox_simple(
     return compute_bbox_from_projected_points(uv, valid)
 
 
+def _static_frame_segments(
+    items: list[LocalizedFrameObject],
+    motion_speed_thresh: float,
+) -> list[list[LocalizedFrameObject]]:
+    ordered = sorted(items, key=lambda item: int(item.frame_idx))
+    segments: list[list[LocalizedFrameObject]] = []
+    current: list[LocalizedFrameObject] = []
+    prev_frame: int | None = None
+    for item in ordered:
+        is_static = (
+            not bool(getattr(item, "waymo_frame_dynamic", False))
+            or float(item.waymo_frame_speed_mps) <= float(motion_speed_thresh)
+        )
+        frame_idx = int(item.frame_idx)
+        if is_static and (prev_frame is None or frame_idx == prev_frame + 1):
+            current.append(item)
+        else:
+            if len(current) >= 2:
+                segments.append(current)
+            current = [item] if is_static else []
+        prev_frame = frame_idx if is_static else None
+    if len(current) >= 2:
+        segments.append(current)
+    return segments
+
+
+def _choose_shared_static_rotation(segment: list[LocalizedFrameObject]) -> torch.Tensor:
+    rotations = [item.proposal_rotation.detach().cpu().float() for item in segment]
+    scores: list[float] = []
+    for item in segment:
+        diag = item.pose_refine_diagnostics or {}
+        rms = diag.get("corner_rms_after")
+        try:
+            score = -float(rms)
+        except (TypeError, ValueError):
+            score = 0.0
+        scores.append(score)
+    shared = _shared_track_rotation_candidate(rotations, scores, max_spread_deg=12.0)
+    if shared is not None:
+        return shared
+    best_idx = max(range(len(segment)), key=lambda idx: scores[idx])
+    return rotations[best_idx].clone()
+
+
+def _localized_asset_local_payload(item: LocalizedFrameObject) -> dict[str, torch.Tensor] | None:
+    if item.asset_means_local.numel() == 0:
+        return None
+    return {
+        "means_raw": item.asset_means_local,
+        "colors": item.asset_colors,
+        "opacities": item.asset_opacities,
+        "scales": item.asset_scales_local,
+        "quats": item.asset_quats_local,
+    }
+
+
+def _update_localized_item_static_pose(
+    item: LocalizedFrameObject,
+    *,
+    center: torch.Tensor,
+    size: torch.Tensor,
+    rotation: torch.Tensor,
+    segment_start: int,
+    segment_end: int,
+    segment_length: int,
+    clean_state: CleanSceneState,
+    image_hw: tuple[int, int],
+    asset_yaw_correction_deg: float,
+) -> None:
+    center = center.to(dtype=item.proposal_center.dtype)
+    size = size.to(dtype=item.proposal_size.dtype)
+    rotation = _orthonormalize_rotation(rotation.to(dtype=item.proposal_rotation.dtype))
+    source_front_index = int(item.source_front_index)
+    camera_to_world = clean_state.camera_to_world[source_front_index].to(device=center.device, dtype=center.dtype)
+    intrinsics = clean_state.intrinsics[source_front_index].to(device=center.device, dtype=center.dtype)
+    item.proposal_center = center.clone()
+    item.proposal_size = size.clone()
+    item.proposal_rotation = rotation.clone()
+    item.refined_rotation = rotation.clone()
+    item.asset_rotation = rotation.clone()
+    item.asset_bottom_center = center.clone()
+    item.asset_object_to_world = _asset_object_to_world_matrix(rotation, center)
+
+    asset_local = _localized_asset_local_payload(item)
+    if asset_local is not None:
+        item.asset_scale_factors = _compute_asset_scale_factors(asset_local, size)
+        asset_world = _transform_asset_gaussians_simple(
+            asset_local,
+            size,
+            rotation,
+            center,
+            asset_yaw_correction_deg=asset_yaw_correction_deg,
+        )
+        item.asset_means_world = asset_world["means"]
+        item.asset_colors = asset_world["colors"]
+        item.asset_opacities = asset_world["opacities"]
+        item.asset_scales = asset_world["scales"]
+        item.asset_quats = asset_world["quats"]
+        item.asset_scale = float(
+            torch.mean(
+                size
+                / (asset_local["means_raw"].max(dim=0).values - asset_local["means_raw"].min(dim=0).values).clamp_min(1e-6)
+            ).item()
+        )
+        item.projected_asset_bbox = _project_asset_bbox_simple(
+            asset_local=asset_local,
+            target_lwh=size,
+            object_rotation=rotation,
+            object_center=center,
+            camera_to_world=camera_to_world,
+            intrinsics=intrinsics,
+            image_hw=image_hw,
+            asset_yaw_correction_deg=asset_yaw_correction_deg,
+        )
+
+    uv, _, valid = project_dggt_box_corners_model(
+        center,
+        size,
+        rotation,
+        camera_to_world,
+        intrinsics,
+    )
+    item.refined_box_corners_model = uv.detach().cpu().float()
+    item.refined_box_corners_valid = valid.detach().cpu()
+
+    diag = dict(item.pose_refine_diagnostics or {})
+    waymo_uv = item.waymo_box_corners_model
+    waymo_valid = item.waymo_box_corners_valid
+    if waymo_uv is not None and waymo_valid is not None:
+        waymo_uv_dev = waymo_uv.to(device=uv.device, dtype=uv.dtype)
+        waymo_valid_dev = waymo_valid.to(device=uv.device)
+        corner_rms, corner_count = _corner_projection_rms(
+            uv,
+            valid,
+            waymo_uv_dev,
+            waymo_valid_dev,
+            min_count=4,
+        )
+        diag["corner_rms_after"] = _safe_float(corner_rms)
+        diag["valid_corner_count"] = int(corner_count)
+        target_bbox = compute_bbox_from_projected_points(waymo_uv_dev, waymo_valid_dev.bool())
+        refined_bbox = compute_bbox_from_projected_points(uv, valid)
+        if target_bbox is not None and refined_bbox is not None:
+            diag["bbox_iou_after"] = float(box_iou_xyxy(refined_bbox.detach().cpu(), target_bbox.detach().cpu()))
+            target_area = _box_area_xyxy(target_bbox)
+            refined_area = _box_area_xyxy(refined_bbox)
+            target_size = _box_size_xyxy(target_bbox)
+            refined_size = _box_size_xyxy(refined_bbox)
+            if target_area is not None and refined_area is not None and target_area > 1e-6:
+                diag["target_bbox_area_ratio"] = refined_area / target_area
+            if target_size is not None and refined_size is not None:
+                target_w, target_h = target_size
+                refined_w, refined_h = refined_size
+                if target_w > 1e-6:
+                    diag["target_bbox_width_ratio"] = refined_w / target_w
+                if target_h > 1e-6:
+                    diag["target_bbox_height_ratio"] = refined_h / target_h
+        residual = item.refined_box_corners_model - waymo_uv.detach().cpu().float()
+        err = torch.linalg.norm(residual, dim=-1)
+        diag["corner_residual_max_after"] = float(err.max().item())
+        diag["corner_residual_mean_xy_after"] = [float(v) for v in residual.mean(dim=0).tolist()]
+        diag["corner_residual_px_after"] = [float(v) for v in err.tolist()]
+        diag["corner_residual_xy_after"] = [[float(x), float(y)] for x, y in residual.tolist()]
+
+    diag["static_segment_stabilized"] = True
+    diag["static_segment_start_frame"] = int(segment_start)
+    diag["static_segment_end_frame"] = int(segment_end)
+    diag["static_segment_length"] = int(segment_length)
+    diag["static_segment_policy"] = "waymo_static_contiguous_shared_dggt_pose_v1"
+    item.pose_refine_diagnostics = diag
+
+
+def _stabilize_static_localized_segments(
+    items: list[LocalizedFrameObject],
+    *,
+    motion_speed_thresh: float,
+    clean_state: CleanSceneState,
+    image_hw: tuple[int, int],
+    asset_yaw_correction_deg: float,
+) -> None:
+    for segment in _static_frame_segments(items, motion_speed_thresh):
+        center_stack = torch.stack([item.proposal_center.detach().cpu().float() for item in segment], dim=0)
+        size_stack = torch.stack([item.proposal_size.detach().cpu().float() for item in segment], dim=0)
+        shared_center = torch.median(center_stack, dim=0).values
+        shared_size = torch.median(size_stack, dim=0).values
+        shared_rotation = _choose_shared_static_rotation(segment)
+        start_frame = min(int(item.frame_idx) for item in segment)
+        end_frame = max(int(item.frame_idx) for item in segment)
+        for item in segment:
+            _update_localized_item_static_pose(
+                item,
+                center=shared_center,
+                size=shared_size,
+                rotation=shared_rotation,
+                segment_start=start_frame,
+                segment_end=end_frame,
+                segment_length=len(segment),
+                clean_state=clean_state,
+                image_hw=image_hw,
+                asset_yaw_correction_deg=asset_yaw_correction_deg,
+            )
+
+
 def _empty_gaussian_dict() -> dict[str, torch.Tensor]:
     return {
         "means": torch.zeros((0, 3), dtype=torch.float32),
@@ -4364,6 +4568,7 @@ def localize_objects(
         if len(frame_records) == 0:
             continue
 
+        localized_start = len(localized)
         for record in frame_records:
             frame_idx = int(record["frame_idx"])
             geom = record["geom"]
@@ -4509,6 +4714,7 @@ def localize_objects(
                     asset_path=str(asset_path),
                     match_score=match_score,
                     delete_motion_mode=delete_motion_mode,
+                    waymo_frame_dynamic=bool(waymo_frame_dynamic),
                     waymo_frame_speed_mps=waymo_frame_speed,
                     waymo_max_speed_mps=waymo_max_speed,
                     waymo_mean_speed_mps=waymo_mean_speed,
@@ -4557,6 +4763,13 @@ def localize_objects(
                     refined_box_corners_valid=pose_result["refined_valid"],
                 )
             )
+        _stabilize_static_localized_segments(
+            localized[localized_start:],
+            motion_speed_thresh=motion_speed_thresh,
+            clean_state=clean_state,
+            image_hw=image_hw,
+            asset_yaw_correction_deg=asset_yaw_correction_deg,
+        )
 
     return localized
 

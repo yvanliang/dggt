@@ -392,7 +392,7 @@ def _save_corner_projection_overlay_grid(clean_images: torch.Tensor, localized_o
     overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in clean_images]
     layers = [
         ("waymo_box_corners_model", "waymo_box_corners_valid", (0, 255, 0), "waymo"),
-        ("initial_box_corners_model", "initial_box_corners_valid", (255, 200, 0), "dggt init"),
+        # ("initial_box_corners_model", "initial_box_corners_valid", (255, 200, 0), "dggt init"),
         ("refined_box_corners_model", "refined_box_corners_valid", (255, 0, 80), "dggt refined"),
     ]
     for item in localized_objects:
@@ -431,7 +431,7 @@ def _save_bbox_overlay_on_asset_clean_grid(
     overlay_images = [np.array(_tensor_to_pil_rgb(img), copy=True) for img in asset_clean_images]
     layers = [
         ("waymo_box_corners_model", "waymo_box_corners_valid", (0, 255, 0), "waymo"),
-        ("initial_box_corners_model", "initial_box_corners_valid", (255, 200, 0), "dggt init"),
+        # ("initial_box_corners_model", "initial_box_corners_valid", (255, 200, 0), "dggt init"),
         ("refined_box_corners_model", "refined_box_corners_valid", (255, 0, 80), "dggt"),
     ]
     for item in localized_objects:
@@ -918,6 +918,7 @@ def _build_summary(args, sample, alignment, edited_state) -> dict:
                 "asset_path": item.asset_path,
                 "match_score": float(item.match_score),
                 "delete_motion_mode": item.delete_motion_mode,
+                "waymo_frame_dynamic": bool(getattr(item, "waymo_frame_dynamic", False)),
                 "waymo_frame_speed_mps": float(item.waymo_frame_speed_mps),
                 "waymo_max_speed_mps": float(item.waymo_max_speed_mps),
                 "waymo_mean_speed_mps": float(item.waymo_mean_speed_mps),
