@@ -254,6 +254,18 @@ def train_step(
     if mode_b_payload is not None:
         mode_b_payload = _move_mode_b(mode_b_payload, device)
 
+    # Schema v5 fast-path inputs (Mode A only). When absent, the assembler
+    # falls back to its legacy compute path so v4 caches keep working.
+    phase1_localized_lite = item.get("phase1_localized")
+    if phase1_localized_lite is not None:
+        phase1_localized_lite = {
+            k: v.to(device) if torch.is_tensor(v) else v
+            for k, v in phase1_localized_lite.items()
+        }
+    z_splat_cached = item.get("z_splat_cached")
+    if z_splat_cached is not None:
+        z_splat_cached = z_splat_cached.to(device)
+
     bundle = assembler(
         sample=sample,
         predictions=predictions,
@@ -264,6 +276,8 @@ def train_step(
         device=device,
         mode_kind=mode_kind,
         mode_b=mode_b_payload,
+        phase1_localized_lite=phase1_localized_lite,
+        z_splat_cached=z_splat_cached,
     )
     v_pred = scene_flow(
         bundle.z_init,
@@ -477,6 +491,15 @@ def _dump_vis(
         mode_b_payload = item.get("mode_b")
         if mode_b_payload is not None:
             mode_b_payload = _move_mode_b(mode_b_payload, device)
+        phase1_localized_lite = item.get("phase1_localized")
+        if phase1_localized_lite is not None:
+            phase1_localized_lite = {
+                k: v.to(device) if torch.is_tensor(v) else v
+                for k, v in phase1_localized_lite.items()
+            }
+        z_splat_cached = item.get("z_splat_cached")
+        if z_splat_cached is not None:
+            z_splat_cached = z_splat_cached.to(device)
         bundle = assembler(
             sample=sample,
             predictions=predictions,
@@ -486,6 +509,8 @@ def _dump_vis(
             device=device,
             mode_kind=mode_kind,
             mode_b=mode_b_payload,
+            phase1_localized_lite=phase1_localized_lite,
+            z_splat_cached=z_splat_cached,
         )
     dump_flow_features(bundle, vis_dir, save_splat_pca=False)
 

@@ -155,6 +155,27 @@ class WaymoFlowCacheDataset(Dataset):
         cameras_dggt = self._build_cameras_dggt(payload, subset_t)
         alignment = self._build_alignment(payload)
 
+        # Schema v5 fast-path inputs.
+        # * phase1_localized — Mode A only (Mode B doesn't run editor.localize).
+        # * pass2_z_splat   — both modes (precomputed splat→blend→tokenize).
+        # Absent fields → None → assembler falls back to legacy compute, so
+        # v4 caches keep working without modification.
+        schema_version = int(payload.get("schema_version", 0))
+        phase1_localized_subset = None
+        z_splat_cached = None
+        if schema_version >= 5:
+            if mode_kind == "mode_a":
+                phase1_payload = payload.get("phase1_localized")
+                if phase1_payload is not None:
+                    phase1_localized_subset = self._subset_phase1_localized(
+                        phase1_payload, subset_t
+                    )
+            pass2_payload = payload.get("pass2_z_splat")
+            if pass2_payload is not None:
+                z_splat_cached = self._subset_pass2_z_splat(
+                    pass2_payload, subset_t
+                )
+
         return {
             "sample": sample,
             "predictions": predictions,
@@ -165,6 +186,9 @@ class WaymoFlowCacheDataset(Dataset):
             "mode_b": mode_b_block,
             "subset_frames": subset_t,
             "cache_path": str(cache_path),
+            "phase1_localized": phase1_localized_subset,
+            "z_splat_cached": z_splat_cached,
+            "cache_schema_version": schema_version,
         }
 
     # ------------------------------------------------------------------ #
@@ -474,6 +498,99 @@ class WaymoFlowCacheDataset(Dataset):
             "Ks": cams["Ks"].index_select(0, subset).unsqueeze(0),
             "camera_to_world": cams["camera_to_world"].index_select(0, subset).unsqueeze(0),
         }
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _subset_phase1_localized(
+        payload: dict[str, Any],
+        subset: torch.Tensor,
+        num_views: int = 1,
+    ) -> dict[str, torch.Tensor]:
+        """Subset cached phase1_localized to the chosen frame subset.
+
+        Two outputs:
+          (a) Filtered ``slot_idx`` / ``frame_idx`` / ``source_front_index``
+              for ``build_phase1_asset_coverage``. ``frame_idx`` is remapped
+              to the subset-local index; with ``num_views=1``,
+              ``source_front_index`` is the same.
+          (b) ``delete_mask`` / ``shell_mask`` rebuilt for the subsetted
+              clean_state Gaussian set.  The cache stored the FULL-clip
+              flat masks plus a per-frame CSR offset array; we cat the
+              per-frame slices in the subset's order to match the subset
+              ``clean_state.means`` layout.
+        """
+        slot = payload["slot_idx"]
+        frame = payload["frame_idx"]
+        sf = payload["source_front_index"]
+        delete_mask_full = payload["delete_mask"]
+        shell_mask_full = payload["shell_mask"]
+        offsets = payload["frame_gauss_offsets"].to(torch.int64)
+
+        subset_list = subset.tolist()
+        remap = {int(f): i for i, f in enumerate(subset_list)}
+        # Filter (slot, frame, source_front) entries to subset frames; remap.
+        keep_mask = torch.zeros(slot.numel(), dtype=torch.bool)
+        new_frame = torch.full((slot.numel(),), -1, dtype=torch.int32)
+        new_sf = torch.full((slot.numel(),), -1, dtype=torch.int32)
+        for i in range(slot.numel()):
+            f = int(frame[i].item())
+            if f in remap:
+                keep_mask[i] = True
+                new_frame[i] = int(remap[f])
+                # views=1: source_front_index == frame_idx after remap.
+                # views>1: source_front_index = frame*num_views + view_off.
+                old_sf = int(sf[i].item())
+                view_off = old_sf - f * int(num_views)
+                new_sf[i] = int(remap[f]) * int(num_views) + view_off
+        kept_idx = torch.nonzero(keep_mask, as_tuple=False).flatten()
+        slot_kept = slot.index_select(0, kept_idx)
+        frame_kept = new_frame.index_select(0, kept_idx)
+        sf_kept = new_sf.index_select(0, kept_idx)
+
+        # Rebuild masks in subset frame order.
+        delete_chunks: list[torch.Tensor] = []
+        shell_chunks: list[torch.Tensor] = []
+        for f in subset_list:
+            s, e = int(offsets[int(f)].item()), int(offsets[int(f) + 1].item())
+            delete_chunks.append(delete_mask_full[s:e])
+            shell_chunks.append(shell_mask_full[s:e])
+        delete_subset = (
+            torch.cat(delete_chunks) if delete_chunks else torch.zeros(0, dtype=torch.bool)
+        )
+        shell_subset = (
+            torch.cat(shell_chunks) if shell_chunks else torch.zeros(0, dtype=torch.bool)
+        )
+
+        return {
+            "slot_idx": slot_kept,
+            "frame_idx": frame_kept,           # subset-local
+            "source_front_index": sf_kept,     # subset-local
+            "delete_mask": delete_subset,      # bool [N_g_subset], aligned with clean_state.means
+            "shell_mask": shell_subset,
+        }
+
+    @staticmethod
+    def _subset_pass2_z_splat(
+        payload: dict[str, Any],
+        subset: torch.Tensor,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """Dequantize cached z_splat and select the chosen frame subset.
+
+        Returns a tensor of shape ``[1, |subset|, P, C_z]`` (the assembler
+        expects a batched fp tensor).
+        """
+        from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
+
+        q = QuantizedTokens(
+            data=payload["z_splat_int8"],     # [N_frames, P, 1, C_z]
+            scale=payload["z_splat_scale"],   # [N_frames, 1]
+            layout="NPLC",
+        )
+        z_full = dequantize_tokens(q, dtype=dtype)            # [N, P, 1, C_z]
+        z_full = z_full.squeeze(2)                            # [N, P, C_z]
+        z_sub = z_full.index_select(0, subset)                # [|subset|, P, C_z]
+        return z_sub.unsqueeze(0).contiguous()                # [1, |subset|, P, C_z]
 
     # ------------------------------------------------------------------ #
     @staticmethod

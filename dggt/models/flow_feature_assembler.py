@@ -142,6 +142,42 @@ def _concat_gauss_dicts(
     return out
 
 
+class _LiteLocalizedObject:
+    """Minimal duck-typed stand-in for ``LocalizedFrameObject``.
+
+    Cache schema v5 only persists the three fields downstream consumers
+    actually read (``slot_idx``, ``frame_idx``, ``source_front_index`` for
+    ``build_phase1_asset_coverage``).  The OR'd ``delete_mask`` /
+    ``shell_mask`` arrive as separate top-level tensors — apply_mode_a is
+    bypassed entirely on the fast path, so we no longer hydrate per-entry
+    delete/shell index lists.
+    """
+
+    __slots__ = ("slot_idx", "frame_idx", "source_front_index")
+
+    def __init__(self, slot_idx: int, frame_idx: int, source_front_index: int) -> None:
+        self.slot_idx = int(slot_idx)
+        self.frame_idx = int(frame_idx)
+        self.source_front_index = int(source_front_index)
+
+
+def _hydrate_lite_localized(
+    payload: dict[str, torch.Tensor],
+) -> list[_LiteLocalizedObject]:
+    """Reconstruct meta-only ``localized_objects`` list from v5 cache payload."""
+    slot = payload["slot_idx"]
+    frame = payload["frame_idx"]
+    sf = payload["source_front_index"]
+    return [
+        _LiteLocalizedObject(
+            slot_idx=int(slot[i].item()),
+            frame_idx=int(frame[i].item()),
+            source_front_index=int(sf[i].item()),
+        )
+        for i in range(int(slot.numel()))
+    ]
+
+
 def _flatten_asset_kv(
     F_g_lut_asset_by_obj: dict[int, list[torch.Tensor]],
     last_level: int = -1,
@@ -238,6 +274,8 @@ class FlowFeatureAssembler(nn.Module):
         device: torch.device | str | None = None,
         mode_kind: str | None = None,
         mode_b: dict[str, Any] | None = None,
+        phase1_localized_lite: dict[str, torch.Tensor] | None = None,
+        z_splat_cached: torch.Tensor | None = None,
     ) -> FlowFeatureBundle:
         """Assemble the full diffusion-input bundle.
 
@@ -284,6 +322,7 @@ class FlowFeatureAssembler(nn.Module):
                 base_t=base_t,
                 generator=generator,
                 device=device,
+                z_splat_cached=z_splat_cached,
             )
 
         # ----- Mode A path ----- #
@@ -296,14 +335,48 @@ class FlowFeatureAssembler(nn.Module):
             if isinstance(object_slots_spec, str)
             else [int(s) for s in object_slots_spec]
         )
-        localized_objects = self.editor.localize(
-            sample,
-            clean_state,
-            alignment,
-            object_slots,
-            load_asset=False,
-        )
-        edit_state = self.editor.apply_mode_a(clean_state, localized_objects)
+        if phase1_localized_lite is not None:
+            # Schema v5 fast path: skip the 67s editor.localize pose-refine,
+            # skip apply_mode_a, build edit_state directly from cached masks.
+            from dggt.utils.gaussian_edit import EditedSceneState
+            localized_objects = _hydrate_lite_localized(phase1_localized_lite)
+            cached_delete = phase1_localized_lite["delete_mask"].to(device).bool()
+            cached_shell = phase1_localized_lite["shell_mask"].to(device).bool()
+            n_g_clean = int(clean_state.means.shape[0])
+            if int(cached_delete.numel()) != n_g_clean:
+                raise RuntimeError(
+                    f"phase1_localized_lite.delete_mask length ({int(cached_delete.numel())}) "
+                    f"does not match clean_state.means count ({n_g_clean}). The cache and the "
+                    "current frame subset disagree on the per-Gaussian Gaussian count."
+                )
+            clean_dict = {
+                "means": clean_state.means,
+                "colors": clean_state.colors,
+                "opacities": clean_state.opacities,
+                "scales": clean_state.scales,
+                "quats": clean_state.quats,
+            }
+            clean_dict_dev = {k: v.to(device) for k, v in clean_dict.items()}
+            keep_mask_cpu = (~cached_delete).cpu()
+            deleted_dict = {k: v[keep_mask_cpu] for k, v in clean_dict.items()}
+            edit_state = EditedSceneState(
+                clean=clean_dict,
+                deleted=deleted_dict,
+                asset_only={k: v[:0] for k, v in clean_dict.items()},  # empty placeholder
+                edited=deleted_dict,
+                localized_objects=localized_objects,
+                delete_mask=cached_delete.cpu(),
+                shell_mask=cached_shell.cpu(),
+            )
+        else:
+            localized_objects = self.editor.localize(
+                sample,
+                clean_state,
+                alignment,
+                object_slots,
+                load_asset=False,
+            )
+            edit_state = self.editor.apply_mode_a(clean_state, localized_objects)
 
         # Phase 1 asset coverage gating for the asset pass.
         phase1_coverage, phase4_slots = build_phase1_asset_coverage(
@@ -415,18 +488,29 @@ class FlowFeatureAssembler(nn.Module):
             source_hw=(H_img, W_img),
             target_hw=(self.H_splat, self.W_splat),
         )
-        splatted_tok_low = self.feature_splatter(
-            gaussians_dggt=[gaussians_all],
-            pointers=[pointers_all],
-            lut_scene=F_g_lut_scene,
-            lut_asset_dict=F_g_lut_asset if len(F_g_lut_asset) > 0 else None,
-            cameras_dggt=cameras_splat,
-            H=self.H_splat,
-            W=self.W_splat,
-            pool_to=self.patch_grid,
-        )
+        if z_splat_cached is None:
+            splatted_tok_low = self.feature_splatter(
+                gaussians_dggt=[gaussians_all],
+                pointers=[pointers_all],
+                lut_scene=F_g_lut_scene,
+                lut_asset_dict=F_g_lut_asset if len(F_g_lut_asset) > 0 else None,
+                cameras_dggt=cameras_splat,
+                H=self.H_splat,
+                W=self.W_splat,
+                pool_to=self.patch_grid,
+            )
+        else:
+            # Schema v5 fast path: feature_splatter + blend output were cached
+            # (they get fed through scene_tokenizer.encode below), so we skip
+            # the 33s splatter pass entirely. ``splatted_tok_low`` is only kept
+            # in the bundle for visualization; set to None.
+            splatted_tok_low = None
 
         # ------------------- Phase 3: Soft masks + Scaffold -------------- #
+        # NOTE: soft_mask still runs in the cached path because M_preserve /
+        # M_source / M_dest are first-class WAN inputs (not just used for
+        # blending). They are cheap (~36ms total) so caching them isn't worth
+        # the extra disk.
         G_kept_list = [gauss_scene_kept]
         G_deleted_list = [{k: v[edit_state.delete_mask].to(device) for k, v in gauss_scene.items()}]
         G_asset_dict_list = [
@@ -443,16 +527,17 @@ class FlowFeatureAssembler(nn.Module):
         M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=self.patch_grid
         )
-        splatted_tok_low = self._blend_preserve_tokens(
-            clean_levels=F_g_lut_scene,
-            splatted_levels=splatted_tok_low,
-            M_preserve=M_preserve,
-        )
-        splatted_tok_low = self._blend_asset_tokens(
-            splatted_levels=splatted_tok_low,
-            F_g_lut_asset=F_g_lut_asset,
-            I_map_per_obj=I_per_obj,
-        )
+        if z_splat_cached is None:
+            splatted_tok_low = self._blend_preserve_tokens(
+                clean_levels=F_g_lut_scene,
+                splatted_levels=splatted_tok_low,
+                M_preserve=M_preserve,
+            )
+            splatted_tok_low = self._blend_asset_tokens(
+                splatted_levels=splatted_tok_low,
+                F_g_lut_asset=F_g_lut_asset,
+                I_map_per_obj=I_per_obj,
+            )
 
         # Scaffold precursors
         D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
@@ -480,7 +565,15 @@ class FlowFeatureAssembler(nn.Module):
                 "Pass it via the constructor (or VGGT.scene_tokenizer)."
             )
         z_clean = self.scene_tokenizer.encode(F_g_lut_scene, patch_grid=self.patch_grid)
-        z_splat = self.scene_tokenizer.encode(splatted_tok_low, patch_grid=self.patch_grid)
+        if z_splat_cached is None:
+            z_splat = self.scene_tokenizer.encode(splatted_tok_low, patch_grid=self.patch_grid)
+        else:
+            z_splat = z_splat_cached.to(device=z_clean.device, dtype=z_clean.dtype)
+            if z_splat.shape != z_clean.shape:
+                raise ValueError(
+                    f"z_splat_cached shape {tuple(z_splat.shape)} does not match "
+                    f"z_clean shape {tuple(z_clean.shape)}"
+                )
 
         if base_t is None:
             base_t = self.noise_scheduler.sample_base_t(B, device=device, generator=generator)
@@ -545,6 +638,7 @@ class FlowFeatureAssembler(nn.Module):
         base_t: torch.Tensor | None,
         generator: torch.Generator | None,
         device: torch.device,
+        z_splat_cached: torch.Tensor | None = None,
     ) -> FlowFeatureBundle:
         """Mode B forward: pseudo-deletion only, no asset features.
 
@@ -610,19 +704,27 @@ class FlowFeatureAssembler(nn.Module):
             source_hw=(H_img, W_img),
             target_hw=(self.H_splat, self.W_splat),
         )
-        splatted_tok_low = self.feature_splatter(
-            gaussians_dggt=[gauss_kept],
-            pointers=[pointers_all],
-            lut_scene=F_g_lut_scene,
-            lut_asset_dict=None,
-            cameras_dggt=cameras_splat,
-            H=self.H_splat,
-            W=self.W_splat,
-            pool_to=self.patch_grid,
-        )
+        if z_splat_cached is None:
+            splatted_tok_low = self.feature_splatter(
+                gaussians_dggt=[gauss_kept],
+                pointers=[pointers_all],
+                lut_scene=F_g_lut_scene,
+                lut_asset_dict=None,
+                cameras_dggt=cameras_splat,
+                H=self.H_splat,
+                W=self.W_splat,
+                pool_to=self.patch_grid,
+            )
+        else:
+            # Schema v5 fast path: precomputed z_splat replaces the entire
+            # splatter+blend+tokenizer.encode pipeline. ``splatted_tok_low``
+            # is only kept in the bundle for visualization.
+            splatted_tok_low = None
 
         # Phase 3: Soft masks. K = render(kept), I = render(imagined Gaussians),
         # D = 0. Soft-normalize → M_preserve, M_source(=0), M_dest.
+        # NOTE: soft_mask is cheap (~36ms) and produces M_preserve/M_dest
+        # which are first-class WAN inputs, so we keep this even on fast path.
         K_map, _D_map_dummy, I_map_proxy, _ = self.soft_mask.render_coverage(
             G_kept=[gauss_kept],
             G_deleted=[{}],
@@ -638,11 +740,12 @@ class FlowFeatureAssembler(nn.Module):
         M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=self.patch_grid
         )
-        splatted_tok_low = self._blend_preserve_tokens(
-            clean_levels=F_g_lut_scene,
-            splatted_levels=splatted_tok_low,
-            M_preserve=M_preserve,
-        )
+        if z_splat_cached is None:
+            splatted_tok_low = self._blend_preserve_tokens(
+                clean_levels=F_g_lut_scene,
+                splatted_levels=splatted_tok_low,
+                M_preserve=M_preserve,
+            )
 
         # Scaffold (D_edited not meaningful for mode B — pass zeros).
         B = int(F_g_lut_scene[0].shape[0])
@@ -670,7 +773,15 @@ class FlowFeatureAssembler(nn.Module):
                 "FlowFeatureAssembler needs `scene_tokenizer` to produce z_clean/z_splat."
             )
         z_clean = self.scene_tokenizer.encode(F_g_lut_scene, patch_grid=self.patch_grid)
-        z_splat = self.scene_tokenizer.encode(splatted_tok_low, patch_grid=self.patch_grid)
+        if z_splat_cached is None:
+            z_splat = self.scene_tokenizer.encode(splatted_tok_low, patch_grid=self.patch_grid)
+        else:
+            z_splat = z_splat_cached.to(device=z_clean.device, dtype=z_clean.dtype)
+            if z_splat.shape != z_clean.shape:
+                raise ValueError(
+                    f"z_splat_cached shape {tuple(z_splat.shape)} does not match "
+                    f"z_clean shape {tuple(z_clean.shape)} (Mode B fast path)"
+                )
 
         if base_t is None:
             base_t = self.noise_scheduler.sample_base_t(B, device=device, generator=generator)
