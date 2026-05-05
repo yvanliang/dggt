@@ -43,10 +43,8 @@ def _list_cache_files(cache_root: Path, split: str) -> list[Path]:
     root = cache_root / split
     if not root.is_dir():
         raise FileNotFoundError(f"Cache root not found: {root}")
-    # New caches are flat: {root}/{split}/{manifest_index:06d}.pt.
-    # Keep recursive discovery so old {split}/{scene}/{clip_start}.pt caches
-    # remain readable during migration.
-    return sorted(root.rglob("*.pt"))
+    # v6 caches are flat: {cache_root}/{split}/{manifest_index:06d}.pt.
+    return sorted(root.glob("*.pt"))
 
 
 def _read_manifest(path: Path) -> list[dict[str, Any]]:
@@ -131,9 +129,8 @@ class WaymoFlowCacheDataset(Dataset):
         entry = self.entries[idx]
         cache_path = Path(entry["cache_path"])
         payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
-        mode_kind = str(payload.get("mode_kind") or entry.get("mode_kind") or "mode_a")
-        if mode_kind == "unknown":
-            mode_kind = "mode_a"
+        self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
+        mode_kind = str(payload["mode_kind"])
         meta = payload["meta"]
         num_frames_all = int(meta["num_frames"])
         n_select = self._rng.randint(self.min_frames, self.max_frames)
@@ -155,26 +152,35 @@ class WaymoFlowCacheDataset(Dataset):
         cameras_dggt = self._build_cameras_dggt(payload, subset_t)
         alignment = self._build_alignment(payload)
 
-        # Schema v5 fast-path inputs.
-        # * phase1_localized — Mode A only (Mode B doesn't run editor.localize).
-        # * pass2_z_splat   — both modes (precomputed splat→blend→tokenize).
-        # Absent fields → None → assembler falls back to legacy compute, so
-        # v4 caches keep working without modification.
-        schema_version = int(payload.get("schema_version", 0))
+        # Schema v6 fast-path inputs.
+        # * phase1_localized          — Mode A only (Mode B doesn't run editor.localize).
+        # * pass2_splatted_tok_low    — both modes (precomputed splat→blend output,
+        #                               i.e. the *input* to tokenizer.encode).
+        #   This cache is generated with all clip Gaussians as splat sources and
+        #   then sliced on the target-frame axis here. It is intentionally not
+        #   equivalent to re-running live splat after dropping non-subset source
+        #   Gaussians.
+        schema_version = int(payload["schema_version"])
         phase1_localized_subset = None
-        z_splat_cached = None
-        if schema_version >= 5:
-            if mode_kind == "mode_a":
-                phase1_payload = payload.get("phase1_localized")
-                if phase1_payload is not None:
-                    phase1_localized_subset = self._subset_phase1_localized(
-                        phase1_payload, subset_t
-                    )
-            pass2_payload = payload.get("pass2_z_splat")
-            if pass2_payload is not None:
-                z_splat_cached = self._subset_pass2_z_splat(
-                    pass2_payload, subset_t
+        splatted_tok_low_cached = None
+        if mode_kind == "mode_a":
+            phase1_payload = payload.get("phase1_localized")
+            if phase1_payload is None:
+                raise RuntimeError(
+                    f"Mode-A cache {cache_path} missing phase1_localized payload (schema v6)."
                 )
+            phase1_localized_subset = self._subset_phase1_localized(
+                phase1_payload, subset_t
+            )
+        pass2_payload = payload.get("pass2_splatted_tok_low")
+        if pass2_payload is None:
+            raise RuntimeError(
+                f"Cache {cache_path} missing pass2_splatted_tok_low payload "
+                "(schema v6). Re-run tools/precompute_flow_features.py."
+            )
+        splatted_tok_low_cached = self._subset_pass2_splatted_tok_low(
+            pass2_payload, subset_t, dtype=self.lut_dtype,
+        )
 
         return {
             "sample": sample,
@@ -187,9 +193,57 @@ class WaymoFlowCacheDataset(Dataset):
             "subset_frames": subset_t,
             "cache_path": str(cache_path),
             "phase1_localized": phase1_localized_subset,
-            "z_splat_cached": z_splat_cached,
+            "splatted_tok_low_cached": splatted_tok_low_cached,
             "cache_schema_version": schema_version,
         }
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _validate_v6_payload(
+        payload: dict[str, Any],
+        *,
+        cache_path: Path,
+        entry: dict[str, Any],
+    ) -> None:
+        """Fail early unless the payload is the latest v6 training cache."""
+        schema_version = int(payload.get("schema_version", 0))
+        if schema_version != 6:
+            raise RuntimeError(
+                f"Cache {cache_path} has schema_version={schema_version}; "
+                "training now supports only schema_version == 6. "
+                "Re-run tools/precompute_flow_features.py."
+            )
+        mode_kind = payload.get("mode_kind")
+        if mode_kind not in ("mode_a", "mode_b"):
+            raise RuntimeError(
+                f"Cache {cache_path} has invalid mode_kind={mode_kind!r}; "
+                "v6 training caches must set 'mode_a' or 'mode_b'."
+            )
+        entry_mode = entry.get("mode_kind")
+        if entry_mode not in (None, "", "unknown") and str(entry_mode) != str(mode_kind):
+            raise RuntimeError(
+                f"Manifest mode_kind={entry_mode!r} disagrees with cache "
+                f"mode_kind={mode_kind!r} for {cache_path}."
+            )
+        if payload.get("pass2_splatted_tok_low") is None:
+            raise RuntimeError(
+                f"Cache {cache_path} missing pass2_splatted_tok_low; "
+                "v6 training requires pre-tokenizer pass2 cache."
+            )
+        if payload.get("pass2_z_splat") is not None:
+            raise RuntimeError(
+                f"Cache {cache_path} still carries legacy pass2_z_splat; "
+                "regenerate as schema v6 without tokenizer-output cache."
+            )
+        if mode_kind == "mode_a" and payload.get("phase1_localized") is None:
+            raise RuntimeError(
+                f"Mode-A cache {cache_path} missing phase1_localized; "
+                "v6 training requires cached Phase-1 localization."
+            )
+        if mode_kind == "mode_b" and payload.get("phase1_localized") is not None:
+            raise RuntimeError(
+                f"Mode-B cache {cache_path} should not carry phase1_localized."
+            )
 
     # ------------------------------------------------------------------ #
     def _build_sample(self, payload: dict[str, Any], subset: torch.Tensor) -> dict[str, Any]:
@@ -356,12 +410,6 @@ class WaymoFlowCacheDataset(Dataset):
         object_keys = sorted(int(k) for k in asset.keys())
         if len(object_keys) == 0:
             return _empty_asset_pass(patch_grid, patch_start_idx)
-        schema_version = int(payload.get("schema_version", 0))
-        if schema_version < 4:
-            raise RuntimeError(
-                "Mode-A cache asset_pass must use schema_version >= 4 with DGGT-only asset geometry. "
-                f"Got schema_version={schema_version}. Re-run tools/precompute_flow_features.py."
-            )
         asset_pass_space = str(meta.get("asset_pass_space", ""))
         if asset_pass_space != "dggt_fitted":
             raise RuntimeError(
@@ -418,7 +466,7 @@ class WaymoFlowCacheDataset(Dataset):
             dggt_frames = entry.get("G_asset_dggt_per_frame")
             if dggt_frames is None:
                 raise RuntimeError(
-                    f"Mode-A schema {schema_version} cache object {k} lacks G_asset_dggt_per_frame. "
+                    f"Mode-A v6 cache object {k} lacks G_asset_dggt_per_frame. "
                     "Re-run tools/precompute_flow_features.py."
                 )
             G_asset_dggt[k] = [dggt_frames[n] for n in subset_list]
@@ -453,7 +501,8 @@ class WaymoFlowCacheDataset(Dataset):
                             frame indices in the 29-frame clip; the assembler
                             uses subset_frames to pick visibility per chosen
                             frame).
-          delete_mask:      [N_gauss] bool   (UNCHANGED — global pseudo-delete)
+          delete_mask:      [N_gauss_subset] bool, aligned with the subset
+                            clean_state built from cached fp16 dense outputs.
           delete_mask_per_frame_subset: [|subset|, N_gauss] bool
           subset_frames:    [|subset|] long  (mirror of the dataset-wide subset)
           rejection_reason, eligible, num_imagined_objects, metrics, rng_seed.
@@ -464,18 +513,33 @@ class WaymoFlowCacheDataset(Dataset):
                 f"Mode B payload missing for cache: {payload.get('meta', {}).get('clip_name', '?')}. "
                 "Re-run tools/precompute_flow_features.py --edit_mode mode_b on this clip."
             )
-        delete_mask = block["delete_mask"].to(torch.bool)
+        delete_mask_full = block["delete_mask"].to(torch.bool)
         delete_mask_per_frame = block["delete_mask_per_frame"].to(torch.bool)
         if delete_mask_per_frame.dim() != 2:
             raise ValueError(
                 f"delete_mask_per_frame should be [N_clip, N_gauss], got {tuple(delete_mask_per_frame.shape)}"
             )
+        offsets = self._frame_gauss_offsets_from_payload(payload)
+        local_chunks: list[torch.Tensor] = []
+        for f in subset.tolist():
+            s = int(offsets[int(f)].item())
+            e = int(offsets[int(f) + 1].item())
+            local_chunks.append(delete_mask_full[s:e])
+        delete_mask = (
+            torch.cat(local_chunks) if local_chunks else torch.zeros(0, dtype=torch.bool)
+        )
         subset_clip = subset.clone()
         # Some Mode B planner flows use num_frames = max frame_idx + 1, which can
         # be < num_clip_frames if the imagined objects span fewer frames. Clamp.
         n_clip = int(delete_mask_per_frame.shape[0])
-        clamped = subset_clip.clamp_max(max(n_clip - 1, 0))
-        delete_mask_subset = delete_mask_per_frame.index_select(0, clamped)
+        if n_clip == 0:
+            delete_mask_subset = torch.zeros(
+                (int(subset_clip.numel()), int(delete_mask_full.numel())),
+                dtype=torch.bool,
+            )
+        else:
+            clamped = subset_clip.clamp_max(n_clip - 1)
+            delete_mask_subset = delete_mask_per_frame.index_select(0, clamped)
         return {
             "imagined_objects": list(block.get("imagined_objects", [])),
             "rejection_reason": str(block.get("rejection_reason", "")),
@@ -489,6 +553,22 @@ class WaymoFlowCacheDataset(Dataset):
             "delete_core_indices": block.get("delete_core_indices"),
             "delete_shell_indices": block.get("delete_shell_indices"),
         }
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _frame_gauss_offsets_from_payload(payload: dict[str, Any]) -> torch.Tensor:
+        """Rebuild per-frame Gaussian offsets from the cached dense pass1 layout."""
+        depth = payload["pass1"]["depth"].float()
+        if depth.dim() == 4 and depth.shape[-1] == 1:
+            depth = depth[..., 0]
+        sky_mask = payload["raw"]["sky_mask"].float()
+        sky_mask_hw = sky_mask.permute(0, 2, 3, 1)
+        non_sky = (sky_mask_hw < 0.5).any(dim=-1)
+        valid = non_sky & (depth > 1e-4)
+        counts = valid.reshape(valid.shape[0], -1).sum(dim=1).to(torch.long)
+        offsets = torch.zeros((int(counts.numel()) + 1,), dtype=torch.long)
+        offsets[1:] = torch.cumsum(counts, dim=0)
+        return offsets
 
     # ------------------------------------------------------------------ #
     def _build_cameras_dggt(self, payload: dict[str, Any], subset: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -570,27 +650,32 @@ class WaymoFlowCacheDataset(Dataset):
         }
 
     @staticmethod
-    def _subset_pass2_z_splat(
+    def _subset_pass2_splatted_tok_low(
         payload: dict[str, Any],
         subset: torch.Tensor,
         dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        """Dequantize cached z_splat and select the chosen frame subset.
+    ) -> list[torch.Tensor]:
+        """Dequantize cached post-blend ``splatted_tok_low`` and select frames.
 
-        Returns a tensor of shape ``[1, |subset|, P, C_z]`` (the assembler
-        expects a batched fp tensor).
+        Returns a list of ``num_levels`` tensors, each shape
+        ``[1, |subset|, P, C]`` — the format expected by
+        ``FlowFeatureAssembler.forward(splatted_tok_low_cached=...)``.
+
+        The cached tensor was splatted from the full clip's Gaussian set.  The
+        ``index_select`` below slices target frames only; it deliberately does
+        not reproduce live splatting on a subsetted source-Gaussian set.
         """
         from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
 
         q = QuantizedTokens(
-            data=payload["z_splat_int8"],     # [N_frames, P, 1, C_z]
-            scale=payload["z_splat_scale"],   # [N_frames, 1]
+            data=payload["splatted_tok_low_int8"],   # [N_frames, P, L, C]
+            scale=payload["splatted_tok_low_scale"], # [N_frames, L]
             layout="NPLC",
         )
-        z_full = dequantize_tokens(q, dtype=dtype)            # [N, P, 1, C_z]
-        z_full = z_full.squeeze(2)                            # [N, P, C_z]
-        z_sub = z_full.index_select(0, subset)                # [|subset|, P, C_z]
-        return z_sub.unsqueeze(0).contiguous()                # [1, |subset|, P, C_z]
+        full = dequantize_tokens(q, dtype=dtype)              # [N, P, L, C]
+        sub = full.index_select(0, subset)                    # [|subset|, P, L, C]
+        L = int(sub.shape[2])
+        return [sub[:, :, l, :].unsqueeze(0).contiguous() for l in range(L)]
 
     # ------------------------------------------------------------------ #
     @staticmethod

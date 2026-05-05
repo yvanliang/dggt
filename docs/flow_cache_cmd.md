@@ -13,11 +13,19 @@
 | `mode_kind` | `"mode_a"` | `"mode_b"` |
 | `asset_pass` | `{int → {I_asset, A_asset, F_g_lut_asset_int8, ptr_*, G_asset_*}}` | `{}` |
 | `mode_b` | `None` | `{imagined_objects, delete_mask, delete_mask_per_frame, …}` |
+| `phase1_localized` | `{slot_idx, frame_idx, source_front_index, delete_mask, shell_mask, …}` | `None` |
+| `pass2_splatted_tok_low` | tokenizer 前的 splat→blend 特征（int8） | tokenizer 前的 splat→blend 特征（int8） |
 | `pass1` | 相同（gs_map / depth / dyn / int8 LUTs / cameras_dggt） | 相同 |
 | `raw` | 相同（images_u8, sky_mask, dynamic_mask） | 相同 |
 | `meta`, `object_meta` | 相同 | 相同 |
 
 下游模块（`WaymoFlowCacheDataset` + `FlowFeatureAssembler`）会检查 `mode_kind`，并路由到对应的在线代码路径。
+
+## Cache 语义：full-source-Gaussian splat
+
+v6 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend 特征。它的 source Gaussian 集合是完整 clip 的所有帧；训练时随机选 4-8 帧时，dataset 只在 target frame 维度做 `index_select`。
+
+因此 `cache.index_select(subset)` 不应该和“先把 `gs_map` 裁成 subset，再 live 重跑 `FeatureSplatter`”逐 token 相等。后者的 source Gaussian 少了其他帧，遮挡和补洞都会变。验证时应检查 full clip cache 与 full clip live recompute 一致；对子集只检查缓存切片结构正常，以及 mask、`z_clean`、asset tokens、scaffold 等非 pass2 字段一致。这个语义更接近实际推理：推理通常对完整 clip 做 live splat。
 
 
 ## 0. 前置条件

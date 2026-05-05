@@ -56,7 +56,7 @@ from datasets.waymo_edit_dataset import (
 )
 from dggt.models.asset_pass import AssetAggregatorPass
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
-from dggt.utils.feature_quant import quantize_tokens
+from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens, quantize_tokens
 from dggt.utils.flow_cache_io import save_flow_cache
 from dggt.utils.gaussian_edit import parse_object_slots
 from dggt.utils.tokens import select_patch_pyramid
@@ -291,26 +291,69 @@ def _gather_special_tokens(
     return torch.stack(specials, dim=1).contiguous()
 
 
-def _build_pass2_predictions(
-    predictions: dict[str, torch.Tensor],
+def _build_training_predictions_from_cache_payload(
+    *,
+    pass1_tokens: dict[str, Any],
+    gs_map: torch.Tensor,
+    depth: torch.Tensor,
+    dynamic_conf: torch.Tensor,
+    gs_conf: torch.Tensor,
+    pose_enc: torch.Tensor,
+    semantic_logits: torch.Tensor | None,
     patch_start_idx: int,
+    lut_dtype: torch.dtype = torch.float32,
 ) -> dict[str, Any]:
-    """Keep only token levels that pass2_z_splat actually indexes.
+    """Mirror ``WaymoFlowCacheDataset._build_predictions`` for the full clip.
 
-    ``FlowFeatureAssembler._select_lut_scene`` takes the full-pyramid branch
-    when ``image_tokens_list`` is present.  Preserve that branch while dropping
-    the 20 unused levels plus unrelated dense/aggregated outputs before pass2.
+    Phase1 masks and pass2 splatted features must be generated from exactly the
+    same fp16 / int8 cache representation that training later reads.  Otherwise
+    small depth quantization changes can alter the clean Gaussian count and make
+    cached masks impossible to align with ``clean_state``.
     """
-    tokens_list = predictions.get("image_tokens_list")
-    if tokens_list is None:
-        raise KeyError("predictions missing image_tokens_list for pass2")
-    sparse_levels: list[torch.Tensor | None] = [None] * (max(DEFAULT_LEVELS) + 1)
-    for level_idx in DEFAULT_LEVELS:
-        sparse_levels[int(level_idx)] = tokens_list[int(level_idx)].detach()
+    lut_full = dequantize_tokens(
+        QuantizedTokens(
+            data=pass1_tokens["F_g_lut_scene_int8"],
+            scale=pass1_tokens["F_g_lut_scene_scale"],
+            layout="NPLC",
+        ),
+        dtype=lut_dtype,
+    )
+    image_tokens_levels = [
+        lut_full[:, :, l, :].unsqueeze(0).contiguous()
+        for l in range(int(lut_full.shape[2]))
+    ]
     return {
-        "image_tokens_list": sparse_levels,
+        "pose_enc": pose_enc.unsqueeze(0),
+        "depth": depth.unsqueeze(0),
+        "gs_map": gs_map.unsqueeze(0),
+        "dynamic_conf": dynamic_conf.unsqueeze(0),
+        "gs_conf": gs_conf.unsqueeze(0),
+        "semantic_logits": None if semantic_logits is None else semantic_logits.unsqueeze(0),
+        "image_tokens_levels": image_tokens_levels,
         "patch_start_idx": int(patch_start_idx),
     }
+
+
+def _replace_asset_luts_with_cached_dtype(asset_result, asset_payload: dict[int, dict[str, Any]], *, dtype: torch.dtype):
+    """Make pass2 use the same quantized/dequantized asset LUTs as training."""
+    F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
+    for k in asset_result.object_keys:
+        k = int(k)
+        entry = asset_payload[k]
+        F_full = dequantize_tokens(
+            QuantizedTokens(
+                data=entry["F_g_lut_asset_int8"],
+                scale=entry["F_g_lut_asset_scale"],
+                layout="NPLC",
+            ),
+            dtype=dtype,
+        )
+        F_g_lut_asset[k] = [
+            F_full[:, :, l, :].unsqueeze(0).contiguous()
+            for l in range(int(F_full.shape[2]))
+        ]
+    asset_result.F_g_lut_asset = F_g_lut_asset
+    return asset_result
 
 
 def _as_homogeneous_viewmats(world_to_camera: torch.Tensor) -> torch.Tensor:
@@ -624,7 +667,7 @@ def _run_mode_a_asset_pass(
 
 
 # ---------------------------------------------------------------------- #
-# Schema v5 helpers — phase1_localized + pass2_z_splat                    #
+# Schema v6 helpers — phase1_localized + pass2_splatted_tok_low           #
 # ---------------------------------------------------------------------- #
 
 
@@ -696,7 +739,7 @@ def _pack_phase1_localized(
     }
 
 
-def _compute_and_pack_pass2_z_splat(
+def _compute_and_pack_pass2_splatted_tok_low(
     *,
     sample: dict[str, Any],
     predictions: dict[str, torch.Tensor],
@@ -704,20 +747,23 @@ def _compute_and_pack_pass2_z_splat(
     cameras_dggt: dict[str, torch.Tensor],
     clean_state: Any,
     localized_objects: list,
-    tokenizer: Any,
     patch_grid: tuple[int, int],
     H_img: int,
     W_img: int,
     chunk_channels: int,
     device: torch.device,
 ) -> dict[str, Any]:
-    """Run splatter + soft-mask + blend + tokenizer.encode and pack z_splat as int8.
+    """Run splatter + soft-mask + blend and pack the post-blend ``splatted_tok_low`` as int8.
 
     Mirrors ``FlowFeatureAssembler._forward_mode_a`` from after ``editor.localize``
-    through ``z_splat = tokenizer.encode(splatted_tok_low)``.
+    through the second blend (``_blend_asset_tokens``).  ``tokenizer.encode`` is
+    deliberately *not* called here: the tokenizer is still being trained, so we
+    cache its **input** rather than its output.  Training runs ``tokenizer.encode``
+    online with the latest weights, keeping ``z_clean`` and ``z_splat`` in the
+    same latent space.
 
-    The output cache enables training to skip the entire splatter + blend +
-    tokenizer.encode-of-splat path (~33s + 0.04s per step on the full T1 model).
+    The output cache enables training to skip the splatter + blend pass (~33s
+    per step); ``tokenizer.encode`` remains live (38ms — negligible).
     """
     from dggt.models.flow_feature_assembler import FlowFeatureAssembler
     from dggt.utils.gaussian_edit import apply_mode_a
@@ -729,7 +775,7 @@ def _compute_and_pack_pass2_z_splat(
     H_splat = patch_grid[0] * 4
     W_splat = patch_grid[1] * 4
     assembler = FlowFeatureAssembler(
-        scene_tokenizer=tokenizer,
+        scene_tokenizer=None,
         patch_grid=patch_grid,
         H_splat=H_splat,
         W_splat=W_splat,
@@ -821,17 +867,16 @@ def _compute_and_pack_pass2_z_splat(
         splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(assembler.num_levels)]
         for fs in range(0, S_total, frame_chunk):
             fe = min(fs + frame_chunk, S_total)
-            lut_scene_chunk = [lvl[:, fs:fe].contiguous() for lvl in F_g_lut_scene]
-            lut_asset_chunk = (
-                {k: [lvl[:, fs:fe].contiguous() for lvl in lvls]
-                 for k, lvls in F_g_lut_asset.items()}
-                if len(F_g_lut_asset) > 0 else None
-            )
+            # Only target cameras are frame-chunked. The LUT S dimension is
+            # indexed by GaussianPointers.view_n (source frame), so slicing it
+            # would change the token assigned to gaussians outside this target
+            # camera chunk.
+            lut_asset_chunk = F_g_lut_asset if len(F_g_lut_asset) > 0 else None
             cameras_splat_chunk = {k: v[:, fs:fe].contiguous() for k, v in cameras_splat.items()}
             chunk_out = assembler.feature_splatter(
                 gaussians_dggt=[gaussians_all],
                 pointers=[pointers_all],
-                lut_scene=lut_scene_chunk,
+                lut_scene=F_g_lut_scene,
                 lut_asset_dict=lut_asset_chunk,
                 cameras_dggt=cameras_splat_chunk,
                 H=H_splat,
@@ -876,49 +921,50 @@ def _compute_and_pack_pass2_z_splat(
             F_g_lut_asset=F_g_lut_asset,
             I_map_per_obj=I_per_obj,
         )
-        z_splat = tokenizer.encode(splatted_tok_low, patch_grid=patch_grid)
 
-    # z_splat is [B=1, S, P, C_z]. Quantize per-frame on the channel axis using
-    # the existing NPLC utility, treating "L=1".
-    z = z_splat.detach().squeeze(0).contiguous()  # [S, P, C_z]
-    if z.dim() != 3:
-        raise RuntimeError(f"Unexpected z_splat shape {tuple(z_splat.shape)}; need [1,S,P,C_z]")
-    S, P_z, C_z = z.shape
-    z_4d = z.unsqueeze(2)  # [S, P, 1, C_z]
-    q = quantize_tokens(z_4d.float().cpu(), layout="NPLC")
+    # splatted_tok_low: list[L × [1, S, P, C]]. Stack to [S, P, L, C] (NPLC) and
+    # quantize per (frame, level) with the existing int8 utility.
+    if len(splatted_tok_low) == 0:
+        raise RuntimeError("splatted_tok_low is empty after blending")
+    stacked = torch.stack(
+        [lvl.detach().squeeze(0).cpu() for lvl in splatted_tok_low], dim=2
+    ).contiguous()
+    S_full, P_full, L_full, C_full = stacked.shape
+    q = quantize_tokens(stacked.float(), layout="NPLC")
     return {
-        "schema_version": 1,
-        "z_splat_int8": q.data,           # [S, P, 1, C_z]
-        "z_splat_scale": q.scale,         # [S, 1] fp16
+        "schema_version": 2,
+        "splatted_tok_low_int8": q.data,   # [S, P, L, C]
+        "splatted_tok_low_scale": q.scale, # [S, L] fp16
         "patch_grid": (int(patch_grid[0]), int(patch_grid[1])),
-        "z_dim": int(C_z),
+        "channels": int(C_full),
+        "num_levels": int(L_full),
     }
 
 
-def _compute_and_pack_pass2_z_splat_mode_b(
+def _compute_and_pack_pass2_splatted_tok_low_mode_b(
     *,
     sample: dict[str, Any],
     predictions: dict[str, torch.Tensor],
     cameras_dggt: dict[str, torch.Tensor],
     clean_state: Any,
     mode_b_payload: dict[str, Any],
-    tokenizer: Any,
     patch_grid: tuple[int, int],
     H_img: int,
     W_img: int,
     chunk_channels: int,
     device: torch.device,
-) -> dict[str, Any] | None:
-    """Mode B variant of the splatter→blend→tokenizer.encode caching helper.
+) -> dict[str, Any]:
+    """Mode B variant of the splatter+blend caching helper (pre-tokenizer).
 
-    Mirrors ``FlowFeatureAssembler._forward_mode_b`` from after delete_mask is
-    determined through ``z_splat = tokenizer.encode(splatted_tok_low)``.
-    Returns the same packed dict layout as the Mode A helper so the dataset
-    reader doesn't need a per-mode branch.
+    Mirrors ``FlowFeatureAssembler._forward_mode_b`` from after ``delete_mask``
+    is determined through ``_blend_preserve_tokens``.  ``tokenizer.encode`` runs
+    online during training (see Mode A docstring for the rationale).  Returns
+    the same packed dict layout as the Mode A helper so the dataset reader
+    doesn't need a per-mode branch.
 
-    Returns ``None`` if the planner declined to imagine any objects (no
-    deletion → z_splat ≈ z_clean → caching brings no benefit and skipping
-    avoids storing redundant data).
+    Empty plans are still packed: v6 caches make ``pass2_splatted_tok_low``
+    mandatory, and an all-kept Mode-B clip simply produces the no-deletion
+    splatted/blended features.
     """
     from dggt.models.flow_feature_assembler import FlowFeatureAssembler
     from dggt.models.gaussian_pointers import GaussianPointers
@@ -926,13 +972,13 @@ def _compute_and_pack_pass2_z_splat_mode_b(
 
     delete_mask_full = mode_b_payload.get("delete_mask")
     if delete_mask_full is None:
-        return None
+        raise RuntimeError("Mode B pass2 cache requires mode_b.delete_mask")
     delete_mask_full = delete_mask_full.to(torch.bool)
 
     H_splat = patch_grid[0] * 4
     W_splat = patch_grid[1] * 4
     assembler = FlowFeatureAssembler(
-        scene_tokenizer=tokenizer,
+        scene_tokenizer=None,
         patch_grid=patch_grid,
         H_splat=H_splat,
         W_splat=W_splat,
@@ -946,10 +992,10 @@ def _compute_and_pack_pass2_z_splat_mode_b(
     # Build kept / imagined Gaussian dicts from clean_state + delete_mask.
     n_g = int(clean_state.means.shape[0])
     if int(delete_mask_full.numel()) != n_g:
-        # Planner produced a mask incompatible with this clean_state — skip
-        # caching and let assembler fall back to legacy compute (which has
-        # its own defensive zero-mask path).
-        return None
+        raise RuntimeError(
+            f"Mode B delete_mask length {int(delete_mask_full.numel())} does not "
+            f"match clean_state Gaussians {n_g}; cannot write mandatory v6 pass2 cache."
+        )
     clean_dict = {
         "means": clean_state.means.to(device),
         "colors": clean_state.colors.to(device),
@@ -993,12 +1039,11 @@ def _compute_and_pack_pass2_z_splat_mode_b(
         splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(assembler.num_levels)]
         for fs in range(0, S_total, frame_chunk):
             fe = min(fs + frame_chunk, S_total)
-            lut_scene_chunk = [lvl[:, fs:fe].contiguous() for lvl in F_g_lut_scene]
             cameras_splat_chunk = {k: v[:, fs:fe].contiguous() for k, v in cameras_splat.items()}
             chunk_out = assembler.feature_splatter(
                 gaussians_dggt=[gauss_kept],
                 pointers=[ptr_scene_kept],
-                lut_scene=lut_scene_chunk,
+                lut_scene=F_g_lut_scene,
                 lut_asset_dict=None,
                 cameras_dggt=cameras_splat_chunk,
                 H=H_splat,
@@ -1028,20 +1073,21 @@ def _compute_and_pack_pass2_z_splat_mode_b(
             splatted_levels=splatted_tok_low,
             M_preserve=M_preserve,
         )
-        z_splat = tokenizer.encode(splatted_tok_low, patch_grid=patch_grid)
 
-    z = z_splat.detach().squeeze(0).contiguous()
-    if z.dim() != 3:
-        raise RuntimeError(f"Unexpected z_splat shape {tuple(z_splat.shape)}; need [1,S,P,C_z]")
-    S, P_z, C_z = z.shape
-    z_4d = z.unsqueeze(2)
-    q = quantize_tokens(z_4d.float().cpu(), layout="NPLC")
+    if len(splatted_tok_low) == 0:
+        raise RuntimeError("splatted_tok_low is empty after blending (mode_b)")
+    stacked = torch.stack(
+        [lvl.detach().squeeze(0).cpu() for lvl in splatted_tok_low], dim=2
+    ).contiguous()
+    S_full, P_full, L_full, C_full = stacked.shape
+    q = quantize_tokens(stacked.float(), layout="NPLC")
     return {
-        "schema_version": 1,
-        "z_splat_int8": q.data,
-        "z_splat_scale": q.scale,
+        "schema_version": 2,
+        "splatted_tok_low_int8": q.data,
+        "splatted_tok_low_scale": q.scale,
         "patch_grid": (int(patch_grid[0]), int(patch_grid[1])),
-        "z_dim": int(C_z),
+        "channels": int(C_full),
+        "num_levels": int(L_full),
     }
 
 
@@ -1075,7 +1121,6 @@ def precompute_one_clip(
 
     patch_start_idx = int(predictions.get("patch_start_idx", 5))
     pass1_tokens = _pack_pass1_tokens(predictions, patch_start_idx)
-    pass2_predictions = _build_pass2_predictions(predictions, patch_start_idx)
 
     # Pass-1 dense outputs
     gs_map = predictions["gs_map"][0].to(torch.float16).cpu()
@@ -1093,9 +1138,38 @@ def precompute_one_clip(
     _assert_no_nan_tensor("pass1.pose_enc", pose_enc, require_finite=True)
     _assert_no_nan_tensor("pass1.semantic_logits", semantic_logits)
 
+    images_u8 = images_clean[0].clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).cpu()
+    sky_mask = sample["sky_mask"].to(torch.bool).cpu()
+    dynamic_mask_src = sample.get("dynamic_mask", sample.get("masks"))
+    dynamic_mask = (dynamic_mask_src.to(torch.bool).cpu() if dynamic_mask_src is not None else None)
+    sample_cached = dict(sample)
+    sample_cached["images_clean"] = images_u8.to(torch.float32).div(255.0)
+    sample_cached["images"] = sample_cached["images_clean"]
+    sample_cached["sky_mask"] = sky_mask
+    sample_cached["masks"] = sky_mask
+    sample_cached["dynamic_mask"] = dynamic_mask
+
+    # From here on, run Phase1 and pass2 from the exact representation that the
+    # training dataset will read back from disk.  This keeps cached masks,
+    # Gaussian counts, and splatted features aligned with training-time
+    # ``clean_state`` construction.
+    del predictions
+    predictions = _build_training_predictions_from_cache_payload(
+        pass1_tokens=pass1_tokens,
+        gs_map=gs_map,
+        depth=depth,
+        dynamic_conf=dynamic_conf,
+        gs_conf=gs_conf,
+        pose_enc=pose_enc,
+        semantic_logits=semantic_logits,
+        patch_start_idx=patch_start_idx,
+        lut_dtype=torch.float32,
+    )
+    _cleanup_cuda(device)
+
     # Phase 1
-    clean_state = editor.build_clean_bundle(sample, predictions)
-    alignment = editor.align(sample, clean_state)
+    clean_state = editor.build_clean_bundle(sample_cached, predictions)
+    alignment = editor.align(sample_cached, clean_state)
     _assert_no_nan_tensor("clean_state.world_to_camera", clean_state.world_to_camera, require_finite=True)
     _assert_no_nan_tensor("clean_state.intrinsics", clean_state.intrinsics, require_finite=True)
     _assert_no_nan_tensor("clean_state.camera_to_world", clean_state.camera_to_world, require_finite=True)
@@ -1104,18 +1178,15 @@ def precompute_one_clip(
         "Ks": clean_state.intrinsics.cpu().to(torch.float32),
         "camera_to_world": clean_state.camera_to_world.cpu().to(torch.float32),
     }
-    del predictions
-    predictions = pass2_predictions
-    _cleanup_cuda(device)
     asset_pass_payload: dict[int, dict[str, Any]] = {}
     asset_pass_result = None
     mode_b_payload: dict[str, Any] | None = None
     phase1_localized_payload: dict[str, Any] | None = None
-    pass2_z_splat_payload: dict[str, Any] | None = None
+    pass2_splatted_tok_low_payload: dict[str, Any] | None = None
     if args.edit_mode == "mode_a":
         if asset_pass is not None and not args.skip_asset_pass:
             asset_pass_result, localized_objects = _run_mode_a_asset_pass(
-                sample,
+                sample_cached,
                 asset_pass,
                 editor,
                 clean_state,
@@ -1124,30 +1195,31 @@ def precompute_one_clip(
                 args,
             )
             asset_pass_payload = _pack_mode_a_asset_pass_result(asset_pass_result)
+            asset_pass_result = _replace_asset_luts_with_cached_dtype(
+                asset_pass_result,
+                asset_pass_payload,
+                dtype=torch.float32,
+            )
             _cleanup_cuda(device)
 
-            # Schema v5: cache the editor's localized_objects + the
-            # splatter→blend→tokenizer.encode output so training can skip the
-            # 67s pose-refine + 33s gsplat pass per step.
+            # Schema v6: cache the editor's localized_objects + the
+            # splatter→blend output so training can skip the 67s pose-refine
+            # + 33s gsplat pass per step.  ``tokenizer.encode`` is NOT cached
+            # because the tokenizer is still being trained — see
+            # ``_compute_and_pack_pass2_splatted_tok_low`` docstring.
             phase1_localized_payload = _pack_phase1_localized(localized_objects, clean_state)
-            tokenizer = getattr(model, "scene_tokenizer", None)
-            if tokenizer is None:
-                raise RuntimeError(
-                    "VGGT model is missing scene_tokenizer; cannot precompute pass2_z_splat."
-                )
-            # The asset_pass leaves significant transient allocations in the
-            # CUDA caching allocator (gsplat colors, intermediate features).
-            # Free them before the splatter helper so we don't fight for the
-            # last ~400 MiB on tight GPUs.
+            # The asset_pass leaves significant transient allocations
+            # (gsplat colors, intermediate features). Drop Python references
+            # and synchronize before the splatter helper without calling
+            # torch.cuda.empty_cache().
             _cleanup_cuda(device)
-            pass2_z_splat_payload = _compute_and_pack_pass2_z_splat(
-                sample=sample,
+            pass2_splatted_tok_low_payload = _compute_and_pack_pass2_splatted_tok_low(
+                sample=sample_cached,
                 predictions=predictions,
                 asset_pass_result=asset_pass_result,
                 cameras_dggt=cameras_dggt,
                 clean_state=clean_state,
                 localized_objects=localized_objects,
-                tokenizer=tokenizer,
                 patch_grid=(H_img // 14, W_img // 14),
                 H_img=H_img,
                 W_img=W_img,
@@ -1156,23 +1228,17 @@ def precompute_one_clip(
             )
             _cleanup_cuda(device)
     elif args.edit_mode == "mode_b":
-        mode_b_payload = _run_mode_b_planner(sample, record, clean_state, alignment, args, device)
-        # Schema v5: cache the splatter→blend→tokenizer.encode output for Mode
-        # B too. Mode B does NOT cache phase1_localized because it doesn't run
-        # editor.localize (delete_mask comes from the planner, already saved).
-        tokenizer = getattr(model, "scene_tokenizer", None)
-        if tokenizer is None:
-            raise RuntimeError(
-                "VGGT model is missing scene_tokenizer; cannot precompute pass2_z_splat."
-            )
+        mode_b_payload = _run_mode_b_planner(sample_cached, record, clean_state, alignment, args, device)
+        # Schema v6: cache the splatter+blend output for Mode B too. Mode B
+        # does NOT cache phase1_localized because it doesn't run editor.localize
+        # (delete_mask comes from the planner, already saved).
         _cleanup_cuda(device)
-        pass2_z_splat_payload = _compute_and_pack_pass2_z_splat_mode_b(
-            sample=sample,
+        pass2_splatted_tok_low_payload = _compute_and_pack_pass2_splatted_tok_low_mode_b(
+            sample=sample_cached,
             predictions=predictions,
             cameras_dggt=cameras_dggt,
             clean_state=clean_state,
             mode_b_payload=mode_b_payload,
-            tokenizer=tokenizer,
             patch_grid=(H_img // 14, W_img // 14),
             H_img=H_img,
             W_img=W_img,
@@ -1183,14 +1249,10 @@ def precompute_one_clip(
     else:
         raise ValueError(f"Unknown edit_mode: {args.edit_mode}")
 
-    images_u8 = images_clean[0].clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).cpu()
-    sky_mask = sample["sky_mask"].to(torch.bool).cpu()
-    dynamic_mask_src = sample.get("dynamic_mask", sample.get("masks"))
-    dynamic_mask = (dynamic_mask_src.to(torch.bool).cpu() if dynamic_mask_src is not None else None)
     object_meta = _build_object_meta(sample)
 
     payload: dict[str, Any] = {
-        "schema_version": 5,
+        "schema_version": 6,
         "mode_kind": args.edit_mode,
         "meta": {
             "manifest_index": _sample_manifest_index(sample, int(sample.get("sample_index", 0))),
@@ -1245,7 +1307,7 @@ def precompute_one_clip(
         "asset_pass": asset_pass_payload,
         "mode_b": mode_b_payload,
         "phase1_localized": phase1_localized_payload,
-        "pass2_z_splat": pass2_z_splat_payload,
+        "pass2_splatted_tok_low": pass2_splatted_tok_low_payload,
     }
     if args.edit_mode == "mode_b" and not args.allow_empty_plan:
         _assert_valid_mode_b_payload(payload)

@@ -301,6 +301,7 @@ class FeatureSplatter(nn.Module):
                 width=int(W),
                 height=int(H),
                 render_mode="RGB",
+                channel_chunk=int(end - start),
             )  # [S, H, W, end-start]
             if pool_to is not None:
                 rendered_chunk = self._area_pool(rendered_chunk, pool_to)

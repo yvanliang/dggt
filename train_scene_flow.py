@@ -92,6 +92,11 @@ def _infer_cache_patch_grid(dataset: WaymoFlowCacheDataset) -> tuple[int, int]:
     if cache_path is None:
         raise KeyError("Cache dataset entry is missing 'cache_path'.")
     payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
+    WaymoFlowCacheDataset._validate_v6_payload(
+        payload,
+        cache_path=Path(cache_path),
+        entry=entry,
+    )
     patch_grid = payload.get("meta", {}).get("patch_grid")
     if patch_grid is None or len(patch_grid) != 2:
         raise KeyError(f"Cache payload {cache_path} is missing meta.patch_grid=(H,W).")
@@ -234,6 +239,49 @@ def freeze_module(module: nn.Module) -> None:
         p.requires_grad_(False)
 
 
+def _move_v6_fast_path_inputs(
+    item: dict[str, Any],
+    mode_kind: str,
+    device: torch.device,
+) -> tuple[dict[str, Any] | None, list[torch.Tensor]]:
+    schema_version = int(item.get("cache_schema_version", 0))
+    if schema_version != 6:
+        raise RuntimeError(
+            f"Training item {item.get('cache_path', '<unknown>')} has "
+            f"cache_schema_version={schema_version}; only v6 cache is supported."
+        )
+
+    if mode_kind not in ("mode_a", "mode_b"):
+        raise RuntimeError(
+            f"Training item {item.get('cache_path', '<unknown>')} has "
+            f"invalid mode_kind={mode_kind!r}."
+        )
+
+    phase1_localized_lite = item.get("phase1_localized")
+    if mode_kind == "mode_a":
+        if phase1_localized_lite is None:
+            raise RuntimeError(
+                f"Mode-A v6 item {item.get('cache_path', '<unknown>')} missing phase1_localized."
+            )
+        phase1_localized_lite = {
+            k: v.to(device) if torch.is_tensor(v) else v
+            for k, v in phase1_localized_lite.items()
+        }
+    else:
+        if phase1_localized_lite is not None:
+            raise RuntimeError(
+                f"Mode-B v6 item {item.get('cache_path', '<unknown>')} unexpectedly has phase1_localized."
+            )
+        phase1_localized_lite = None
+
+    splatted_tok_low_cached = item.get("splatted_tok_low_cached")
+    if splatted_tok_low_cached is None:
+        raise RuntimeError(
+            f"v6 item {item.get('cache_path', '<unknown>')} missing splatted_tok_low_cached."
+        )
+    return phase1_localized_lite, [t.to(device) for t in splatted_tok_low_cached]
+
+
 # ---------------------------------------------------------------------- #
 # Train step                                                              #
 # ---------------------------------------------------------------------- #
@@ -254,17 +302,9 @@ def train_step(
     if mode_b_payload is not None:
         mode_b_payload = _move_mode_b(mode_b_payload, device)
 
-    # Schema v5 fast-path inputs (Mode A only). When absent, the assembler
-    # falls back to its legacy compute path so v4 caches keep working.
-    phase1_localized_lite = item.get("phase1_localized")
-    if phase1_localized_lite is not None:
-        phase1_localized_lite = {
-            k: v.to(device) if torch.is_tensor(v) else v
-            for k, v in phase1_localized_lite.items()
-        }
-    z_splat_cached = item.get("z_splat_cached")
-    if z_splat_cached is not None:
-        z_splat_cached = z_splat_cached.to(device)
+    phase1_localized_lite, splatted_tok_low_cached = _move_v6_fast_path_inputs(
+        item, mode_kind, device
+    )
 
     bundle = assembler(
         sample=sample,
@@ -277,7 +317,7 @@ def train_step(
         mode_kind=mode_kind,
         mode_b=mode_b_payload,
         phase1_localized_lite=phase1_localized_lite,
-        z_splat_cached=z_splat_cached,
+        splatted_tok_low_cached=splatted_tok_low_cached,
     )
     v_pred = scene_flow(
         bundle.z_init,
@@ -491,15 +531,9 @@ def _dump_vis(
         mode_b_payload = item.get("mode_b")
         if mode_b_payload is not None:
             mode_b_payload = _move_mode_b(mode_b_payload, device)
-        phase1_localized_lite = item.get("phase1_localized")
-        if phase1_localized_lite is not None:
-            phase1_localized_lite = {
-                k: v.to(device) if torch.is_tensor(v) else v
-                for k, v in phase1_localized_lite.items()
-            }
-        z_splat_cached = item.get("z_splat_cached")
-        if z_splat_cached is not None:
-            z_splat_cached = z_splat_cached.to(device)
+        phase1_localized_lite, splatted_tok_low_cached = _move_v6_fast_path_inputs(
+            item, mode_kind, device
+        )
         bundle = assembler(
             sample=sample,
             predictions=predictions,
@@ -510,7 +544,7 @@ def _dump_vis(
             mode_kind=mode_kind,
             mode_b=mode_b_payload,
             phase1_localized_lite=phase1_localized_lite,
-            z_splat_cached=z_splat_cached,
+            splatted_tok_low_cached=splatted_tok_low_cached,
         )
     dump_flow_features(bundle, vis_dir, save_splat_pca=False)
 
