@@ -343,7 +343,7 @@ class AssetAggregatorPass(nn.Module):
             pending_depth_renders.clear()
             pending_gaussians.clear()
             if device.type == "cuda":
-                torch.cuda.empty_cache()
+                torch.cuda.synchronize(device)
 
         localized_by_key = self._index_localized_objects(localized_objects or [])
         for slot_idx in candidate_slots:

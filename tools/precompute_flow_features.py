@@ -270,7 +270,9 @@ def _assemble_4level_lut(
 ) -> torch.Tensor:
     """Select 4 pyramid levels and stack to `[S, P, 4, C]`."""
     patches = select_patch_pyramid(image_tokens_list, levels, patch_start_idx)
-    arr = torch.stack([p.squeeze(0) for p in patches], dim=2)   # [S, P, L, C]
+    # Stack on CPU so pass1 packing does not add a transient multi-GB GPU copy
+    # on top of the full VGGT token pyramid.
+    arr = torch.stack([p.squeeze(0).detach().cpu() for p in patches], dim=2)   # [S, P, L, C]
     return arr.contiguous()
 
 
@@ -285,8 +287,30 @@ def _gather_special_tokens(
         tok = image_tokens_list[lvl]
         if tok.dim() != 4 or tok.shape[0] != 1:
             raise ValueError(f"expected [1, S, P, C] per level, got {tuple(tok.shape)}")
-        specials.append(tok[0, :, :patch_start_idx, :])
+        specials.append(tok[0, :, :patch_start_idx, :].detach().cpu())
     return torch.stack(specials, dim=1).contiguous()
+
+
+def _build_pass2_predictions(
+    predictions: dict[str, torch.Tensor],
+    patch_start_idx: int,
+) -> dict[str, Any]:
+    """Keep only token levels that pass2_z_splat actually indexes.
+
+    ``FlowFeatureAssembler._select_lut_scene`` takes the full-pyramid branch
+    when ``image_tokens_list`` is present.  Preserve that branch while dropping
+    the 20 unused levels plus unrelated dense/aggregated outputs before pass2.
+    """
+    tokens_list = predictions.get("image_tokens_list")
+    if tokens_list is None:
+        raise KeyError("predictions missing image_tokens_list for pass2")
+    sparse_levels: list[torch.Tensor | None] = [None] * (max(DEFAULT_LEVELS) + 1)
+    for level_idx in DEFAULT_LEVELS:
+        sparse_levels[int(level_idx)] = tokens_list[int(level_idx)].detach()
+    return {
+        "image_tokens_list": sparse_levels,
+        "patch_start_idx": int(patch_start_idx),
+    }
 
 
 def _as_homogeneous_viewmats(world_to_camera: torch.Tensor) -> torch.Tensor:
@@ -1051,6 +1075,7 @@ def precompute_one_clip(
 
     patch_start_idx = int(predictions.get("patch_start_idx", 5))
     pass1_tokens = _pack_pass1_tokens(predictions, patch_start_idx)
+    pass2_predictions = _build_pass2_predictions(predictions, patch_start_idx)
 
     # Pass-1 dense outputs
     gs_map = predictions["gs_map"][0].to(torch.float16).cpu()
@@ -1079,6 +1104,9 @@ def precompute_one_clip(
         "Ks": clean_state.intrinsics.cpu().to(torch.float32),
         "camera_to_world": clean_state.camera_to_world.cpu().to(torch.float32),
     }
+    del predictions
+    predictions = pass2_predictions
+    _cleanup_cuda(device)
     asset_pass_payload: dict[int, dict[str, Any]] = {}
     asset_pass_result = None
     mode_b_payload: dict[str, Any] | None = None
