@@ -208,6 +208,21 @@ def _aabb_iou(min_a: torch.Tensor, max_a: torch.Tensor, min_b: torch.Tensor, max
     return inter_vol / denom
 
 
+def _bbox_2d_iou(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Compute IoU between two 2D boxes in [x1, y1, x2, y2] format."""
+    x1 = max(float(a[0].item()), float(b[0].item()))
+    y1 = max(float(a[1].item()), float(b[1].item()))
+    x2 = min(float(a[2].item()), float(b[2].item()))
+    y2 = min(float(a[3].item()), float(b[3].item()))
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, float(a[2].item()) - float(a[0].item())) * max(0.0, float(a[3].item()) - float(a[1].item()))
+    area_b = max(0.0, float(b[2].item()) - float(b[0].item())) * max(0.0, float(b[3].item()) - float(b[1].item()))
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0.0 else 0.0
+
+
 def _existing_box_at_frame(obj: dict[str, Any], frame_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     present_mask = obj.get("present_mask")
     if present_mask is not None:
@@ -274,6 +289,26 @@ def _existing_box_at_frame(obj: dict[str, Any], frame_idx: int) -> tuple[torch.T
 
 
 class ModeBPlanner:
+    # Ordered search regions from tight→wide for _sample_base_center_from_camera_xy_shift.
+    _SEARCH_REGIONS_STRICT = (
+        (0.54, 0.76, 0.28, 0.72),
+        (0.50, 0.82, 0.18, 0.82),
+        (0.44, 0.88, 0.08, 0.92),
+        (0.36, 0.92, 0.02, 0.98),
+    )
+    _SEARCH_REGIONS_WIDE = (
+        (0.50, 0.82, 0.18, 0.82),
+        (0.44, 0.88, 0.08, 0.92),
+        (0.36, 0.92, 0.02, 0.98),
+        (0.28, 0.96, 0.00, 1.00),
+    )
+    _SEARCH_REGIONS_ULTRA = (
+        (0.44, 0.88, 0.08, 0.92),
+        (0.36, 0.92, 0.02, 0.98),
+        (0.28, 0.96, 0.00, 1.00),
+        (0.20, 0.98, 0.00, 1.00),
+    )
+
     def __init__(
         self,
         *,
@@ -328,6 +363,9 @@ class ModeBPlanner:
         self.rng_seed = int(rng_seed)
         self.rng = random.Random(self.rng_seed)
         self._scene_point_candidate_cache: dict[int, torch.Tensor] = {}
+        # Tier-adjustable: controls search region style and ground-y margin
+        self._search_region_style: str = "strict"
+        self._ground_y_margin_mult: float = 1.0
 
     def _sample_target_count(self, views: int) -> int:
         if int(views) == 1:
@@ -533,12 +571,12 @@ class ModeBPlanner:
         if int(candidate_mask.sum().item()) == 0:
             return None
 
-        search_regions = (
-            (0.54, 0.76, 0.28, 0.72),
-            (0.50, 0.82, 0.18, 0.82),
-            (0.44, 0.88, 0.08, 0.92),
-            (0.36, 0.92, 0.02, 0.98),
-        )
+        if self._search_region_style == "ultra":
+            search_regions = self._SEARCH_REGIONS_ULTRA
+        elif self._search_region_style == "wide":
+            search_regions = self._SEARCH_REGIONS_WIDE
+        else:
+            search_regions = self._SEARCH_REGIONS_STRICT
         for y0, y1, x0, x1 in search_regions:
             y_lo = int(round(float(height) * y0))
             y_hi = int(round(float(height) * y1))
@@ -579,7 +617,7 @@ class ModeBPlanner:
         points = clean_state.means.detach().cpu().float()
         if ground_y.numel() > 0:
             gy = float(ground_y[min(int(frame_idx), ground_y.numel() - 1)].item())
-            y_margin = max(float(size[2].item()) * 1.0, 0.25)
+            y_margin = max(float(size[2].item()) * 1.0, 0.25) * self._ground_y_margin_mult
             candidate_y = points[candidate_indices, 1]
             near_ground = (candidate_y - gy).abs() <= y_margin
             if int(near_ground.sum().item()) >= 32:
@@ -797,7 +835,6 @@ class ModeBPlanner:
         bboxes = torch.zeros((num_frames, num_views, 4), dtype=torch.float32)
         semantic_overlap = 0
         max_frame_semantic_overlap = 0
-        max_existing_iou = 0.0
         length = float(size[0].item())
         frame_skip_counts: dict[str, int] = {}
 
@@ -805,30 +842,6 @@ class ModeBPlanner:
             frame_skip_counts[reason] = frame_skip_counts.get(reason, 0) + 1
 
         for frame_idx in range(num_frames):
-            rotation = _rotation_from_yaw(float(yaws[frame_idx].item()), dtype=centers.dtype)
-            candidate_corners = build_box_corners(centers[frame_idx], size, rotation)
-            cand_min, cand_max = _aabb_from_corners(candidate_corners)
-
-            for obj in existing_objects:
-                existing = _existing_box_at_frame(obj, frame_idx)
-                if existing is None:
-                    continue
-                ex_center, ex_size, ex_rotation = existing
-                ex_corners = build_box_corners(ex_center, ex_size, ex_rotation)
-                ex_min, ex_max = _aabb_from_corners(ex_corners)
-                iou = _aabb_iou(cand_min, cand_max, ex_min, ex_max)
-                max_existing_iou = max(max_existing_iou, iou)
-                if iou > 0.0:
-                    return False, {"reason": "existing_3d_box_overlap", "existing_box_iou_3d": max_existing_iou}
-
-            for obj in accepted:
-                other_center = obj.center_dggt_per_frame[min(frame_idx, obj.center_dggt_per_frame.shape[0] - 1)]
-                other_size = obj.size_dggt
-                other_yaw = float(obj.yaw_dggt_per_frame[min(frame_idx, obj.yaw_dggt_per_frame.shape[0] - 1)].item())
-                other_corners = build_box_corners(other_center, other_size, _rotation_from_yaw(other_yaw))
-                other_min, other_max = _aabb_from_corners(other_corners)
-                if _aabb_iou(cand_min, cand_max, other_min, other_max) > 0.0:
-                    return False, {"reason": "imagined_3d_box_overlap", "existing_box_iou_3d": max_existing_iou}
 
             for view_idx in range(num_views):
                 image_idx = _image_index(frame_idx, view_idx, num_views, clean_state.images.shape[0])
@@ -901,6 +914,24 @@ class ModeBPlanner:
                 if not self._ground_support_ok(clean_state, bbox, image_idx, image_hw):
                     count_skip("insufficient_ground_support")
                     continue
+                # --- 2D overlap with already-accepted imagined objects ---
+                imagined_2d_overlap = False
+                for obj in accepted:
+                    local_fi = min(frame_idx, obj.bbox_2d_per_view.shape[0] - 1)
+                    if view_idx >= obj.bbox_2d_per_view.shape[1]:
+                        continue
+                    other_bbox = obj.bbox_2d_per_view[local_fi, view_idx]
+                    other_w = float((other_bbox[2] - other_bbox[0]).item())
+                    other_h = float((other_bbox[3] - other_bbox[1]).item())
+                    if other_w <= 0.0 or other_h <= 0.0:
+                        continue
+                    if _bbox_2d_iou(bbox, other_bbox) > 0.0:
+                        imagined_2d_overlap = True
+                        break
+                if imagined_2d_overlap:
+                    count_skip("imagined_2d_box_overlap")
+                    continue
+
                 bboxes[frame_idx, view_idx] = bbox
                 visible[frame_idx, view_idx] = True
                 overlap_bbox = _scale_box_xyxy(bbox, 0.90, image_hw)
@@ -918,7 +949,6 @@ class ModeBPlanner:
                         "reason": "semantic_overlap",
                         "semantic_overlap_px": int(semantic_overlap),
                         "max_frame_semantic_overlap_px": int(max_frame_semantic_overlap),
-                        "existing_box_iou_3d": max_existing_iou,
                     }
 
         keep_frames = _longest_visible_run(visible.any(dim=1))
@@ -927,14 +957,12 @@ class ModeBPlanner:
                 "reason": "no_visible_frames",
                 "visible_frames": 0,
                 "frame_skip_counts": frame_skip_counts,
-                "existing_box_iou_3d": max_existing_iou,
             }
         if self.require_first_frame_visible and not bool(keep_frames[0].item()):
             return False, {
                 "reason": "first_frame_not_visible",
                 "visible_frames": int(keep_frames.sum().item()),
                 "frame_skip_counts": frame_skip_counts,
-                "existing_box_iou_3d": max_existing_iou,
             }
         visible &= keep_frames.view(-1, 1)
         bboxes = bboxes * keep_frames.view(-1, 1, 1).to(dtype=bboxes.dtype)
@@ -944,7 +972,6 @@ class ModeBPlanner:
                 "reason": "too_few_visible_frames",
                 "visible_frames": visible_frames,
                 "frame_skip_counts": frame_skip_counts,
-                "existing_box_iou_3d": max_existing_iou,
             }
 
         return True, {
@@ -952,17 +979,148 @@ class ModeBPlanner:
             "bboxes": bboxes,
             "semantic_overlap_px": int(semantic_overlap),
             "max_frame_semantic_overlap_px": int(max_frame_semantic_overlap),
-            "existing_box_iou_3d": float(max_existing_iou),
             "visible_frames": visible_frames,
         }
 
-    def _view_coverage_ok(self, objects: list[ImaginedObject], num_views: int) -> bool:
+    def _view_coverage_ok(
+        self,
+        objects: list[ImaginedObject],
+        num_views: int,
+        *,
+        min_visible_frames_override: int | None = None,
+    ) -> bool:
         if num_views < 3:
             return True
+        threshold = min_visible_frames_override if min_visible_frames_override is not None else self.min_visible_frames
         for view_idx in range(num_views):
-            if not any(int(obj.visible_in_frame_per_view[view_idx].sum().item()) >= self.min_visible_frames for obj in objects):
+            if not any(int(obj.visible_in_frame_per_view[view_idx].sum().item()) >= threshold for obj in objects):
                 return False
         return True
+
+    _RELAXABLE_ATTR_NAMES = (
+        "min_visible_frames",
+        "min_projected_area_px",
+        "min_projected_transfer_size_px",
+        "max_projected_area_ratio",
+        "max_projected_width_ratio",
+        "max_projected_height_ratio",
+        "min_projected_top_y_ratio",
+        "min_projected_center_y_ratio",
+        "min_projected_bottom_y_ratio",
+        "max_projected_bottom_y_ratio",
+        "min_ground_support_ratio",
+        "max_semantic_overlap_px",
+        "yaw_jitter_deg",
+        "canonical_size_jitter",
+        "max_trials_per_object",
+    )
+    # Non-numeric attributes that are snapshotted / restored separately.
+    _RELAXABLE_NON_NUMERIC = (
+        "_search_region_style",
+        "_ground_y_margin_mult",
+    )
+
+    def _snapshot_relaxable_state(self) -> dict[str, Any]:
+        snap = {name: getattr(self, name) for name in self._RELAXABLE_ATTR_NAMES}
+        for name in self._RELAXABLE_NON_NUMERIC:
+            snap[name] = getattr(self, name)
+        return snap
+
+    def _restore_relaxable_state(self, snapshot: dict[str, Any]) -> None:
+        for name, value in snapshot.items():
+            setattr(self, name, value)
+
+    def _apply_relaxation_overrides(self, overrides: dict[str, Any]) -> None:
+        all_relaxable = set(self._RELAXABLE_ATTR_NAMES) | set(self._RELAXABLE_NON_NUMERIC)
+        for key, value in overrides.items():
+            if key.startswith("__"):
+                continue
+            if key in all_relaxable:
+                setattr(self, key, value)
+
+    def _build_relaxation_tiers(self) -> list[dict[str, Any]]:
+        """Progressively relaxed planner thresholds for fallback passes.
+
+        Tier 0 keeps the configured (strict) thresholds; later tiers loosen
+        size, visibility, and image-position constraints. The "no 3D box
+        overlap with existing or already-accepted targets" rule is enforced
+        unconditionally inside `_validate_candidate`, so it remains in
+        force across every tier.
+
+        The y-axis floors below keep imagined targets grounded — they cannot
+        drift up into the sky.  Later tiers widen the spatial search region
+        in ``_sample_base_center_from_camera_xy_shift`` and loosen the
+        ground-plane proximity margin so that targets can be placed on
+        slightly sloped or elevated surfaces.
+        """
+        return [
+            {"__name__": "strict"},
+            {
+                "__name__": "moderate",
+                "min_visible_frames": max(8, int(round(self.min_visible_frames * 0.6))),
+                "min_projected_area_px": max(36.0, self.min_projected_area_px * 0.6),
+                "min_projected_transfer_size_px": max(64.0, self.min_projected_transfer_size_px * 0.7),
+                "max_projected_area_ratio": min(0.18, self.max_projected_area_ratio * 1.4),
+                "max_projected_width_ratio": min(0.55, self.max_projected_width_ratio * 1.18),
+                "max_projected_height_ratio": min(0.62, self.max_projected_height_ratio * 1.15),
+                "min_projected_top_y_ratio": max(0.12, self.min_projected_top_y_ratio - 0.06),
+                "min_projected_center_y_ratio": max(0.28, self.min_projected_center_y_ratio - 0.06),
+                "min_projected_bottom_y_ratio": max(0.42, self.min_projected_bottom_y_ratio - 0.06),
+                "max_projected_bottom_y_ratio": min(0.96, self.max_projected_bottom_y_ratio + 0.03),
+                "min_ground_support_ratio": max(0.08, self.min_ground_support_ratio * 0.55),
+                "max_semantic_overlap_px": max(self.max_semantic_overlap_px, 64),
+                "yaw_jitter_deg": max(self.yaw_jitter_deg, 45.0),
+                "canonical_size_jitter": min(0.30, max(self.canonical_size_jitter, 0.22)),
+                "max_trials_per_object": max(self.max_trials_per_object, 120),
+                "_search_region_style": "wide",
+                "_ground_y_margin_mult": 1.5,
+            },
+            {
+                "__name__": "aggressive",
+                "min_visible_frames": max(5, int(round(self.min_visible_frames * 0.35))),
+                "min_projected_area_px": max(24.0, self.min_projected_area_px * 0.35),
+                "min_projected_transfer_size_px": max(48.0, self.min_projected_transfer_size_px * 0.5),
+                "max_projected_area_ratio": min(0.24, self.max_projected_area_ratio * 1.8),
+                "max_projected_width_ratio": min(0.62, self.max_projected_width_ratio * 1.30),
+                "max_projected_height_ratio": min(0.68, self.max_projected_height_ratio * 1.25),
+                # Floor y-bounds: bottom must stay below the horizon, top cannot rise into sky.
+                "min_projected_top_y_ratio": max(0.10, self.min_projected_top_y_ratio - 0.10),
+                "min_projected_center_y_ratio": max(0.25, self.min_projected_center_y_ratio - 0.10),
+                "min_projected_bottom_y_ratio": max(0.40, self.min_projected_bottom_y_ratio - 0.10),
+                "max_projected_bottom_y_ratio": min(0.98, self.max_projected_bottom_y_ratio + 0.05),
+                "min_ground_support_ratio": max(0.05, self.min_ground_support_ratio * 0.30),
+                "max_semantic_overlap_px": max(self.max_semantic_overlap_px, 256),
+                "yaw_jitter_deg": max(self.yaw_jitter_deg, 60.0),
+                "canonical_size_jitter": min(0.40, max(self.canonical_size_jitter, 0.30)),
+                "max_trials_per_object": max(self.max_trials_per_object, 160),
+                "_search_region_style": "wide",
+                "_ground_y_margin_mult": 2.0,
+            },
+            {
+                "__name__": "ultra",
+                # Ultra-aggressive: accept nearly anything that doesn't overlap
+                # an existing 3D box. These targets may be small, partially
+                # visible, or near image borders — but they still sit on valid
+                # scene geometry and cannot float above the horizon.
+                "min_visible_frames": max(3, int(round(self.min_visible_frames * 0.20))),
+                "min_projected_area_px": max(16.0, self.min_projected_area_px * 0.20),
+                "min_projected_transfer_size_px": max(32.0, self.min_projected_transfer_size_px * 0.35),
+                "max_projected_area_ratio": min(0.30, self.max_projected_area_ratio * 2.5),
+                "max_projected_width_ratio": min(0.70, self.max_projected_width_ratio * 1.50),
+                "max_projected_height_ratio": min(0.75, self.max_projected_height_ratio * 1.40),
+                "min_projected_top_y_ratio": max(0.08, self.min_projected_top_y_ratio - 0.14),
+                "min_projected_center_y_ratio": max(0.20, self.min_projected_center_y_ratio - 0.15),
+                "min_projected_bottom_y_ratio": max(0.35, self.min_projected_bottom_y_ratio - 0.15),
+                "max_projected_bottom_y_ratio": min(0.99, self.max_projected_bottom_y_ratio + 0.07),
+                "min_ground_support_ratio": max(0.02, self.min_ground_support_ratio * 0.15),
+                "max_semantic_overlap_px": max(self.max_semantic_overlap_px, 512),
+                "yaw_jitter_deg": max(self.yaw_jitter_deg, 90.0),
+                "canonical_size_jitter": min(0.50, max(self.canonical_size_jitter, 0.40)),
+                "max_trials_per_object": max(self.max_trials_per_object, 200),
+                "_search_region_style": "ultra",
+                "_ground_y_margin_mult": 3.0,
+            },
+        ]
 
     def plan(
         self,
@@ -986,94 +1144,133 @@ class ModeBPlanner:
             ground_y = torch.zeros((num_frames,), dtype=torch.float32)
 
         accepted: list[ImaginedObject] = []
+        accepted_tier_assignment: list[str] = []
         rejection_counts: dict[str, int] = {}
         rejection_counts_by_shrink: dict[str, dict[str, int]] = {}
+        rejection_counts_by_tier: dict[str, dict[str, int]] = {}
+        accepted_per_tier: dict[str, int] = {}
+        trials_per_tier: dict[str, int] = {}
         frame_skip_counts_by_rejection: dict[str, dict[str, int]] = {}
         best_too_few_visible_frames = 0
         best_too_few_skip_counts: dict[str, int] = {}
-        shrink_factors = (1.0, 0.7, 0.5, 0.35, 0.25, 0.18)
-        for slot in range(target_count):
-            accepted_obj = None
-            for shrink in shrink_factors:
-                shrink_key = f"{shrink:.2f}"
-                rejection_counts_by_shrink.setdefault(shrink_key, {})
-                for trial in range(self.max_trials_per_object):
-                    size = self._sample_size(existing_objects) * float(shrink)
-                    base_center, base_frame_idx, image_idx = self._sample_base_center(
-                        clean_state,
-                        size,
-                        ground_y,
-                        num_frames,
-                        num_views,
-                        view_hint=slot + trial,
-                    )
-                    forward = clean_state.camera_to_world[image_idx, :3, 2].detach().cpu().float()
-                    yaw = _yaw_from_forward(forward)
-                    yaw += math.radians(self.rng.uniform(-self.yaw_jitter_deg, self.yaw_jitter_deg))
-                    if self.rng.random() < 0.5:
-                        yaw += math.pi
-                    motion_mode = self._sample_motion_mode(camera_motion_level)
-                    occluder_profile = self._sample_occluder_profile()
-                    centers, yaws = self._build_motion(
-                        clean_state,
-                        base_center,
-                        base_frame_idx,
-                        yaw,
-                        size,
-                        motion_mode,
-                        ground_y,
-                        num_frames,
-                        num_views,
-                    )
-                    ok, info = self._validate_candidate(
-                        clean_state,
-                        centers,
-                        yaws,
-                        size,
-                        existing_objects,
-                        accepted,
-                        num_views,
-                        occluder_profile=occluder_profile,
-                    )
-                    if not ok:
-                        reason = str(info.get("reason", "unknown"))
-                        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-                        shrink_counts = rejection_counts_by_shrink[shrink_key]
-                        shrink_counts[reason] = shrink_counts.get(reason, 0) + 1
-                        frame_skip_counts = info.get("frame_skip_counts", {})
-                        if isinstance(frame_skip_counts, dict):
-                            reason_frame_counts = frame_skip_counts_by_rejection.setdefault(reason, {})
-                            for skip_reason, count in frame_skip_counts.items():
-                                skip_key = str(skip_reason)
-                                reason_frame_counts[skip_key] = reason_frame_counts.get(skip_key, 0) + int(count)
-                        if reason == "too_few_visible_frames":
-                            visible_frames = int(info.get("visible_frames", 0))
-                            if visible_frames >= best_too_few_visible_frames:
-                                best_too_few_visible_frames = visible_frames
-                                best_too_few_skip_counts = dict(info.get("frame_skip_counts", {}))
-                        continue
-                    accepted_obj = ImaginedObject(
-                        slot=slot,
-                        motion_mode=motion_mode,
-                        size_dggt=size.detach().cpu().float(),
-                        center_dggt_per_frame=centers.detach().cpu().float(),
-                        yaw_dggt_per_frame=yaws.detach().cpu().float(),
-                        visible_in_frame_per_view=info["visible"].T.contiguous(),
-                        bbox_2d_per_view=info["bboxes"].contiguous(),
-                        semantic_overlap_px=int(info["semantic_overlap_px"]),
-                        existing_box_iou_3d=float(info["existing_box_iou_3d"]),
-                        occluder_profile=occluder_profile,
-                    )
+        shrink_factors = (1.0, 0.7, 0.5, 0.35, 0.25, 0.18, 0.12)
+        relaxation_tiers = self._build_relaxation_tiers()
+        snapshot = self._snapshot_relaxable_state()
+        try:
+            for tier in relaxation_tiers:
+                tier_name = str(tier.get("__name__", "tier"))
+                rejection_counts_by_tier.setdefault(tier_name, {})
+                accepted_per_tier.setdefault(tier_name, 0)
+                trials_per_tier.setdefault(tier_name, 0)
+                if len(accepted) >= target_count:
                     break
-                if accepted_obj is not None:
-                    break
-            if accepted_obj is not None:
-                accepted.append(accepted_obj)
+                self._restore_relaxable_state(snapshot)
+                self._apply_relaxation_overrides(tier)
+                for slot in range(len(accepted), target_count):
+                    accepted_obj = None
+                    for shrink in shrink_factors:
+                        shrink_key = f"{shrink:.2f}"
+                        rejection_counts_by_shrink.setdefault(shrink_key, {})
+                        for trial in range(self.max_trials_per_object):
+                            trials_per_tier[tier_name] += 1
+                            size = self._sample_size(existing_objects) * float(shrink)
+                            base_center, base_frame_idx, image_idx = self._sample_base_center(
+                                clean_state,
+                                size,
+                                ground_y,
+                                num_frames,
+                                num_views,
+                                view_hint=slot + trial,
+                            )
+                            forward = clean_state.camera_to_world[image_idx, :3, 2].detach().cpu().float()
+                            yaw = _yaw_from_forward(forward)
+                            yaw += math.radians(self.rng.uniform(-self.yaw_jitter_deg, self.yaw_jitter_deg))
+                            if self.rng.random() < 0.5:
+                                yaw += math.pi
+                            motion_mode = self._sample_motion_mode(camera_motion_level)
+                            occluder_profile = self._sample_occluder_profile()
+                            centers, yaws = self._build_motion(
+                                clean_state,
+                                base_center,
+                                base_frame_idx,
+                                yaw,
+                                size,
+                                motion_mode,
+                                ground_y,
+                                num_frames,
+                                num_views,
+                            )
+                            ok, info = self._validate_candidate(
+                                clean_state,
+                                centers,
+                                yaws,
+                                size,
+                                existing_objects,
+                                accepted,
+                                num_views,
+                                occluder_profile=occluder_profile,
+                            )
+                            if not ok:
+                                reason = str(info.get("reason", "unknown"))
+                                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                                shrink_counts = rejection_counts_by_shrink[shrink_key]
+                                shrink_counts[reason] = shrink_counts.get(reason, 0) + 1
+                                tier_counts = rejection_counts_by_tier[tier_name]
+                                tier_counts[reason] = tier_counts.get(reason, 0) + 1
+                                frame_skip_counts = info.get("frame_skip_counts", {})
+                                if isinstance(frame_skip_counts, dict):
+                                    reason_frame_counts = frame_skip_counts_by_rejection.setdefault(reason, {})
+                                    for skip_reason, count in frame_skip_counts.items():
+                                        skip_key = str(skip_reason)
+                                        reason_frame_counts[skip_key] = reason_frame_counts.get(skip_key, 0) + int(count)
+                                if reason == "too_few_visible_frames":
+                                    visible_frames = int(info.get("visible_frames", 0))
+                                    if visible_frames >= best_too_few_visible_frames:
+                                        best_too_few_visible_frames = visible_frames
+                                        best_too_few_skip_counts = dict(info.get("frame_skip_counts", {}))
+                                continue
+                            accepted_obj = ImaginedObject(
+                                slot=slot,
+                                motion_mode=motion_mode,
+                                size_dggt=size.detach().cpu().float(),
+                                center_dggt_per_frame=centers.detach().cpu().float(),
+                                yaw_dggt_per_frame=yaws.detach().cpu().float(),
+                                visible_in_frame_per_view=info["visible"].T.contiguous(),
+                                bbox_2d_per_view=info["bboxes"].contiguous(),
+                                semantic_overlap_px=int(info["semantic_overlap_px"]),
+                                occluder_profile=occluder_profile,
+                            )
+                            break
+                        if accepted_obj is not None:
+                            break
+                    if accepted_obj is not None:
+                        accepted.append(accepted_obj)
+                        accepted_tier_assignment.append(tier_name)
+                        accepted_per_tier[tier_name] += 1
+        finally:
+            self._restore_relaxable_state(snapshot)
+
+        # For the eligibility check, use the most relaxed min_visible_frames
+        # that was actually applied to any tier that contributed accepted
+        # objects.  This prevents the strict snapshot value from rejecting
+        # objects that were accepted under a relaxed tier.
+        min_vis_for_coverage = int(self.min_visible_frames)
+        if accepted_tier_assignment:
+            tier_min_vis = {}
+            for tier in relaxation_tiers:
+                tname = str(tier.get("__name__", "tier"))
+                tier_min_vis[tname] = int(tier.get("min_visible_frames", self.min_visible_frames))
+            used_tiers = set(accepted_tier_assignment)
+            min_vis_for_coverage = min(tier_min_vis.get(t, min_vis_for_coverage) for t in used_tiers)
 
         min_count = 1 if num_views == 1 else 3
-        eligible = len(accepted) >= min_count and self._view_coverage_ok(accepted, num_views)
+        eligible = len(accepted) >= min_count and self._view_coverage_ok(
+            accepted, num_views, min_visible_frames_override=min_vis_for_coverage,
+        )
         rejection_reason = "" if eligible else "too_few_accepted_objects"
-        if len(accepted) >= min_count and not self._view_coverage_ok(accepted, num_views):
+        if len(accepted) >= min_count and not self._view_coverage_ok(
+            accepted, num_views, min_visible_frames_override=min_vis_for_coverage,
+        ):
             rejection_reason = "view_coverage_failed"
 
         return ModeBPlan(
@@ -1109,6 +1306,11 @@ class ModeBPlanner:
                 "best_rejected_visible_frames": int(best_too_few_visible_frames),
                 "best_rejected_frame_skip_counts": best_too_few_skip_counts,
                 "rejection_counts_by_shrink": rejection_counts_by_shrink,
+                "rejection_counts_by_tier": rejection_counts_by_tier,
+                "accepted_per_tier": accepted_per_tier,
+                "trials_per_tier": trials_per_tier,
+                "accepted_tier_assignment": list(accepted_tier_assignment),
+                "relaxation_tier_names": [str(t.get("__name__", "")) for t in relaxation_tiers],
                 "frame_skip_counts_by_rejection": frame_skip_counts_by_rejection,
             },
         )

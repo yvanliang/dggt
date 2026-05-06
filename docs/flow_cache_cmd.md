@@ -97,8 +97,9 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python tools/precompute_flow_features.py \
 
 如果要对一个 Mode B 样本做临时可视化（想象框叠加 + 伪删除点云渲染 + D_map）：
 ```bash
-CUDA_VISIBLE_DEVICES=3 python inference_mode_b.py --output_dir runs/mode_a_all_vis \
-    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt
+CUDA_VISIBLE_DEVICES=3 python inference_mode_b.py --output_dir runs/mode_b_all_vis \
+    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+     --planner_seed 0
 # 输出：runs/mode_a_all_vis/{imagined_boxes_overlay, deleted_render_grid,
 #          d_map_grid, mode_b_summary.json, mode_b_dmap.pt}
 ```
