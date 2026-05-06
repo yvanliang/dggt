@@ -11,6 +11,7 @@ opacities) is detached inside this module.
 """
 from __future__ import annotations
 
+import math
 from typing import Mapping, Sequence
 
 import torch
@@ -22,6 +23,12 @@ from dggt.models.gaussian_pointers import (
     SCENE_OBJECT_ID,
     SRC_KIND_ASSET,
     SRC_KIND_SCENE,
+)
+from gsplat.cuda._wrapper import (
+    fully_fused_projection,
+    isect_offset_encode,
+    isect_tiles,
+    rasterize_to_pixels,
 )
 from gsplat.rendering import rasterization
 
@@ -72,6 +79,7 @@ class FeatureSplatter(nn.Module):
         H: int,
         W: int,
         pool_to: int | None = 37,
+        tile_masks: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         """Splat features per level.
 
@@ -100,6 +108,10 @@ class FeatureSplatter(nn.Module):
         pool_to
             Target patch grid, either an int for square grids or `(H, W)`.
             `None` skips pooling and returns full resolution.
+        tile_masks
+            Optional bool tensor `[B, S, tile_h, tile_w]`. When provided,
+            gsplat skips raster work for inactive tiles. Inactive pixels render
+            as zero; callers must only use those splat values where acceptable.
 
         Returns
         -------
@@ -114,6 +126,13 @@ class FeatureSplatter(nn.Module):
         viewmats = cameras_dggt["viewmats"]  # [B, S, 4, 4]
         Ks = cameras_dggt["Ks"]              # [B, S, 3, 3]
         S = viewmats.shape[1]
+        if tile_masks is not None:
+            if tile_masks.dim() != 4 or tile_masks.shape[:2] != (B, S):
+                raise ValueError(
+                    f"tile_masks must be [B,S,tile_h,tile_w] with B,S={(B, S)}, "
+                    f"got {tuple(tile_masks.shape)}"
+                )
+            tile_masks = tile_masks.to(device=viewmats.device, dtype=torch.bool)
 
         if pool_to is not None:
             pool_h, pool_w = self._normalize_grid(pool_to)
@@ -145,6 +164,7 @@ class FeatureSplatter(nn.Module):
                 H=H,
                 W=W,
                 pool_to=pool_to,
+                tile_mask=None if tile_masks is None else tile_masks[b],
             )
 
             for l in range(self.num_levels):
@@ -167,6 +187,7 @@ class FeatureSplatter(nn.Module):
         H: int,
         W: int,
         pool_to: int | tuple[int, int] | None,
+        tile_mask: torch.Tensor | None = None,                 # [S, tile_h, tile_w]
     ) -> list[torch.Tensor]:
         device = viewmats.device
 
@@ -213,6 +234,7 @@ class FeatureSplatter(nn.Module):
                 H=H,
                 W=W,
                 pool_to=pool_to,
+                tile_mask=tile_mask,
             )
             rendered_levels.append(rendered)
 
@@ -282,32 +304,146 @@ class FeatureSplatter(nn.Module):
         H: int,
         W: int,
         pool_to: int | tuple[int, int] | None,
+        tile_mask: torch.Tensor | None = None,  # [S, tile_h, tile_w]
     ) -> torch.Tensor:
         C = flat_lut.shape[-1]
+        if tile_mask is not None and not bool(tile_mask.any().item()):
+            if pool_to is None:
+                return torch.zeros((viewmats.shape[0], H, W, C), dtype=flat_lut.dtype, device=viewmats.device)
+            pool_h, pool_w = self._normalize_grid(pool_to)
+            return torch.zeros((viewmats.shape[0], pool_h * pool_w, C), dtype=flat_lut.dtype, device=viewmats.device)
+
         chunks: list[torch.Tensor] = []
         for start in range(0, C, self.chunk_channels):
             end = min(start + self.chunk_channels, C)
             # Gather only the channel slice currently being rasterized. This avoids
             # materializing [N_gaussians, 3072], which is the dominant memory spike.
             colors_chunk = flat_lut[:, start:end].index_select(0, global_idx).contiguous()
-            rendered_chunk, _, _ = rasterization(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,
-                colors=colors_chunk,
-                viewmats=viewmats.float(),
-                Ks=Ks.float(),
-                width=int(W),
-                height=int(H),
-                render_mode="RGB",
-                channel_chunk=int(end - start),
-            )  # [S, H, W, end-start]
+            if tile_mask is None:
+                rendered_chunk, _, _ = rasterization(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=colors_chunk,
+                    viewmats=viewmats.float(),
+                    Ks=Ks.float(),
+                    width=int(W),
+                    height=int(H),
+                    render_mode="RGB",
+                    channel_chunk=int(end - start),
+                )  # [S, H, W, end-start]
+            else:
+                rendered_chunk = self._rasterize_chunk_with_tile_mask(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=colors_chunk,
+                    viewmats=viewmats.float(),
+                    Ks=Ks.float(),
+                    H=H,
+                    W=W,
+                    tile_mask=tile_mask,
+                )
             if pool_to is not None:
                 rendered_chunk = self._area_pool(rendered_chunk, pool_to)
             chunks.append(rendered_chunk)
             del colors_chunk
         return torch.cat(chunks, dim=-1)  # [S, H, W, C] or [S, P, C]
+
+    @staticmethod
+    def _rasterize_chunk_with_tile_mask(
+        *,
+        means: torch.Tensor,
+        quats: torch.Tensor,
+        scales: torch.Tensor,
+        opacities: torch.Tensor,
+        colors: torch.Tensor,
+        viewmats: torch.Tensor,
+        Ks: torch.Tensor,
+        H: int,
+        W: int,
+        tile_mask: torch.Tensor,
+        tile_size: int = 16,
+    ) -> torch.Tensor:
+        """gsplat RGB rasterization with a tile mask.
+
+        This mirrors `gsplat.rendering.rasterization(..., packed=True,
+        render_mode="RGB")` for the subset used by FeatureSplatter, but exposes
+        the low-level `masks` argument of `rasterize_to_pixels`.
+        """
+        S = int(viewmats.shape[0])
+        N = int(means.shape[0])
+        C = int(colors.shape[-1])
+        device = means.device
+        tile_h = math.ceil(int(H) / float(tile_size))
+        tile_w = math.ceil(int(W) / float(tile_size))
+        if tuple(tile_mask.shape) != (S, tile_h, tile_w):
+            raise ValueError(
+                f"tile_mask must be {(S, tile_h, tile_w)}, got {tuple(tile_mask.shape)}"
+            )
+
+        proj = fully_fused_projection(
+            means,
+            None,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            int(W),
+            int(H),
+            eps2d=0.3,
+            packed=True,
+            near_plane=0.01,
+            far_plane=1e10,
+            radius_clip=0.0,
+            sparse_grad=False,
+            calc_compensations=False,
+            camera_model="pinhole",
+            opacities=opacities,
+        )
+        batch_ids, camera_ids, gaussian_ids, radii, means2d, depths, conics, _ = proj
+        if gaussian_ids.numel() == 0:
+            return torch.zeros((S, H, W, C), dtype=colors.dtype, device=device)
+
+        image_ids = batch_ids * S + camera_ids
+        packed_opacities = opacities.view(1, N)[batch_ids, gaussian_ids]
+        packed_colors = colors.view(1, N, C)[batch_ids, gaussian_ids]
+        _tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
+            means2d,
+            radii,
+            depths,
+            int(tile_size),
+            int(tile_w),
+            int(tile_h),
+            segmented=False,
+            packed=True,
+            n_images=S,
+            image_ids=image_ids,
+            gaussian_ids=gaussian_ids,
+        )
+        if isect_ids.numel() == 0:
+            return torch.zeros((S, H, W, C), dtype=colors.dtype, device=device)
+        isect_offsets = isect_offset_encode(isect_ids, S, int(tile_w), int(tile_h)).reshape(
+            S, tile_h, tile_w
+        )
+        rendered, _alphas = rasterize_to_pixels(
+            means2d,
+            conics,
+            packed_colors.contiguous(),
+            packed_opacities,
+            int(W),
+            int(H),
+            int(tile_size),
+            isect_offsets,
+            flatten_ids,
+            backgrounds=None,
+            masks=tile_mask.to(device=device, dtype=torch.bool),
+            packed=True,
+            absgrad=False,
+        )
+        return rendered
 
     @staticmethod
     def _normalize_grid(grid: int | tuple[int, int]) -> tuple[int, int]:

@@ -141,6 +141,38 @@ def test_chunked_equals_unchunked():
     assert diff < 1e-4, f"chunked vs full max diff {diff} > 1e-4"
 
 
+def test_tile_mask_all_true_matches_unmasked_and_all_false_is_zero():
+    device = torch.device("cuda")
+    C = 8
+    splatter = FeatureSplatter(channels=C, chunk_channels=C, num_levels=1, patch_grid=(37, 37))
+
+    gauss = _make_scene_gaussian(device)
+    ptr = _trivial_pointers(n=1, device=device)
+    lut = torch.randn((1, 1, 1369, C), device=device)
+    viewmat, K = _make_camera(74, 74, device)
+    cameras = {"viewmats": viewmat.unsqueeze(0), "Ks": K.unsqueeze(0)}
+
+    out_full = splatter(
+        gaussians_dggt=[gauss], pointers=[ptr], lut_scene=[lut],
+        lut_asset_dict=None, cameras_dggt=cameras, H=74, W=74, pool_to=37,
+    )[0]
+    tile_h = (74 + 15) // 16
+    tile_w = (74 + 15) // 16
+    out_masked = splatter(
+        gaussians_dggt=[gauss], pointers=[ptr], lut_scene=[lut],
+        lut_asset_dict=None, cameras_dggt=cameras, H=74, W=74, pool_to=37,
+        tile_masks=torch.ones((1, 1, tile_h, tile_w), dtype=torch.bool, device=device),
+    )[0]
+    assert (out_full - out_masked).abs().max().item() < 1e-4
+
+    out_zero = splatter(
+        gaussians_dggt=[gauss], pointers=[ptr], lut_scene=[lut],
+        lut_asset_dict=None, cameras_dggt=cameras, H=74, W=74, pool_to=37,
+        tile_masks=torch.zeros((1, 1, tile_h, tile_w), dtype=torch.bool, device=device),
+    )[0]
+    assert out_zero.abs().max().item() == 0.0
+
+
 def test_invisible_gaussian_contributes_zero():
     device = torch.device("cuda")
     splatter = FeatureSplatter(channels=4, chunk_channels=4, num_levels=1, patch_grid=(37, 37))

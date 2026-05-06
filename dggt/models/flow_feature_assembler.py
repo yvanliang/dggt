@@ -675,6 +675,7 @@ class FlowFeatureAssembler(nn.Module):
             # Defensive: if Gaussian count drifted (it shouldn't — Pass1 is
             # deterministic), fall back to "delete nothing" to keep training going.
             delete_mask = torch.zeros((n_g,), dtype=torch.bool)
+        mode_b_noop = not bool(delete_mask.any().item())
         clean_dict = {
             "means": clean_state.means.to(device),
             "colors": clean_state.colors.to(device),
@@ -709,12 +710,18 @@ class FlowFeatureAssembler(nn.Module):
         F_g_lut_scene = self._select_lut_scene(predictions)
 
         # Phase 2: Splat scene tokens onto kept Gaussians only.
-        cameras_splat = self.scale_cameras_for_render(
-            cameras_dggt,
-            source_hw=(H_img, W_img),
-            target_hw=(self.H_splat, self.W_splat),
-        )
-        if splatted_tok_low_cached is None:
+        if mode_b_noop:
+            # No imagined/deleted region means Mode B is a true no-op for this
+            # frame subset.  Re-splatting the clean scene would still alter
+            # low-coverage/sky tokens through K/(K+eps), so bypass it exactly.
+            splatted_tok_low = [t.to(device=device) for t in F_g_lut_scene]
+        else:
+            cameras_splat = self.scale_cameras_for_render(
+                cameras_dggt,
+                source_hw=(H_img, W_img),
+                target_hw=(self.H_splat, self.W_splat),
+            )
+        if (not mode_b_noop) and splatted_tok_low_cached is None:
             splatted_tok_low = self.feature_splatter(
                 gaussians_dggt=[gauss_kept],
                 pointers=[pointers_all],
@@ -725,7 +732,7 @@ class FlowFeatureAssembler(nn.Module):
                 W=self.W_splat,
                 pool_to=self.patch_grid,
             )
-        else:
+        elif not mode_b_noop:
             # Schema v6 fast path: post-blend splatted_tok_low is cached.
             # tokenizer.encode below still runs live so z_clean / z_splat use
             # the latest tokenizer weights.
@@ -740,22 +747,37 @@ class FlowFeatureAssembler(nn.Module):
         # D = 0. Soft-normalize → M_preserve, M_source(=0), M_dest.
         # NOTE: soft_mask is cheap (~36ms) and produces M_preserve/M_dest
         # which are first-class WAN inputs, so we keep this even on fast path.
-        K_map, _D_map_dummy, I_map_proxy, _ = self.soft_mask.render_coverage(
-            G_kept=[gauss_kept],
-            G_deleted=[{}],
-            G_asset_dggt_dict=[{0: gauss_imagined}] if gauss_imagined["means"].numel() > 0 else [{}],
-            cameras_dggt=cameras_dggt,
-            H=H_img,
-            W=W_img,
-        )
-        D_map = torch.zeros_like(I_map_proxy)
-        I_map = I_map_proxy
-        I_per_obj: list[dict[int, torch.Tensor]] = [{}]
+        B = int(F_g_lut_scene[0].shape[0])
+        S = int(F_g_lut_scene[0].shape[1])
+        if mode_b_noop:
+            K_map = torch.ones((B, S, H_img, W_img, 1), dtype=torch.float32, device=device)
+            D_map = torch.zeros_like(K_map)
+            I_map = torch.zeros_like(K_map)
+            I_per_obj: list[dict[int, torch.Tensor]] = [{} for _ in range(B)]
+            M_preserve = torch.ones(
+                (B, S, self.patch_grid[0] * self.patch_grid[1], 1),
+                dtype=torch.float32,
+                device=device,
+            )
+            M_source = torch.zeros_like(M_preserve)
+            M_dest = torch.zeros_like(M_preserve)
+        else:
+            K_map, _D_map_dummy, I_map_proxy, _ = self.soft_mask.render_coverage(
+                G_kept=[gauss_kept],
+                G_deleted=[{}],
+                G_asset_dggt_dict=[{0: gauss_imagined}],
+                cameras_dggt=cameras_dggt,
+                H=H_img,
+                W=W_img,
+            )
+            D_map = torch.zeros_like(I_map_proxy)
+            I_map = I_map_proxy
+            I_per_obj = [{}]
 
-        M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
-            K_map, D_map, I_map, target_grid=self.patch_grid
-        )
-        if splatted_tok_low_cached is None:
+            M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
+                K_map, D_map, I_map, target_grid=self.patch_grid
+            )
+        if (not mode_b_noop) and splatted_tok_low_cached is None:
             splatted_tok_low = self._blend_preserve_tokens(
                 clean_levels=F_g_lut_scene,
                 splatted_levels=splatted_tok_low,
@@ -764,8 +786,6 @@ class FlowFeatureAssembler(nn.Module):
         # Cached path already includes the preserve blend — no-op here.
 
         # Scaffold (D_edited not meaningful for mode B — pass zeros).
-        B = int(F_g_lut_scene[0].shape[0])
-        S = int(F_g_lut_scene[0].shape[1])
         D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
         A_edited_hires = (K_map + I_map).clamp(0.0, 1.0)
         dyn_prior = torch.sigmoid(
@@ -792,7 +812,9 @@ class FlowFeatureAssembler(nn.Module):
         # share the latest tokenizer weights.  The cache only stores the input
         # to tokenizer.encode (post-blend splatted_tok_low).
         z_clean = self.scene_tokenizer.encode(F_g_lut_scene, patch_grid=self.patch_grid)
-        z_splat = self.scene_tokenizer.encode(splatted_tok_low, patch_grid=self.patch_grid)
+        z_splat = z_clean if mode_b_noop else self.scene_tokenizer.encode(
+            splatted_tok_low, patch_grid=self.patch_grid
+        )
         if z_splat.shape != z_clean.shape:
             raise ValueError(
                 f"z_splat shape {tuple(z_splat.shape)} does not match "

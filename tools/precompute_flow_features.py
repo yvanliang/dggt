@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import math
 import os
 import sys
 import threading
@@ -670,6 +671,69 @@ def _run_mode_a_asset_pass(
 # Schema v6 helpers — phase1_localized + pass2_splatted_tok_low           #
 # ---------------------------------------------------------------------- #
 
+ACTIVE_SPLAT_THRESHOLD = 1e-3
+GSPLAT_TILE_SIZE = 16
+
+
+def _splat_weight_to_tile_masks(
+    splat_weight: torch.Tensor,
+    *,
+    threshold: float = ACTIVE_SPLAT_THRESHOLD,
+    patch_grid: tuple[int, int],
+    H_splat: int,
+    W_splat: int,
+    tile_size: int = GSPLAT_TILE_SIZE,
+) -> torch.Tensor:
+    """Convert per-token splat contribution `[B,S,P,1]` into gsplat tile masks."""
+    if splat_weight.dim() != 4 or splat_weight.shape[-1] != 1:
+        raise ValueError(f"splat_weight must be [B,S,P,1], got {tuple(splat_weight.shape)}")
+    B, S, P, _ = splat_weight.shape
+    patch_h, patch_w = int(patch_grid[0]), int(patch_grid[1])
+    if int(P) != patch_h * patch_w:
+        raise ValueError(f"splat_weight P={int(P)} does not match patch_grid={patch_grid}")
+    if H_splat % patch_h != 0 or W_splat % patch_w != 0:
+        raise ValueError(f"splat size {(H_splat, W_splat)} must be divisible by patch_grid={patch_grid}")
+
+    active = splat_weight[..., 0].detach() > float(threshold)
+    active_grid = active.reshape(B, S, patch_h, patch_w)
+    tile_h = math.ceil(int(H_splat) / float(tile_size))
+    tile_w = math.ceil(int(W_splat) / float(tile_size))
+    pix_h = int(H_splat) // patch_h
+    pix_w = int(W_splat) // patch_w
+    tile_masks = torch.zeros((B, S, tile_h, tile_w), dtype=torch.bool, device=active.device)
+    for ty in range(tile_h):
+        y0 = int(ty * tile_size)
+        y1 = min(int((ty + 1) * tile_size), int(H_splat))
+        py0 = max(0, min(patch_h, y0 // pix_h))
+        py1 = max(py0, min(patch_h, math.ceil(y1 / float(pix_h))))
+        for tx in range(tile_w):
+            x0 = int(tx * tile_size)
+            x1 = min(int((tx + 1) * tile_size), int(W_splat))
+            px0 = max(0, min(patch_w, x0 // pix_w))
+            px1 = max(px0, min(patch_w, math.ceil(x1 / float(pix_w))))
+            if py1 > py0 and px1 > px0:
+                tile_masks[:, :, ty, tx] = active_grid[:, :, py0:py1, px0:px1].any(dim=(-1, -2))
+    return tile_masks
+
+
+def _mode_a_splat_weight(
+    *,
+    assembler,
+    M_preserve: torch.Tensor,
+    I_per_obj: list[dict[int, torch.Tensor]],
+) -> torch.Tensor:
+    """Final Mode-A weight multiplying FeatureSplatter after preserve+asset blends."""
+    asset_weight = torch.zeros_like(M_preserve)
+    for b, per_obj in enumerate(I_per_obj):
+        for alpha_hires in per_obj.values():
+            alpha_tok = assembler.soft_mask._area_pool_to_grid(
+                alpha_hires.unsqueeze(0).to(dtype=M_preserve.dtype),
+                assembler.patch_grid,
+            ).clamp(0.0, 1.0)
+            asset_weight[b : b + 1] = asset_weight[b : b + 1] + alpha_tok[0:1]
+    asset_blend = (asset_weight / float(assembler.asset_token_full_alpha)).clamp(0.0, 1.0)
+    return (1.0 - M_preserve).clamp(0.0, 1.0) * (1.0 - asset_blend)
+
 
 def _pack_phase1_localized(
     localized_objects: list,
@@ -858,36 +922,9 @@ def _compute_and_pack_pass2_splatted_tok_low(
     cameras_dggt_dev = {k: v.to(device) for k, v in cameras_dggt_b.items()}
 
     with torch.no_grad():
-        # The splatter rasterizes ALL frames in one gsplat call. For full clips
-        # (S=29) with millions of Gaussians the intermediate index tensors can
-        # OOM (>40 GiB), so chunk frames into groups of `frame_chunk` and
-        # concat. Per-frame splat is independent — chunking is exact.
-        S_total = int(F_g_lut_scene[0].shape[1])
-        frame_chunk = 2
-        splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(assembler.num_levels)]
-        for fs in range(0, S_total, frame_chunk):
-            fe = min(fs + frame_chunk, S_total)
-            # Only target cameras are frame-chunked. The LUT S dimension is
-            # indexed by GaussianPointers.view_n (source frame), so slicing it
-            # would change the token assigned to gaussians outside this target
-            # camera chunk.
-            lut_asset_chunk = F_g_lut_asset if len(F_g_lut_asset) > 0 else None
-            cameras_splat_chunk = {k: v[:, fs:fe].contiguous() for k, v in cameras_splat.items()}
-            chunk_out = assembler.feature_splatter(
-                gaussians_dggt=[gaussians_all],
-                pointers=[pointers_all],
-                lut_scene=F_g_lut_scene,
-                lut_asset_dict=lut_asset_chunk,
-                cameras_dggt=cameras_splat_chunk,
-                H=H_splat,
-                W=W_splat,
-                pool_to=patch_grid,
-            )
-            for lvl_idx, lvl_tensor in enumerate(chunk_out):
-                splatted_levels[lvl_idx].append(lvl_tensor)
-        splatted_tok_low = [torch.cat(parts, dim=1) for parts in splatted_levels]
-
-        # Soft mask coverage (needed for blend), per-object alpha for asset blend.
+        # Soft masks are cheap and define where the final post-blend feature
+        # actually depends on FeatureSplatter.  Compute them before splatting
+        # so inactive target tiles can be skipped by gsplat.
         G_kept_list = [gauss_scene_kept]
         G_deleted_list = [
             {k: v[edit_state.delete_mask].to(device) for k, v in gauss_scene.items()}
@@ -911,6 +948,50 @@ def _compute_and_pack_pass2_splatted_tok_low(
         M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=patch_grid
         )
+        splat_weight = _mode_a_splat_weight(
+            assembler=assembler,
+            M_preserve=M_preserve,
+            I_per_obj=I_per_obj,
+        )
+        active_tile_masks = _splat_weight_to_tile_masks(
+            splat_weight,
+            threshold=ACTIVE_SPLAT_THRESHOLD,
+            patch_grid=patch_grid,
+            H_splat=H_splat,
+            W_splat=W_splat,
+        )
+
+        # The splatter rasterizes ALL frames in one gsplat call. For full clips
+        # (S=29) with millions of Gaussians the intermediate index tensors can
+        # OOM (>40 GiB), so chunk frames into groups of `frame_chunk` and
+        # concat. Per-frame splat is independent — chunking is exact.
+        S_total = int(F_g_lut_scene[0].shape[1])
+        frame_chunk = 2
+        splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(assembler.num_levels)]
+        for fs in range(0, S_total, frame_chunk):
+            fe = min(fs + frame_chunk, S_total)
+            # Only target cameras are frame-chunked. The LUT S dimension is
+            # indexed by GaussianPointers.view_n (source frame), so slicing it
+            # would change the token assigned to gaussians outside this target
+            # camera chunk.
+            lut_asset_chunk = F_g_lut_asset if len(F_g_lut_asset) > 0 else None
+            cameras_splat_chunk = {k: v[:, fs:fe].contiguous() for k, v in cameras_splat.items()}
+            tile_masks_chunk = active_tile_masks[:, fs:fe].contiguous()
+            chunk_out = assembler.feature_splatter(
+                gaussians_dggt=[gaussians_all],
+                pointers=[pointers_all],
+                lut_scene=F_g_lut_scene,
+                lut_asset_dict=lut_asset_chunk,
+                cameras_dggt=cameras_splat_chunk,
+                H=H_splat,
+                W=W_splat,
+                pool_to=patch_grid,
+                tile_masks=tile_masks_chunk,
+            )
+            for lvl_idx, lvl_tensor in enumerate(chunk_out):
+                splatted_levels[lvl_idx].append(lvl_tensor)
+        splatted_tok_low = [torch.cat(parts, dim=1) for parts in splatted_levels]
+
         splatted_tok_low = assembler._blend_preserve_tokens(
             clean_levels=F_g_lut_scene,
             splatted_levels=splatted_tok_low,
@@ -963,8 +1044,8 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
     doesn't need a per-mode branch.
 
     Empty plans are still packed: v6 caches make ``pass2_splatted_tok_low``
-    mandatory, and an all-kept Mode-B clip simply produces the no-deletion
-    splatted/blended features.
+    mandatory, but an all-kept Mode-B clip is a true no-op and therefore
+    stores the clean scene tokens directly.
     """
     from dggt.models.flow_feature_assembler import FlowFeatureAssembler
     from dggt.models.gaussian_pointers import GaussianPointers
@@ -996,6 +1077,7 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
             f"Mode B delete_mask length {int(delete_mask_full.numel())} does not "
             f"match clean_state Gaussians {n_g}; cannot write mandatory v6 pass2 cache."
         )
+    mode_b_noop = not bool(delete_mask_full.any().item())
     clean_dict = {
         "means": clean_state.means.to(device),
         "colors": clean_state.colors.to(device),
@@ -1033,46 +1115,62 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
     cameras_dggt_dev = {k: v.to(device) for k, v in cameras_dggt_b.items()}
 
     with torch.no_grad():
-        # Frame-chunk the splatter to keep peak memory bounded on full clips.
-        S_total = int(F_g_lut_scene[0].shape[1])
-        frame_chunk = 2
-        splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(assembler.num_levels)]
-        for fs in range(0, S_total, frame_chunk):
-            fe = min(fs + frame_chunk, S_total)
-            cameras_splat_chunk = {k: v[:, fs:fe].contiguous() for k, v in cameras_splat.items()}
-            chunk_out = assembler.feature_splatter(
-                gaussians_dggt=[gauss_kept],
-                pointers=[ptr_scene_kept],
-                lut_scene=F_g_lut_scene,
-                lut_asset_dict=None,
-                cameras_dggt=cameras_splat_chunk,
-                H=H_splat,
-                W=W_splat,
-                pool_to=patch_grid,
+        if mode_b_noop:
+            # No imagined/deleted region means the Mode-B edit is a no-op.
+            # Store clean tokens directly; splatting would only introduce
+            # coverage-mask artifacts in low-alpha/sky tokens.
+            splatted_tok_low = [lvl.to(device) for lvl in F_g_lut_scene]
+        else:
+            # Soft mask coverage with imagined Gaussians as the I_map source.
+            K_map, _D_map, I_map_proxy, _ = assembler.soft_mask.render_coverage(
+                G_kept=[gauss_kept],
+                G_deleted=[{}],
+                G_asset_dggt_dict=[{0: gauss_imagined}],
+                cameras_dggt=cameras_dggt_dev,
+                H=H_img,
+                W=W_img,
             )
-            for lvl_idx, lvl_tensor in enumerate(chunk_out):
-                splatted_levels[lvl_idx].append(lvl_tensor)
-        splatted_tok_low = [torch.cat(parts, dim=1) for parts in splatted_levels]
+            D_map = torch.zeros_like(I_map_proxy)
+            I_map = I_map_proxy
+            M_preserve, _M_source, _M_dest = assembler.soft_mask.pool_and_normalize(
+                K_map, D_map, I_map, target_grid=patch_grid
+            )
+            active_tile_masks = _splat_weight_to_tile_masks(
+                (1.0 - M_preserve).clamp(0.0, 1.0),
+                threshold=ACTIVE_SPLAT_THRESHOLD,
+                patch_grid=patch_grid,
+                H_splat=H_splat,
+                W_splat=W_splat,
+            )
 
-        # Soft mask coverage with imagined Gaussians as the I_map source.
-        K_map, _D_map, I_map_proxy, _ = assembler.soft_mask.render_coverage(
-            G_kept=[gauss_kept],
-            G_deleted=[{}],
-            G_asset_dggt_dict=[{0: gauss_imagined}] if gauss_imagined["means"].numel() > 0 else [{}],
-            cameras_dggt=cameras_dggt_dev,
-            H=H_img,
-            W=W_img,
-        )
-        D_map = torch.zeros_like(I_map_proxy)
-        I_map = I_map_proxy
-        M_preserve, _M_source, _M_dest = assembler.soft_mask.pool_and_normalize(
-            K_map, D_map, I_map, target_grid=patch_grid
-        )
-        splatted_tok_low = assembler._blend_preserve_tokens(
-            clean_levels=F_g_lut_scene,
-            splatted_levels=splatted_tok_low,
-            M_preserve=M_preserve,
-        )
+            # Frame-chunk the splatter to keep peak memory bounded on full clips.
+            S_total = int(F_g_lut_scene[0].shape[1])
+            frame_chunk = 2
+            splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(assembler.num_levels)]
+            for fs in range(0, S_total, frame_chunk):
+                fe = min(fs + frame_chunk, S_total)
+                cameras_splat_chunk = {k: v[:, fs:fe].contiguous() for k, v in cameras_splat.items()}
+                tile_masks_chunk = active_tile_masks[:, fs:fe].contiguous()
+                chunk_out = assembler.feature_splatter(
+                    gaussians_dggt=[gauss_kept],
+                    pointers=[ptr_scene_kept],
+                    lut_scene=F_g_lut_scene,
+                    lut_asset_dict=None,
+                    cameras_dggt=cameras_splat_chunk,
+                    H=H_splat,
+                    W=W_splat,
+                    pool_to=patch_grid,
+                    tile_masks=tile_masks_chunk,
+                )
+                for lvl_idx, lvl_tensor in enumerate(chunk_out):
+                    splatted_levels[lvl_idx].append(lvl_tensor)
+            splatted_tok_low = [torch.cat(parts, dim=1) for parts in splatted_levels]
+
+            splatted_tok_low = assembler._blend_preserve_tokens(
+                clean_levels=F_g_lut_scene,
+                splatted_levels=splatted_tok_low,
+                M_preserve=M_preserve,
+            )
 
     if len(splatted_tok_low) == 0:
         raise RuntimeError("splatted_tok_low is empty after blending (mode_b)")
