@@ -228,6 +228,7 @@ class FlowFeatureAssembler(nn.Module):
         preserve_token_bypass: bool = True,
         asset_token_direct_blend: bool = True,
         asset_token_full_alpha: float = 0.5,
+        unedited_preserve_threshold: float = 1e-4,
         editor_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
@@ -241,6 +242,7 @@ class FlowFeatureAssembler(nn.Module):
         self.preserve_token_bypass = bool(preserve_token_bypass)
         self.asset_token_direct_blend = bool(asset_token_direct_blend)
         self.asset_token_full_alpha = float(asset_token_full_alpha)
+        self.unedited_preserve_threshold = float(unedited_preserve_threshold)
 
         self.editor = GaussianSceneEditor(**(editor_kwargs or {}))
         self.feature_splatter = FeatureSplatter(
@@ -535,6 +537,14 @@ class FlowFeatureAssembler(nn.Module):
         M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=self.patch_grid
         )
+        M_preserve, M_source, M_dest = self._force_preserve_unedited_tokens(
+            K_map=K_map,
+            D_map=D_map,
+            I_map=I_map,
+            M_preserve=M_preserve,
+            M_source=M_source,
+            M_dest=M_dest,
+        )
         if splatted_tok_low_cached is None:
             splatted_tok_low = self._blend_preserve_tokens(
                 clean_levels=F_g_lut_scene,
@@ -546,7 +556,7 @@ class FlowFeatureAssembler(nn.Module):
                 F_g_lut_asset=F_g_lut_asset,
                 I_map_per_obj=I_per_obj,
             )
-        # Cached path already includes both blends — no-op here.
+        # Cached path already stores the post-blend splatted_tok_low.
 
         # Scaffold precursors
         D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
@@ -777,13 +787,21 @@ class FlowFeatureAssembler(nn.Module):
             M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
                 K_map, D_map, I_map, target_grid=self.patch_grid
             )
+            M_preserve, M_source, M_dest = self._force_preserve_unedited_tokens(
+                K_map=K_map,
+                D_map=D_map,
+                I_map=I_map,
+                M_preserve=M_preserve,
+                M_source=M_source,
+                M_dest=M_dest,
+            )
         if (not mode_b_noop) and splatted_tok_low_cached is None:
             splatted_tok_low = self._blend_preserve_tokens(
                 clean_levels=F_g_lut_scene,
                 splatted_levels=splatted_tok_low,
                 M_preserve=M_preserve,
             )
-        # Cached path already includes the preserve blend — no-op here.
+        # Cached path already stores the post-blend splatted_tok_low.
 
         # Scaffold (D_edited not meaningful for mode B — pass zeros).
         D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
@@ -929,6 +947,52 @@ class FlowFeatureAssembler(nn.Module):
     # ------------------------------------------------------------------ #
     # Internal helpers                                                    #
     # ------------------------------------------------------------------ #
+    def _unedited_preserve_token_mask(
+        self,
+        *,
+        D_map: torch.Tensor,
+        I_map: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        edit_map = (D_map + I_map).clamp(0.0, 1.0)
+        edit_tok = SoftMaskBuilder._area_pool_to_grid(
+            edit_map,
+            self.patch_grid,
+        ).to(device=reference.device, dtype=reference.dtype)
+        return edit_tok <= float(self.unedited_preserve_threshold)
+
+    def _force_preserve_unedited_tokens(
+        self,
+        *,
+        K_map: torch.Tensor,
+        D_map: torch.Tensor,
+        I_map: torch.Tensor,
+        M_preserve: torch.Tensor,
+        M_source: torch.Tensor,
+        M_dest: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Make edit-free tokens true preserve tokens.
+
+        DGGT renders sky through ``SkyGaussian`` and excludes sky pixels from
+        foreground scene Gaussians.  Therefore low/zero kept-Gaussian coverage
+        is not, by itself, an edit request.  The diffusion masks should mark a
+        token editable only when deleted or inserted/imagined coverage is
+        actually present.  This keeps sky and other untouched alpha holes on
+        the clean-token path while preserving the original soft D/I ratios on
+        real edit footprints.
+        """
+        del K_map  # kept coverage does not define whether a token is edited
+        force_preserve = self._unedited_preserve_token_mask(
+            D_map=D_map,
+            I_map=I_map,
+            reference=M_preserve,
+        )
+
+        M_preserve = torch.where(force_preserve, torch.ones_like(M_preserve), M_preserve)
+        M_source = torch.where(force_preserve, torch.zeros_like(M_source), M_source)
+        M_dest = torch.where(force_preserve, torch.zeros_like(M_dest), M_dest)
+        return M_preserve, M_source, M_dest
+
     def _blend_preserve_tokens(
         self,
         clean_levels: Sequence[torch.Tensor],

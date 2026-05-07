@@ -211,7 +211,7 @@ CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node=1 train_scene_flow.py \
 
 | 字段 | Mode A | Mode B |
 |------------------------|---------------------------------|----------------------------------|
-| `M_preserve, M_source, M_dest` | K/(K+D+I+ε), D/…, I/… | K/(K+I+ε), 0, I/… |
+| `M_preserve, M_source, M_dest` | K/(K+D+I+ε), D/…, I/…；D+I≈0 的未编辑 token 强制 preserve | K/(K+I+ε), 0, I/…；I≈0 的未编辑 token 强制 preserve |
 | `K_map, D_map, I_map` | scene-kept α, scene-deleted α, asset α | scene-kept α, **0**, imagined-Gaussian α |
 | `splatted_tok_low` | scene LUT splat 到 kept + asset Gaussians 上 | scene LUT 只 splat 到 kept Gaussians 上 |
 | `F_asset_tokens` | `[B, K·S·P, 3072]`，来自缓存的 asset LUTs | `[B, 0, 3072]`（空） |

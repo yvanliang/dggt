@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -472,7 +473,7 @@ def _run_one_sample(
     images = sample["images_clean"].unsqueeze(0).to(device)
     print(f"[mode_b] sample {sample_index}: running VGGT forward", flush=True)
     with torch.no_grad():
-        predictions = model(images, return_tokens=args.dump_features)
+        predictions = model(images, return_tokens=bool(args.dump_features and args.splat_pca))
 
     print(f"[mode_b] sample {sample_index}: building clean scene", flush=True)
     editor = GaussianSceneEditor()
@@ -666,6 +667,18 @@ def _run_flow_feature_dump(
     from dggt.models.flow_feature_assembler import FlowFeatureAssembler
     from dggt.utils.flow_viz import dump_flow_features
 
+    if not args.splat_pca:
+        return _run_flow_feature_mask_dump(
+            sample=sample,
+            predictions=predictions,
+            clean_state=clean_state,
+            plan=plan,
+            delete_mask=delete_mask,
+            output_dir=output_dir,
+            device=device,
+            args=args,
+        )
+
     image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
     patch_grid = (image_hw[0] // 14, image_hw[1] // 14)
     patch_start_idx = int(predictions.get("patch_start_idx", 5))
@@ -693,6 +706,7 @@ def _run_flow_feature_dump(
         patch_grid=patch_grid,
         H_splat=patch_grid[0] * 4,
         W_splat=patch_grid[1] * 4,
+        chunk_channels=64,
         editor_kwargs={"use_pose_refine": True},
     ).to(device)
 
@@ -720,6 +734,148 @@ def _run_flow_feature_dump(
         save_coverage=True,
         save_scaffold=True,
         save_splat_pca=args.splat_pca,
+    )
+
+
+def _run_flow_feature_mask_dump(
+    *,
+    sample: dict[str, Any],
+    predictions: dict[str, torch.Tensor],
+    clean_state,
+    plan,
+    delete_mask: torch.Tensor,
+    output_dir: Path,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Dump Mode-B masks/scaffold without materializing 3072-D splat features."""
+    from dggt.models.flow_feature_assembler import FlowFeatureAssembler
+    from dggt.models.scaffold import ScaffoldPacker
+    from dggt.utils.flow_viz import dump_flow_features
+
+    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
+    patch_grid = (image_hw[0] // 14, image_hw[1] // 14)
+    patch_start_idx = int(predictions.get("patch_start_idx", 5))
+    B = 1
+    S = int(clean_state.images.shape[0])
+    H_img, W_img = image_hw
+    P = int(patch_grid[0] * patch_grid[1])
+
+    assembler = FlowFeatureAssembler(
+        scene_tokenizer=None,
+        patch_grid=patch_grid,
+        H_splat=patch_grid[0] * 4,
+        W_splat=patch_grid[1] * 4,
+        chunk_channels=64,
+        editor_kwargs={"use_pose_refine": True},
+    ).to(device)
+    assembler.eval()
+
+    delete_mask = delete_mask.to(device=device, dtype=torch.bool)
+    mode_b_noop = not bool(delete_mask.any().item())
+    clean_dict = {
+        "means": clean_state.means.to(device),
+        "colors": clean_state.colors.to(device),
+        "opacities": clean_state.opacities.to(device),
+        "scales": clean_state.scales.to(device),
+        "quats": clean_state.quats.to(device),
+    }
+    keep_mask = ~delete_mask
+    gauss_kept = {k: v[keep_mask] for k, v in clean_dict.items()}
+    gauss_imagined = {k: v[delete_mask] for k, v in clean_dict.items()}
+    cameras_dggt = {
+        "viewmats": _as_homogeneous_viewmats(clean_state.world_to_camera).unsqueeze(0).to(device),
+        "Ks": clean_state.intrinsics.unsqueeze(0).to(device),
+        "camera_to_world": clean_state.camera_to_world.unsqueeze(0).to(device),
+    }
+
+    with torch.no_grad():
+        if mode_b_noop:
+            K_map = torch.ones((B, S, H_img, W_img, 1), dtype=torch.float32, device=device)
+            D_map = torch.zeros_like(K_map)
+            I_map = torch.zeros_like(K_map)
+            I_per_obj: list[dict[int, torch.Tensor]] = [{}]
+            M_preserve = torch.ones((B, S, P, 1), dtype=torch.float32, device=device)
+            M_source = torch.zeros_like(M_preserve)
+            M_dest = torch.zeros_like(M_preserve)
+        else:
+            K_map, _D_map_dummy, I_map_proxy, _ = assembler.soft_mask.render_coverage(
+                G_kept=[gauss_kept],
+                G_deleted=[{}],
+                G_asset_dggt_dict=[{0: gauss_imagined}],
+                cameras_dggt=cameras_dggt,
+                H=H_img,
+                W=W_img,
+            )
+            D_map = torch.zeros_like(I_map_proxy)
+            I_map = I_map_proxy
+            I_per_obj = [{}]
+            M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
+                K_map, D_map, I_map, target_grid=patch_grid
+            )
+            M_preserve, M_source, M_dest = assembler._force_preserve_unedited_tokens(
+                K_map=K_map,
+                D_map=D_map,
+                I_map=I_map,
+                M_preserve=M_preserve,
+                M_source=M_source,
+                M_dest=M_dest,
+            )
+
+        D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
+        A_edited_hires = (K_map + I_map).clamp(0.0, 1.0)
+        dyn_prior = torch.sigmoid(
+            predictions["dynamic_conf"].reshape(B, S, H_img, W_img, 1).to(device)
+        ).float()
+        time_index = torch.arange(S, dtype=torch.float32, device=device).view(1, S)
+        time_index = time_index / max(S - 1, 1)
+        scaffold_hires = ScaffoldPacker.build_scaffold_hires(
+            D_edited=D_edited_hires,
+            A_edited=A_edited_hires,
+            K_map=K_map,
+            D_map=D_map,
+            I_map=I_map,
+            dynamic_prior=dyn_prior,
+            time_index=time_index,
+        )
+
+    empty_shape = SimpleNamespace(shape=(0,))
+    bundle = SimpleNamespace(
+        edit_bundle=SimpleNamespace(clean_state=clean_state),
+        phase4_slots=[],
+        splatted_tok_low=[],
+        K_map=K_map,
+        D_map=D_map,
+        I_map=I_map,
+        I_map_per_obj=I_per_obj,
+        M_preserve=M_preserve,
+        M_source=M_source,
+        M_dest=M_dest,
+        scaffold_hires=scaffold_hires,
+        scaffold_tok=SimpleNamespace(shape=(B, S, P, 768)),
+        z_clean=empty_shape,
+        z_splat=empty_shape,
+        z_init=empty_shape,
+        t_tok=empty_shape,
+        F_asset_tokens=SimpleNamespace(shape=(B, 0, 3072)),
+        patch_grid=patch_grid,
+        patch_start_idx=patch_start_idx,
+        extras={
+            "mode_kind": "mode_b",
+            "imagined_objects": list(plan.to_dict().get("imagined_objects", [])),
+            "num_imagined_objects": int(plan.num_imagined_objects),
+            "rejection_reason": str(plan.to_dict().get("rejection_reason", "")),
+            "dump_kind": "mask_only",
+        },
+    )
+    return dump_flow_features(
+        bundle,
+        output_dir,
+        save_tensors=False,
+        save_masks=True,
+        save_coverage=True,
+        save_scaffold=True,
+        save_splat_pca=False,
     )
 
 

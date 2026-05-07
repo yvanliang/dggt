@@ -948,6 +948,14 @@ def _compute_and_pack_pass2_splatted_tok_low(
         M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=patch_grid
         )
+        M_preserve, M_source, M_dest = assembler._force_preserve_unedited_tokens(
+            K_map=K_map,
+            D_map=D_map,
+            I_map=I_map,
+            M_preserve=M_preserve,
+            M_source=M_source,
+            M_dest=M_dest,
+        )
         splat_weight = _mode_a_splat_weight(
             assembler=assembler,
             M_preserve=M_preserve,
@@ -1013,7 +1021,7 @@ def _compute_and_pack_pass2_splatted_tok_low(
     S_full, P_full, L_full, C_full = stacked.shape
     q = quantize_tokens(stacked.float(), layout="NPLC")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "splatted_tok_low_int8": q.data,   # [S, P, L, C]
         "splatted_tok_low_scale": q.scale, # [S, L] fp16
         "patch_grid": (int(patch_grid[0]), int(patch_grid[1])),
@@ -1132,8 +1140,16 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
             )
             D_map = torch.zeros_like(I_map_proxy)
             I_map = I_map_proxy
-            M_preserve, _M_source, _M_dest = assembler.soft_mask.pool_and_normalize(
+            M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
                 K_map, D_map, I_map, target_grid=patch_grid
+            )
+            M_preserve, M_source, M_dest = assembler._force_preserve_unedited_tokens(
+                K_map=K_map,
+                D_map=D_map,
+                I_map=I_map,
+                M_preserve=M_preserve,
+                M_source=M_source,
+                M_dest=M_dest,
             )
             active_tile_masks = _splat_weight_to_tile_masks(
                 (1.0 - M_preserve).clamp(0.0, 1.0),
@@ -1180,7 +1196,7 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
     S_full, P_full, L_full, C_full = stacked.shape
     q = quantize_tokens(stacked.float(), layout="NPLC")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "splatted_tok_low_int8": q.data,
         "splatted_tok_low_scale": q.scale,
         "patch_grid": (int(patch_grid[0]), int(patch_grid[1])),
