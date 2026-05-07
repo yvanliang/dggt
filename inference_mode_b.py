@@ -20,6 +20,7 @@ from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.gs import concat_list
 from dggt.utils.mode_b_planner import ModeBPlanner, apply_mode_b
 from inference_scene_editor import (
+    _as_homogeneous_viewmats,
     _load_model,
     _make_pil_grid,
     _predict_camera_mats,
@@ -86,6 +87,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--slow_camera_step_ratio", type=float, default=0.006)
     parser.add_argument("--allow_empty_plan", action="store_true")
     parser.add_argument("--plan_only", action="store_true")
+    parser.add_argument(
+        "--dump_features",
+        action="store_true",
+        help=(
+            "Run the training FlowFeatureAssembler for Mode B and dump the actual "
+            "bundle masks/coverage/scaffold under flow_features/."
+        ),
+    )
+    parser.add_argument(
+        "--splat_pca",
+        action="store_true",
+        help="When --dump_features is set, also dump PCA-RGB of splatted_tok per level.",
+    )
     return parser
 
 
@@ -458,7 +472,7 @@ def _run_one_sample(
     images = sample["images_clean"].unsqueeze(0).to(device)
     print(f"[mode_b] sample {sample_index}: running VGGT forward", flush=True)
     with torch.no_grad():
-        predictions = model(images)
+        predictions = model(images, return_tokens=args.dump_features)
 
     print(f"[mode_b] sample {sample_index}: building clean scene", flush=True)
     editor = GaussianSceneEditor()
@@ -522,6 +536,23 @@ def _run_one_sample(
         grid_nrow = args.views if args.views > 1 else min(4, int(clean_state.images.shape[0]))
         _save_grid(clean_state.images, output_dir / "input_images_grid.jpg", nrow=grid_nrow)
         _save_imagined_boxes_overlay(clean_state.images, plan, output_dir / "imagined_boxes_overlay.jpg", nrow=grid_nrow)
+        if args.dump_features:
+            zero_delete = torch.zeros(
+                (int(clean_state.means.shape[0]),),
+                dtype=torch.bool,
+                device=device,
+            )
+            summary["flow_features_summary"] = _run_flow_feature_dump(
+                sample=sample,
+                predictions=predictions,
+                clean_state=clean_state,
+                model=model,
+                plan=plan,
+                delete_mask=zero_delete,
+                output_dir=output_dir,
+                device=device,
+                args=args,
+            )
         _write_json(output_dir / "mode_b_summary.json", summary)
         print(
             f"[mode_b] sample {sample_index}: accepted zero imagined objects; "
@@ -601,9 +632,95 @@ def _run_one_sample(
             **_mode_b_record_meta(record),
         }
     )
+    if args.dump_features:
+        summary["flow_features_summary"] = _run_flow_feature_dump(
+            sample=sample,
+            predictions=predictions,
+            clean_state=clean_state,
+            model=model,
+            plan=plan,
+            delete_mask=deletion.delete_mask,
+            output_dir=output_dir,
+            device=device,
+            args=args,
+        )
     _write_json(output_dir / "mode_b_summary.json", summary)
     print(json.dumps(summary, indent=2))
     return summary
+
+
+def _run_flow_feature_dump(
+    *,
+    sample: dict[str, Any],
+    predictions: dict[str, torch.Tensor],
+    clean_state,
+    model,
+    plan,
+    delete_mask: torch.Tensor,
+    output_dir: Path,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Dump Mode-B masks by invoking the same assembler path used by training."""
+    from dggt.models.asset_pass import AssetPassResult
+    from dggt.models.flow_feature_assembler import FlowFeatureAssembler
+    from dggt.utils.flow_viz import dump_flow_features
+
+    image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
+    patch_grid = (image_hw[0] // 14, image_hw[1] // 14)
+    patch_start_idx = int(predictions.get("patch_start_idx", 5))
+    asset_pass_empty = AssetPassResult(
+        patch_grid=patch_grid,
+        patch_start_idx=patch_start_idx,
+        object_keys=[],
+        cameras_waymo={},
+        F_g_lut_asset={},
+        ptr_asset={},
+        G_asset_waymo={},
+        G_asset_dggt={},
+        I_asset={},
+        A_asset={},
+        asset_pass_space="mode_b_empty",
+        fit_metrics={},
+    )
+    cameras_dggt = {
+        "viewmats": _as_homogeneous_viewmats(clean_state.world_to_camera).unsqueeze(0).to(device),
+        "Ks": clean_state.intrinsics.unsqueeze(0).to(device),
+        "camera_to_world": clean_state.camera_to_world.unsqueeze(0).to(device),
+    }
+    assembler = FlowFeatureAssembler(
+        scene_tokenizer=getattr(model, "scene_tokenizer", None),
+        patch_grid=patch_grid,
+        H_splat=patch_grid[0] * 4,
+        W_splat=patch_grid[1] * 4,
+        editor_kwargs={"use_pose_refine": True},
+    ).to(device)
+
+    mode_b_payload = dict(plan.to_dict())
+    mode_b_payload["delete_mask"] = delete_mask.to(device).bool()
+    mode_b_payload["num_imagined_objects"] = int(plan.num_imagined_objects)
+
+    with torch.no_grad():
+        bundle = assembler(
+            sample=sample,
+            predictions=predictions,
+            asset_pass_result=asset_pass_empty,
+            cameras_dggt=cameras_dggt,
+            object_slots_spec="all",
+            base_t=None,
+            device=device,
+            mode_kind="mode_b",
+            mode_b=mode_b_payload,
+        )
+    return dump_flow_features(
+        bundle,
+        output_dir,
+        save_tensors=False,
+        save_masks=True,
+        save_coverage=True,
+        save_scaffold=True,
+        save_splat_pca=args.splat_pca,
+    )
 
 
 def main() -> None:
@@ -685,9 +802,6 @@ def main() -> None:
                 "mode_b_in_mode_a_views3": summary.get("mode_b_in_mode_a_views3"),
             }
         )
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
     if multi_sample:
         run_summary = {
             "num_samples": len(all_summaries),

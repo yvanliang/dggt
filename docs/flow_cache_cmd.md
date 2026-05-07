@@ -75,6 +75,9 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python inference_scene_editor.py \
 #          flow_features/{flow_features.pt, masks/, coverage/, scaffold/}}
 ```
 
+`--dump_features` 会直接调用训练同用的 `FlowFeatureAssembler`，因此
+`flow_features/masks/{M_preserve,M_source,M_dest}_grid.jpg` 可视化的就是训练实际消费的 mask。
+
 
 ## 2. Mode B 预计算（想象目标放置 + 伪删除）
 
@@ -99,10 +102,17 @@ CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python tools/precompute_flow_features.py \
 ```bash
 CUDA_VISIBLE_DEVICES=3 python inference_mode_b.py --output_dir runs/mode_b_all_vis \
     --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
-     --planner_seed 0
-# 输出：runs/mode_a_all_vis/{imagined_boxes_overlay, deleted_render_grid,
-#          d_map_grid, mode_b_summary.json, mode_b_dmap.pt}
+    --planner_seed 0 \
+    --dump_features
+# 输出：runs/mode_b_all_vis/{imagined_boxes_overlay, deleted_render_grid,
+#          d_map_grid, mode_b_summary.json,
+#          flow_features/{masks/, coverage/, scaffold/}}
 ```
+
+Mode B 的 `--dump_features` 同样走训练用 `FlowFeatureAssembler(mode_kind="mode_b")`，
+不会另写一套 mask 计算逻辑；导出的 mask 是 bundle 中的
+`M_preserve/M_source/M_dest` 的 JPG 可视化。注意：非空 imagined 区域会触发一次
+训练同路径的 feature splat，因此比只画框和 `D_map` 慢。
 
 
 ## 3. 构建合并训练 manifest

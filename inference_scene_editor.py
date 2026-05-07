@@ -1233,9 +1233,6 @@ def main() -> None:
                 "clip_name": summary.get("clip_name"),
             }
         )
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
     if multi_sample:
         run_summary = {
             "num_samples": len(all_summaries),
