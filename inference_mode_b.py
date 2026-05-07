@@ -815,6 +815,8 @@ def _run_flow_feature_mask_dump(
             M_dest = torch.zeros_like(M_preserve)
         else:
             K_map, D_map, I_map, I_per_obj = assembler._render_mode_b_per_target_coverage(
+                sample=sample,
+                clean_state=clean_state,
                 clean_dict=clean_dict,
                 delete_masks_by_target=delete_masks_by_target,
                 cameras_dggt=cameras_dggt,

@@ -84,6 +84,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--views", type=int, default=1)
     p.add_argument("--start", type=int, default=None, help="Start dataset index, inclusive. Defaults to 0.")
     p.add_argument("--end", type=int, default=None, help="End dataset index, exclusive. Defaults to dataset length.")
+    p.add_argument("--subset", choices=["all", "even", "odd"], default="all", help="Process only even or odd dataset indices within the [start, end) range.")
     p.add_argument("--start_clip_idx", type=int, default=0)
     p.add_argument("--end_clip_idx", type=int, default=-1, help="-1 for all")
     p.add_argument("--force_overwrite", action="store_true")
@@ -1127,6 +1128,8 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
         else:
             # Soft mask coverage with each target frame's own delete mask.
             K_map, D_map, I_map, _ = assembler._render_mode_b_per_target_coverage(
+                sample=sample,
+                clean_state=clean_state,
                 clean_dict=clean_dict,
                 delete_masks_by_target=delete_masks_by_target,
                 cameras_dggt=cameras_dggt_dev,
@@ -1467,8 +1470,14 @@ def main() -> None:
         gzip_level=int(args.gzip_level),
         max_threads=int(args.max_save_threads),
     )
+    indices = list(range(start_idx, end_idx))
+    if args.subset == "even":
+        indices = [i for i in indices if i % 2 == 0]
+    elif args.subset == "odd":
+        indices = [i for i in indices if i % 2 != 0]
+
     progress = tqdm(
-        range(start_idx, end_idx),
+        indices,
         desc=f"precompute {args.edit_mode}/{args.split}",
         unit="clip",
         dynamic_ncols=True,

@@ -745,6 +745,8 @@ class FlowFeatureAssembler(nn.Module):
             M_dest = torch.zeros_like(M_preserve)
         else:
             K_map, D_map, I_map, I_per_obj = self._render_mode_b_per_target_coverage(
+                sample=sample,
+                clean_state=clean_state,
                 clean_dict=clean_dict,
                 delete_masks_by_target=delete_masks_by_target,
                 cameras_dggt=cameras_dggt,
@@ -985,6 +987,8 @@ class FlowFeatureAssembler(nn.Module):
     def _render_mode_b_per_target_coverage(
         self,
         *,
+        sample: dict[str, Any],
+        clean_state: CleanSceneState,
         clean_dict: dict[str, torch.Tensor],
         delete_masks_by_target: torch.Tensor,
         cameras_dggt: dict[str, torch.Tensor],
@@ -1002,6 +1006,7 @@ class FlowFeatureAssembler(nn.Module):
                 f"{tuple(delete_masks_by_target.shape)} for S={S}, N_g={int(clean_dict['means'].shape[0])}"
             )
 
+        timestamps = self._mode_b_timestamps(sample, num_images=S, device=viewmats.device)
         K_chunks: list[torch.Tensor] = []
         I_chunks: list[torch.Tensor] = []
         for target_idx in range(S):
@@ -1009,8 +1014,20 @@ class FlowFeatureAssembler(nn.Module):
                 device=clean_dict["means"].device, dtype=torch.bool
             )
             keep_mask = ~del_mask
-            gauss_kept = {k: v[keep_mask] for k, v in clean_dict.items()}
-            gauss_deleted = {k: v[del_mask] for k, v in clean_dict.items()}
+            gauss_kept = self._mode_b_time_aware_gaussians_for_target(
+                clean_state=clean_state,
+                clean_dict=clean_dict,
+                base_mask=keep_mask,
+                target_idx=target_idx,
+                timestamps=timestamps,
+            )
+            gauss_deleted = self._mode_b_time_aware_gaussians_for_target(
+                clean_state=clean_state,
+                clean_dict=clean_dict,
+                base_mask=del_mask,
+                target_idx=target_idx,
+                timestamps=timestamps,
+            )
             cameras_one = {
                 "viewmats": cameras_dggt["viewmats"][:, target_idx : target_idx + 1].contiguous(),
                 "Ks": cameras_dggt["Ks"][:, target_idx : target_idx + 1].contiguous(),
@@ -1031,6 +1048,90 @@ class FlowFeatureAssembler(nn.Module):
         D_map = torch.zeros_like(I_map)
         I_per_obj = [{0: I_map[0]}]
         return K_map, D_map, I_map, I_per_obj
+
+    @staticmethod
+    def _mode_b_timestamps(
+        sample: dict[str, Any],
+        *,
+        num_images: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        timestamps = sample["timestamps"].detach().float().to(device)
+        if int(timestamps.numel()) == int(num_images):
+            return timestamps
+        num_frames = int(sample["frame_indices"].numel()) if "frame_indices" in sample else int(timestamps.numel())
+        num_views = max(1, int(sample["cam_ids"].numel())) if "cam_ids" in sample else 1
+        if int(timestamps.numel()) == num_frames and num_frames * num_views == int(num_images):
+            return timestamps.repeat_interleave(num_views)
+        raise ValueError(
+            f"Unexpected timestamp shape: got {int(timestamps.numel())} values for {int(num_images)} images "
+            f"(frames={num_frames}, views={num_views})"
+        )
+
+    @staticmethod
+    def _mode_b_alpha_t(
+        t: torch.Tensor,
+        t0: torch.Tensor,
+        alpha: torch.Tensor,
+        gamma0: torch.Tensor,
+        gamma1: float = 0.1,
+    ) -> torch.Tensor:
+        sigma = torch.log(torch.tensor(gamma1, dtype=alpha.dtype, device=alpha.device)) / (
+            gamma0.to(device=alpha.device, dtype=alpha.dtype) ** 2 + 1e-6
+        )
+        conf = torch.exp(sigma * (t0.to(device=alpha.device, dtype=alpha.dtype) - t) ** 2)
+        return (alpha * conf).float()
+
+    @staticmethod
+    def _subset_gauss_with_opacity(
+        clean_dict: dict[str, torch.Tensor],
+        mask: torch.Tensor,
+        opacity: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        out = {k: v[mask] for k, v in clean_dict.items()}
+        out["opacities"] = opacity.reshape(-1, 1)
+        return out
+
+    def _mode_b_time_aware_gaussians_for_target(
+        self,
+        *,
+        clean_state: CleanSceneState,
+        clean_dict: dict[str, torch.Tensor],
+        base_mask: torch.Tensor,
+        target_idx: int,
+        timestamps: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Match DGGT's static/dynamic Gaussian alpha split for one target image."""
+        device = clean_dict["means"].device
+        base_mask = base_mask.to(device=device, dtype=torch.bool)
+        if not bool(base_mask.any().item()):
+            return _empty_gauss_dict(device)
+
+        dynamic_prob = clean_state.dynamic_prob.to(device=device, dtype=torch.float32)
+        source_image_ids = clean_state.source_image_ids.to(device=device, dtype=torch.long)
+        gs_conf = clean_state.gs_conf.to(device=device, dtype=torch.float32)
+        opacities = clean_dict["opacities"].to(device=device, dtype=torch.float32).view(-1)
+
+        chunks: list[dict[str, torch.Tensor]] = []
+        static_mask = base_mask & (dynamic_prob < 0.5)
+        if bool(static_mask.any().item()):
+            static_opacity = opacities[static_mask] * (1.0 - dynamic_prob[static_mask])
+            static_opacity = self._mode_b_alpha_t(
+                timestamps[source_image_ids[static_mask]].to(device=device, dtype=torch.float32),
+                timestamps[int(target_idx)],
+                static_opacity,
+                gs_conf[static_mask],
+            )
+            chunks.append(self._subset_gauss_with_opacity(clean_dict, static_mask, static_opacity))
+
+        dynamic_mask = base_mask & (source_image_ids == int(target_idx))
+        if bool(dynamic_mask.any().item()):
+            dynamic_opacity = opacities[dynamic_mask] * dynamic_prob[dynamic_mask]
+            chunks.append(self._subset_gauss_with_opacity(clean_dict, dynamic_mask, dynamic_opacity))
+
+        if len(chunks) == 0:
+            return _empty_gauss_dict(device)
+        return _concat_gauss_dicts(chunks, device=device)
 
     def _splat_mode_b_per_target(
         self,
