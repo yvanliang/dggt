@@ -501,9 +501,10 @@ class WaymoFlowCacheDataset(Dataset):
                             frame indices in the 29-frame clip; the assembler
                             uses subset_frames to pick visibility per chosen
                             frame).
-          delete_mask:      [N_gauss_subset] bool, aligned with the subset
-                            clean_state built from cached fp16 dense outputs.
-          delete_mask_per_frame_subset: [|subset|, N_gauss] bool
+          delete_mask:      [N_gauss_subset] bool, the union of the per-target
+                            frame masks below.
+          delete_mask_per_frame_subset: [|subset|, N_gauss_subset] bool,
+                            aligned with the subset clean_state.
           subset_frames:    [|subset|] long  (mirror of the dataset-wide subset)
           rejection_reason, eligible, num_imagined_objects, metrics, rng_seed.
         """
@@ -519,27 +520,41 @@ class WaymoFlowCacheDataset(Dataset):
             raise ValueError(
                 f"delete_mask_per_frame should be [N_clip, N_gauss], got {tuple(delete_mask_per_frame.shape)}"
             )
+        if int(delete_mask_per_frame.shape[1]) != int(delete_mask_full.numel()):
+            raise ValueError(
+                "delete_mask_per_frame N_gauss does not match delete_mask: "
+                f"{tuple(delete_mask_per_frame.shape)} vs {int(delete_mask_full.numel())}"
+            )
         offsets = self._frame_gauss_offsets_from_payload(payload)
-        local_chunks: list[torch.Tensor] = []
-        for f in subset.tolist():
-            s = int(offsets[int(f)].item())
-            e = int(offsets[int(f) + 1].item())
-            local_chunks.append(delete_mask_full[s:e])
-        delete_mask = (
-            torch.cat(local_chunks) if local_chunks else torch.zeros(0, dtype=torch.bool)
-        )
         subset_clip = subset.clone()
         # Some Mode B planner flows use num_frames = max frame_idx + 1, which can
         # be < num_clip_frames if the imagined objects span fewer frames. Clamp.
         n_clip = int(delete_mask_per_frame.shape[0])
-        if n_clip == 0:
-            delete_mask_subset = torch.zeros(
-                (int(subset_clip.numel()), int(delete_mask_full.numel())),
-                dtype=torch.bool,
-            )
+        subset_list = subset.tolist()
+        local_rows: list[torch.Tensor] = []
+        if n_clip > 0:
+            for target_f in subset_list:
+                row_full = delete_mask_per_frame[min(int(target_f), n_clip - 1)]
+                row_chunks: list[torch.Tensor] = []
+                for source_f in subset_list:
+                    s = int(offsets[int(source_f)].item())
+                    e = int(offsets[int(source_f) + 1].item())
+                    row_chunks.append(row_full[s:e])
+                local_rows.append(
+                    torch.cat(row_chunks) if row_chunks else torch.zeros(0, dtype=torch.bool)
+                )
+        if local_rows:
+            delete_mask_subset = torch.stack(local_rows, dim=0)
         else:
-            clamped = subset_clip.clamp_max(n_clip - 1)
-            delete_mask_subset = delete_mask_per_frame.index_select(0, clamped)
+            subset_count = 0
+            for source_f in subset_list:
+                subset_count += int(offsets[int(source_f) + 1].item() - offsets[int(source_f)].item())
+            delete_mask_subset = torch.zeros((int(subset_clip.numel()), subset_count), dtype=torch.bool)
+        delete_mask = (
+            delete_mask_subset.any(dim=0)
+            if delete_mask_subset.numel() > 0
+            else torch.zeros((0,), dtype=torch.bool)
+        )
         return {
             "imagined_objects": list(block.get("imagined_objects", [])),
             "rejection_reason": str(block.get("rejection_reason", "")),
@@ -548,6 +563,7 @@ class WaymoFlowCacheDataset(Dataset):
             "metrics": dict(block.get("metrics", {})),
             "rng_seed": int(block.get("rng_seed", 0)),
             "delete_mask": delete_mask,
+            "delete_mask_per_frame": delete_mask_subset,
             "delete_mask_per_frame_subset": delete_mask_subset,
             "subset_frames": subset_clip,
             "delete_core_indices": block.get("delete_core_indices"),

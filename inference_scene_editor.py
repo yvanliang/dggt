@@ -162,7 +162,7 @@ def _tensor_to_pil_rgb(image: torch.Tensor) -> Image.Image:
         raise ValueError(f"Expected 1 or 3 channels, got {image.shape[0]}")
     image_u8 = image.mul(255.0).add(0.5).clamp(0.0, 255.0).to(torch.uint8).permute(1, 2, 0).contiguous()
     height, width = image_u8.shape[:2]
-    return Image.frombytes("RGB", (width, height), bytes(image_u8.view(torch.uint8).untyped_storage()))
+    return Image.frombytes("RGB", (width, height), image_u8.numpy().tobytes())
 
 
 def _make_pil_grid(images: list[Image.Image], nrow: int) -> Image.Image:

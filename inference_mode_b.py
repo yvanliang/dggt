@@ -550,6 +550,7 @@ def _run_one_sample(
                 model=model,
                 plan=plan,
                 delete_mask=zero_delete,
+                delete_mask_per_frame=None,
                 output_dir=output_dir,
                 device=device,
                 args=args,
@@ -641,6 +642,7 @@ def _run_one_sample(
             model=model,
             plan=plan,
             delete_mask=deletion.delete_mask,
+            delete_mask_per_frame=deletion.delete_mask_per_frame,
             output_dir=output_dir,
             device=device,
             args=args,
@@ -658,6 +660,7 @@ def _run_flow_feature_dump(
     model,
     plan,
     delete_mask: torch.Tensor,
+    delete_mask_per_frame: torch.Tensor | None,
     output_dir: Path,
     device: torch.device,
     args: argparse.Namespace,
@@ -674,6 +677,7 @@ def _run_flow_feature_dump(
             clean_state=clean_state,
             plan=plan,
             delete_mask=delete_mask,
+            delete_mask_per_frame=delete_mask_per_frame,
             output_dir=output_dir,
             device=device,
             args=args,
@@ -712,6 +716,8 @@ def _run_flow_feature_dump(
 
     mode_b_payload = dict(plan.to_dict())
     mode_b_payload["delete_mask"] = delete_mask.to(device).bool()
+    if delete_mask_per_frame is not None:
+        mode_b_payload["delete_mask_per_frame"] = delete_mask_per_frame.to(device).bool()
     mode_b_payload["num_imagined_objects"] = int(plan.num_imagined_objects)
 
     with torch.no_grad():
@@ -744,6 +750,7 @@ def _run_flow_feature_mask_dump(
     clean_state,
     plan,
     delete_mask: torch.Tensor,
+    delete_mask_per_frame: torch.Tensor | None,
     output_dir: Path,
     device: torch.device,
     args: argparse.Namespace,
@@ -772,22 +779,30 @@ def _run_flow_feature_mask_dump(
     assembler.eval()
 
     delete_mask = delete_mask.to(device=device, dtype=torch.bool)
-    mode_b_noop = not bool(delete_mask.any().item())
     clean_dict = {
         "means": clean_state.means.to(device),
         "colors": clean_state.colors.to(device),
-        "opacities": clean_state.opacities.to(device),
+        "opacities": clean_state.opacities.to(device).view(-1, 1)
+            if clean_state.opacities.dim() == 1 else clean_state.opacities.to(device),
         "scales": clean_state.scales.to(device),
         "quats": clean_state.quats.to(device),
     }
-    keep_mask = ~delete_mask
-    gauss_kept = {k: v[keep_mask] for k, v in clean_dict.items()}
-    gauss_imagined = {k: v[delete_mask] for k, v in clean_dict.items()}
     cameras_dggt = {
         "viewmats": _as_homogeneous_viewmats(clean_state.world_to_camera).unsqueeze(0).to(device),
         "Ks": clean_state.intrinsics.unsqueeze(0).to(device),
         "camera_to_world": clean_state.camera_to_world.unsqueeze(0).to(device),
     }
+    mode_b_payload = {"delete_mask": delete_mask}
+    if delete_mask_per_frame is not None:
+        mode_b_payload["delete_mask_per_frame"] = delete_mask_per_frame.to(device).bool()
+    delete_masks_by_target = assembler._mode_b_delete_masks_by_target(
+        mode_b=mode_b_payload,
+        delete_mask=delete_mask,
+        S=S,
+        n_g=int(clean_state.means.shape[0]),
+        device=device,
+    )
+    mode_b_noop = not bool(delete_masks_by_target.any().item())
 
     with torch.no_grad():
         if mode_b_noop:
@@ -799,17 +814,13 @@ def _run_flow_feature_mask_dump(
             M_source = torch.zeros_like(M_preserve)
             M_dest = torch.zeros_like(M_preserve)
         else:
-            K_map, _D_map_dummy, I_map_proxy, _ = assembler.soft_mask.render_coverage(
-                G_kept=[gauss_kept],
-                G_deleted=[{}],
-                G_asset_dggt_dict=[{0: gauss_imagined}],
+            K_map, D_map, I_map, I_per_obj = assembler._render_mode_b_per_target_coverage(
+                clean_dict=clean_dict,
+                delete_masks_by_target=delete_masks_by_target,
                 cameras_dggt=cameras_dggt,
                 H=H_img,
                 W=W_img,
             )
-            D_map = torch.zeros_like(I_map_proxy)
-            I_map = I_map_proxy
-            I_per_obj = [{}]
             M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
                 K_map, D_map, I_map, target_grid=patch_grid
             )

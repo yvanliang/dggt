@@ -1056,7 +1056,6 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
     stores the clean scene tokens directly.
     """
     from dggt.models.flow_feature_assembler import FlowFeatureAssembler
-    from dggt.models.gaussian_pointers import GaussianPointers
     from dggt.models.scene_pointers import build_scene_pointers
 
     delete_mask_full = mode_b_payload.get("delete_mask")
@@ -1085,7 +1084,6 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
             f"Mode B delete_mask length {int(delete_mask_full.numel())} does not "
             f"match clean_state Gaussians {n_g}; cannot write mandatory v6 pass2 cache."
         )
-    mode_b_noop = not bool(delete_mask_full.any().item())
     clean_dict = {
         "means": clean_state.means.to(device),
         "colors": clean_state.colors.to(device),
@@ -1094,10 +1092,6 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
         "scales": clean_state.scales.to(device),
         "quats": clean_state.quats.to(device),
     }
-    keep_mask_dev = (~delete_mask_full).to(device)
-    del_mask_dev = delete_mask_full.to(device)
-    gauss_kept = {k: v[keep_mask_dev] for k, v in clean_dict.items()}
-    gauss_imagined = {k: v[del_mask_dev] for k, v in clean_dict.items()}
 
     ptr_scene = build_scene_pointers(
         clean_state.source_image_ids,
@@ -1106,15 +1100,17 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
         patch_size=int(H_img // patch_grid[0]),
         patch_grid=patch_grid,
     ).to(device)
-    ptr_scene_kept = GaussianPointers(
-        src_kind=ptr_scene.src_kind[keep_mask_dev],
-        object_id=ptr_scene.object_id[keep_mask_dev],
-        view_n=ptr_scene.view_n[keep_mask_dev],
-        patch_idx=ptr_scene.patch_idx[keep_mask_dev],
-        visible_mask=ptr_scene.visible_mask[keep_mask_dev],
-    )
 
     F_g_lut_scene = assembler._select_lut_scene(predictions)
+    S_total = int(F_g_lut_scene[0].shape[1])
+    delete_masks_by_target = assembler._mode_b_delete_masks_by_target(
+        mode_b=mode_b_payload,
+        delete_mask=delete_mask_full,
+        S=S_total,
+        n_g=n_g,
+        device=device,
+    )
+    mode_b_noop = not bool(delete_masks_by_target.any().item())
     cameras_dggt_b = _ensure_batched_cameras(cameras_dggt)
     cameras_splat = FlowFeatureAssembler.scale_cameras_for_render(
         cameras_dggt_b, source_hw=(H_img, W_img), target_hw=(H_splat, W_splat),
@@ -1129,17 +1125,14 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
             # coverage-mask artifacts in low-alpha/sky tokens.
             splatted_tok_low = [lvl.to(device) for lvl in F_g_lut_scene]
         else:
-            # Soft mask coverage with imagined Gaussians as the I_map source.
-            K_map, _D_map, I_map_proxy, _ = assembler.soft_mask.render_coverage(
-                G_kept=[gauss_kept],
-                G_deleted=[{}],
-                G_asset_dggt_dict=[{0: gauss_imagined}],
+            # Soft mask coverage with each target frame's own delete mask.
+            K_map, D_map, I_map, _ = assembler._render_mode_b_per_target_coverage(
+                clean_dict=clean_dict,
+                delete_masks_by_target=delete_masks_by_target,
                 cameras_dggt=cameras_dggt_dev,
                 H=H_img,
                 W=W_img,
             )
-            D_map = torch.zeros_like(I_map_proxy)
-            I_map = I_map_proxy
             M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
                 K_map, D_map, I_map, target_grid=patch_grid
             )
@@ -1159,28 +1152,14 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
                 W_splat=W_splat,
             )
 
-            # Frame-chunk the splatter to keep peak memory bounded on full clips.
-            S_total = int(F_g_lut_scene[0].shape[1])
-            frame_chunk = 2
-            splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(assembler.num_levels)]
-            for fs in range(0, S_total, frame_chunk):
-                fe = min(fs + frame_chunk, S_total)
-                cameras_splat_chunk = {k: v[:, fs:fe].contiguous() for k, v in cameras_splat.items()}
-                tile_masks_chunk = active_tile_masks[:, fs:fe].contiguous()
-                chunk_out = assembler.feature_splatter(
-                    gaussians_dggt=[gauss_kept],
-                    pointers=[ptr_scene_kept],
-                    lut_scene=F_g_lut_scene,
-                    lut_asset_dict=None,
-                    cameras_dggt=cameras_splat_chunk,
-                    H=H_splat,
-                    W=W_splat,
-                    pool_to=patch_grid,
-                    tile_masks=tile_masks_chunk,
-                )
-                for lvl_idx, lvl_tensor in enumerate(chunk_out):
-                    splatted_levels[lvl_idx].append(lvl_tensor)
-            splatted_tok_low = [torch.cat(parts, dim=1) for parts in splatted_levels]
+            splatted_tok_low = assembler._splat_mode_b_per_target(
+                clean_dict=clean_dict,
+                ptr_scene=ptr_scene,
+                delete_masks_by_target=delete_masks_by_target,
+                lut_scene=F_g_lut_scene,
+                cameras_splat=cameras_splat,
+                tile_masks=active_tile_masks,
+            )
 
             splatted_tok_low = assembler._blend_preserve_tokens(
                 clean_levels=F_g_lut_scene,

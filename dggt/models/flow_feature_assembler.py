@@ -18,6 +18,7 @@ the "online part" that follows offline caching.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -674,8 +675,8 @@ class FlowFeatureAssembler(nn.Module):
         clean_images = clean_state.images
         H_img, W_img = int(clean_images.shape[-2]), int(clean_images.shape[-1])
 
-        # Pseudo-delete mask from cache. The cache stored the per-Gaussian
-        # delete mask computed against the same deterministic clean_state.
+        # Pseudo-delete masks from cache. Prefer the per-target-frame masks so
+        # the diffusion edit footprint matches the rendered Mode-B hole.
         delete_mask = mode_b.get("delete_mask")
         if delete_mask is None:
             raise RuntimeError("Mode B forward requires `mode_b.delete_mask`.")
@@ -685,7 +686,6 @@ class FlowFeatureAssembler(nn.Module):
             # Defensive: if Gaussian count drifted (it shouldn't — Pass1 is
             # deterministic), fall back to "delete nothing" to keep training going.
             delete_mask = torch.zeros((n_g,), dtype=torch.bool)
-        mode_b_noop = not bool(delete_mask.any().item())
         clean_dict = {
             "means": clean_state.means.to(device),
             "colors": clean_state.colors.to(device),
@@ -694,13 +694,9 @@ class FlowFeatureAssembler(nn.Module):
             "scales": clean_state.scales.to(device),
             "quats": clean_state.quats.to(device),
         }
-        keep_mask_dev = (~delete_mask).to(device)
-        del_mask_dev = delete_mask.to(device)
-        gauss_kept = {k: v[keep_mask_dev] for k, v in clean_dict.items()}
-        gauss_imagined = {k: v[del_mask_dev] for k, v in clean_dict.items()}
 
-        # Pointers (scene only). The kept/imagined slices keep the per-Gaussian
-        # ordering so we can splat scene tokens onto kept gaussians.
+        # Pointers (scene only). Per-target-frame deletion is applied later
+        # because each target frame can remove a different subset of Gaussians.
         ptr_scene = build_scene_pointers(
             clean_state.source_image_ids,
             clean_state.source_y,
@@ -708,57 +704,33 @@ class FlowFeatureAssembler(nn.Module):
             patch_size=int(H_img // self.patch_grid[0]),
             patch_grid=self.patch_grid,
         ).to(device)
+
+        F_g_lut_scene = self._select_lut_scene(predictions)
+        B = int(F_g_lut_scene[0].shape[0])
+        S = int(F_g_lut_scene[0].shape[1])
+        delete_masks_by_target = self._mode_b_delete_masks_by_target(
+            mode_b=mode_b,
+            delete_mask=delete_mask,
+            S=S,
+            n_g=n_g,
+            device=device,
+        )
+        delete_mask_union = delete_masks_by_target.any(dim=0)
+        mode_b_noop = not bool(delete_mask_union.any().item())
+        keep_mask_union = ~delete_mask_union
+        gauss_kept = {k: v[keep_mask_union] for k, v in clean_dict.items()}
+        gauss_imagined = {k: v[delete_mask_union] for k, v in clean_dict.items()}
         ptr_scene_kept = GaussianPointers(
-            src_kind=ptr_scene.src_kind[keep_mask_dev],
-            object_id=ptr_scene.object_id[keep_mask_dev],
-            view_n=ptr_scene.view_n[keep_mask_dev],
-            patch_idx=ptr_scene.patch_idx[keep_mask_dev],
-            visible_mask=ptr_scene.visible_mask[keep_mask_dev],
+            src_kind=ptr_scene.src_kind[keep_mask_union],
+            object_id=ptr_scene.object_id[keep_mask_union],
+            view_n=ptr_scene.view_n[keep_mask_union],
+            patch_idx=ptr_scene.patch_idx[keep_mask_union],
+            visible_mask=ptr_scene.visible_mask[keep_mask_union],
         )
         pointers_all = ptr_scene_kept
 
-        F_g_lut_scene = self._select_lut_scene(predictions)
-
-        # Phase 2: Splat scene tokens onto kept Gaussians only.
-        if mode_b_noop:
-            # No imagined/deleted region means Mode B is a true no-op for this
-            # frame subset.  Re-splatting the clean scene would still alter
-            # low-coverage/sky tokens through K/(K+eps), so bypass it exactly.
-            splatted_tok_low = [t.to(device=device) for t in F_g_lut_scene]
-        else:
-            cameras_splat = self.scale_cameras_for_render(
-                cameras_dggt,
-                source_hw=(H_img, W_img),
-                target_hw=(self.H_splat, self.W_splat),
-            )
-        if (not mode_b_noop) and splatted_tok_low_cached is None:
-            splatted_tok_low = self.feature_splatter(
-                gaussians_dggt=[gauss_kept],
-                pointers=[pointers_all],
-                lut_scene=F_g_lut_scene,
-                lut_asset_dict=None,
-                cameras_dggt=cameras_splat,
-                H=self.H_splat,
-                W=self.W_splat,
-                pool_to=self.patch_grid,
-            )
-        elif not mode_b_noop:
-            # Schema v6 fast path: post-blend splatted_tok_low is cached.
-            # tokenizer.encode below still runs live so z_clean / z_splat use
-            # the latest tokenizer weights.
-            # The cached values use the full clip as the splat source set and
-            # are sliced only on target frames by the dataset.
-            splatted_tok_low = [
-                t.to(device=F_g_lut_scene[0].device, dtype=F_g_lut_scene[0].dtype)
-                for t in splatted_tok_low_cached
-            ]
-
-        # Phase 3: Soft masks. K = render(kept), I = render(imagined Gaussians),
-        # D = 0. Soft-normalize → M_preserve, M_source(=0), M_dest.
-        # NOTE: soft_mask is cheap (~36ms) and produces M_preserve/M_dest
-        # which are first-class WAN inputs, so we keep this even on fast path.
-        B = int(F_g_lut_scene[0].shape[0])
-        S = int(F_g_lut_scene[0].shape[1])
+        # Phase 3: Soft masks. K = render(per-frame kept),
+        # I = render(per-frame pseudo-deleted Gaussians), D = 0.
         if mode_b_noop:
             K_map = torch.ones((B, S, H_img, W_img, 1), dtype=torch.float32, device=device)
             D_map = torch.zeros_like(K_map)
@@ -772,18 +744,13 @@ class FlowFeatureAssembler(nn.Module):
             M_source = torch.zeros_like(M_preserve)
             M_dest = torch.zeros_like(M_preserve)
         else:
-            K_map, _D_map_dummy, I_map_proxy, _ = self.soft_mask.render_coverage(
-                G_kept=[gauss_kept],
-                G_deleted=[{}],
-                G_asset_dggt_dict=[{0: gauss_imagined}],
+            K_map, D_map, I_map, I_per_obj = self._render_mode_b_per_target_coverage(
+                clean_dict=clean_dict,
+                delete_masks_by_target=delete_masks_by_target,
                 cameras_dggt=cameras_dggt,
                 H=H_img,
                 W=W_img,
             )
-            D_map = torch.zeros_like(I_map_proxy)
-            I_map = I_map_proxy
-            I_per_obj = [{}]
-
             M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
                 K_map, D_map, I_map, target_grid=self.patch_grid
             )
@@ -795,12 +762,46 @@ class FlowFeatureAssembler(nn.Module):
                 M_source=M_source,
                 M_dest=M_dest,
             )
-        if (not mode_b_noop) and splatted_tok_low_cached is None:
+
+        # Phase 2: Splat scene tokens onto per-frame kept Gaussians only.
+        if mode_b_noop:
+            # No imagined/deleted region means Mode B is a true no-op for this
+            # frame subset. Re-splatting the clean scene would still alter
+            # low-coverage/sky tokens through K/(K+eps), so bypass it exactly.
+            splatted_tok_low = [t.to(device=device) for t in F_g_lut_scene]
+        elif splatted_tok_low_cached is None:
+            cameras_splat = self.scale_cameras_for_render(
+                cameras_dggt,
+                source_hw=(H_img, W_img),
+                target_hw=(self.H_splat, self.W_splat),
+            )
+            active_tile_masks = self._splat_weight_to_tile_masks(
+                (1.0 - M_preserve).clamp(0.0, 1.0),
+                threshold=1e-3,
+                H_splat=self.H_splat,
+                W_splat=self.W_splat,
+            )
+            splatted_tok_low = self._splat_mode_b_per_target(
+                clean_dict=clean_dict,
+                ptr_scene=ptr_scene,
+                delete_masks_by_target=delete_masks_by_target,
+                lut_scene=F_g_lut_scene,
+                cameras_splat=cameras_splat,
+                tile_masks=active_tile_masks,
+            )
             splatted_tok_low = self._blend_preserve_tokens(
                 clean_levels=F_g_lut_scene,
                 splatted_levels=splatted_tok_low,
                 M_preserve=M_preserve,
             )
+        else:
+            # Schema v6 fast path: post-blend splatted_tok_low is cached.
+            # tokenizer.encode below still runs live so z_clean / z_splat use
+            # the latest tokenizer weights.
+            splatted_tok_low = [
+                t.to(device=F_g_lut_scene[0].device, dtype=F_g_lut_scene[0].dtype)
+                for t in splatted_tok_low_cached
+            ]
         # Cached path already stores the post-blend splatted_tok_low.
 
         # Scaffold (D_edited not meaningful for mode B — pass zeros).
@@ -876,8 +877,8 @@ class FlowFeatureAssembler(nn.Module):
             asset_only={},
             edited=gauss_kept,
             localized_objects=[],
-            delete_mask=delete_mask.to(device),
-            shell_mask=delete_mask.to(device),
+            delete_mask=delete_mask_union.to(device),
+            shell_mask=delete_mask_union.to(device),
         )
         edit_bundle = EditedSceneBundle(
             clean_state=clean_state,
@@ -891,8 +892,9 @@ class FlowFeatureAssembler(nn.Module):
             G_asset_per_object={},
             per_gauss_pointers=None,
             edit_meta={
-                "delete_mask": delete_mask,
-                "shell_mask": delete_mask,
+                "delete_mask": delete_mask_union.detach().cpu(),
+                "delete_mask_per_frame": delete_masks_by_target.detach().cpu(),
+                "shell_mask": delete_mask_union.detach().cpu(),
                 "phase4_slots": [],
                 "mode_kind": "mode_b",
                 "imagined_objects": list(mode_b.get("imagined_objects", [])),
@@ -940,13 +942,192 @@ class FlowFeatureAssembler(nn.Module):
                 "imagined_objects": list(mode_b.get("imagined_objects", [])),
                 "num_imagined_objects": int(mode_b.get("num_imagined_objects", 0)),
                 "rejection_reason": str(mode_b.get("rejection_reason", "")),
-                "delete_mask": delete_mask.cpu(),
+                "delete_mask": delete_mask_union.detach().cpu(),
+                "delete_mask_per_frame": delete_masks_by_target.detach().cpu(),
             },
         )
 
     # ------------------------------------------------------------------ #
     # Internal helpers                                                    #
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _mode_b_delete_masks_by_target(
+        *,
+        mode_b: dict[str, Any],
+        delete_mask: torch.Tensor,
+        S: int,
+        n_g: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return target-frame delete masks as `[S, N_g]`.
+
+        `mode_b.delete_mask` is a union mask kept for compatibility. New v6
+        caches also carry per-target-frame masks; those are the authoritative
+        edit footprint for Mode B.
+        """
+        for key in ("delete_mask_per_frame_subset", "delete_mask_per_frame"):
+            per_frame = mode_b.get(key)
+            if not torch.is_tensor(per_frame) or per_frame.numel() == 0:
+                continue
+            per_frame = per_frame.to(device=device, dtype=torch.bool)
+            if per_frame.dim() != 2 or int(per_frame.shape[1]) != int(n_g):
+                continue
+            if int(per_frame.shape[0]) == int(S):
+                return per_frame.contiguous()
+            row_idx = torch.arange(int(S), device=device).clamp_max(int(per_frame.shape[0]) - 1)
+            return per_frame.index_select(0, row_idx).contiguous()
+
+        delete_mask = delete_mask.to(device=device, dtype=torch.bool)
+        if int(delete_mask.numel()) != int(n_g):
+            delete_mask = torch.zeros((int(n_g),), dtype=torch.bool, device=device)
+        return delete_mask.view(1, int(n_g)).expand(int(S), int(n_g)).contiguous()
+
+    def _render_mode_b_per_target_coverage(
+        self,
+        *,
+        clean_dict: dict[str, torch.Tensor],
+        delete_masks_by_target: torch.Tensor,
+        cameras_dggt: dict[str, torch.Tensor],
+        H: int,
+        W: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]]]:
+        """Render Mode-B K/I coverage with the target frame's own delete mask."""
+        viewmats = cameras_dggt["viewmats"]
+        if int(viewmats.shape[0]) != 1:
+            raise ValueError("Mode-B per-target coverage currently expects batch size 1.")
+        S = int(viewmats.shape[1])
+        if tuple(delete_masks_by_target.shape) != (S, int(clean_dict["means"].shape[0])):
+            raise ValueError(
+                "delete_masks_by_target must be [S,N_g], got "
+                f"{tuple(delete_masks_by_target.shape)} for S={S}, N_g={int(clean_dict['means'].shape[0])}"
+            )
+
+        K_chunks: list[torch.Tensor] = []
+        I_chunks: list[torch.Tensor] = []
+        for target_idx in range(S):
+            del_mask = delete_masks_by_target[target_idx].to(
+                device=clean_dict["means"].device, dtype=torch.bool
+            )
+            keep_mask = ~del_mask
+            gauss_kept = {k: v[keep_mask] for k, v in clean_dict.items()}
+            gauss_deleted = {k: v[del_mask] for k, v in clean_dict.items()}
+            cameras_one = {
+                "viewmats": cameras_dggt["viewmats"][:, target_idx : target_idx + 1].contiguous(),
+                "Ks": cameras_dggt["Ks"][:, target_idx : target_idx + 1].contiguous(),
+            }
+            K_one, _D_dummy, I_one, _ = self.soft_mask.render_coverage(
+                G_kept=[gauss_kept],
+                G_deleted=[{}],
+                G_asset_dggt_dict=[{0: gauss_deleted}],
+                cameras_dggt=cameras_one,
+                H=H,
+                W=W,
+            )
+            K_chunks.append(K_one)
+            I_chunks.append(I_one)
+
+        K_map = torch.cat(K_chunks, dim=1)
+        I_map = torch.cat(I_chunks, dim=1)
+        D_map = torch.zeros_like(I_map)
+        I_per_obj = [{0: I_map[0]}]
+        return K_map, D_map, I_map, I_per_obj
+
+    def _splat_mode_b_per_target(
+        self,
+        *,
+        clean_dict: dict[str, torch.Tensor],
+        ptr_scene: GaussianPointers,
+        delete_masks_by_target: torch.Tensor,
+        lut_scene: Sequence[torch.Tensor],
+        cameras_splat: dict[str, torch.Tensor],
+        tile_masks: torch.Tensor | None,
+    ) -> list[torch.Tensor]:
+        """Feature-splat Mode B one target frame at a time.
+
+        FeatureSplatter accepts one Gaussian set for all target cameras. Mode B
+        needs a different kept set per target frame, so exact semantics require
+        frame-wise splats.
+        """
+        viewmats = cameras_splat["viewmats"]
+        if int(viewmats.shape[0]) != 1:
+            raise ValueError("Mode-B per-target splat currently expects batch size 1.")
+        S = int(viewmats.shape[1])
+        splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(self.num_levels)]
+        for target_idx in range(S):
+            del_mask = delete_masks_by_target[target_idx].to(
+                device=clean_dict["means"].device, dtype=torch.bool
+            )
+            keep_mask = ~del_mask
+            gauss_kept = {k: v[keep_mask] for k, v in clean_dict.items()}
+            ptr_kept = GaussianPointers(
+                src_kind=ptr_scene.src_kind[keep_mask],
+                object_id=ptr_scene.object_id[keep_mask],
+                view_n=ptr_scene.view_n[keep_mask],
+                patch_idx=ptr_scene.patch_idx[keep_mask],
+                visible_mask=ptr_scene.visible_mask[keep_mask],
+            )
+            cameras_one = {
+                "viewmats": cameras_splat["viewmats"][:, target_idx : target_idx + 1].contiguous(),
+                "Ks": cameras_splat["Ks"][:, target_idx : target_idx + 1].contiguous(),
+            }
+            tile_one = None if tile_masks is None else tile_masks[:, target_idx : target_idx + 1].contiguous()
+            chunk_out = self.feature_splatter(
+                gaussians_dggt=[gauss_kept],
+                pointers=[ptr_kept],
+                lut_scene=lut_scene,
+                lut_asset_dict=None,
+                cameras_dggt=cameras_one,
+                H=self.H_splat,
+                W=self.W_splat,
+                pool_to=self.patch_grid,
+                tile_masks=tile_one,
+            )
+            for level_idx, level_tensor in enumerate(chunk_out):
+                splatted_levels[level_idx].append(level_tensor)
+        return [torch.cat(parts, dim=1) for parts in splatted_levels]
+
+    def _splat_weight_to_tile_masks(
+        self,
+        splat_weight: torch.Tensor,
+        *,
+        threshold: float,
+        H_splat: int,
+        W_splat: int,
+        tile_size: int = 16,
+    ) -> torch.Tensor:
+        """Convert per-token splat contribution `[B,S,P,1]` into gsplat tiles."""
+        if splat_weight.dim() != 4 or splat_weight.shape[-1] != 1:
+            raise ValueError(f"splat_weight must be [B,S,P,1], got {tuple(splat_weight.shape)}")
+        B, S, P, _ = splat_weight.shape
+        patch_h, patch_w = self.patch_grid
+        if int(P) != patch_h * patch_w:
+            raise ValueError(f"splat_weight P={int(P)} does not match patch_grid={self.patch_grid}")
+        if int(H_splat) % patch_h != 0 or int(W_splat) % patch_w != 0:
+            raise ValueError(
+                f"splat size {(H_splat, W_splat)} must be divisible by patch_grid={self.patch_grid}"
+            )
+
+        active = splat_weight[..., 0].detach() > float(threshold)
+        active_grid = active.reshape(B, S, patch_h, patch_w)
+        tile_h = math.ceil(int(H_splat) / float(tile_size))
+        tile_w = math.ceil(int(W_splat) / float(tile_size))
+        pix_h = int(H_splat) // patch_h
+        pix_w = int(W_splat) // patch_w
+        tile_masks = torch.zeros((B, S, tile_h, tile_w), dtype=torch.bool, device=active.device)
+        for ty in range(tile_h):
+            y0 = int(ty * tile_size)
+            y1 = min(int((ty + 1) * tile_size), int(H_splat))
+            py0 = max(0, min(patch_h, y0 // pix_h))
+            py1 = max(py0, min(patch_h, math.ceil(y1 / float(pix_h))))
+            for tx in range(tile_w):
+                x0 = int(tx * tile_size)
+                x1 = min(int((tx + 1) * tile_size), int(W_splat))
+                px0 = max(0, min(patch_w, x0 // pix_w))
+                px1 = max(px0, min(patch_w, math.ceil(x1 / float(pix_w))))
+                if py1 > py0 and px1 > px0:
+                    tile_masks[:, :, ty, tx] = active_grid[:, :, py0:py1, px0:px1].any(dim=(-1, -2))
+        return tile_masks
+
     def _unedited_preserve_token_mask(
         self,
         *,
