@@ -80,20 +80,15 @@ class SoftMaskBuilder(nn.Module):
             K_map_b = self._render_alpha(G_kept[b], viewmats, Ks, H, W, device, dtype)
             D_map_b = self._render_alpha(G_deleted[b], viewmats, Ks, H, W, device, dtype)
 
-            per_obj: dict[int, torch.Tensor] = {}
-            if G_asset_dggt_dict[b] is not None:
-                for obj_key, gauss in G_asset_dggt_dict[b].items():
-                    per_obj[int(obj_key)] = self._render_alpha(
-                        gauss, viewmats, Ks, H, W, device, dtype
-                    )
-            if len(per_obj) > 0:
-                I_map_b = torch.clamp(
-                    torch.stack(list(per_obj.values()), dim=0).sum(dim=0),
-                    min=0.0,
-                    max=1.0,
-                )
-            else:
-                I_map_b = torch.zeros((S, H, W, 1), dtype=dtype, device=device)
+            I_map_b, per_obj = self._render_asset_owner_alpha(
+                G_asset_dggt_dict[b],
+                viewmats,
+                Ks,
+                H,
+                W,
+                device,
+                dtype,
+            )
 
             K_list.append(K_map_b)
             D_list.append(D_map_b)
@@ -184,6 +179,72 @@ class SoftMaskBuilder(nn.Module):
         )
         # alphas: [S, H, W, 1], already in [0, 1]
         return alphas.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _render_asset_owner_alpha(
+        asset_dict: Mapping[int, Mapping[str, torch.Tensor]] | None,
+        viewmats: torch.Tensor,
+        Ks: torch.Tensor,
+        H: int,
+        W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """Render inserted assets together so only asset-asset visibility is resolved."""
+        S = int(viewmats.shape[0])
+        zero = torch.zeros((S, H, W, 1), dtype=dtype, device=device)
+        if asset_dict is None:
+            return zero, {}
+
+        assets = {int(k): v for k, v in asset_dict.items()}
+        all_keys = sorted(assets.keys())
+        nonempty_keys = [
+            k
+            for k in all_keys
+            if assets[k].get("means") is not None and assets[k]["means"].numel() > 0
+        ]
+        if len(nonempty_keys) == 0:
+            return zero, {k: zero.clone() for k in all_keys}
+
+        means_chunks: list[torch.Tensor] = []
+        quats_chunks: list[torch.Tensor] = []
+        scales_chunks: list[torch.Tensor] = []
+        opacities_chunks: list[torch.Tensor] = []
+        color_chunks: list[torch.Tensor] = []
+        channel_by_key = {k: i for i, k in enumerate(nonempty_keys)}
+
+        for obj_key in nonempty_keys:
+            gauss = assets[obj_key]
+            means = gauss["means"].to(device).detach().float()
+            n = int(means.shape[0])
+            means_chunks.append(means)
+            quats_chunks.append(gauss["quats"].to(device).detach().float())
+            scales_chunks.append(gauss["scales"].to(device).detach().float())
+            opacities_chunks.append(gauss["opacities"].to(device).detach().float().view(-1))
+            colors = torch.zeros((n, len(nonempty_keys)), dtype=dtype, device=device)
+            colors[:, channel_by_key[obj_key]] = 1.0
+            color_chunks.append(colors)
+
+        rendered, _, _ = rasterization(
+            means=torch.cat(means_chunks, dim=0),
+            quats=torch.cat(quats_chunks, dim=0),
+            scales=torch.cat(scales_chunks, dim=0),
+            opacities=torch.cat(opacities_chunks, dim=0),
+            colors=torch.cat(color_chunks, dim=0),
+            viewmats=viewmats.float(),
+            Ks=Ks.float(),
+            width=int(W),
+            height=int(H),
+            render_mode="RGB",
+            channel_chunk=min(len(nonempty_keys), 32),
+        )
+        owner = rendered.clamp(0.0, 1.0)
+        per_obj: dict[int, torch.Tensor] = {}
+        for obj_key in all_keys:
+            channel = channel_by_key.get(obj_key)
+            per_obj[obj_key] = zero.clone() if channel is None else owner[..., channel : channel + 1]
+        I_map = owner.sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
+        return I_map, per_obj
 
     @staticmethod
     def _normalize_grid(grid: int | tuple[int, int]) -> tuple[int, int]:
