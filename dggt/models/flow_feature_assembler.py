@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -527,7 +527,7 @@ class FlowFeatureAssembler(nn.Module):
         G_asset_dict_list = [
             {int(k): gauss for k, gauss in edit_bundle.G_asset_per_object.items()}
         ]
-        K_map, D_map, I_map, I_per_obj = self.soft_mask.render_coverage(
+        K_map, D_map, I_map, I_per_obj = self._render_mode_a_depth_aware_coverage(
             G_kept_list,
             G_deleted_list,
             G_asset_dict_list,
@@ -1274,6 +1274,149 @@ class FlowFeatureAssembler(nn.Module):
         M_source = torch.where(force_preserve, torch.zeros_like(M_source), M_source)
         M_dest = torch.where(force_preserve, torch.zeros_like(M_dest), M_dest)
         return M_preserve, M_source, M_dest
+
+    def _render_mode_a_depth_aware_coverage(
+        self,
+        G_kept: Sequence[Mapping[str, torch.Tensor]],
+        G_deleted: Sequence[Mapping[str, torch.Tensor]],
+        G_asset_dggt_dict: Sequence[Mapping[int, Mapping[str, torch.Tensor]]],
+        cameras_dggt: Mapping[str, torch.Tensor],
+        H: int,
+        W: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]]]:
+        """Render Mode-A coverage with edited-scene depth ordering.
+
+        Deleted coverage is still rendered independently because it marks the
+        source footprint.  Kept and inserted assets are rendered together with
+        one-hot owner colors, so asset-asset and asset-scene occlusion decide
+        which destination object is actually visible.
+        """
+        if len(G_deleted) != len(G_kept) or len(G_asset_dggt_dict) != len(G_kept):
+            raise ValueError(
+                f"Mode-A coverage batch mismatch: kept={len(G_kept)} "
+                f"deleted={len(G_deleted)} assets={len(G_asset_dggt_dict)}"
+            )
+        self.soft_mask._validate_cameras(cameras_dggt, expected_B=len(G_kept))
+        viewmats_all = cameras_dggt["viewmats"]
+        Ks_all = cameras_dggt["Ks"]
+        device = viewmats_all.device
+        dtype = torch.float32
+
+        B = int(viewmats_all.shape[0])
+        K_list: list[torch.Tensor] = []
+        D_list: list[torch.Tensor] = []
+        I_list: list[torch.Tensor] = []
+        I_per_obj_list: list[dict[int, torch.Tensor]] = []
+
+        for b in range(B):
+            viewmats = viewmats_all[b]
+            Ks = Ks_all[b]
+            K_map_b, I_map_b, per_obj = self._render_mode_a_visible_owner_coverage_one(
+                G_kept[b],
+                G_asset_dggt_dict[b],
+                viewmats,
+                Ks,
+                H,
+                W,
+                device,
+                dtype,
+            )
+            D_map_b = self.soft_mask._render_alpha(
+                G_deleted[b],
+                viewmats,
+                Ks,
+                H,
+                W,
+                device,
+                dtype,
+            )
+
+            K_list.append(K_map_b)
+            D_list.append(D_map_b)
+            I_list.append(I_map_b)
+            I_per_obj_list.append(per_obj)
+
+        return (
+            torch.stack(K_list, dim=0),
+            torch.stack(D_list, dim=0),
+            torch.stack(I_list, dim=0),
+            I_per_obj_list,
+        )
+
+    @staticmethod
+    def _render_mode_a_visible_owner_coverage_one(
+        G_kept: Mapping[str, torch.Tensor] | None,
+        G_asset_dggt: Mapping[int, Mapping[str, torch.Tensor]] | None,
+        viewmats: torch.Tensor,
+        Ks: torch.Tensor,
+        H: int,
+        W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[int, torch.Tensor]]:
+        S = int(viewmats.shape[0])
+        zero = torch.zeros((S, int(H), int(W), 1), dtype=dtype, device=device)
+        asset_dict = {} if G_asset_dggt is None else {int(k): v for k, v in G_asset_dggt.items()}
+        all_asset_keys = sorted(asset_dict.keys())
+        nonempty_asset_keys = [
+            k
+            for k in all_asset_keys
+            if asset_dict[k].get("means") is not None and asset_dict[k]["means"].numel() > 0
+        ]
+        owner_channels = 1 + len(nonempty_asset_keys)
+        asset_channel = {k: i + 1 for i, k in enumerate(nonempty_asset_keys)}
+
+        means_chunks: list[torch.Tensor] = []
+        quats_chunks: list[torch.Tensor] = []
+        scales_chunks: list[torch.Tensor] = []
+        opacities_chunks: list[torch.Tensor] = []
+        owner_color_chunks: list[torch.Tensor] = []
+
+        def append_owner(gauss: Mapping[str, torch.Tensor] | None, channel: int) -> None:
+            if gauss is None:
+                return
+            means = gauss.get("means")
+            if means is None or means.numel() == 0:
+                return
+            n = int(means.shape[0])
+            means_chunks.append(means.to(device).detach().float())
+            quats_chunks.append(gauss["quats"].to(device).detach().float())
+            scales_chunks.append(gauss["scales"].to(device).detach().float())
+            opacities_chunks.append(gauss["opacities"].to(device).detach().float().view(-1))
+            colors = torch.zeros((n, owner_channels), dtype=dtype, device=device)
+            colors[:, int(channel)] = 1.0
+            owner_color_chunks.append(colors)
+
+        append_owner(G_kept, 0)
+        for obj_key in nonempty_asset_keys:
+            append_owner(asset_dict[obj_key], asset_channel[obj_key])
+
+        if len(means_chunks) == 0:
+            return zero, zero.clone(), {k: zero.clone() for k in all_asset_keys}
+
+        from gsplat.rendering import rasterization
+
+        rendered, _, _ = rasterization(
+            means=torch.cat(means_chunks, dim=0),
+            quats=torch.cat(quats_chunks, dim=0),
+            scales=torch.cat(scales_chunks, dim=0),
+            opacities=torch.cat(opacities_chunks, dim=0),
+            colors=torch.cat(owner_color_chunks, dim=0),
+            viewmats=viewmats.float(),
+            Ks=Ks.float(),
+            width=int(W),
+            height=int(H),
+            render_mode="RGB",
+            channel_chunk=min(max(1, owner_channels), 32),
+        )
+        owner = rendered.clamp(0.0, 1.0)
+        K_map = owner[..., 0:1]
+        I_map = owner[..., 1:].sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
+        per_obj: dict[int, torch.Tensor] = {}
+        for obj_key in all_asset_keys:
+            channel = asset_channel.get(obj_key)
+            per_obj[obj_key] = zero.clone() if channel is None else owner[..., channel : channel + 1]
+        return K_map, I_map, per_obj
 
     def _blend_preserve_tokens(
         self,
