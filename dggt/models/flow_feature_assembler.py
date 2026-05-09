@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -491,46 +491,19 @@ class FlowFeatureAssembler(nn.Module):
             source_hw=(H_img, W_img),
             target_hw=(self.H_splat, self.W_splat),
         )
-        if splatted_tok_low_cached is None:
-            splatted_tok_low = self.feature_splatter(
-                gaussians_dggt=[gaussians_all],
-                pointers=[pointers_all],
-                lut_scene=F_g_lut_scene,
-                lut_asset_dict=F_g_lut_asset if len(F_g_lut_asset) > 0 else None,
-                cameras_dggt=cameras_splat,
-                H=self.H_splat,
-                W=self.W_splat,
-                pool_to=self.patch_grid,
-            )
-        else:
-            # Schema v6 fast path: post-blend splatted_tok_low was cached, so
-            # we skip the 33s splatter pass.  ``tokenizer.encode`` still runs
-            # online below so z_clean and z_splat share the latest tokenizer
-            # weights.  The blend is also already applied in the cache, so the
-            # subsequent _blend_* calls become no-ops on this branch.
-            # The cache was generated with full-clip source Gaussians and then
-            # target-frame sliced by the dataset.  It is not expected to match a
-            # live splat that first drops non-subset source Gaussians; this
-            # matches the typical full-clip inference path.
-            splatted_tok_low = [
-                t.to(device=F_g_lut_scene[0].device, dtype=F_g_lut_scene[0].dtype)
-                for t in splatted_tok_low_cached
-            ]
 
         # ------------------- Phase 3: Soft masks + Scaffold -------------- #
         # NOTE: soft_mask still runs in the cached path because M_preserve /
         # M_source / M_dest are first-class WAN inputs (not just used for
         # blending). They are cheap (~36ms total) so caching them isn't worth
         # the extra disk.
-        G_kept_list = [gauss_scene_kept]
-        G_deleted_list = [{k: v[edit_state.delete_mask].to(device) for k, v in gauss_scene.items()}]
-        G_asset_dict_list = [
-            {int(k): gauss for k, gauss in edit_bundle.G_asset_per_object.items()}
-        ]
-        K_map, D_map, I_map, I_per_obj = self.soft_mask.render_coverage(
-            G_kept_list,
-            G_deleted_list,
-            G_asset_dict_list,
+        K_map, D_map, I_map, I_per_obj = self._render_mode_a_per_target_coverage(
+            sample=sample,
+            clean_state=clean_state,
+            clean_dict=gauss_scene,
+            keep_mask=keep_mask,
+            delete_mask=edit_state.delete_mask.to(device),
+            asset_pass_result=asset_pass_result,
             cameras_dggt=cameras_dggt,
             H=H_img,
             W=W_img,
@@ -547,6 +520,18 @@ class FlowFeatureAssembler(nn.Module):
             M_dest=M_dest,
         )
         if splatted_tok_low_cached is None:
+            splatted_tok_low = self._splat_mode_a_per_target(
+                sample=sample,
+                clean_state=clean_state,
+                clean_dict=gauss_scene,
+                keep_mask=keep_mask,
+                ptr_scene=ptr_scene,
+                asset_pass_result=asset_pass_result,
+                lut_scene=F_g_lut_scene,
+                lut_asset_dict=F_g_lut_asset,
+                cameras_splat=cameras_splat,
+                tile_masks=None,
+            )
             splatted_tok_low = self._blend_preserve_tokens(
                 clean_levels=F_g_lut_scene,
                 splatted_levels=splatted_tok_low,
@@ -557,6 +542,14 @@ class FlowFeatureAssembler(nn.Module):
                 F_g_lut_asset=F_g_lut_asset,
                 I_map_per_obj=I_per_obj,
             )
+        else:
+            # Schema v6 fast path: post-blend splatted_tok_low is cached.
+            # tokenizer.encode below still runs live so z_clean / z_splat use
+            # the latest tokenizer weights.
+            splatted_tok_low = [
+                t.to(device=F_g_lut_scene[0].device, dtype=F_g_lut_scene[0].dtype)
+                for t in splatted_tok_low_cached
+            ]
         # Cached path already stores the post-blend splatted_tok_low.
 
         # Scaffold precursors
@@ -1092,6 +1085,74 @@ class FlowFeatureAssembler(nn.Module):
         out["opacities"] = opacity.reshape(-1, 1)
         return out
 
+    @staticmethod
+    def _empty_pointers(device: torch.device) -> GaussianPointers:
+        return GaussianPointers(
+            src_kind=torch.zeros((0,), dtype=torch.int32, device=device),
+            object_id=torch.zeros((0,), dtype=torch.int32, device=device),
+            view_n=torch.zeros((0,), dtype=torch.int32, device=device),
+            patch_idx=torch.zeros((0,), dtype=torch.int32, device=device),
+            visible_mask=torch.zeros((0,), dtype=torch.bool, device=device),
+        )
+
+    @staticmethod
+    def _subset_pointers(ptr: GaussianPointers, mask: torch.Tensor) -> GaussianPointers:
+        mask = mask.to(device=ptr.src_kind.device, dtype=torch.bool)
+        return GaussianPointers(
+            src_kind=ptr.src_kind[mask],
+            object_id=ptr.object_id[mask],
+            view_n=ptr.view_n[mask],
+            patch_idx=ptr.patch_idx[mask],
+            visible_mask=ptr.visible_mask[mask],
+        )
+
+    def _time_aware_gaussians_and_pointers_for_target(
+        self,
+        *,
+        clean_state: CleanSceneState,
+        clean_dict: dict[str, torch.Tensor],
+        ptr_scene: GaussianPointers,
+        base_mask: torch.Tensor,
+        target_idx: int,
+        timestamps: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], GaussianPointers]:
+        """Match DGGT's target-frame static/dynamic split and keep pointers aligned."""
+        device = clean_dict["means"].device
+        base_mask = base_mask.to(device=device, dtype=torch.bool)
+        if not bool(base_mask.any().item()):
+            return _empty_gauss_dict(device), self._empty_pointers(device)
+
+        dynamic_prob = clean_state.dynamic_prob.to(device=device, dtype=torch.float32)
+        source_image_ids = clean_state.source_image_ids.to(device=device, dtype=torch.long)
+        gs_conf = clean_state.gs_conf.to(device=device, dtype=torch.float32)
+        opacities = clean_dict["opacities"].to(device=device, dtype=torch.float32).view(-1)
+        ptr_scene = ptr_scene.to(device)
+
+        gauss_chunks: list[dict[str, torch.Tensor]] = []
+        ptr_chunks: list[GaussianPointers] = []
+
+        static_mask = base_mask & (dynamic_prob < 0.5)
+        if bool(static_mask.any().item()):
+            static_opacity = opacities[static_mask] * (1.0 - dynamic_prob[static_mask])
+            static_opacity = self._mode_b_alpha_t(
+                timestamps[source_image_ids[static_mask]].to(device=device, dtype=torch.float32),
+                timestamps[int(target_idx)],
+                static_opacity,
+                gs_conf[static_mask],
+            )
+            gauss_chunks.append(self._subset_gauss_with_opacity(clean_dict, static_mask, static_opacity))
+            ptr_chunks.append(self._subset_pointers(ptr_scene, static_mask))
+
+        dynamic_mask = base_mask & (source_image_ids == int(target_idx))
+        if bool(dynamic_mask.any().item()):
+            dynamic_opacity = opacities[dynamic_mask] * dynamic_prob[dynamic_mask]
+            gauss_chunks.append(self._subset_gauss_with_opacity(clean_dict, dynamic_mask, dynamic_opacity))
+            ptr_chunks.append(self._subset_pointers(ptr_scene, dynamic_mask))
+
+        if len(gauss_chunks) == 0:
+            return _empty_gauss_dict(device), self._empty_pointers(device)
+        return _concat_gauss_dicts(gauss_chunks, device=device), concat_pointers(ptr_chunks)
+
     def _mode_b_time_aware_gaussians_for_target(
         self,
         *,
@@ -1132,6 +1193,215 @@ class FlowFeatureAssembler(nn.Module):
         if len(chunks) == 0:
             return _empty_gauss_dict(device)
         return _concat_gauss_dicts(chunks, device=device)
+
+    @staticmethod
+    def _mode_a_asset_dict_for_target(
+        asset_pass_result: AssetPassResult,
+        target_idx: int,
+        *,
+        device: torch.device,
+    ) -> dict[int, dict[str, torch.Tensor]]:
+        if asset_pass_result.G_asset_dggt is None:
+            return {}
+        out: dict[int, dict[str, torch.Tensor]] = {}
+        for obj_key in asset_pass_result.object_keys:
+            obj_key = int(obj_key)
+            frames = asset_pass_result.G_asset_dggt.get(obj_key)
+            if frames is None or int(target_idx) >= len(frames):
+                out[obj_key] = _empty_gauss_dict(device)
+            else:
+                out[obj_key] = {k: v.to(device) for k, v in frames[int(target_idx)].items()}
+        return out
+
+    def _mode_a_asset_gaussians_and_pointers_for_target(
+        self,
+        asset_pass_result: AssetPassResult,
+        target_idx: int,
+        *,
+        device: torch.device,
+    ) -> tuple[list[dict[str, torch.Tensor]], list[GaussianPointers]]:
+        if asset_pass_result.G_asset_dggt is None:
+            return [], []
+        gauss_chunks: list[dict[str, torch.Tensor]] = []
+        ptr_chunks: list[GaussianPointers] = []
+        for obj_key in asset_pass_result.object_keys:
+            obj_key = int(obj_key)
+            frames = asset_pass_result.G_asset_dggt.get(obj_key)
+            ptr_frames = asset_pass_result.ptr_asset.get(obj_key)
+            if frames is None or ptr_frames is None or int(target_idx) >= len(frames) or int(target_idx) >= len(ptr_frames):
+                continue
+            gauss = {k: v.to(device) for k, v in frames[int(target_idx)].items()}
+            n = int(gauss["means"].shape[0])
+            if n == 0:
+                continue
+            ptr = ptr_frames[int(target_idx)].to(device)
+            if int(ptr.patch_idx.numel()) != n:
+                raise ValueError(
+                    f"Mode-A asset pointer/Gaussian count mismatch for object {obj_key}, "
+                    f"target {target_idx}: ptr={int(ptr.patch_idx.numel())}, gauss={n}"
+                )
+            gauss_chunks.append(gauss)
+            ptr_chunks.append(ptr)
+        return gauss_chunks, ptr_chunks
+
+    def _render_mode_a_per_target_coverage(
+        self,
+        *,
+        sample: dict[str, Any],
+        clean_state: CleanSceneState,
+        clean_dict: dict[str, torch.Tensor],
+        keep_mask: torch.Tensor,
+        delete_mask: torch.Tensor,
+        asset_pass_result: AssetPassResult,
+        cameras_dggt: dict[str, torch.Tensor],
+        H: int,
+        W: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]]]:
+        viewmats = cameras_dggt["viewmats"]
+        if int(viewmats.shape[0]) != 1:
+            raise ValueError("Mode-A per-target coverage currently expects batch size 1.")
+        S = int(viewmats.shape[1])
+        device = clean_dict["means"].device
+        timestamps = self._mode_b_timestamps(sample, num_images=S, device=viewmats.device)
+
+        K_chunks: list[torch.Tensor] = []
+        D_chunks: list[torch.Tensor] = []
+        I_chunks: list[torch.Tensor] = []
+        per_obj_chunks: dict[int, list[torch.Tensor]] = {
+            int(k): [] for k in asset_pass_result.object_keys
+        }
+        keep_mask = keep_mask.to(device=device, dtype=torch.bool)
+        delete_mask = delete_mask.to(device=device, dtype=torch.bool)
+
+        for target_idx in range(S):
+            gauss_kept = self._mode_b_time_aware_gaussians_for_target(
+                clean_state=clean_state,
+                clean_dict=clean_dict,
+                base_mask=keep_mask,
+                target_idx=target_idx,
+                timestamps=timestamps,
+            )
+            gauss_deleted = self._mode_b_time_aware_gaussians_for_target(
+                clean_state=clean_state,
+                clean_dict=clean_dict,
+                base_mask=delete_mask,
+                target_idx=target_idx,
+                timestamps=timestamps,
+            )
+            asset_dict = self._mode_a_asset_dict_for_target(
+                asset_pass_result,
+                target_idx,
+                device=device,
+            )
+            cameras_one = {
+                "viewmats": cameras_dggt["viewmats"][:, target_idx : target_idx + 1].contiguous(),
+                "Ks": cameras_dggt["Ks"][:, target_idx : target_idx + 1].contiguous(),
+            }
+            K_one, D_one, I_one, per_one = self.soft_mask.render_coverage(
+                G_kept=[gauss_kept],
+                G_deleted=[gauss_deleted],
+                G_asset_dggt_dict=[asset_dict],
+                cameras_dggt=cameras_one,
+                H=H,
+                W=W,
+            )
+            K_chunks.append(K_one)
+            D_chunks.append(D_one)
+            I_chunks.append(I_one)
+            for obj_key in per_obj_chunks:
+                per_obj_chunks[obj_key].append(
+                    per_one[0].get(obj_key, I_one.new_zeros((1, H, W, 1)))
+                )
+
+        K_map = torch.cat(K_chunks, dim=1)
+        D_map = torch.cat(D_chunks, dim=1)
+        I_map = torch.cat(I_chunks, dim=1)
+        I_per_obj = [
+            {obj_key: torch.cat(parts, dim=0) for obj_key, parts in per_obj_chunks.items()}
+        ]
+        return K_map, D_map, I_map, I_per_obj
+
+    def _render_mode_a_depth_aware_coverage(
+        self,
+        G_kept: Sequence[Mapping[str, torch.Tensor]],
+        G_deleted: Sequence[Mapping[str, torch.Tensor]],
+        G_asset_dggt_dict: Sequence[Mapping[int, Mapping[str, torch.Tensor]]],
+        cameras_dggt: Mapping[str, torch.Tensor],
+        H: int,
+        W: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]]]:
+        """Compatibility wrapper for older debug tools.
+
+        The current Mode-A rule is: K/D stay independent, while inserted
+        assets are rendered together so only asset-asset visibility is resolved.
+        """
+        return self.soft_mask.render_coverage(
+            G_kept,
+            G_deleted,
+            G_asset_dggt_dict,
+            cameras_dggt=cameras_dggt,
+            H=H,
+            W=W,
+        )
+
+    def _splat_mode_a_per_target(
+        self,
+        *,
+        sample: dict[str, Any],
+        clean_state: CleanSceneState,
+        clean_dict: dict[str, torch.Tensor],
+        keep_mask: torch.Tensor,
+        ptr_scene: GaussianPointers,
+        asset_pass_result: AssetPassResult,
+        lut_scene: Sequence[torch.Tensor],
+        lut_asset_dict: dict[int, list[torch.Tensor]],
+        cameras_splat: dict[str, torch.Tensor],
+        tile_masks: torch.Tensor | None,
+    ) -> list[torch.Tensor]:
+        viewmats = cameras_splat["viewmats"]
+        if int(viewmats.shape[0]) != 1:
+            raise ValueError("Mode-A per-target splat currently expects batch size 1.")
+        S = int(viewmats.shape[1])
+        device = clean_dict["means"].device
+        timestamps = self._mode_b_timestamps(sample, num_images=S, device=viewmats.device)
+        keep_mask = keep_mask.to(device=device, dtype=torch.bool)
+
+        splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(self.num_levels)]
+        for target_idx in range(S):
+            gauss_scene_t, ptr_scene_t = self._time_aware_gaussians_and_pointers_for_target(
+                clean_state=clean_state,
+                clean_dict=clean_dict,
+                ptr_scene=ptr_scene,
+                base_mask=keep_mask,
+                target_idx=target_idx,
+                timestamps=timestamps,
+            )
+            asset_gauss_chunks, asset_ptr_chunks = self._mode_a_asset_gaussians_and_pointers_for_target(
+                asset_pass_result,
+                target_idx,
+                device=device,
+            )
+            gauss_all = _concat_gauss_dicts([gauss_scene_t] + asset_gauss_chunks, device=device)
+            ptr_all = concat_pointers([ptr_scene_t] + asset_ptr_chunks)
+            cameras_one = {
+                "viewmats": cameras_splat["viewmats"][:, target_idx : target_idx + 1].contiguous(),
+                "Ks": cameras_splat["Ks"][:, target_idx : target_idx + 1].contiguous(),
+            }
+            tile_one = None if tile_masks is None else tile_masks[:, target_idx : target_idx + 1].contiguous()
+            chunk_out = self.feature_splatter(
+                gaussians_dggt=[gauss_all],
+                pointers=[ptr_all],
+                lut_scene=lut_scene,
+                lut_asset_dict=lut_asset_dict if len(asset_ptr_chunks) > 0 else None,
+                cameras_dggt=cameras_one,
+                H=self.H_splat,
+                W=self.W_splat,
+                pool_to=self.patch_grid,
+                tile_masks=tile_one,
+            )
+            for level_idx, level_tensor in enumerate(chunk_out):
+                splatted_levels[level_idx].append(level_tensor)
+        return [torch.cat(parts, dim=1) for parts in splatted_levels]
 
     def _splat_mode_b_per_target(
         self,

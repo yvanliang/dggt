@@ -854,9 +854,7 @@ def _compute_and_pack_pass2_splatted_tok_low(
     edit_state = apply_mode_a(clean_state, localized_objects)
 
     # Build pointers (mirrors FlowFeatureAssembler.forward).
-    from dggt.models.gaussian_pointers import GaussianPointers
-    from dggt.models.scene_pointers import build_scene_pointers, concat_pointers
-    from dggt.models.flow_feature_assembler import _concat_gauss_dicts
+    from dggt.models.scene_pointers import build_scene_pointers
 
     ptr_scene = build_scene_pointers(
         clean_state.source_image_ids,
@@ -865,40 +863,8 @@ def _compute_and_pack_pass2_splatted_tok_low(
         patch_size=int(H_img // patch_grid[0]),
         patch_grid=patch_grid,
     ).to(device)
-    asset_gauss_chunks: list[dict[str, torch.Tensor]] = []
-    ptr_chunks: list[GaussianPointers] = [ptr_scene]
-    for obj_key in asset_pass_result.object_keys:
-        obj_ptrs = asset_pass_result.ptr_asset[int(obj_key)]
-        obj_gauss_frames = asset_pass_result.G_asset_dggt[int(obj_key)]
-        per_frame_gauss_cat = [
-            {k: v.to(device) for k, v in g.items()} for g in obj_gauss_frames
-        ]
-        flat_gauss = _concat_gauss_dicts(per_frame_gauss_cat, device=device)
-        asset_gauss_chunks.append(flat_gauss)
-        flat_ptr = GaussianPointers(
-            src_kind=torch.cat([p.src_kind for p in obj_ptrs]),
-            object_id=torch.cat([p.object_id for p in obj_ptrs]),
-            view_n=torch.cat([p.view_n for p in obj_ptrs]),
-            patch_idx=torch.cat([p.patch_idx for p in obj_ptrs]),
-            visible_mask=torch.cat([p.visible_mask for p in obj_ptrs]),
-        )
-        ptr_chunks.append(flat_ptr)
-
     gauss_scene = {k: v.to(device) for k, v in edit_state.clean.items()}
-    gauss_scene_kept = {k: v[~edit_state.delete_mask] for k, v in gauss_scene.items()}
     keep_mask = (~edit_state.delete_mask).to(device)
-    ptr_scene_kept = GaussianPointers(
-        src_kind=ptr_scene.src_kind[keep_mask],
-        object_id=ptr_scene.object_id[keep_mask],
-        view_n=ptr_scene.view_n[keep_mask],
-        patch_idx=ptr_scene.patch_idx[keep_mask],
-        visible_mask=ptr_scene.visible_mask[keep_mask],
-    )
-    ptr_chunks[0] = ptr_scene_kept
-    pointers_all = concat_pointers(ptr_chunks)
-    gaussians_all = _concat_gauss_dicts(
-        [gauss_scene_kept] + asset_gauss_chunks, device=device
-    )
 
     # F_g_lut_scene from cached image_tokens_levels.
     F_g_lut_scene = assembler._select_lut_scene(predictions)
@@ -926,22 +892,13 @@ def _compute_and_pack_pass2_splatted_tok_low(
         # Soft masks are cheap and define where the final post-blend feature
         # actually depends on FeatureSplatter.  Compute them before splatting
         # so inactive target tiles can be skipped by gsplat.
-        G_kept_list = [gauss_scene_kept]
-        G_deleted_list = [
-            {k: v[edit_state.delete_mask].to(device) for k, v in gauss_scene.items()}
-        ]
-        G_asset_dict_list = [
-            {
-                int(k): _concat_gauss_dicts(
-                    asset_pass_result.G_asset_dggt[int(k)], device=device
-                )
-                for k in asset_pass_result.object_keys
-            }
-        ]
-        K_map, D_map, I_map, I_per_obj = assembler.soft_mask.render_coverage(
-            G_kept_list,
-            G_deleted_list,
-            G_asset_dict_list,
+        K_map, D_map, I_map, I_per_obj = assembler._render_mode_a_per_target_coverage(
+            sample=sample,
+            clean_state=clean_state,
+            clean_dict=gauss_scene,
+            keep_mask=keep_mask,
+            delete_mask=edit_state.delete_mask.to(device),
+            asset_pass_result=asset_pass_result,
             cameras_dggt=cameras_dggt_dev,
             H=H_img,
             W=W_img,
@@ -970,36 +927,18 @@ def _compute_and_pack_pass2_splatted_tok_low(
             W_splat=W_splat,
         )
 
-        # The splatter rasterizes ALL frames in one gsplat call. For full clips
-        # (S=29) with millions of Gaussians the intermediate index tensors can
-        # OOM (>40 GiB), so chunk frames into groups of `frame_chunk` and
-        # concat. Per-frame splat is independent — chunking is exact.
-        S_total = int(F_g_lut_scene[0].shape[1])
-        frame_chunk = 2
-        splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(assembler.num_levels)]
-        for fs in range(0, S_total, frame_chunk):
-            fe = min(fs + frame_chunk, S_total)
-            # Only target cameras are frame-chunked. The LUT S dimension is
-            # indexed by GaussianPointers.view_n (source frame), so slicing it
-            # would change the token assigned to gaussians outside this target
-            # camera chunk.
-            lut_asset_chunk = F_g_lut_asset if len(F_g_lut_asset) > 0 else None
-            cameras_splat_chunk = {k: v[:, fs:fe].contiguous() for k, v in cameras_splat.items()}
-            tile_masks_chunk = active_tile_masks[:, fs:fe].contiguous()
-            chunk_out = assembler.feature_splatter(
-                gaussians_dggt=[gaussians_all],
-                pointers=[pointers_all],
-                lut_scene=F_g_lut_scene,
-                lut_asset_dict=lut_asset_chunk,
-                cameras_dggt=cameras_splat_chunk,
-                H=H_splat,
-                W=W_splat,
-                pool_to=patch_grid,
-                tile_masks=tile_masks_chunk,
-            )
-            for lvl_idx, lvl_tensor in enumerate(chunk_out):
-                splatted_levels[lvl_idx].append(lvl_tensor)
-        splatted_tok_low = [torch.cat(parts, dim=1) for parts in splatted_levels]
+        splatted_tok_low = assembler._splat_mode_a_per_target(
+            sample=sample,
+            clean_state=clean_state,
+            clean_dict=gauss_scene,
+            keep_mask=keep_mask,
+            ptr_scene=ptr_scene,
+            asset_pass_result=asset_pass_result,
+            lut_scene=F_g_lut_scene,
+            lut_asset_dict=F_g_lut_asset,
+            cameras_splat=cameras_splat,
+            tile_masks=active_tile_masks,
+        )
 
         splatted_tok_low = assembler._blend_preserve_tokens(
             clean_levels=F_g_lut_scene,
@@ -1022,7 +961,7 @@ def _compute_and_pack_pass2_splatted_tok_low(
     S_full, P_full, L_full, C_full = stacked.shape
     q = quantize_tokens(stacked.float(), layout="NPLC")
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "splatted_tok_low_int8": q.data,   # [S, P, L, C]
         "splatted_tok_low_scale": q.scale, # [S, L] fp16
         "patch_grid": (int(patch_grid[0]), int(patch_grid[1])),
