@@ -361,12 +361,14 @@ class FlowFeatureAssembler(nn.Module):
             }
             clean_dict_dev = {k: v.to(device) for k, v in clean_dict.items()}
             keep_mask_cpu = (~cached_delete).cpu()
-            deleted_dict = {k: v[keep_mask_cpu] for k, v in clean_dict.items()}
+            delete_mask_cpu = cached_delete.cpu()
+            deleted_dict = {k: v[delete_mask_cpu] for k, v in clean_dict.items()}
+            edited_dict = {k: v[keep_mask_cpu] for k, v in clean_dict.items()}
             edit_state = EditedSceneState(
                 clean=clean_dict,
                 deleted=deleted_dict,
                 asset_only={k: v[:0] for k, v in clean_dict.items()},  # empty placeholder
-                edited=deleted_dict,
+                edited=edited_dict,
                 localized_objects=localized_objects,
                 delete_mask=cached_delete.cpu(),
                 shell_mask=cached_shell.cpu(),

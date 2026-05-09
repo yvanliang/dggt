@@ -4911,9 +4911,9 @@ def apply_mode_a(clean_state: CleanSceneState, localized_objects: list[Localized
         if item.delete_shell_indices.numel() > 0:
             shell_mask[item.delete_shell_indices] = True
             delete_mask[item.delete_shell_indices] = True
-    deleted = _subset_gaussians(clean, ~delete_mask)
+    deleted = _subset_gaussians(clean, delete_mask)
     asset_only = _concat_gaussians([])
-    edited = deleted
+    edited = _subset_gaussians(clean, ~delete_mask)
 
     return EditedSceneState(
         clean=clean,

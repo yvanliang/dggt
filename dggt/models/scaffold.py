@@ -3,7 +3,7 @@
 The scaffold carries geometric / mask / temporal priors that condition the
 scene flow. Channels (per the implementation plan):
 
-    0 : D_edited        — depth of the edited scene (G_kept + G_asset) at target view
+    0 : D_edited        — depth of the edited scene (G_kept + G_asset) at target view, temporarily an empty channel
     1 : A_edited        — alpha of the edited scene
     2 : K_soft          — preserve coverage (upsampled hires; aligns with gs_head)
     3 : D_soft          — source (deletion) coverage

@@ -463,6 +463,8 @@ def _build_object_meta(sample: dict[str, Any]) -> dict[str, Any]:
         "protected_object_indices",
         "protected_object_count",
         "protected_object_boxes_by_frame",
+        "camera_to_world_corrected",
+        "intrinsics",
     ]
     out: dict[str, Any] = {}
     for k in object_keys:
