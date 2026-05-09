@@ -802,99 +802,29 @@ def _build_phase1_asset_coverage(
 
 def _composite_asset_over_clean(
     clean_images: torch.Tensor,
-    result: AssetPassResult,
-    scene_kept: dict[str, torch.Tensor],
-    cameras_dggt: dict[str, torch.Tensor],
-    device: torch.device,
+    i_asset_per_slot: dict[int, torch.Tensor],
+    a_asset_per_slot: dict[int, torch.Tensor],
 ) -> torch.Tensor:
-    """Depth-aware asset overlay for visualization.
+    """Over-compose every object's I_asset / A_asset onto the clean views.
 
-    The per-object ``I_asset/A_asset`` images are isolated renders.  For the
-    over-clean debug grid we render kept scene Gaussians as zero-color
-    occluders and the current frame's assets as RGB+alpha in one gsplat pass,
-    so asset-asset and asset-scene depth ordering is visible in the JPG.
+    Mirrors how Phase 4's asset renders are consumed downstream — this grid
+    answers "on each frame, which pixels does the asset pass claim to own".
     """
-    clean = clean_images.detach().cpu().float().clamp(0.0, 1.0)
-    if result.G_asset_dggt is None or len(result.object_keys) == 0:
-        return clean.clone()
-
-    viewmats = cameras_dggt["viewmats"].to(device).float()
-    Ks = cameras_dggt["Ks"].to(device).float()
-    if viewmats.dim() != 3 or Ks.dim() != 3:
-        raise ValueError(
-            f"asset overlay cameras must be [S,4,4]/[S,3,3], got "
-            f"{tuple(viewmats.shape)} and {tuple(Ks.shape)}"
-        )
-    num_images = int(clean.shape[0])
-    H, W = int(clean.shape[-2]), int(clean.shape[-1])
-
-    from gsplat.rendering import rasterization
-
-    frames: list[torch.Tensor] = []
-    with torch.no_grad():
-        for image_idx in range(num_images):
-            means_chunks: list[torch.Tensor] = []
-            quats_chunks: list[torch.Tensor] = []
-            scales_chunks: list[torch.Tensor] = []
-            opacities_chunks: list[torch.Tensor] = []
-            color_chunks: list[torch.Tensor] = []
-
-            scene_means = scene_kept.get("means")
-            if scene_means is not None and scene_means.numel() > 0:
-                n_scene = int(scene_means.shape[0])
-                means_chunks.append(scene_means.to(device).float())
-                quats_chunks.append(scene_kept["quats"].to(device).float())
-                scales_chunks.append(scene_kept["scales"].to(device).float())
-                opacities_chunks.append(scene_kept["opacities"].to(device).float().view(-1))
-                color_chunks.append(torch.zeros((n_scene, 4), dtype=torch.float32, device=device))
-
-            for slot_idx in result.object_keys:
-                frames_for_slot = result.G_asset_dggt[int(slot_idx)]
-                if image_idx >= len(frames_for_slot):
-                    continue
-                gauss = frames_for_slot[image_idx]
-                means = gauss.get("means")
-                if means is None or means.numel() == 0:
-                    continue
-                rgb = gauss["colors"].to(device).float().clamp(0.0, 1.0)
-                alpha_probe = torch.ones((rgb.shape[0], 1), dtype=torch.float32, device=device)
-                means_chunks.append(means.to(device).float())
-                quats_chunks.append(gauss["quats"].to(device).float())
-                scales_chunks.append(gauss["scales"].to(device).float())
-                opacities_chunks.append(gauss["opacities"].to(device).float().view(-1))
-                color_chunks.append(torch.cat([rgb, alpha_probe], dim=-1))
-
-            if len(means_chunks) == 0:
-                frames.append(clean[image_idx])
-                continue
-
-            rendered, _, _ = rasterization(
-                means=torch.cat(means_chunks, dim=0),
-                quats=torch.cat(quats_chunks, dim=0),
-                scales=torch.cat(scales_chunks, dim=0),
-                opacities=torch.cat(opacities_chunks, dim=0),
-                colors=torch.cat(color_chunks, dim=0),
-                viewmats=viewmats[image_idx : image_idx + 1],
-                Ks=Ks[image_idx : image_idx + 1],
-                width=W,
-                height=H,
-                render_mode="RGB",
-                channel_chunk=4,
-            )
-            asset_rgba = rendered[0].permute(2, 0, 1).detach().cpu().float().clamp(0.0, 1.0)
-            asset_rgb = asset_rgba[:3]
-            asset_alpha = asset_rgba[3:4]
-            frames.append((asset_rgb + (1.0 - asset_alpha) * clean[image_idx]).clamp(0.0, 1.0))
-
-    return torch.stack(frames, dim=0)
+    base = clean_images.detach().cpu().float().clamp(0.0, 1.0).clone()
+    num_images = base.shape[0]
+    for slot_idx, i_asset in i_asset_per_slot.items():
+        alpha = a_asset_per_slot[slot_idx]
+        rgb = i_asset[0].detach().cpu().float().clamp(0.0, 1.0)
+        a = alpha[0].detach().cpu().float().clamp(0.0, 1.0)
+        if rgb.shape[0] != num_images or a.shape[0] != num_images:
+            continue
+        base = a * rgb + (1.0 - a) * base
+    return base.clamp(0.0, 1.0)
 
 
 def _save_asset_pass_outputs(
     result: AssetPassResult,
     clean_images: torch.Tensor,
-    scene_kept: dict[str, torch.Tensor],
-    cameras_dggt: dict[str, torch.Tensor],
-    device: torch.device,
     output_dir: Path,
     num_views: int,
     skip_ply: bool,
@@ -934,10 +864,8 @@ def _save_asset_pass_outputs(
 
     composite = _composite_asset_over_clean(
         clean_images=clean_images,
-        result=result,
-        scene_kept=scene_kept,
-        cameras_dggt=cameras_dggt,
-        device=device,
+        i_asset_per_slot=result.I_asset,
+        a_asset_per_slot=result.A_asset,
     )
     _save_grid(composite, asset_pass_dir / "asset_pass_over_clean_grid.jpg", nrow=max(1, num_views))
     if localized_objects is not None:
@@ -1208,9 +1136,6 @@ def _run_one_sample(
     asset_pass_summary = _save_asset_pass_outputs(
         asset_pass_result,
         clean_images=clean_state.images,
-        scene_kept={k: v[~edited_state.delete_mask] for k, v in edited_state.clean.items()},
-        cameras_dggt=cameras_dggt_for_asset,
-        device=device,
         output_dir=output_dir,
         num_views=num_views,
         skip_ply=args.skip_ply,

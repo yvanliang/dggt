@@ -938,7 +938,7 @@ def _compute_and_pack_pass2_splatted_tok_low(
                 for k in asset_pass_result.object_keys
             }
         ]
-        K_map, D_map, I_map, I_per_obj = assembler._render_mode_a_depth_aware_coverage(
+        K_map, D_map, I_map, I_per_obj = assembler.soft_mask.render_coverage(
             G_kept_list,
             G_deleted_list,
             G_asset_dict_list,
@@ -1022,7 +1022,7 @@ def _compute_and_pack_pass2_splatted_tok_low(
     S_full, P_full, L_full, C_full = stacked.shape
     q = quantize_tokens(stacked.float(), layout="NPLC")
     return {
-        "schema_version": 4,
+        "schema_version": 3,
         "splatted_tok_low_int8": q.data,   # [S, P, L, C]
         "splatted_tok_low_scale": q.scale, # [S, L] fp16
         "patch_grid": (int(patch_grid[0]), int(patch_grid[1])),
@@ -1319,7 +1319,7 @@ def precompute_one_clip(
                 patch_grid=(H_img // 14, W_img // 14),
                 H_img=H_img,
                 W_img=W_img,
-                chunk_channels=32,
+                chunk_channels=64,
                 device=device,
             )
             _cleanup_cuda(device)
