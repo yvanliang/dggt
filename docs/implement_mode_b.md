@@ -50,7 +50,7 @@ Mode B 的目标是：在"目标很少或没有目标"的场景里**假想**若�
   "in_mode_a_views1": true, "in_mode_a_views3": true,
   "front_editable_count_per_frame": [1,1,1,...],
   "front3_editable_count_per_frame": [2,2,2,...],
-  "existing_objects": [  // 只拷来自 Mode A candidates 的字段，用于 3D 冲突检测
+  "existing_objects": [  // 只拷来自 Mode A candidates 的字段，用于 canonical size 先验
     { "scene_raw_object_id": "...", "obj_to_world_waymo": [[...],...], "box_size_waymo": [...], "present_mask": [true,...] }
   ]
 }
@@ -62,7 +62,6 @@ Mode B 的目标是：在"目标很少或没有目标"的场景里**假想**若�
 - 29 帧 clean scene（`build_clean_scene_state` 的 `CleanSceneState`），含：
   - `means` `[N_gauss, 3]`, `source_image_ids`, `depth [29,H,W]`, `camera_to_world [29,4,4]`, `intrinsics [29,3,3]`
   - `semantic_vehicle_mask [29,H,W]`（predictions 的 semantic head argmax == 4）
-  - existing 编辑目标的 DGGT-空间 refined box（若有）
 - Mode A candidates 中的 `refined_size_dggt` 经验分布（用于 canonical car size 先验）
 
 规划算法：
@@ -96,9 +95,7 @@ Mode B 的目标是：在"目标很少或没有目标"的场景里**假想**若�
    - (a) 落在地面：`center_y_t ≈ ground_y_per_frame[t]` ±10% canonical height。
    - (b) **2D 视角内**：把 8 个 3D bbox 角点投影到每一帧每一视角（`clean_state.world_to_camera / intrinsics`），如果帧上至少 4 个角点可见 + 投影框面积 ≥ 64 px² → 记 `visible_in_frame=True`。要求 `visible_in_frame.sum() ≥ 15`。
    - (c) **与已有语义车辆 mask 冲突**：对每帧每视角，取投影 bbox 的多边形填充，和 `clean_state.semantic_vehicle_mask[image_idx]` 做逐像素交集。**全 clip 全视角的总交集像素数 ≤ 50**（用户硬约束）。
-   - (d) **与已有 3D bbox 冲突**：把 existing_objects 的 DGGT bbox（Sim3×Waymo）与候选 bbox 做 3D AABB 相交测试，禁止相交。
-   - (e) **不挡进已有墙/建筑**：取投影 bbox 的中心像素，查 `clean_state.depth[image_idx, v_c, u_c]`，要求 `depth_at_center + 1.0 > bbox_depth`（bbox 中心不能深于 DGGT depth → 避免插在墙内）。canonical_length 用作 tolerance。
-   - (f) **目标之间不冲突**：已接受的假想目标之间做 AABB 相交测试。
+   - (d) **不挡进已有墙/建筑**：取投影 bbox 的中心像素，查 `clean_state.depth[image_idx, v_c, u_c]`，要求 `depth_at_center + 1.0 > bbox_depth`（bbox 中心不能深于 DGGT depth → 避免插在墙内）。canonical_length 用作 tolerance。
 
    `max_trials` 后仍失败 → 该目标缩小 canonical size × 0.8 重试一次；还失败 → 从当前 sample 的目标数里剔除。最终接受 count 低于 min_count（views=1 的 min=1，views=3 的 min=3）→ 整个 sample 标记 `eligibility=false` 不入 manifest。
 
@@ -116,7 +113,7 @@ Mode B 的目标是：在"目标很少或没有目标"的场景里**假想**若�
          "yaw_dggt_per_frame": [...29],
          "visible_in_frame_per_view": [[true,...29], ... num_views],  // 按 frame-major view-minor 展开
          "bbox_2d_per_view": [...29, num_views, 4],
-         "semantic_overlap_px": 12, "existing_box_iou_3d": 0.0
+         "semantic_overlap_px": 12
        }
      ],
      "rng_seed": 12345
@@ -197,7 +194,7 @@ python -u inference_mode_b.py \
 | `tools/build_mode_b_manifest.py` | 新建 | 枚举全 Waymo clips，生成 `mode_b_candidates.jsonl` 和 `training_mode_b_views{1,3}.jsonl` |
 | `inference_mode_b.py` | 新建 | 单样本 debug 脚本（§3.5） |
 | `dggt/utils/gaussian_edit.py` | 轻微改动 | 把 `_points_in_box` 从私有改为暴露（`points_in_box`），复用到 planner |
-| `tests/test_mode_b_planner.py` | 新建 | 单元测试（规划器的冲突检测、motion trajectory、≥15 帧约束） |
+| `tests/test_mode_b_planner.py` | 新建 | 单元测试（motion trajectory、≥15 帧约束、semantic overlap 阈值） |
 
 **不要改动**：`WaymoEditDataset.__getitem__`、`GaussianSceneEditor`、`AssetAggregatorPass`——Mode B 数据生成是 Mode A 管线的**外围扩展**，不改已跑通的数据流。
 
@@ -212,7 +209,7 @@ python -u inference_mode_b.py \
 | `yaw_jitter_deg` | ±30 | yaw 采样扰动 |
 | `motion_probs` | (0.5, 0.3, 0.2) | static / slow / ego_matched |
 | `core_scale / shell_scale` | 1.0 / 1.05 | Gaussian 子集选择（Mode A 是 0.85 / 1.05；Mode B 用 1.0 因无 pose refine 误差） |
-| `depth_tolerance_m` | canonical_length | §3.2 (e) |
+| `depth_tolerance_m` | canonical_length | §3.2 (d) |
 | `num_imagined_objects_views1` | U{1, 2, 3} | |
 | `num_imagined_objects_views3` | U{3, 4, 5} | |
 
@@ -225,7 +222,7 @@ python -u inference_mode_b.py \
 ## 四、验证 / 通过标准（执行阶段使用）
 
 1. **可视化对齐**：Mode B debug 样本 `vis/mode_b/{idx}/deleted_render_grid.jpg` 和 Mode A `vis/1/deleted_render_grid.jpg` 的深色洞风格肉眼同构（洞中心黑、边缘有 shell smear）。
-2. **规划器过拟合**：对固定 seed 的 10 个 clip，规划得到的 `imagined_objects` 全部满足 §3.2 (a)–(f)，`semantic_overlap_px ≤ 50` 严格通过。
+2. **规划器过拟合**：对固定 seed 的 10 个 clip，规划得到的 `imagined_objects` 全部满足 §3.2 (a)–(d)，`semantic_overlap_px ≤ 50` 严格通过。
 3. **轨迹连续性**：静止目标所有帧 `center_dggt` 逐元素方差 < 1e-6；slow/ego_matched 在相邻帧的位移 ≤ `canonical_length / 29 × 2`，无跳变。
 4. **15 帧约束**：至少 15 帧 `visible_in_frame=True`，否则该 slot 不入 summary。
 5. **D_map 面积**：D_map 大于 bbox 投影多边形的填充面积、但小于 1.5 × 多边形面积（允许 shell 扩散）。

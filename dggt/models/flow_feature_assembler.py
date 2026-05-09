@@ -777,6 +777,8 @@ class FlowFeatureAssembler(nn.Module):
                 W_splat=self.W_splat,
             )
             splatted_tok_low = self._splat_mode_b_per_target(
+                sample=sample,
+                clean_state=clean_state,
                 clean_dict=clean_dict,
                 ptr_scene=ptr_scene,
                 delete_masks_by_target=delete_masks_by_target,
@@ -1406,6 +1408,8 @@ class FlowFeatureAssembler(nn.Module):
     def _splat_mode_b_per_target(
         self,
         *,
+        sample: dict[str, Any],
+        clean_state: CleanSceneState,
         clean_dict: dict[str, torch.Tensor],
         ptr_scene: GaussianPointers,
         delete_masks_by_target: torch.Tensor,
@@ -1423,19 +1427,27 @@ class FlowFeatureAssembler(nn.Module):
         if int(viewmats.shape[0]) != 1:
             raise ValueError("Mode-B per-target splat currently expects batch size 1.")
         S = int(viewmats.shape[1])
+        if tuple(delete_masks_by_target.shape) != (S, int(clean_dict["means"].shape[0])):
+            raise ValueError(
+                "delete_masks_by_target must be [S,N_g], got "
+                f"{tuple(delete_masks_by_target.shape)} for S={S}, N_g={int(clean_dict['means'].shape[0])}"
+            )
+        timestamps = self._mode_b_timestamps(sample, num_images=S, device=viewmats.device)
+        device = clean_dict["means"].device
+
         splatted_levels: list[list[torch.Tensor]] = [[] for _ in range(self.num_levels)]
         for target_idx in range(S):
             del_mask = delete_masks_by_target[target_idx].to(
-                device=clean_dict["means"].device, dtype=torch.bool
+                device=device, dtype=torch.bool
             )
             keep_mask = ~del_mask
-            gauss_kept = {k: v[keep_mask] for k, v in clean_dict.items()}
-            ptr_kept = GaussianPointers(
-                src_kind=ptr_scene.src_kind[keep_mask],
-                object_id=ptr_scene.object_id[keep_mask],
-                view_n=ptr_scene.view_n[keep_mask],
-                patch_idx=ptr_scene.patch_idx[keep_mask],
-                visible_mask=ptr_scene.visible_mask[keep_mask],
+            gauss_kept, ptr_kept = self._time_aware_gaussians_and_pointers_for_target(
+                clean_state=clean_state,
+                clean_dict=clean_dict,
+                ptr_scene=ptr_scene,
+                base_mask=keep_mask,
+                target_idx=target_idx,
+                timestamps=timestamps,
             )
             cameras_one = {
                 "viewmats": cameras_splat["viewmats"][:, target_idx : target_idx + 1].contiguous(),

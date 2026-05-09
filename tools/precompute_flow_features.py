@@ -1095,6 +1095,8 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
             )
 
             splatted_tok_low = assembler._splat_mode_b_per_target(
+                sample=sample,
+                clean_state=clean_state,
                 clean_dict=clean_dict,
                 ptr_scene=ptr_scene,
                 delete_masks_by_target=delete_masks_by_target,
