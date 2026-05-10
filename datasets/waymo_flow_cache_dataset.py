@@ -614,6 +614,12 @@ class WaymoFlowCacheDataset(Dataset):
               flat masks plus a per-frame CSR offset array; we cat the
               per-frame slices in the subset's order to match the subset
               ``clean_state.means`` layout.
+
+        This function does not re-run ``resolve_editable_subset``.  That
+        helper is subset-dependent, while v6 caches are generated once for the
+        full 29-frame clip before the random 4-8 frame training subsequence is
+        known.  The cache therefore preserves the full-clip edit decision and
+        this reader only remaps/slices it to the sampled target frames.
         """
         slot = payload["slot_idx"]
         frame = payload["frame_idx"]

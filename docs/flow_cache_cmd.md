@@ -178,6 +178,47 @@ torchrun --nproc_per_node=8 train_scene_flow.py \
 pytest tests/test_offline_cache.py tests/test_mode_b_planner.py \
        tests/test_scene_pointers.py tests/test_per_token_noise.py -q
 
+# WYSIWYG / pass2 校验说明：
+# - 校验对象是完整 29 帧 cache，不是训练时随机采样出的 4-8 帧子序列。
+# - 默认会从 .pt 反读完整 29 帧，输出 cache-derived 可视化，并用完整 29 帧
+#   live assembler 重算 pass2_splatted_tok_low，和 .pt 中保存的 int8/scale 做逐值校验。
+# - 默认使用 zero tokenizer stub；这是因为 cache 实际保存的是 tokenizer 前的
+#   pass2_splatted_tok_low。需要额外验证/保存 29 帧 latent 时再加 --with_tokenizer --ckpt_path。
+# - --chunk_channels 默认是 64，和当前 verifier 默认值一致；显存紧张时可手动降到 32。
+
+# Mode A：完整 29 帧 WYSIWYG 校验。将 000000.pt 换成实际存在的 Mode-A cache。
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. conda run -n dggt --no-capture-output \
+    python -u tools/verify_flow_cache_wysiwyg.py \
+    --cache_path /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a/training/000000.pt \
+    --output_dir runs/flow_cache_wysiwyg_mode_a \
+    --nrow 4
+
+# Mode B：完整 29 帧 WYSIWYG 校验。将 002025.pt 换成实际存在的 Mode-B cache。
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. conda run -n dggt --no-capture-output \
+    python -u tools/verify_flow_cache_wysiwyg.py \
+    --cache_path /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_b/training/002025.pt \
+    --output_dir runs/flow_cache_wysiwyg_mode_b \
+    --nrow 4
+
+# 快速只看 cache-derived 可视化，不重算 live pass2：
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. conda run -n dggt --no-capture-output \
+    python -u tools/verify_flow_cache_wysiwyg.py \
+    --cache_path /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_b/training/002025.pt \
+    --output_dir runs/flow_cache_wysiwyg_mode_b_quick \
+    --skip_live_compare \
+    --splat_pca \
+    --nrow 4
+
+# 显存充足时，额外使用真实 scene_tokenizer 生成并保存 flow_features.pt。
+# 这一步会显著增加 29 帧验证的显存占用。
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. conda run -n dggt --no-capture-output \
+    python -u tools/verify_flow_cache_wysiwyg.py \
+    --cache_path /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_b/training/002025.pt \
+    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+    --output_dir runs/flow_cache_wysiwyg_mode_b_with_tokenizer \
+    --with_tokenizer \
+    --nrow 4
+
 # Smoke：一个 Mode A 片段 + 一个 Mode B 片段端到端测试
 CUDA_VISIBLE_DEVICES=3 python tools/precompute_flow_features.py \
     --edit_mode mode_a --ckpt_path .../model_latest_waymo.pt \

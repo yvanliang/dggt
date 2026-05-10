@@ -10,6 +10,10 @@ Given the three Gaussian groups produced by `GaussianSceneEditor`:
 we rasterize alpha-only maps `K_map`, `D_map`, `I_map` at full resolution, then
 area-pool them to a 37x37 patch grid and normalize so the three soft masks sum
 to (almost) one per patch.
+
+Note: The occlusion semantics here is intentional footprint normalization, not
+full scene depth compositing. This explicitly expresses the "edit footprint"
+rather than strict visibility against the kept scene.
 """
 from __future__ import annotations
 

@@ -637,6 +637,14 @@ def _run_mode_a_asset_pass(
     Returns (asset_result, localized_objects). The latter is the
     ``editor.localize`` output we just paid pose-refinement for, which the
     caller should persist into the cache so training time can skip it.
+
+    Design note: the offline cache is a full-clip artifact (normally 29
+    frames).  The P4.5 ``resolve_editable_subset`` rule is intentionally not
+    applied here because it depends on the random 4-8 frame subsequence chosen
+    later by ``WaymoFlowCacheDataset`` during diffusion training.  At cache
+    write time that subsequence is unknown, so the cache stores the full
+    per-frame localization/delete state and the dataset only slices it on the
+    target-frame axis after the training subset is known.
     """
     with torch.no_grad():
         object_slots = parse_object_slots(sample, "all")
