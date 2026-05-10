@@ -273,7 +273,7 @@ class ScaffoldPacker(nn.Module):
 - `I_map_per_obj` 保留每对象独立 map（供 Phase 6 cross-attn 偏置），`I_map = sum_k I_map_per_obj[k].clamp(0,1)`。
 - 归一化：`N = K_soft + D_soft + I_soft + eps`；三路各自 `X_soft / N`。
 - 面积池化 kernel=14、stride=14（518 → 37），**不用 interpolate**。
-- scaffold 7 通道：`D_edited_lowres, A_edited_lowres, K_soft, D_soft, I_soft, dynamic_prior_lowres, time_index` → MLP 到 768。
+- scaffold 7 通道：采用先高分拼接再池化（hires-then-pooled）策略。包含 `D_edited, A_edited, K_soft, D_soft, I_soft, dynamic_prior, time_index`，其中 `D_edited` 使用 per-batch max 进行动态归一化以适应不同场景深度尺度。池化后再通过 MLP 映射到 768。
 
 **smoke test**：
 - 无编辑场景：`K_soft ≈ 1, D_soft ≈ 0, I_soft ≈ 0`（逐 token L1 差 < 0.05）。
@@ -314,6 +314,7 @@ class AssetAggregatorPass(nn.Module):
 - **batch 化**：`K` 个对象 × `N` 帧 拼成 `[K*N, 3, H, W]` 单次过 aggregator，然后 reshape 回 dict。
 - **指针**：对每粒资产高斯，在每帧 Waymo 相机下做 `P = K @ [R | t] @ means_waymo`，落到 `37×37` 网格；对自遮挡做 depth-test（rasterize 出 α>τ 才算 visible），`visible_mask=False` 的帧回退到最近可见帧的 `(view_n, patch_idx)`。
 - **T_w2d**：训练调用 `estimate_scene_alignment` 的底层 Umeyama（已在 `gaussian_edit.py`）；推理可退化为 `T_w2d = I`。
+- **默认渲染空间**：训练默认使用 `render_space="dggt_fitted"` 模式（此模式比原始 Plan 描述的 Waymo-coord 模式更稳健且避免了坐标系拟合误差），Waymo-coord 路径仅作为兼容回退。
 - **资产无时默认空返回**：delete-only 样本里 `K=0`，所有 dict 返回空，下游 `FeatureSplatter` 跳过 asset LUT。
 
 **smoke test**：
@@ -360,7 +361,7 @@ class AssetAggregatorPass(nn.Module):
    raw:         images [29,3,518,518] uint8, sky_mask / dynamic_mask [29,1,518,518] bool
    object_meta: per-(M, 29) bbox_present / bbox_editable / obj_to_world / box_size / target_bbox_model / ...
                 + per-object scene match scores / asset paths / speed statistics
-   asset_static: per asset_id → {means_raw, colors, opacities, scales, quats, vertex_count}  (跨 clip 去重)
+   asset_static: per-clip per-frame fitted DGGT Gaussian 列表
    pass1:       cameras_dggt.viewmats / .Ks [29,...] fp32
                 gs_map / depth / dynamic_conf / gs_conf [29,518,518,...] fp16
                 F_g_lut_scene [29,1369,4,3072] int8 + per-(level,frame) scale
@@ -640,7 +641,7 @@ class FlowDGGT(nn.Module):
 |---|:-:|:-:|---|
 | 数据 IO + JPEG/PNG 解码 | ✓ | | raw images / sky / dynamic mask 存 uint8 |
 | 元数据（`bbox_present/editable / obj_to_world / box_size / target_bbox_model`）for 全 29 帧 | ✓ | | |
-| 资产静态 `means_raw/colors/opacities/scales/quats` | ✓（每 asset 一份，cross-clip 共享） | | |
+| 资产静态 `means_raw/colors/opacities/scales/quats` | ✓（per-clip per-frame fitted DGGT Gaussian 列表） | | |
 | `obj_to_world` 作用到资产得到 Waymo-coord Gaussian | ✓（per-object per-frame） | | 纯几何 |
 | 每对象每帧 `I_asset / A_asset` rasterize | ✓ 全 29 帧 | | GT Waymo cam，无网络 |
 | 每对象每帧 `ptr_asset (patch_idx, visible_mask)` | ✓ 全 29 帧 | | α+depth 遮挡测试，无网络 |
@@ -648,8 +649,8 @@ class FlowDGGT(nn.Module):
 | Pass-1 heads `gs_map/depth/dynamic_conf/gs_conf/pose_enc/semantic_logits` | ✓ 全 29 帧，fp16 | **永不在线** | |
 | Phase 4 asset-aggregator `F_g_lut_asset[k]` | ✓ 全 29 帧，int8 | **永不在线** | per-object |
 | `editable_object_indices`（简化规则 `present ∧ editable`） | | ✓ | O(M·|subset|) 位运算 |
-| Phase 1 `GaussianSceneEditor`（align + localize + apply_mode_a） | | ✓ | 读 cached `gs_map/depth/cameras` 直接构造 `CleanSceneState`，绕过 VGGT heads |
-| `FeatureSplatter`（gsplat chunked 3072-d） | | ✓ | ~100 ms |
+| Phase 1 `GaussianSceneEditor`（align + localize + apply_mode_a） | ✓ (cache) | ✓ (fast-path) | 离线缓存 `delete_mask/shell_mask`，在线走 fast-path 组装 `EditedSceneState` |
+| `FeatureSplatter`（gsplat chunked 3072-d） | ✓ (cache) | ✓ (fast-path) | 离线缓存 `pass2_splatted_tok_low`（在线训练绕过，推理在线跑） |
 | `SoftMaskBuilder`（K/D/I α 渲染 + 归一化） | | ✓ | ~100 ms |
 | `ScaffoldPacker`（MLP） | | ✓ | 可训练 |
 | `tokenizer.encode` → `z_clean/z_splat` | | ✓ | T1 冻结 encoder |

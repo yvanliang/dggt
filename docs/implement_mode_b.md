@@ -120,14 +120,17 @@ Mode B 的目标是：在"目标很少或没有目标"的场景里**假想**若�
    }
    ```
 
-### 3.3 Deletion 仿真（3D-删除，**不注入新高斯**）
+### 3.3 Deletion 仿真（2D vehicle-occluder + depth keep + semantic-vehicle protection，**不注入新高斯**）
 
-对每个假想目标、每一帧：
+对每个假想目标、每一帧每视角：
 
-1. 构造**时变 3D bbox**（center_dggt_per_frame[t], size_dggt, yaw_dggt_per_frame[t]）。
-2. 在 `clean_state.means` 里挑出 `_points_in_box(means, center, R_yaw, size, scale=1.0)` 的索引 → `delete_core_indices`。
-3. 附加 shell：`_points_in_box(..., scale=1.05)` 的索引减去 core → `delete_shell_indices`（匹配 Mode A 的 `core_scale=0.85, shell_scale=1.05`；这里 core 用 1.0 是因为 Mode B 里没有 Waymo-pose refine 误差，直接用 GT 尺寸）。
-4. 合并所有假想目标的索引 → `delete_mask [N_gauss]`。
+1. 构造**时变 3D bbox**（center_dggt_per_frame[t], size_dggt, yaw_dggt_per_frame[t]），并将其投影到 2D 得到 2D bbox。
+2. 在 2D 像素空间，使用 `_points_in_vehicle_occluder`（基于 super-ellipse 的车体形状）挑选出落在 bbox 内部的高斯索引。
+3. 附加 shell 扩展与过滤：应用 `core_scale=1.0, shell_scale=1.05`（此处语义为 2D bbox 缩放系数 + depth slack ratio）获取 shell 高斯。
+4. **深度过滤（depth keep）**：仅保留满足 `depths >= min_object_depth - shell_depth_slack` 的高斯，防止将深处的无关背景全部误删。
+5. **语义保护（semantic-vehicle protect）**：减去 `frame_protected_mask`（真实语义 vehicle 像素），防止把同帧内实际存在的真实车辆误删。
+6. 将最终经过 occluder + depth + semantic 过滤后得到的高斯分别记录为 `delete_core_indices` 与 `delete_shell_indices`。
+7. 合并所有假想目标的索引 → `delete_mask [N_gauss]`。
 5. **渲染**：调 `_render_edited_sequence_with_dggt`（`inference_scene_editor.py:548` 已有的函数），传入 `delete_mask=mode_b_delete_mask` 即可，视觉风格会自然和 Mode A deletion 一致，因为用的是同一条渲染链路。
 6. **D_map**：
    - `D_map[image_idx]` = 单独渲染 `delete_mask` 指向的那部分 Gaussians 的 alpha channel（透过 `_rasterize_scene` 取 alpha 分量）。
@@ -193,7 +196,7 @@ python -u inference_mode_b.py \
 | `dggt/utils/ground_plane.py` | 新建 | `estimate_ground_plane_per_frame(clean_state)` |
 | `tools/build_mode_b_manifest.py` | 新建 | 枚举全 Waymo clips，生成 `mode_b_candidates.jsonl` 和 `training_mode_b_views{1,3}.jsonl` |
 | `inference_mode_b.py` | 新建 | 单样本 debug 脚本（§3.5） |
-| `dggt/utils/gaussian_edit.py` | 轻微改动 | 把 `_points_in_box` 从私有改为暴露（`points_in_box`），复用到 planner |
+| `dggt/utils/gaussian_edit.py` | 不改动 | Mode B 使用 2D occluder，不再依赖 `_points_in_box` |
 | `tests/test_mode_b_planner.py` | 新建 | 单元测试（motion trajectory、≥15 帧约束、semantic overlap 阈值） |
 
 **不要改动**：`WaymoEditDataset.__getitem__`、`GaussianSceneEditor`、`AssetAggregatorPass`——Mode B 数据生成是 Mode A 管线的**外围扩展**，不改已跑通的数据流。

@@ -484,10 +484,20 @@ class FeatureSplatter(nn.Module):
         B = len(gaussians_dggt)
         if len(pointers) != B:
             raise ValueError(f"pointers length ({len(pointers)}) != gaussians_dggt length ({B})")
-        if lut_scene[0].shape[0] != B:
-            raise ValueError(
-                f"lut_scene batch dim ({lut_scene[0].shape[0]}) != gaussians_dggt length ({B})"
-            )
+            
+        for l in range(self.num_levels):
+            if lut_scene[l].shape[0] != B:
+                raise ValueError(
+                    f"lut_scene[{l}] batch dim ({lut_scene[l].shape[0]}) != gaussians_dggt length ({B})"
+                )
+
+        if lut_asset_dict is not None:
+            for k, lvls in lut_asset_dict.items():
+                for l in range(self.num_levels):
+                    if lvls[l].shape[0] != B:
+                        raise ValueError(
+                            f"lut_asset_dict[{k}][{l}] batch dim ({lvls[l].shape[0]}) != gaussians_dggt length ({B})"
+                        )
 
         if "viewmats" not in cameras_dggt or "Ks" not in cameras_dggt:
             raise ValueError("cameras_dggt must contain 'viewmats' and 'Ks'")
@@ -514,4 +524,23 @@ class FeatureSplatter(nn.Module):
                 if arr.shape[0] != N_g:
                     raise ValueError(
                         f"pointers[{b}].{attr} length ({arr.shape[0]}) != means length ({N_g})"
+                    )
+
+            if __debug__ and N_g > 0:
+                view_n = pointers[b].view_n
+                patch_idx = pointers[b].patch_idx
+                N_scene = lut_scene[0].shape[1]
+                
+                view_n_min, view_n_max = int(view_n.min()), int(view_n.max())
+                if view_n_min < 0 or view_n_max >= N_scene:
+                    raise ValueError(
+                        f"pointers[{b}].view_n out of bounds [0, {N_scene - 1}], "
+                        f"got min {view_n_min}, max {view_n_max}"
+                    )
+                
+                patch_idx_min, patch_idx_max = int(patch_idx.min()), int(patch_idx.max())
+                if patch_idx_min < 0 or patch_idx_max >= self.num_patches:
+                    raise ValueError(
+                        f"pointers[{b}].patch_idx out of bounds [0, {self.num_patches - 1}], "
+                        f"got min {patch_idx_min}, max {patch_idx_max}"
                     )

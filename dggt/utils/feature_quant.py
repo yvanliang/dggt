@@ -56,11 +56,20 @@ def quantize_tokens(
         raise ValueError(f"Expected 4-D tensor, got shape {tuple(tokens.shape)}")
     x = tokens.detach()
     if not bool(torch.isfinite(x).all().item()):
-        nan_count = int(torch.isnan(x).sum().item()) if x.is_floating_point() else 0
-        inf_count = int(torch.isinf(x).sum().item()) if x.is_floating_point() else 0
+        if x.is_floating_point():
+            nans = torch.isnan(x)
+            infs = torch.isinf(x)
+            nan_count = int(nans.sum().item())
+            inf_count = int(infs.sum().item())
+            nan_per_frame = nans.view(x.shape[0], -1).sum(dim=1).tolist()
+            inf_per_frame = infs.view(x.shape[0], -1).sum(dim=1).tolist()
+        else:
+            nan_count = inf_count = 0
+            nan_per_frame = inf_per_frame = []
         raise ValueError(
-            f"Cannot quantize non-finite tokens: shape={tuple(x.shape)} "
-            f"dtype={x.dtype} nan={nan_count} inf={inf_count}"
+            f"Cannot quantize non-finite tokens: layout={layout} shape={tuple(x.shape)} "
+            f"dtype={x.dtype} nan={nan_count} (per_frame: {nan_per_frame}) "
+            f"inf={inf_count} (per_frame: {inf_per_frame})"
         )
     if layout == "NPLC":
         # [N, P, L, C] -> reduce over (P, C) to get per (N, L) scale
@@ -80,13 +89,14 @@ def quantize_tokens(
 
 def dequantize_tokens(q: QuantizedTokens, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Return fp tensor recovered from int8 + per-(level, frame) scale."""
-    x = q.data.to(dtype)
-    s = q.scale.to(dtype)
+    math_dtype = q.scale.dtype
+    x = q.data.to(math_dtype)
+    s = q.scale
     if q.layout == "NPLC":
         s = s.view(s.shape[0], 1, s.shape[1], 1)
     else:
         s = s.view(s.shape[0], s.shape[1], 1, 1)
-    return x * s
+    return (x * s).to(dtype)
 
 
 def roundtrip_cosine(

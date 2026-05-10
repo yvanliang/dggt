@@ -24,10 +24,7 @@ import torch.nn as nn
 from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
 from dggt.utils.gaussian_edit import (
     Sim3Transform,
-    apply_sim3_to_gaussian_dict,
     empty_gaussian_dict,
-    load_asset_gaussians,
-    transform_asset_gaussians,
 )
 from dggt.utils.tokens import select_patch_pyramid
 
@@ -43,12 +40,16 @@ class AssetPassResult:
     cameras_waymo: dict[str, torch.Tensor]
     F_g_lut_asset: dict[int, list[torch.Tensor]]
     ptr_asset: dict[int, list[GaussianPointers]]
-    G_asset_waymo: dict[int, list[dict[str, torch.Tensor]]]
     G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] | None
     I_asset: dict[int, torch.Tensor]
     A_asset: dict[int, torch.Tensor]
-    asset_pass_space: str = "legacy_waymo_sim3"
+    G_asset_waymo: dict[int, list[dict[str, torch.Tensor]]] | None = None
+    asset_pass_space: str = ""
     fit_metrics: dict[int, list[dict[str, Any]]] | None = None
+
+    def __post_init__(self) -> None:
+        if self.G_asset_waymo is None:
+            self.G_asset_waymo = {}
 
 
 def compute_runtime_patch_grid(model_hw: tuple[int, int], patch_size: int = 14) -> tuple[int, int]:
@@ -210,13 +211,13 @@ class AssetAggregatorPass(nn.Module):
         self,
         sample: dict[str, Any],
         selected_object_slots: Sequence[int] | None = None,
-        alignment: Sim3Transform | None = None,
-        asset_cache: dict[str, dict[str, torch.Tensor]] | None = None,
+        alignment: Sim3Transform | None = None, # Deprecated
+        asset_cache: dict[str, dict[str, torch.Tensor]] | None = None, # Deprecated
         occlusion_test: bool = True,
         aggregator_batch_size: int = 0,
         localized_objects: Sequence[Any] | None = None,
         cameras_dggt: dict[str, torch.Tensor] | None = None,
-        render_space: str = "legacy_waymo_sim3",
+        render_space: str = "dggt_fitted", # Deprecated
         collect_fit_metrics: bool = False,
     ) -> AssetPassResult:
         images_clean = sample["images_clean"]
@@ -228,36 +229,25 @@ class AssetAggregatorPass(nn.Module):
         device = self._infer_device(images_clean)
         model_hw = (int(images_clean.shape[-2]), int(images_clean.shape[-1]))
         patch_grid = compute_runtime_patch_grid(model_hw, patch_size=self.patch_size)
-        render_space = str(render_space)
-        if render_space not in ("legacy_waymo_sim3", "dggt_fitted"):
-            raise ValueError(
-                f"render_space must be 'legacy_waymo_sim3' or 'dggt_fitted', got {render_space!r}"
-            )
-        if render_space == "dggt_fitted":
-            if localized_objects is None:
-                raise ValueError("render_space='dggt_fitted' requires localized_objects")
-            if cameras_dggt is None:
-                raise ValueError("render_space='dggt_fitted' requires cameras_dggt")
-            render_cameras = self._build_dggt_cameras(sample, cameras_dggt, device=device)
-        else:
-            render_cameras = self._build_waymo_cameras(sample, model_hw, device=device)
+
+        if localized_objects is None:
+            raise ValueError("AssetAggregatorPass requires localized_objects")
+        if cameras_dggt is None:
+            raise ValueError("AssetAggregatorPass requires cameras_dggt")
+            
+        render_cameras = self._build_dggt_cameras(sample, cameras_dggt, device=device)
         candidate_slots = self._resolve_object_slots(sample, selected_object_slots)
-        cache = {} if asset_cache is None else asset_cache
 
         object_keys: list[int] = []
-        G_asset_waymo: dict[int, list[dict[str, torch.Tensor]]] = {}
         patch_start_idx = int(getattr(self.aggregator, "patch_start_idx", 0))
 
         F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
         I_asset: dict[int, torch.Tensor] = {}
         A_asset: dict[int, torch.Tensor] = {}
         ptr_asset: dict[int, list[GaussianPointers]] = {}
-        if render_space == "dggt_fitted":
-            G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] | None = {}
-        else:
-            G_asset_dggt = {} if alignment is not None else None
+        G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] = {}
         fit_metrics: dict[int, list[dict[str, Any]]] | None = (
-            {} if render_space == "dggt_fitted" and bool(collect_fit_metrics) else None
+            {} if bool(collect_fit_metrics) else None
         )
 
         batch_size = int(aggregator_batch_size)
@@ -311,18 +301,8 @@ class AssetAggregatorPass(nn.Module):
                     occlusion_test,
                 )
                 gauss_seq_cpu = _to_cpu_gaussian_sequence(gauss_seq)
-                if render_space == "dggt_fitted":
-                    if G_asset_dggt is not None:
-                        G_asset_dggt[int(slot_idx)] = gauss_seq_cpu
-                else:
-                    G_asset_waymo[int(slot_idx)] = gauss_seq_cpu
-                    if G_asset_dggt is not None:
-                        if alignment is None:
-                            raise ValueError("legacy Waymo asset pass cannot build DGGT gaussians without alignment")
-                        G_asset_dggt[int(slot_idx)] = [
-                            apply_sim3_to_gaussian_dict(gauss, alignment)
-                            for gauss in gauss_seq_cpu
-                        ]
+                G_asset_dggt[int(slot_idx)] = gauss_seq_cpu
+
                 if fit_metrics is not None:
                     fit_metrics[int(slot_idx)] = self._build_fit_metrics_for_object(
                         slot_idx=int(slot_idx),
@@ -349,24 +329,16 @@ class AssetAggregatorPass(nn.Module):
         for slot_idx in candidate_slots:
             if not self._is_valid_asset_slot(sample, slot_idx):
                 continue
-            if render_space == "dggt_fitted":
-                gauss_seq, rgb_seq, alpha_seq, depth_seq = self._render_dggt_fitted_object_sequence(
-                    sample=sample,
-                    slot_idx=slot_idx,
-                    cameras=render_cameras,
-                    model_hw=model_hw,
-                    device=device,
-                    localized_by_key=localized_by_key,
-                )
-            else:
-                gauss_seq, rgb_seq, alpha_seq, depth_seq = self._render_object_sequence(
-                    sample,
-                    slot_idx,
-                    render_cameras,
-                    model_hw,
-                    device,
-                    cache,
-                )
+
+            gauss_seq, rgb_seq, alpha_seq, depth_seq = self._render_dggt_fitted_object_sequence(
+                sample=sample,
+                slot_idx=slot_idx,
+                cameras=render_cameras,
+                model_hw=model_hw,
+                device=device,
+                localized_by_key=localized_by_key,
+            )
+            
             if len(gauss_seq) == 0:
                 continue
             if not any(gauss["means"].numel() > 0 for gauss in gauss_seq):
@@ -390,11 +362,11 @@ class AssetAggregatorPass(nn.Module):
             cameras_waymo={k: v.detach().cpu() for k, v in render_cameras.items()},
             F_g_lut_asset=F_g_lut_asset,
             ptr_asset=ptr_asset,
-            G_asset_waymo=G_asset_waymo,
             G_asset_dggt=G_asset_dggt,
             I_asset=I_asset,
             A_asset=A_asset,
-            asset_pass_space=render_space,
+            G_asset_waymo={},
+            asset_pass_space=str(render_space),
             fit_metrics=fit_metrics,
         )
 
@@ -433,52 +405,6 @@ class AssetAggregatorPass(nn.Module):
         if asset_paths is None or slot_idx < 0 or slot_idx >= len(asset_paths):
             return False
         return Path(str(asset_paths[slot_idx])).is_file()
-
-    def _build_waymo_cameras(
-        self,
-        sample: dict[str, Any],
-        model_hw: tuple[int, int],
-        device: torch.device,
-    ) -> dict[str, torch.Tensor]:
-        num_frames = int(sample["frame_indices"].numel())
-        num_views = int(sample["cam_ids"].numel())
-
-        camera_to_world = sample["camera_to_world_corrected"].detach().cpu().float().view(-1, 4, 4)
-        world_to_camera = torch.linalg.inv(camera_to_world)
-        intrinsics_raw = sample["intrinsics"].detach().cpu().float()
-        raw_hw = sample["raw_image_size_hw"].detach().cpu().long()
-
-        K_model_per_view = []
-        for view_idx in range(num_views):
-            view_hw = (int(raw_hw[view_idx, 0].item()), int(raw_hw[view_idx, 1].item()))
-            K_model_per_view.append(
-                compute_model_intrinsics(
-                    intrinsics_raw[view_idx],
-                    view_hw,
-                    model_hw,
-                )
-            )
-        K_model = torch.stack(
-            [
-                K_model_per_view[view_idx]
-                for _frame_idx in range(num_frames)
-                for view_idx in range(num_views)
-            ],
-            dim=0,
-        )
-
-        image_to_frame = torch.arange(num_frames, dtype=torch.long).repeat_interleave(num_views)
-        image_to_view = torch.arange(num_views, dtype=torch.long).repeat(num_frames)
-        cam_ids = sample["cam_ids"].detach().cpu().long()[image_to_view]
-
-        return {
-            "camera_to_world": camera_to_world.to(device),
-            "world_to_camera": world_to_camera.to(device),
-            "K_model": K_model.to(device),
-            "image_to_frame": image_to_frame.to(device),
-            "image_to_view": image_to_view.to(device),
-            "cam_ids": cam_ids.to(device),
-        }
 
     def _build_dggt_cameras(
         self,
@@ -607,73 +533,6 @@ class AssetAggregatorPass(nn.Module):
 
         return gauss_seq, rgb_seq, alpha_seq, depth_seq
 
-    def _render_object_sequence(
-        self,
-        sample: dict[str, Any],
-        slot_idx: int,
-        cameras_waymo: dict[str, torch.Tensor],
-        model_hw: tuple[int, int],
-        device: torch.device,
-        asset_cache: dict[str, dict[str, torch.Tensor]],
-    ) -> tuple[
-        list[dict[str, torch.Tensor]],
-        list[torch.Tensor],
-        list[torch.Tensor],
-        list[torch.Tensor],
-    ]:
-        num_images = int(cameras_waymo["world_to_camera"].shape[0])
-        H, W = int(model_hw[0]), int(model_hw[1])
-        zero_rgb = torch.zeros((3, H, W), dtype=torch.float32, device=device)
-        zero_alpha = torch.zeros((1, H, W), dtype=torch.float32, device=device)
-        zero_depth = torch.zeros((H, W), dtype=torch.float32, device=device)
-
-        track_valid = sample["object_track_valid_mask_selected"][slot_idx].detach().cpu().bool()
-        obj_to_world = sample["object_obj_to_world_selected"][slot_idx].detach().cpu().float()
-        box_size = sample["object_box_size_selected"][slot_idx].detach().cpu().float()
-
-        gauss_seq: list[dict[str, torch.Tensor]] = []
-        rgb_seq: list[torch.Tensor] = []
-        alpha_seq: list[torch.Tensor] = []
-        depth_seq: list[torch.Tensor] = []
-
-        for image_idx in range(num_images):
-            frame_idx = int(cameras_waymo["image_to_frame"][image_idx].item())
-            asset_path = self._resolve_asset_path_for_image(sample, slot_idx, image_idx)
-            if (
-                frame_idx < 0
-                or frame_idx >= track_valid.shape[0]
-                or not bool(track_valid[frame_idx].item())
-                or asset_path == ""
-            ):
-                gauss_seq.append(empty_gaussian_dict())
-                rgb_seq.append(zero_rgb.clone())
-                alpha_seq.append(zero_alpha.clone())
-                depth_seq.append(zero_depth.clone())
-                continue
-
-            asset_local = load_asset_gaussians(asset_path, asset_cache)
-            object_rotation = obj_to_world[frame_idx, :3, :3].to(device)
-            object_center = obj_to_world[frame_idx, :3, 3].to(device)
-            target_lwh = box_size[frame_idx].to(device)
-            gauss_waymo = transform_asset_gaussians(
-                asset_local,
-                target_lwh,
-                object_rotation,
-                object_center,
-            )
-            rgb, alpha, depth = self._render_gaussians_for_camera(
-                gauss_waymo,
-                cameras_waymo["world_to_camera"][image_idx],
-                cameras_waymo["K_model"][image_idx],
-                (H, W),
-            )
-            gauss_seq.append(gauss_waymo)
-            rgb_seq.append(rgb)
-            alpha_seq.append(alpha)
-            depth_seq.append(depth)
-
-        return gauss_seq, rgb_seq, alpha_seq, depth_seq
-
     @staticmethod
     def _box_iou_xyxy(box_a: torch.Tensor | None, box_b: torch.Tensor | None) -> float:
         if box_a is None or box_b is None:
@@ -780,34 +639,6 @@ class AssetAggregatorPass(nn.Module):
                     row[key] = pose_diag.get(key)
             metrics.append(row)
         return metrics
-
-    def _resolve_asset_path_for_image(
-        self,
-        sample: dict[str, Any],
-        slot_idx: int,
-        image_idx: int,
-    ) -> str:
-        image_valid = sample.get("object_asset_image_valid_mask_selected")
-        image_paths = sample.get("object_asset_image_paths_selected")
-        if (
-            isinstance(image_valid, torch.Tensor)
-            and image_paths is not None
-            and 0 <= slot_idx < image_valid.shape[0]
-            and 0 <= image_idx < image_valid.shape[1]
-            and 0 <= slot_idx < len(image_paths)
-            and 0 <= image_idx < len(image_paths[slot_idx])
-        ):
-            if bool(image_valid[slot_idx, image_idx].item()):
-                return str(image_paths[slot_idx][image_idx])
-            return ""
-
-        asset_paths = sample.get("object_asset_paths")
-        if asset_paths is None or slot_idx < 0 or slot_idx >= len(asset_paths):
-            return ""
-        asset_path = str(asset_paths[slot_idx])
-        if asset_path == "" or not Path(asset_path).is_file():
-            return ""
-        return asset_path
 
     def _render_gaussians_for_camera(
         self,
