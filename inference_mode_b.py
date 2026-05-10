@@ -809,12 +809,21 @@ def _run_flow_feature_mask_dump(
             K_map = torch.ones((B, S, H_img, W_img, 1), dtype=torch.float32, device=device)
             D_map = torch.zeros_like(K_map)
             I_map = torch.zeros_like(K_map)
+            D_edited_hires = assembler._pass1_depth_hires(
+                predictions,
+                B=B,
+                S=S,
+                H=H_img,
+                W=W_img,
+                device=device,
+                dtype=K_map.dtype,
+            )
             I_per_obj: list[dict[int, torch.Tensor]] = [{}]
             M_preserve = torch.ones((B, S, P, 1), dtype=torch.float32, device=device)
             M_source = torch.zeros_like(M_preserve)
             M_dest = torch.zeros_like(M_preserve)
         else:
-            K_map, D_map, I_map, I_per_obj = assembler._render_mode_b_per_target_coverage(
+            K_map, D_map, I_map, I_per_obj, D_edited_hires = assembler._render_mode_b_per_target_coverage(
                 sample=sample,
                 clean_state=clean_state,
                 clean_dict=clean_dict,
@@ -822,6 +831,7 @@ def _run_flow_feature_mask_dump(
                 cameras_dggt=cameras_dggt,
                 H=H_img,
                 W=W_img,
+                return_effective_depth=True,
             )
             M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
                 K_map, D_map, I_map, target_grid=patch_grid
@@ -835,8 +845,10 @@ def _run_flow_feature_mask_dump(
                 M_dest=M_dest,
             )
 
-        D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
-        A_edited_hires = (K_map + I_map).clamp(0.0, 1.0)
+        A_edited_hires = assembler.soft_mask.compose_deleted_hole_alpha(
+            K_alpha=K_map,
+            hole_alpha=I_map,
+        )
         dyn_prior = torch.sigmoid(
             predictions["dynamic_conf"].reshape(B, S, H_img, W_img, 1).to(device)
         ).float()
@@ -864,6 +876,8 @@ def _run_flow_feature_mask_dump(
         M_preserve=M_preserve,
         M_source=M_source,
         M_dest=M_dest,
+        D_edited_hires=D_edited_hires,
+        A_edited_hires=A_edited_hires,
         scaffold_hires=scaffold_hires,
         scaffold_tok=SimpleNamespace(shape=(B, S, P, 768)),
         z_clean=empty_shape,

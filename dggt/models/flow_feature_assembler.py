@@ -93,6 +93,8 @@ class FlowFeatureBundle:
     M_preserve: torch.Tensor                                   # [B, S, P, 1]
     M_source: torch.Tensor
     M_dest: torch.Tensor
+    D_edited_hires: torch.Tensor                               # [B, S, H, W, 1] raw effective depth
+    A_edited_hires: torch.Tensor                               # [B, S, H, W, 1] edited alpha
     scaffold_hires: torch.Tensor                               # [B, S, H, W, 7]
     scaffold_tok: torch.Tensor                                 # [B, S, P, 768]
 
@@ -499,7 +501,7 @@ class FlowFeatureAssembler(nn.Module):
         # M_source / M_dest are first-class WAN inputs (not just used for
         # blending). They are cheap (~36ms total) so caching them isn't worth
         # the extra disk.
-        K_map, D_map, I_map, I_per_obj = self._render_mode_a_per_target_coverage(
+        K_map, D_map, I_map, I_per_obj, D_edited_hires = self._render_mode_a_per_target_coverage(
             sample=sample,
             clean_state=clean_state,
             clean_dict=gauss_scene,
@@ -509,6 +511,7 @@ class FlowFeatureAssembler(nn.Module):
             cameras_dggt=cameras_dggt,
             H=H_img,
             W=W_img,
+            return_effective_depth=True,
         )
         M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=self.patch_grid
@@ -554,9 +557,10 @@ class FlowFeatureAssembler(nn.Module):
             ]
         # Cached path already stores the post-blend splatted_tok_low.
 
-        # Scaffold precursors
-        D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
-        A_edited_hires = (K_map + I_map).clamp(0.0, 1.0)
+        # Scaffold precursors.  D_edited_hires follows the same visibility rule
+        # as the masks: inserted assets are composited over the kept DGGT scene,
+        # not depth-tested against it.
+        A_edited_hires = self._compose_edited_alpha(K_map, I_map)
         dyn_prior = torch.sigmoid(
             predictions["dynamic_conf"].reshape(B, S, H_img, W_img, 1).to(device)
         ).float()
@@ -624,6 +628,8 @@ class FlowFeatureAssembler(nn.Module):
             M_preserve=M_preserve,
             M_source=M_source,
             M_dest=M_dest,
+            D_edited_hires=D_edited_hires,
+            A_edited_hires=A_edited_hires,
             scaffold_hires=scaffold_hires,
             scaffold_tok=scaffold_tok,
             z_clean=z_clean,
@@ -725,11 +731,22 @@ class FlowFeatureAssembler(nn.Module):
         pointers_all = ptr_scene_kept
 
         # Phase 3: Soft masks. K = render(per-frame kept),
-        # I = render(per-frame pseudo-deleted Gaussians), D = 0.
+        # I = render(per-frame pseudo-deleted Gaussians) as the hole footprint,
+        # D = 0 because Mode B uses M_dest-style inpainting, not source-object
+        # deletion conditioning.
         if mode_b_noop:
             K_map = torch.ones((B, S, H_img, W_img, 1), dtype=torch.float32, device=device)
             D_map = torch.zeros_like(K_map)
             I_map = torch.zeros_like(K_map)
+            D_edited_hires = self._pass1_depth_hires(
+                predictions,
+                B=B,
+                S=S,
+                H=H_img,
+                W=W_img,
+                device=device,
+                dtype=K_map.dtype,
+            )
             I_per_obj: list[dict[int, torch.Tensor]] = [{} for _ in range(B)]
             M_preserve = torch.ones(
                 (B, S, self.patch_grid[0] * self.patch_grid[1], 1),
@@ -739,7 +756,7 @@ class FlowFeatureAssembler(nn.Module):
             M_source = torch.zeros_like(M_preserve)
             M_dest = torch.zeros_like(M_preserve)
         else:
-            K_map, D_map, I_map, I_per_obj = self._render_mode_b_per_target_coverage(
+            K_map, D_map, I_map, I_per_obj, D_edited_hires = self._render_mode_b_per_target_coverage(
                 sample=sample,
                 clean_state=clean_state,
                 clean_dict=clean_dict,
@@ -747,6 +764,7 @@ class FlowFeatureAssembler(nn.Module):
                 cameras_dggt=cameras_dggt,
                 H=H_img,
                 W=W_img,
+                return_effective_depth=True,
             )
             M_preserve, M_source, M_dest = self.soft_mask.pool_and_normalize(
                 K_map, D_map, I_map, target_grid=self.patch_grid
@@ -803,9 +821,13 @@ class FlowFeatureAssembler(nn.Module):
             ]
         # Cached path already stores the post-blend splatted_tok_low.
 
-        # Scaffold (D_edited not meaningful for mode B — pass zeros).
-        D_edited_hires = D_map.new_zeros((B, S, H_img, W_img, 1))
-        A_edited_hires = (K_map + I_map).clamp(0.0, 1.0)
+        # In Mode B the pseudo-deleted Gaussians define an empty hole footprint,
+        # not a visible inserted object.  Keep scaffold depth/alpha unknown in
+        # that footprint so it matches the deletion-rendered training input.
+        A_edited_hires = self.soft_mask.compose_deleted_hole_alpha(
+            K_alpha=K_map,
+            hole_alpha=I_map,
+        )
         dyn_prior = torch.sigmoid(
             predictions["dynamic_conf"].reshape(B, S, H_img, W_img, 1).to(device)
         ).float()
@@ -925,6 +947,8 @@ class FlowFeatureAssembler(nn.Module):
             M_preserve=M_preserve,
             M_source=M_source,
             M_dest=M_dest,
+            D_edited_hires=D_edited_hires,
+            A_edited_hires=A_edited_hires,
             scaffold_hires=scaffold_hires,
             scaffold_tok=scaffold_tok,
             z_clean=z_clean,
@@ -949,6 +973,41 @@ class FlowFeatureAssembler(nn.Module):
     # ------------------------------------------------------------------ #
     # Internal helpers                                                    #
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _compose_edited_alpha(K_map: torch.Tensor, I_map: torch.Tensor) -> torch.Tensor:
+        """Alpha of kept scene with inserted / imagined footprint overlaid."""
+        return (1.0 - (1.0 - K_map.clamp(0.0, 1.0)) * (1.0 - I_map.clamp(0.0, 1.0))).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _pass1_depth_hires(
+        predictions: dict[str, torch.Tensor],
+        *,
+        B: int,
+        S: int,
+        H: int,
+        W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return Pass-1 depth as `[B,S,H,W,1]` for true no-op scaffolds."""
+        depth = predictions.get("depth")
+        if not torch.is_tensor(depth):
+            return torch.zeros((B, S, H, W, 1), dtype=dtype, device=device)
+        depth = depth.to(device=device, dtype=dtype)
+        if depth.dim() == 4:
+            depth = depth.unsqueeze(0)
+        if depth.dim() != 5:
+            return torch.zeros((B, S, H, W, 1), dtype=dtype, device=device)
+        if depth.shape[-1] != 1:
+            depth = depth[..., :1]
+        if tuple(depth.shape[:4]) != (B, S, H, W):
+            try:
+                depth = depth.reshape(B, S, H, W, 1)
+            except RuntimeError:
+                return torch.zeros((B, S, H, W, 1), dtype=dtype, device=device)
+        depth = torch.where(torch.isfinite(depth) & (depth > 0.0), depth, torch.zeros_like(depth))
+        return depth
+
     @staticmethod
     def _mode_b_delete_masks_by_target(
         *,
@@ -991,7 +1050,11 @@ class FlowFeatureAssembler(nn.Module):
         cameras_dggt: dict[str, torch.Tensor],
         H: int,
         W: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]]]:
+        return_effective_depth: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]]]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]], torch.Tensor]
+    ):
         """Render Mode-B K/I coverage with the target frame's own delete mask."""
         viewmats = cameras_dggt["viewmats"]
         if int(viewmats.shape[0]) != 1:
@@ -1006,6 +1069,7 @@ class FlowFeatureAssembler(nn.Module):
         timestamps = self._mode_b_timestamps(sample, num_images=S, device=viewmats.device)
         K_chunks: list[torch.Tensor] = []
         I_chunks: list[torch.Tensor] = []
+        depth_chunks: list[torch.Tensor] = []
         for target_idx in range(S):
             del_mask = delete_masks_by_target[target_idx].to(
                 device=clean_dict["means"].device, dtype=torch.bool
@@ -1029,14 +1093,42 @@ class FlowFeatureAssembler(nn.Module):
                 "viewmats": cameras_dggt["viewmats"][:, target_idx : target_idx + 1].contiguous(),
                 "Ks": cameras_dggt["Ks"][:, target_idx : target_idx + 1].contiguous(),
             }
-            K_one, _D_dummy, I_one, _ = self.soft_mask.render_coverage(
-                G_kept=[gauss_kept],
-                G_deleted=[{}],
-                G_asset_dggt_dict=[{0: gauss_deleted}],
-                cameras_dggt=cameras_one,
-                H=H,
-                W=W,
-            )
+            if return_effective_depth:
+                K_one, K_depth_one = self.soft_mask._render_alpha_depth(
+                    gauss_kept,
+                    cameras_one["viewmats"][0],
+                    cameras_one["Ks"][0],
+                    H,
+                    W,
+                    cameras_one["viewmats"].device,
+                    torch.float32,
+                )
+                I_one, _ = self.soft_mask._render_asset_owner_alpha(
+                    {0: gauss_deleted},
+                    cameras_one["viewmats"][0],
+                    cameras_one["Ks"][0],
+                    H,
+                    W,
+                    cameras_one["viewmats"].device,
+                    torch.float32,
+                )
+                D_edited_one = self.soft_mask.compose_deleted_hole_depth(
+                    K_alpha=K_one,
+                    K_depth=K_depth_one,
+                    hole_alpha=I_one,
+                ).unsqueeze(0)
+                K_one = K_one.unsqueeze(0)
+                I_one = I_one.unsqueeze(0)
+                depth_chunks.append(D_edited_one)
+            else:
+                K_one, _D_dummy, I_one, _ = self.soft_mask.render_coverage(
+                    G_kept=[gauss_kept],
+                    G_deleted=[{}],
+                    G_asset_dggt_dict=[{0: gauss_deleted}],
+                    cameras_dggt=cameras_one,
+                    H=H,
+                    W=W,
+                )
             K_chunks.append(K_one)
             I_chunks.append(I_one)
 
@@ -1044,6 +1136,9 @@ class FlowFeatureAssembler(nn.Module):
         I_map = torch.cat(I_chunks, dim=1)
         D_map = torch.zeros_like(I_map)
         I_per_obj = [{0: I_map[0]}]
+        if return_effective_depth:
+            D_edited = torch.cat(depth_chunks, dim=1) if depth_chunks else torch.zeros_like(I_map)
+            return K_map, D_map, I_map, I_per_obj, D_edited
         return K_map, D_map, I_map, I_per_obj
 
     @staticmethod
@@ -1260,7 +1355,11 @@ class FlowFeatureAssembler(nn.Module):
         cameras_dggt: dict[str, torch.Tensor],
         H: int,
         W: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]]]:
+        return_effective_depth: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]]]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[dict[int, torch.Tensor]], torch.Tensor]
+    ):
         viewmats = cameras_dggt["viewmats"]
         if int(viewmats.shape[0]) != 1:
             raise ValueError("Mode-A per-target coverage currently expects batch size 1.")
@@ -1271,6 +1370,7 @@ class FlowFeatureAssembler(nn.Module):
         K_chunks: list[torch.Tensor] = []
         D_chunks: list[torch.Tensor] = []
         I_chunks: list[torch.Tensor] = []
+        depth_chunks: list[torch.Tensor] = []
         per_obj_chunks: dict[int, list[torch.Tensor]] = {
             int(k): [] for k in asset_pass_result.object_keys
         }
@@ -1301,14 +1401,27 @@ class FlowFeatureAssembler(nn.Module):
                 "viewmats": cameras_dggt["viewmats"][:, target_idx : target_idx + 1].contiguous(),
                 "Ks": cameras_dggt["Ks"][:, target_idx : target_idx + 1].contiguous(),
             }
-            K_one, D_one, I_one, per_one = self.soft_mask.render_coverage(
-                G_kept=[gauss_kept],
-                G_deleted=[gauss_deleted],
-                G_asset_dggt_dict=[asset_dict],
-                cameras_dggt=cameras_one,
-                H=H,
-                W=W,
-            )
+            if return_effective_depth:
+                K_one, D_one, I_one, per_one, D_edited_one = (
+                    self.soft_mask.render_coverage_and_effective_depth(
+                        G_kept=[gauss_kept],
+                        G_deleted=[gauss_deleted],
+                        G_asset_dggt_dict=[asset_dict],
+                        cameras_dggt=cameras_one,
+                        H=H,
+                        W=W,
+                    )
+                )
+                depth_chunks.append(D_edited_one)
+            else:
+                K_one, D_one, I_one, per_one = self.soft_mask.render_coverage(
+                    G_kept=[gauss_kept],
+                    G_deleted=[gauss_deleted],
+                    G_asset_dggt_dict=[asset_dict],
+                    cameras_dggt=cameras_one,
+                    H=H,
+                    W=W,
+                )
             K_chunks.append(K_one)
             D_chunks.append(D_one)
             I_chunks.append(I_one)
@@ -1323,6 +1436,9 @@ class FlowFeatureAssembler(nn.Module):
         I_per_obj = [
             {obj_key: torch.cat(parts, dim=0) for obj_key, parts in per_obj_chunks.items()}
         ]
+        if return_effective_depth:
+            D_edited = torch.cat(depth_chunks, dim=1) if depth_chunks else torch.zeros_like(I_map)
+            return K_map, D_map, I_map, I_per_obj, D_edited
         return K_map, D_map, I_map, I_per_obj
 
     def _render_mode_a_depth_aware_coverage(

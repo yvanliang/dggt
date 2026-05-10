@@ -72,7 +72,7 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python inference_scene_editor.py \
     --dump_features
 
 # 输出可视化结果：runs/mode_a_smoke/{deleted_render_grid, asset_image_grid,
-#          flow_features/{flow_features.pt, masks/, coverage/, scaffold/}}
+#          flow_features/{flow_features.pt, masks/, coverage/, scaffold/, depth/}}
 ```
 
 `--dump_features` 会直接调用训练同用的 `FlowFeatureAssembler`，因此
@@ -106,7 +106,7 @@ CUDA_VISIBLE_DEVICES=3 python inference_mode_b.py --output_dir runs/mode_b_all_v
     --dump_features
 # 输出：runs/mode_b_all_vis/{imagined_boxes_overlay, deleted_render_grid,
 #          d_map_grid, mode_b_summary.json,
-#          flow_features/{masks/, coverage/, scaffold/}}
+#          flow_features/{masks/, coverage/, scaffold/, depth/}}
 ```
 
 Mode B 的 `--dump_features` 同样走训练用 `FlowFeatureAssembler(mode_kind="mode_b")`，
@@ -165,7 +165,7 @@ torchrun --nproc_per_node=8 train_scene_flow.py \
 
 在每个 `--vis_every` step，rank-0 会将一组可视化结果保存到 `runs/flow_t1/vis/step_<N>/flow_features/` 下：
 
-* 两种模式都有：`flow_features.pt`、`masks/`、`coverage/`、`scaffold/`。
+* 两种模式都有：`flow_features.pt`、`masks/`、`coverage/`、`scaffold/`、`depth/`。
 * 仅 Mode B：额外包含 `mode_b/{clean_grid, I_map_grid, imagined_boxes_overlay}.jpg`。
 
 仅 Mode A：`coverage/` 中已经包含每个资产目标对应的 `I_per_obj_slot{XX}_grid.jpg`。

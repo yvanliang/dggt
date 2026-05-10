@@ -902,7 +902,7 @@ def _compute_and_pack_pass2_splatted_tok_low(
         # Soft masks are cheap and define where the final post-blend feature
         # actually depends on FeatureSplatter.  Compute them before splatting
         # so inactive target tiles can be skipped by gsplat.
-        K_map, D_map, I_map, I_per_obj = assembler._render_mode_a_per_target_coverage(
+        K_map, D_map, I_map, I_per_obj, D_edited_hires = assembler._render_mode_a_per_target_coverage(
             sample=sample,
             clean_state=clean_state,
             clean_dict=gauss_scene,
@@ -912,7 +912,9 @@ def _compute_and_pack_pass2_splatted_tok_low(
             cameras_dggt=cameras_dggt_dev,
             H=H_img,
             W=W_img,
+            return_effective_depth=True,
         )
+        _assert_no_nan_tensor("pass3.D_edited_hires", D_edited_hires)
         M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
             K_map, D_map, I_map, target_grid=patch_grid
         )
@@ -1076,7 +1078,7 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
             splatted_tok_low = [lvl.to(device) for lvl in F_g_lut_scene]
         else:
             # Soft mask coverage with each target frame's own delete mask.
-            K_map, D_map, I_map, _ = assembler._render_mode_b_per_target_coverage(
+            K_map, D_map, I_map, _, D_edited_hires = assembler._render_mode_b_per_target_coverage(
                 sample=sample,
                 clean_state=clean_state,
                 clean_dict=clean_dict,
@@ -1084,7 +1086,9 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
                 cameras_dggt=cameras_dggt_dev,
                 H=H_img,
                 W=W_img,
+                return_effective_depth=True,
             )
+            _assert_no_nan_tensor("pass3.D_edited_hires", D_edited_hires)
             M_preserve, M_source, M_dest = assembler.soft_mask.pool_and_normalize(
                 K_map, D_map, I_map, target_grid=patch_grid
             )

@@ -11,6 +11,7 @@ layout:
     coverage/{K,D,I}_map_grid.jpg
     coverage/I_per_obj_slot{XX}_grid.jpg
     scaffold/chan{0..6}_grid.jpg
+    depth/{D_edited_hires,A_edited_hires}_grid.jpg
     splat_pca/level{0..3}_grid.jpg   # only when save_splat_pca=True
 """
 from __future__ import annotations
@@ -43,7 +44,7 @@ def _tensor_to_pil_rgb(image: torch.Tensor):
         raise ValueError(f"Expected 1 or 3 channels, got {image.shape[0]}")
     u8 = image.mul(255.0).add(0.5).clamp(0.0, 255.0).to(torch.uint8).permute(1, 2, 0).contiguous()
     h, w = u8.shape[:2]
-    return Image.frombytes("RGB", (w, h), u8.numpy().tobytes())
+    return Image.frombytes("RGB", (w, h), bytes(u8.reshape(-1).tolist()))
 
 
 def _make_pil_grid(images: list, nrow: int):
@@ -72,6 +73,42 @@ def save_image_grid(
     nrow = min(4, N) if nrow is None else max(1, min(nrow, N))
     pil_images = [_tensor_to_pil_rgb(img) for img in images]
     _make_pil_grid(pil_images, nrow=nrow).save(path)
+
+
+def _depth_to_viz_images(depth: torch.Tensor) -> torch.Tensor:
+    """Normalize raw depth per image to `[N,1,H,W]` for inspection."""
+    if depth.dim() == 5:
+        B, S, H, W, C = depth.shape
+        if C != 1:
+            raise ValueError(f"Expected depth trailing dim=1, got {C}")
+        x = depth.reshape(B * S, H, W, 1).permute(0, 3, 1, 2)
+    elif depth.dim() == 4 and depth.shape[-1] == 1:
+        x = depth.permute(0, 3, 1, 2)
+    elif depth.dim() == 4 and depth.shape[1] == 1:
+        x = depth
+    else:
+        raise ValueError(f"Unsupported depth shape {tuple(depth.shape)}")
+
+    x = x.detach().cpu().float()
+    out = torch.zeros_like(x)
+    for idx in range(int(x.shape[0])):
+        d = x[idx, 0]
+        valid = torch.isfinite(d) & (d > 0.0)
+        if not bool(valid.any().item()):
+            continue
+        vals = d[valid]
+        if int(vals.numel()) >= 16:
+            lo = torch.quantile(vals, 0.02)
+            hi = torch.quantile(vals, 0.98)
+        else:
+            lo = vals.min()
+            hi = vals.max()
+        if float((hi - lo).abs().item()) < 1e-6:
+            out[idx, 0][valid] = 1.0
+        else:
+            out[idx, 0] = ((d - lo) / (hi - lo).clamp_min(1e-6)).clamp(0.0, 1.0)
+            out[idx, 0][~valid] = 0.0
+    return out
 
 
 def _patch_mask_to_image(
@@ -155,6 +192,20 @@ def dump_flow_features(
             arr = sh[..., c : c + 1].permute(0, 3, 1, 2).float().clamp(0.0, 1.0)
             save_image_grid(arr, sc_dir / f"chan{c}_grid.jpg", nrow=nrow)
 
+        depth_dir = feat_dir / "depth"
+        depth_dir.mkdir(parents=True, exist_ok=True)
+        raw_depth = getattr(bundle, "D_edited_hires", None)
+        if torch.is_tensor(raw_depth):
+            depth_grid = _depth_to_viz_images(raw_depth)
+        else:
+            depth_grid = sh[..., 0:1].permute(0, 3, 1, 2).float().clamp(0.0, 1.0)
+        save_image_grid(depth_grid, depth_dir / "D_edited_hires_grid.jpg", nrow=nrow)
+
+        edited_alpha = getattr(bundle, "A_edited_hires", None)
+        if torch.is_tensor(edited_alpha):
+            alpha_grid = edited_alpha[0].permute(0, 3, 1, 2).float().clamp(0.0, 1.0)
+            save_image_grid(alpha_grid, depth_dir / "A_edited_hires_grid.jpg", nrow=nrow)
+
     if save_splat_pca:
         pca_dir = feat_dir / "splat_pca"
         pca_dir.mkdir(parents=True, exist_ok=True)
@@ -177,6 +228,8 @@ def dump_flow_features(
         "patch_grid": list(bundle.patch_grid),
         "shapes": {
             "M_preserve": list(bundle.M_preserve.shape),
+            "D_edited_hires": list(getattr(bundle, "D_edited_hires", bundle.scaffold_hires[..., 0:1]).shape),
+            "A_edited_hires": list(getattr(bundle, "A_edited_hires", bundle.scaffold_hires[..., 1:2]).shape),
             "scaffold_tok": list(bundle.scaffold_tok.shape),
             "z_clean": list(bundle.z_clean.shape),
             "z_splat": list(bundle.z_splat.shape),
@@ -185,6 +238,15 @@ def dump_flow_features(
             "F_asset_tokens": list(bundle.F_asset_tokens.shape),
         },
     }
+    raw_depth = getattr(bundle, "D_edited_hires", None)
+    if torch.is_tensor(raw_depth):
+        depth_float = raw_depth.detach().float()
+        valid_depth = torch.isfinite(depth_float) & (depth_float > 0.0)
+        summary["depth"] = {
+            "D_edited_valid_px": int(valid_depth.sum().item()),
+            "D_edited_max": float(depth_float[valid_depth].max().item()) if bool(valid_depth.any().item()) else 0.0,
+            "D_edited_mean": float(depth_float[valid_depth].mean().item()) if bool(valid_depth.any().item()) else 0.0,
+        }
     if mode_kind == "mode_b":
         summary["imagined_objects"] = list(bundle.extras.get("imagined_objects", []))
         summary["rejection_reason"] = str(bundle.extras.get("rejection_reason", ""))
@@ -288,6 +350,8 @@ def _build_feature_pack(bundle) -> dict[str, Any]:
         "M_preserve": _f16(bundle.M_preserve),
         "M_source": _f16(bundle.M_source),
         "M_dest": _f16(bundle.M_dest),
+        "D_edited_hires": _f16(bundle.D_edited_hires),
+        "A_edited_hires": _f16(bundle.A_edited_hires),
         "scaffold_hires": _f16(bundle.scaffold_hires),
         "scaffold_tok": _f16(bundle.scaffold_tok),
         "z_clean": _f16(bundle.z_clean),
