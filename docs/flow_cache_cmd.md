@@ -84,14 +84,14 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python inference_scene_editor.py \
 生成 Mode B 缓存：VGGT Pass 1 + `ModeBPlanner.plan(...)` + `apply_mode_b(...)`。不包含 asset pass —— 扩散模型会幻化新内容。
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. python tools/precompute_flow_features.py \
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python tools/precompute_flow_features.py \
     --edit_mode mode_b \
-    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+    --ckpt_path /home/dancer/liangyiyuan/dggt/model_latest_waymo.pt \
     --split training \
-    --out_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_b \
+    --out_root /data/intelssd/liangyiyuan/waymo_processed_dggt/flow_cache_mode_b \
     --views 1 \
     --planner_seed 0 \
-    --allow_empty_plan
+    --allow_empty_plan --start 500
 ```
 
 `--allow_empty_plan` 会为规划器无法满足条件的片段保留缓存文件（这样 manifest 条目可以与 manifest split 保持 1:1）。如果不使用它，脚本会报错并跳过该片段。

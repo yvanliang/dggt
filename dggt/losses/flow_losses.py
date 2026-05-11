@@ -140,12 +140,20 @@ def build_rectified_flow_target(
     )
     num_train_timesteps = int(scheduler.config.num_train_timesteps)
     indices = (u * num_train_timesteps).long().clamp_(0, num_train_timesteps - 1)
-    sigmas = scheduler.sigmas.to(device=device, dtype=z_clean.dtype)[indices]
+    # diffusers' FlowMatchEulerDiscreteScheduler stores sigmas in the SD3/Wan
+    # noise-progress convention (sigmas[0]=1 means "full noise", sigmas[-1]≈0
+    # means "clean"). Our rectified-flow target below is written in the
+    # clean-progress convention (σ=0 is noise, σ=1 is clean), so we flip the
+    # lookup. Without this flip, `shift>1` — which Wan uses to bias sampling
+    # toward the noise side — ends up biasing our training toward the clean
+    # side instead, leaving the noise regime essentially untrained.
+    sched_sigmas = scheduler.sigmas.to(device=device, dtype=z_clean.dtype)
+    sigmas = 1.0 - sched_sigmas[indices]
     sigmas4 = sigmas.view(batch_size, 1, 1, 1)
     eps = torch.randn_like(z_clean)
 
     # Clean-progress rectified flow from docs/implement_scene_flow_plan.md:
-    # t=0 is noise, t=1 is z_clean, v = z_clean - eps.
+    # σ=0 is noise, σ=1 is z_clean, v = z_clean - eps.
     z_t = (1.0 - sigmas4) * eps + sigmas4 * z_clean
     v_gt = z_clean - eps
     weights = compute_loss_weighting_for_sd3(
