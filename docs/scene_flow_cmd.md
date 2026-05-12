@@ -52,8 +52,8 @@ CUDA_VISIBLE_DEVICES=2 python -u train_scene_flow_pretrain.py \
     --sequence_length 8 \
     --pretrain_task full_scene \
     --patch_grid_h 25 --patch_grid_w 37 \
-    --batch_size 4 \
-    --grad_accum_steps 2 \
+    --batch_size 2 \
+    --grad_accum_steps 4 \
     --num_workers 8 \
     --max_steps 100000 \
     --warmup_steps 5000 \
@@ -64,6 +64,7 @@ CUDA_VISIBLE_DEVICES=2 python -u train_scene_flow_pretrain.py \
     --val_batches 1 \
     --val_log_images 8 \
     --val_sample_steps 30 \
+    --val_guidance_scales "1.0,2.0,4.0" \
     --seed 0 \
     --precision bf16 \
     --wandb \

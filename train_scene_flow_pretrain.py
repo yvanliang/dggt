@@ -1194,10 +1194,24 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--no_val_render_rgb", action="store_true")
 
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="RAE official config uses wd=0.0 for from-scratch DiT on frozen-encoder latents.")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
-    parser.add_argument("--ema_decay", type=float, default=0.999)
-    parser.add_argument("--shift", type=float, default=6.0)
+    parser.add_argument("--ema_decay", type=float, default=0.9995,
+                        help="RAE uses 0.9995 (half-life ~1.4k steps); smoother validation than 0.999.")
+    parser.add_argument(
+        "--shift",
+        type=float,
+        default=16.0,
+        help=(
+            "FlowMatch noise-schedule shift. Per RAE (arxiv 2510.11690) "
+            "shift = sqrt(m / m_ref). m_ref=4096. Per-frame m = 25*37*768 "
+            "= 710400 -> alpha ~= 13.2; per-clip (S=8) m = 5.68M -> alpha "
+            "~= 37. We pick 16 as a compromise between per-frame and "
+            "per-clip dimension counts. Use 6 only when matching the "
+            "legacy low-D Wan recipe."
+        ),
+    )
     parser.add_argument("--lambda_flow", type=float, default=1.0)
     parser.add_argument("--lambda_preserve", type=float, default=1.0)
     parser.add_argument("--preserve_floor", type=float, default=0.2)
@@ -1206,8 +1220,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--min_inst_patches", type=int, default=4)
     parser.add_argument("--max_inst_patches", type=int, default=150)
     parser.add_argument("--dyn_threshold", type=float, default=0.05)
-    parser.add_argument("--guidance_scale", type=float, default=4.0,
-                        help="CFG scale for validation sampling.")
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "CFG scale for validation sampling. RAE's reported FID 1.51 uses "
+            "scale=1.0 (no guidance). Higher scales amplify per-patch noise "
+            "into grid artifacts early in training; bump only after the model "
+            "converges enough that cond/uncond diverge meaningfully."
+        ),
+    )
     parser.add_argument("--uncond_drop_prob", type=float, default=0.1,
                         help="Per-sample probability of dropping cross-attn KV during training (CFG prerequisite).")
     parser.add_argument("--val_guidance_scales", type=str, default="",
