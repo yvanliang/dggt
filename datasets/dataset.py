@@ -328,13 +328,11 @@ class WaymoOpenDataset(Dataset):
         dynamic_mask_paths = self.dynamic_mask_path[idx]
         semantic_mask_paths = self.semantic_mask_path[idx]
 
-        start_idx = random.randint(0, max(1, len(image_paths[0] if self.views == 3 else image_paths) - 21))
+        total_frames = len(image_paths[0] if self.views == 3 else image_paths)
+        start_idx = random.randint(0, max(0, total_frames - self.sequence_length))
 
         if self.mode == 1:
-            indices = [start_idx]
-            intervals = sorted(random.sample(range(1, 20), self.sequence_length - 1))
-            for interval in intervals:
-                indices.append(start_idx + interval)
+            indices = list(range(start_idx, start_idx + self.sequence_length))
 
             #images
             if self.views == 1:
@@ -368,7 +366,7 @@ class WaymoOpenDataset(Dataset):
                 "masks": masks,
                 "image_paths": seq,
                 "timestamps": timestamps,
-                "interval": intervals,
+                "interval": [1] * (self.sequence_length - 1),
             }
 
         
