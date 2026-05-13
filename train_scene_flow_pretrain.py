@@ -61,6 +61,7 @@ from diffusers.training_utils import EMAModel
 
 
 TOKENIZER_LEVELS = (4, 11, 17, 23)
+SKY_CLASS_INDEX = 9
 
 
 def is_distributed() -> bool:
@@ -366,6 +367,28 @@ def _normalized_mask_grid(mask: torch.Tensor, patch_grid: tuple[int, int], max_f
 
 def _image_grid(images: torch.Tensor, max_frames: int) -> torch.Tensor:
     return images[:1, :max_frames].detach().float().cpu().reshape(-1, *images.shape[2:]).clamp(0.0, 1.0)
+
+
+def _semantic_logits_to_sky_mask(
+    semantic_logits: torch.Tensor,
+    *,
+    sky_class_index: int = SKY_CLASS_INDEX,
+) -> torch.Tensor:
+    """Convert predicted semantic logits `[B,S,H,W,C]` to sky mask `[B,S,3,H,W]`."""
+    if semantic_logits.ndim != 5:
+        raise ValueError(f"Expected semantic_logits [B,S,H,W,C], got {tuple(semantic_logits.shape)}")
+    if semantic_logits.shape[-1] <= int(sky_class_index):
+        raise ValueError(
+            f"semantic_logits has {semantic_logits.shape[-1]} classes, "
+            f"cannot read sky_class_index={sky_class_index}"
+        )
+    sky = (semantic_logits.float().argmax(dim=-1) == int(sky_class_index)).to(dtype=semantic_logits.dtype)
+    return sky[:, :, None].repeat(1, 1, 3, 1, 1)
+
+
+def _sky_mask_image_grid(sky_mask: torch.Tensor, max_frames: int) -> torch.Tensor:
+    mask = sky_mask[:1, :max_frames, :1].detach().float().cpu()
+    return mask.reshape(-1, *mask.shape[2:]).clamp(0.0, 1.0)
 
 
 def _predict_camera_mats(
@@ -674,20 +697,31 @@ def render_validation_rgb(
             generated_pose_enc = vggt_model.camera_head(gen_agg)[-1]
             generated_depth, _ = vggt_model.depth_head(gen_agg, images, patch_start_idx)
             generated_dynamic_conf, _ = vggt_model.instance_head(gen_dino, images, patch_start_idx)
+            generated_semantic_logits, _ = vggt_model.semantic_head(gen_dino, images, patch_start_idx)
+            generated_sky_mask = _semantic_logits_to_sky_mask(generated_semantic_logits)
 
     del generated_image_tokens, gen_agg, gen_dino
 
-    # DGGT-aligned generated render: match inference.py mode=2 sky handling.
-    # Sky/non-sky gating comes from batch["masks"], and sky appearance comes
-    # from sky_model(images, extrinsic, intrinsic), which reads the GT RGB
-    # source frames exactly like the original DGGT inference script.
+    # Generated path consumes no GT sky mask and no sky_model background.
+    # Its sky/non-sky split comes from the semantic_head output decoded from
+    # generated tokens. Background remains black because sky_model reads GT RGB
+    # source images and is therefore not allowed in this no-GT diagnostic.
+    result["generated_pred_sky_mask"] = _sky_mask_image_grid(generated_sky_mask, frames)
     result["generated_raw_3dgs_rgb"] = _render_gs_map_rgb(
-        vggt_model, images, masks, timestamps,
+        vggt_model, images, generated_sky_mask, timestamps,
         generated_pose_enc, generated_depth, raw_gs_map, raw_gs_conf,
         generated_dynamic_conf,
-        device, frames, background_mode="sky", use_sky_mask=True,
+        device, frames, background_mode="black", use_sky_mask=True,
     )
-    del generated_pose_enc, generated_depth, raw_gs_map, raw_gs_conf, generated_dynamic_conf
+    del (
+        generated_pose_enc,
+        generated_depth,
+        raw_gs_map,
+        raw_gs_conf,
+        generated_dynamic_conf,
+        generated_semantic_logits,
+        generated_sky_mask,
+    )
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
