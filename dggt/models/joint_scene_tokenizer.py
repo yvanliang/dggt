@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 
 from dggt.layers.block import Block
-from dggt.layers.rope import PositionGetter, RotaryPositionEmbedding2D
+from dggt.layers.rope import (
+    PositionGetter,
+    RotaryPositionEmbedding1D,
+    RotaryPositionEmbedding2D,
+)
 
 
 def _reset_linear(module: nn.Module) -> None:
@@ -115,7 +119,12 @@ def _get_cached_2d_sincos_pos_embed(
 
 
 class FrameGlobalBlockPair(nn.Module):
-    """Alternates per-frame attention with global cross-frame attention."""
+    """Alternates per-frame attention with global cross-frame attention.
+
+    Per-frame attention uses 2D RoPE over patch positions; cross-frame attention
+    uses 1D RoPE over frame positions so the latent is sensitive to temporal
+    order and generalizes from S=8 (train) to longer clips at inference.
+    """
 
     def __init__(
         self,
@@ -129,10 +138,19 @@ class FrameGlobalBlockPair(nn.Module):
         qk_norm: bool = True,
         init_values: float = 1e-6,
         rope: RotaryPositionEmbedding2D | None = None,
+        temporal_rope: RotaryPositionEmbedding1D | None = None,
     ) -> None:
         super().__init__()
         if rope is not None:
             _validate_rope_head_dim(dim, num_heads, "FrameGlobalBlockPair")
+        if temporal_rope is not None and dim % num_heads != 0:
+            raise ValueError(
+                f"FrameGlobalBlockPair: dim={dim} must be divisible by num_heads={num_heads}"
+            )
+        if temporal_rope is not None and (dim // num_heads) % 2 != 0:
+            raise ValueError(
+                f"FrameGlobalBlockPair: head_dim={dim // num_heads} must be even for 1D RoPE"
+            )
         self.frame_block = Block(
             dim=dim,
             num_heads=num_heads,
@@ -153,29 +171,53 @@ class FrameGlobalBlockPair(nn.Module):
             ffn_bias=ffn_bias,
             qk_norm=qk_norm,
             init_values=init_values,
+            rope=temporal_rope,
         )
+        self._uses_temporal_rope = temporal_rope is not None
 
-    def forward(self, x: torch.Tensor, patch_positions: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        patch_positions: torch.Tensor | None = None,
+        frame_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Expected [B, S, P, D], got shape={tuple(x.shape)}")
 
         batch_size, seq_len, num_patches, dim = x.shape
-        frame_positions = None
+        frame_patch_positions = None
         if patch_positions is not None:
             expected_shape = (batch_size, seq_len, num_patches, 2)
             if tuple(patch_positions.shape) != expected_shape:
                 raise ValueError(
                     f"Expected patch_positions shape {expected_shape}, got {tuple(patch_positions.shape)}"
                 )
-            frame_positions = patch_positions.reshape(batch_size * seq_len, num_patches, 2)
+            frame_patch_positions = patch_positions.reshape(batch_size * seq_len, num_patches, 2)
         x = x.reshape(batch_size * seq_len, num_patches, dim)
-        x = self.frame_block(x, pos=frame_positions)
+        x = self.frame_block(x, pos=frame_patch_positions)
         x = x.reshape(batch_size, seq_len, num_patches, dim)
 
         # Cross-frame attention is applied per patch location instead of over the
         # full S*P token product. This keeps memory bounded for longer clips.
         x = x.permute(0, 2, 1, 3).reshape(batch_size * num_patches, seq_len, dim)
-        x = self.global_block(x)
+        temporal_pos = None
+        if self._uses_temporal_rope:
+            if frame_positions is None:
+                temporal_pos = torch.arange(seq_len, device=x.device).view(1, seq_len)
+                temporal_pos = temporal_pos.expand(batch_size * num_patches, seq_len)
+            else:
+                expected_fp = (batch_size, seq_len)
+                if tuple(frame_positions.shape) != expected_fp:
+                    raise ValueError(
+                        f"Expected frame_positions shape {expected_fp}, got {tuple(frame_positions.shape)}"
+                    )
+                temporal_pos = (
+                    frame_positions.view(batch_size, 1, seq_len)
+                    .expand(batch_size, num_patches, seq_len)
+                    .reshape(batch_size * num_patches, seq_len)
+                    .contiguous()
+                )
+        x = self.global_block(x, pos=temporal_pos)
         x = x.reshape(batch_size, num_patches, seq_len, dim).permute(0, 2, 1, 3)
         return x
 
@@ -357,11 +399,11 @@ class JointSceneTokenizerEncoder(nn.Module):
     def __init__(
         self,
         *,
-        latent_dim: int = 768,
-        hidden_dim: int = 896,
+        latent_dim: int = 1024,
+        hidden_dim: int = 1152,
         num_layers: int = 4,
         num_block_pairs: int = 3,
-        num_heads: int = 14,
+        num_heads: int = 16,
         layer_attn_depth: int = 2,
         layer_attn_heads: int = 8,
         stream_dim: int = 1024,
@@ -374,8 +416,8 @@ class JointSceneTokenizerEncoder(nn.Module):
         init_values: float = 1e-6,
     ) -> None:
         super().__init__()
-        if latent_dim % 3 != 0:
-            raise ValueError(f"latent_dim ({latent_dim}) must be divisible by 3 for the joint channel split")
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}")
         if hidden_dim != latent_dim + detail_dim:
             raise ValueError(
                 f"hidden_dim ({hidden_dim}) must equal latent_dim + detail_dim ({latent_dim + detail_dim})"
@@ -384,8 +426,13 @@ class JointSceneTokenizerEncoder(nn.Module):
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.stream_dim = stream_dim
+        # Split latent_dim into three non-uniform sub-streams (sum == latent_dim).
+        sub_b = latent_dim // 3
+        sub_a = latent_dim - 2 * sub_b
+        self._sub_dims = (sub_a, sub_b, sub_b)
         self.position_getter = PositionGetter()
         self.patch_rope = RotaryPositionEmbedding2D()
+        self.temporal_rope = RotaryPositionEmbedding1D()
         self._patch_pos_embed_cache: dict[tuple[int, int, int, str], torch.Tensor] = {}
         self.stream_norms = nn.ModuleList(
             [
@@ -403,9 +450,9 @@ class JointSceneTokenizerEncoder(nn.Module):
             [
                 nn.ModuleDict(
                     {
-                        "dino": nn.Linear(stream_dim, latent_dim // 3),
-                        "frame": nn.Linear(stream_dim, latent_dim // 3),
-                        "global": nn.Linear(stream_dim, latent_dim // 3),
+                        "dino": nn.Linear(stream_dim, sub_a),
+                        "frame": nn.Linear(stream_dim, sub_b),
+                        "global": nn.Linear(stream_dim, sub_b),
                     }
                 )
                 for _ in range(num_layers)
@@ -437,13 +484,13 @@ class JointSceneTokenizerEncoder(nn.Module):
                     qk_norm=qk_norm,
                     init_values=init_values,
                     rope=self.patch_rope,
+                    temporal_rope=self.temporal_rope,
                 )
                 for _ in range(num_block_pairs)
             ]
         )
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, latent_dim)
-        self.latent_norm = nn.LayerNorm(latent_dim)
 
         self.reset_parameters()
 
@@ -455,6 +502,7 @@ class JointSceneTokenizerEncoder(nn.Module):
         self,
         image_tokens_list_4: Sequence[torch.Tensor],
         patch_grid: tuple[int, int] | None = None,
+        frame_positions_1d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if len(image_tokens_list_4) != self.num_layers:
             raise ValueError(f"Expected {self.num_layers} levels, got {len(image_tokens_list_4)}")
@@ -474,6 +522,14 @@ class JointSceneTokenizerEncoder(nn.Module):
         )
         patch_positions = self.position_getter(batch_size * seq_len, patch_h, patch_w, reference_tokens.device)
         patch_positions = patch_positions.view(batch_size, seq_len, num_patches, 2)
+
+        if frame_positions_1d is not None:
+            if frame_positions_1d.ndim != 2 or tuple(frame_positions_1d.shape) != (batch_size, seq_len):
+                raise ValueError(
+                    f"Expected frame_positions_1d shape ({batch_size}, {seq_len}), got "
+                    f"{tuple(frame_positions_1d.shape)}"
+                )
+            frame_positions_1d = frame_positions_1d.to(device=reference_tokens.device, dtype=torch.long)
 
         per_layer_tokens = []
         for layer_idx, x_layer in enumerate(image_tokens_list_4):
@@ -507,23 +563,24 @@ class JointSceneTokenizerEncoder(nn.Module):
         x = self.layer_attn(x)
         x = self.layer_pool(x)
         for block in self.blocks:
-            x = block(x, patch_positions=patch_positions)
+            x = block(x, patch_positions=patch_positions, frame_positions=frame_positions_1d)
         z = self.out_proj(self.out_norm(x))
-        return self.latent_norm(z)
+        return z
 
 
 class JointSceneTokenizerDecoder(nn.Module):
     def __init__(
         self,
         *,
-        latent_dim: int = 768,
-        hidden_dim: int = 896,
+        latent_dim: int = 1024,
+        hidden_dim: int = 1152,
         num_layers: int = 4,
         num_block_pairs: int = 3,
-        num_heads: int = 14,
+        num_heads: int = 16,
         layer_attn_depth: int = 2,
         layer_attn_heads: int = 8,
         stream_dim: int = 1024,
+        detail_dim: int | None = None,  # accepted for API parity with the encoder
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
         proj_bias: bool = True,
@@ -532,10 +589,12 @@ class JointSceneTokenizerDecoder(nn.Module):
         init_values: float = 1e-6,
     ) -> None:
         super().__init__()
+        del detail_dim  # decoder does not have a detail branch
         self.num_layers = num_layers
         self.hidden_dim = hidden_dim
         self.position_getter = PositionGetter()
         self.patch_rope = RotaryPositionEmbedding2D()
+        self.temporal_rope = RotaryPositionEmbedding1D()
         self._patch_pos_embed_cache: dict[tuple[int, int, int, str], torch.Tensor] = {}
         self.in_proj = nn.Linear(latent_dim, hidden_dim)
         self.in_norm = nn.LayerNorm(hidden_dim)
@@ -551,6 +610,7 @@ class JointSceneTokenizerDecoder(nn.Module):
                     qk_norm=qk_norm,
                     init_values=init_values,
                     rope=self.patch_rope,
+                    temporal_rope=self.temporal_rope,
                 )
                 for _ in range(num_block_pairs)
             ]
@@ -595,6 +655,7 @@ class JointSceneTokenizerDecoder(nn.Module):
         self,
         z: torch.Tensor,
         patch_grid: tuple[int, int] | None = None,
+        frame_positions_1d: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         if z.ndim != 4:
             raise ValueError(f"Expected latent shape [B, S, P, C], got {tuple(z.shape)}")
@@ -612,9 +673,17 @@ class JointSceneTokenizerDecoder(nn.Module):
         patch_positions = self.position_getter(batch_size * seq_len, patch_h, patch_w, z.device)
         patch_positions = patch_positions.view(batch_size, seq_len, num_patches, 2)
 
+        if frame_positions_1d is not None:
+            if frame_positions_1d.ndim != 2 or tuple(frame_positions_1d.shape) != (batch_size, seq_len):
+                raise ValueError(
+                    f"Expected frame_positions_1d shape ({batch_size}, {seq_len}), got "
+                    f"{tuple(frame_positions_1d.shape)}"
+                )
+            frame_positions_1d = frame_positions_1d.to(device=z.device, dtype=torch.long)
+
         x = self.in_norm(self.in_proj(z)) + patch_pos_embed
         for block in self.blocks:
-            x = block(x, patch_positions=patch_positions)
+            x = block(x, patch_positions=patch_positions, frame_positions=frame_positions_1d)
 
         x = self.layer_unpool(x)
         x = x + self.layer_embed.view(1, 1, 1, self.num_layers, -1)
@@ -636,19 +705,26 @@ class JointSceneTokenizer(nn.Module):
         self,
         image_tokens_4: Sequence[torch.Tensor],
         patch_grid: tuple[int, int] | None = None,
+        frame_positions_1d: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.encoder(image_tokens_4, patch_grid=patch_grid)
+        return self.encoder(image_tokens_4, patch_grid=patch_grid, frame_positions_1d=frame_positions_1d)
 
     def decode(
         self,
         z: torch.Tensor,
         patch_grid: tuple[int, int] | None = None,
+        frame_positions_1d: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
-        return self.decoder(z, patch_grid=patch_grid)
+        return self.decoder(z, patch_grid=patch_grid, frame_positions_1d=frame_positions_1d)
 
     def forward(
         self,
         image_tokens_4: Sequence[torch.Tensor],
         patch_grid: tuple[int, int] | None = None,
+        frame_positions_1d: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
-        return self.decode(self.encode(image_tokens_4, patch_grid=patch_grid), patch_grid=patch_grid)
+        return self.decode(
+            self.encode(image_tokens_4, patch_grid=patch_grid, frame_positions_1d=frame_positions_1d),
+            patch_grid=patch_grid,
+            frame_positions_1d=frame_positions_1d,
+        )

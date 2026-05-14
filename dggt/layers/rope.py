@@ -186,3 +186,64 @@ class RotaryPositionEmbedding2D(nn.Module):
 
         # Combine processed features
         return torch.cat((vertical_features, horizontal_features), dim=-1)
+
+
+class RotaryPositionEmbedding1D(nn.Module):
+    """1D Rotary Position Embedding for temporal / cross-frame attention.
+
+    Mirrors `RotaryPositionEmbedding2D` but operates on a single position axis.
+    The feature dimension only needs to be even (no 4-divisibility requirement),
+    so it composes with any standard head dim.
+
+    Args:
+        frequency: Base frequency for the position embeddings. Default: 100.0.
+    """
+
+    def __init__(self, frequency: float = 100.0):
+        super().__init__()
+        self.base_frequency = frequency
+        self.frequency_cache: Dict[Tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _compute_frequency_components(
+        self, dim: int, seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cache_key = (dim, seq_len, device, dtype)
+        if cache_key not in self.frequency_cache:
+            exponents = torch.arange(0, dim, 2, device=device).float() / dim
+            inv_freq = 1.0 / (self.base_frequency ** exponents)
+
+            positions = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+            angles = torch.einsum("i,j->ij", positions, inv_freq)
+            angles = torch.cat((angles, angles), dim=-1).to(dtype)
+            self.frequency_cache[cache_key] = (angles.cos().to(dtype), angles.sin().to(dtype))
+        return self.frequency_cache[cache_key]
+
+    @staticmethod
+    def _rotate_features(x: torch.Tensor) -> torch.Tensor:
+        feature_dim = x.shape[-1]
+        x1, x2 = x[..., : feature_dim // 2], x[..., feature_dim // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """Applies 1D rotary embeddings.
+
+        Args:
+            tokens: Tensor of shape (batch_size, n_heads, n_tokens, dim) with even dim.
+            positions: LongTensor of shape (batch_size, n_tokens) giving the position
+                index of each token.
+
+        Returns:
+            Tensor of the same shape as `tokens` with applied 1D RoPE.
+        """
+        assert tokens.size(-1) % 2 == 0, "Feature dimension must be even"
+        assert positions.ndim == 2, "Positions must have shape (batch_size, n_tokens)"
+
+        feature_dim = tokens.size(-1)
+        max_position = int(positions.max().item()) + 1
+        cos_comp, sin_comp = self._compute_frequency_components(
+            feature_dim, max_position, tokens.device, tokens.dtype
+        )
+
+        cos = F.embedding(positions, cos_comp)[:, None, :, :]
+        sin = F.embedding(positions, sin_comp)[:, None, :, :]
+        return (tokens * cos) + (self._rotate_features(tokens) * sin)
