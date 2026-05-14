@@ -1236,7 +1236,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--shift",
         type=float,
-        default=16.0,
+        default=10.0,
         help=(
             "FlowMatch noise-schedule shift. Per RAE (arxiv 2510.11690) "
             "shift = sqrt(m / m_ref). m_ref=4096. Per-frame m = 25*37*768 "
