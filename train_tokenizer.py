@@ -52,6 +52,8 @@ NCCL_P2P_DISABLE=1 torchrun \
     --sample_window 20 \
     --min_frames 4 \
     --max_frames 8 \
+    --decoder_noise_tau 0.8 \
+    --decoder_noise_distribution uniform \
     --batch_size 1 \
     --grad_accum_steps 8 \
     --num_workers 16 \
@@ -139,6 +141,27 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--head_warmup_steps", type=int, default=5000)
     parser.add_argument("--grad_clip_norm", type=float, default=1.0)
 
+    parser.add_argument(
+        "--decoder_noise_tau",
+        type=float,
+        default=0.0,
+        help=(
+            "RAE-style decoder noise strength. During training, decode z+n where "
+            "n~N(0,sigma^2 I) and sigma is sampled per sample. Default keeps existing "
+            "training behavior; set to 0.8 for the RAE DINOv2-B recipe."
+        ),
+    )
+    parser.add_argument(
+        "--decoder_noise_distribution",
+        type=str,
+        default="half_normal",
+        choices=["half_normal", "uniform"],
+        help=(
+            "How to sample decoder noise sigma. `half_normal` implements the paper "
+            "sigma~|N(0,tau^2)|; `uniform` matches the released RAE code's U(0,tau)."
+        ),
+    )
+
     parser.add_argument("--lambda_tok_rec", type=float, default=1.0)
     parser.add_argument("--lambda_tok_cos", type=float, default=0.2)
     parser.add_argument("--lambda_head_anchor", type=float, default=0.5)
@@ -170,6 +193,29 @@ def get_default_asset_root() -> str:
     return "/data/disk2/lyy_dataset/test_transfer/objects_ply_transformed"
 
 
+def sample_decoder_noise_augmented_latent(
+    z: torch.Tensor,
+    tau: float,
+    distribution: str = "half_normal",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RAE decoder noise augmentation: z+n, n~N(0,sigma^2 I)."""
+    if tau <= 0.0:
+        sigma = z.new_zeros((z.shape[0],) + (1,) * (z.ndim - 1))
+        return z, sigma
+
+    sigma_shape = (z.shape[0],) + (1,) * (z.ndim - 1)
+    if distribution == "half_normal":
+        sigma = torch.randn(sigma_shape, device=z.device, dtype=torch.float32).abs().mul_(float(tau))
+    elif distribution == "uniform":
+        sigma = torch.rand(sigma_shape, device=z.device, dtype=torch.float32).mul_(float(tau))
+    else:
+        raise ValueError(f"Unsupported decoder_noise_distribution={distribution!r}")
+
+    noise = torch.randn_like(z, dtype=torch.float32) * sigma
+    z_noisy = z.float() + noise
+    return z_noisy.to(dtype=z.dtype), sigma.to(dtype=z.dtype)
+
+
 class TokenizerTrainWrapper(nn.Module):
     def __init__(self, tokenizer: nn.Module):
         super().__init__()
@@ -180,13 +226,22 @@ class TokenizerTrainWrapper(nn.Module):
         image_tokens: list[torch.Tensor] | None = None,
         latent: torch.Tensor | None = None,
         patch_grid: tuple[int, int] | None = None,
+        decoder_noise_tau: float = 0.0,
+        decoder_noise_distribution: str = "half_normal",
     ) -> tuple[torch.Tensor, list[torch.Tensor]] | list[torch.Tensor]:
         if latent is not None:
             return self.tokenizer.decode(latent, patch_grid=patch_grid)
         if image_tokens is None:
             raise ValueError("Either image_tokens or latent must be provided")
         z = self.tokenizer.encode(image_tokens, patch_grid=patch_grid)
-        decoded = self.tokenizer.decode(z, patch_grid=patch_grid)
+        decode_z = z
+        if self.training and decoder_noise_tau > 0.0:
+            decode_z, _ = sample_decoder_noise_augmented_latent(
+                z,
+                decoder_noise_tau,
+                decoder_noise_distribution,
+            )
+        decoded = self.tokenizer.decode(decode_z, patch_grid=patch_grid)
         return z, decoded
 
 
@@ -832,7 +887,12 @@ def build_student_outputs(
 ) -> dict[str, Any]:
     patch_grid = infer_patch_grid(images, teacher["image_patch"][0].shape[2])
     with autocast_enabled:
-        z, decoded_patch = tokenizer_runner(image_tokens=teacher["image_patch"], patch_grid=patch_grid)
+        z, decoded_patch = tokenizer_runner(
+            image_tokens=teacher["image_patch"],
+            patch_grid=patch_grid,
+            decoder_noise_tau=args.decoder_noise_tau,
+            decoder_noise_distribution=args.decoder_noise_distribution,
+        )
         image_hat_4 = reattach_special_tokens_from_selected(
             teacher["image_levels"],
             teacher["patch_start_idx"],
@@ -872,9 +932,18 @@ def compute_noisy_decoder_loss(
     std_stats: torch.Tensor,
     patch_grid: tuple[int, int],
     autocast_enabled,
+    decoder_noise_tau: float = 0.0,
+    decoder_noise_distribution: str = "half_normal",
 ) -> torch.Tensor:
     with autocast_enabled:
-        z_noisy, _, _ = sample_noisy_latent(latent)
+        if decoder_noise_tau > 0.0:
+            z_noisy, _ = sample_decoder_noise_augmented_latent(
+                latent,
+                decoder_noise_tau,
+                decoder_noise_distribution,
+            )
+        else:
+            z_noisy, _, _ = sample_noisy_latent(latent)
 
         def _decode_noisy_tuple(noisy_latent: torch.Tensor):
             decoded = tokenizer_runner(latent=noisy_latent, patch_grid=patch_grid)
@@ -1167,6 +1236,8 @@ def run_visualization_eval(
             feature_stats["std"],
             patch_grid,
             autocast_context(args, device),
+            decoder_noise_tau=args.decoder_noise_tau,
+            decoder_noise_distribution=args.decoder_noise_distribution,
         )
         scalar_logs["noisy"] = float(noisy_loss.detach().item())
         scalar_logs["loss"] += noisy_weight * scalar_logs["noisy"]
@@ -1399,6 +1470,8 @@ def main() -> None:
                             feature_stats["std"],
                             patch_grid,
                             autocast_context(args, device),
+                            decoder_noise_tau=args.decoder_noise_tau,
+                            decoder_noise_distribution=args.decoder_noise_distribution,
                         )
                         scalar_logs["noisy"] = float(noisy_loss.detach().item())
                         scalar_logs["loss"] += noisy_weight * scalar_logs["noisy"]
