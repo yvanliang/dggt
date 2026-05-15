@@ -1204,6 +1204,21 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--resume_path", type=str, default=None)
     parser.add_argument("--patch_grid_h", type=int, default=37)
     parser.add_argument("--patch_grid_w", type=int, default=37)
+    parser.add_argument(
+        "--latent_dim",
+        type=int,
+        default=1024,
+        help=(
+            "Tokenizer latent channel count. Must match the tokenizer "
+            "ckpt's output dim and the channel count in feature_stats. "
+            "Sets WanSceneFlow out_channels (and patch_embedding in_channels "
+            "via in_channels = 3 * latent_dim + 3). RAE tests 384/768/1024; "
+            "the 4-layer DGGT pyramid (12288-D) compresses naturally to 1024 "
+            "(12:1 ratio) — better than 768 (16:1) for our pretrained-feature "
+            "input. Theorem 1 requires trunk hidden_dim >= latent_dim "
+            "(we have hidden=1536, OK up to latent_dim=1536)."
+        ),
+    )
 
     parser.add_argument("--scene_start", type=int, default=0)
     parser.add_argument("--scene_end", type=int, default=600)
@@ -1236,14 +1251,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--shift",
         type=float,
-        default=10.0,
+        default=11.0,
         help=(
             "FlowMatch noise-schedule shift. Per RAE (arxiv 2510.11690) "
-            "shift = sqrt(m / m_ref). m_ref=4096. Per-frame m = 25*37*768 "
-            "= 710400 -> alpha ~= 13.2; per-clip (S=8) m = 5.68M -> alpha "
-            "~= 37. We pick 16 as a compromise between per-frame and "
-            "per-clip dimension counts. Use 6 only when matching the "
-            "legacy low-D Wan recipe."
+            "shift = sqrt(m / m_ref). m_ref=4096. Per-frame "
+            "m = patch_h * patch_w * latent_dim (e.g. 25*37*1024 = 947200 "
+            "-> alpha ~= 15.2; or 25*37*768 = 710400 -> ~= 13.2). "
+            "Per-clip multiplies by S. RAE-style theoretical shift can be "
+            "10-15; under our limited training budget (vs RAE's 1.4M steps) "
+            "shift=10 keeps the sigma distribution more balanced so "
+            "mid-/clean-sigma samples are seen too. Lower it (e.g. 6-8) "
+            "if validation cleanup steps remain undertrained."
         ),
     )
     parser.add_argument("--lambda_flow", type=float, default=1.0)
@@ -1315,9 +1333,17 @@ def main() -> None:
         device,
     )
 
-    scene_flow = WanSceneFlow.from_scene_config(bring_up=False, patch_grid=args.patch_grid).to(device)
+    # in_channels packs [z_t, z_splat, scaffold_tok, M_preserve, M_source, M_dest]
+    # along the channel axis: 3 * latent_dim + 3 mask channels.
+    sf_in_channels = 3 * int(args.latent_dim) + 3
+    scene_flow = WanSceneFlow.from_scene_config(
+        bring_up=False,
+        patch_grid=args.patch_grid,
+        in_channels=sf_in_channels,
+        out_channels=int(args.latent_dim),
+    ).to(device)
     scene_flow.enable_gradient_checkpointing()
-    load_into_buffers(scene_flow, args.feature_stats_path, token_dim=768)
+    load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
 
     scene_names = discover_scene_names(args.image_dir, args.scene_start, args.scene_end)
     dataset = WaymoOpenDataset(

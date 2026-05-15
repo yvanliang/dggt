@@ -251,6 +251,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--precision", type=str, default="bf16", choices=("fp32", "bf16"))
     parser.add_argument("--require_dynamic_mask", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--latent_dim",
+        type=int,
+        default=1024,
+        help=(
+            "Tokenizer latent channel count. Must match the tokenizer ckpt's "
+            "actual output dim. SceneFlow's --latent_dim will read these stats "
+            "(mu_z/sigma_z of this size) into its normalize buffers."
+        ),
+    )
     return parser
 
 
@@ -283,7 +293,10 @@ def main() -> None:
         flush=True,
     )
 
-    stats = compute_per_channel_stats(iter_latents(model, loader, args, device), token_dim=768)
+    stats = compute_per_channel_stats(
+        iter_latents(model, loader, args, device),
+        token_dim=int(args.latent_dim),
+    )
     stats["source"] = {
         "image_dir": args.image_dir,
         "scene_names": parse_scene_names(args),
