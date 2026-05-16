@@ -1,0 +1,493 @@
+"""Validation edit dataset for the FlowDGGT validation flow-cache pipeline.
+
+Each ``data/final_info_validation.json`` entry describes four edits on one
+29-frame clip: ``deletion`` / ``insertion`` / ``replacement`` / ``repositioning``.
+This dataset turns one entry into a ``sample`` dict consumable by the shared
+``gaussian_edit`` / ``asset_pass`` primitives, using a fixed **6-slot** layout:
+
+====  ============================  ===========================  ====================
+slot  role                          3D box source                asset
+====  ============================  ===========================  ====================
+0     delete: deletion source       all_object_info tar          none (deleted)
+1     delete: replacement source    all_object_info tar          none (deleted)
+2     delete: repositioning source  all_object_info tar          none (deleted)
+3     asset: insertion              all_object_info_insertion    insertion_candidates
+4     asset: replacement            slot-1 refined box (later)    replacement_candidates
+5     asset: repositioning          slot-2 refined box + shift    repositioning own asset
+====  ============================  ===========================  ====================
+
+Delete slots (0..2) are localized by the stock :func:`localize_objects` with
+``load_asset=False`` (asset stays empty -> contributes only deletion). Asset
+slots (3..5) are *not* in the localize loop and carry ``object_valid_mask=False``
+so :func:`_collect_protected_boxes` skips them (slot-4 shares slot-1's box; if it
+were "protected" it would block deleting the replacement source). Asset
+placement happens in :mod:`dggt.utils.validation_edit_localize`.
+
+3D boxes come from ``data/validation_info/*`` tars (NOT tfrecord / instances).
+The tar ``object_to_world`` is in the same absolute Waymo world frame as the
+processed dataset's ``ego_pose`` (verified), so NO normalization is applied.
+"""
+from __future__ import annotations
+
+import json
+import tarfile
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from datasets.waymo_edit_dataset import (
+    DEFAULT_PROCESSED_ROOT,
+    DEFAULT_TRANSFER_HW,
+    build_box_corners_world,
+    build_intrinsic_matrix,
+    compose_waymo_camera_to_world,
+    load_and_preprocess_images,
+    numpy_like_to_torch,
+    read_image_size,
+    resolve_image_path,
+)
+
+# Segment-name -> processed validation scene-dir index (authoritative mapping).
+from pointcloud_validation.toolkits.waymo_name_index import val_name2index
+
+CLIP_LENGTH = 29
+NUM_SLOTS = 6
+DEFAULT_ASSET_ROOT = "/data/disk2/lyy_dataset/test_transfer/objects_ply_transformed"
+DEFAULT_ALL_OBJECT_INFO_ROOT = "data/validation_info/all_object_info"
+DEFAULT_ALL_OBJECT_INFO_INSERTION_ROOT = "data/validation_info/all_object_info_insertion"
+
+# slot index -> (role, edit-variant it participates in)
+DELETE_SLOTS = (0, 1, 2)
+ASSET_SLOTS = (3, 4, 5)
+SLOT_ROLE = {
+    0: "delete_deletion",
+    1: "delete_replacement",
+    2: "delete_repositioning",
+    3: "asset_insertion",
+    4: "asset_replacement",
+    5: "asset_repositioning",
+}
+# asset slot -> delete slot whose refined box it reuses (3 = insertion, no source)
+ASSET_SOURCE_BOX_SLOT = {4: 1, 5: 2}
+
+
+class MissingAssetError(RuntimeError):
+    """Raised when a required asset ``.ply`` cannot be resolved."""
+
+    def __init__(self, missing: list[tuple[str, str]]):
+        self.missing = missing
+        msg = "; ".join(f"{aid} -> {path}" for aid, path in missing)
+        super().__init__(f"missing asset ply: {msg}")
+
+
+def _resolve_mask_root(scene_root: Path) -> Path | None:
+    for cand in (
+        scene_root / "fine_dynamic_masks" / "all",
+        scene_root / "dynamic_masks",
+        scene_root / "fine_dynamic_masks" / "vehicle",
+        scene_root / "dynamic_masks" / "vehicle",
+    ):
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def _list_cam0_frame_indices(scene_root: Path) -> list[int]:
+    image_root = scene_root / "images"
+    out: list[int] = []
+    for path in sorted(image_root.glob("*_0.jpg")) + sorted(image_root.glob("*_0.png")):
+        try:
+            out.append(int(path.stem.split("_")[0]))
+        except Exception:
+            continue
+    return sorted(out)
+
+
+class _TarFrames:
+    """Lazy reader over a ``<segment>.tar`` of per-frame all_object_info JSONs.
+
+    Sorted member index ``i`` corresponds 1:1 to scene frame index ``i``
+    (both equal the number of scene frames / ego poses).
+    """
+
+    def __init__(self, tar_path: Path):
+        self.tar_path = tar_path
+        with tarfile.open(tar_path) as tf:
+            self._names = sorted(n for n in tf.getnames() if n.endswith(".json"))
+        self._cache: dict[int, dict[str, Any]] = {}
+
+    def __len__(self) -> int:
+        return len(self._names)
+
+    def frame(self, scene_frame_idx: int) -> dict[str, Any]:
+        if scene_frame_idx < 0 or scene_frame_idx >= len(self._names):
+            return {}
+        if scene_frame_idx in self._cache:
+            return self._cache[scene_frame_idx]
+        with tarfile.open(self.tar_path) as tf:
+            member = tf.extractfile(self._names[scene_frame_idx])
+            data = json.load(member) if member is not None else {}
+        self._cache[scene_frame_idx] = data
+        return data
+
+
+class WaymoValidationEditDataset:
+    """``final_info_validation`` entry -> 29-frame 6-slot ``sample`` dict."""
+
+    def __init__(
+        self,
+        final_info_path: str = "data/final_info_validation.json",
+        processed_root: str = DEFAULT_PROCESSED_ROOT,
+        all_object_info_root: str = DEFAULT_ALL_OBJECT_INFO_ROOT,
+        all_object_info_insertion_root: str = DEFAULT_ALL_OBJECT_INFO_INSERTION_ROOT,
+        asset_root: str = DEFAULT_ASSET_ROOT,
+        split: str = "validation",
+        clip_length: int = CLIP_LENGTH,
+    ) -> None:
+        self.final_info_path = Path(final_info_path)
+        self.processed_root = Path(processed_root)
+        self.split = str(split)
+        self.processed_split_root = self.processed_root / self.split
+        self.annotations_root = (
+            self.processed_root / "waymo_edit_cache" / "annotations" / self.split
+        )
+        self.all_object_info_root = Path(all_object_info_root)
+        self.all_object_info_insertion_root = Path(all_object_info_insertion_root)
+        self.asset_root = Path(asset_root)
+        self.clip_length = int(clip_length)
+        self.camera_ids = [0]  # views=1 only (editor constraint)
+
+        with open(self.final_info_path) as f:
+            self.entries: list[dict[str, Any]] = json.load(f)
+
+        self._ann_cache: dict[str, dict[str, Any]] = {}
+        self._tar_cache: dict[str, _TarFrames] = {}
+        self._ins_tar_cache: dict[str, _TarFrames] = {}
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    # ---- helpers -----------------------------------------------------------
+
+    def _annotation(self, segment: str) -> dict[str, Any]:
+        if segment not in self._ann_cache:
+            ann_path = (
+                self.annotations_root
+                / f"segment-{segment}_with_camera_labels.json"
+            )
+            if not ann_path.is_file():
+                raise FileNotFoundError(f"annotation json not found: {ann_path}")
+            with open(ann_path) as f:
+                self._ann_cache[segment] = json.load(f)
+        return self._ann_cache[segment]
+
+    def _all_object_info(self, segment: str) -> _TarFrames:
+        if segment not in self._tar_cache:
+            tar_path = self.all_object_info_root / f"{segment}.tar"
+            if not tar_path.is_file():
+                raise FileNotFoundError(f"all_object_info tar not found: {tar_path}")
+            self._tar_cache[segment] = _TarFrames(tar_path)
+        return self._tar_cache[segment]
+
+    def _insertion_info(self, segment: str) -> _TarFrames:
+        if segment not in self._ins_tar_cache:
+            tar_path = self.all_object_info_insertion_root / f"{segment}.tar"
+            if not tar_path.is_file():
+                raise FileNotFoundError(
+                    f"all_object_info_insertion tar not found: {tar_path}"
+                )
+            self._ins_tar_cache[segment] = _TarFrames(tar_path)
+        return self._ins_tar_cache[segment]
+
+    def _resolve_asset_path(self, asset_id: str) -> str:
+        return str(self.asset_root / f"{asset_id}.ply")
+
+    # ---- main --------------------------------------------------------------
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        entry = self.entries[idx]
+        clip_name = str(entry["clip_name"])
+        segment, clip_index_str = clip_name.rsplit("_", 1)
+        clip_index = int(clip_index_str)
+
+        if segment not in val_name2index:
+            raise KeyError(f"segment not in val_name2index: {segment}")
+        scene_idx = int(val_name2index[segment])
+        scene_dir = f"{scene_idx:03d}"
+        scene_root = self.processed_split_root / scene_dir
+        if not scene_root.is_dir():
+            raise FileNotFoundError(f"processed scene dir not found: {scene_root}")
+
+        frames = _list_cam0_frame_indices(scene_root)
+        start = clip_index * self.clip_length
+        scene_frame_indices = frames[start : start + self.clip_length]
+        if len(scene_frame_indices) != self.clip_length:
+            raise ValueError(
+                f"clip {clip_name}: need {self.clip_length} frames, got "
+                f"{len(scene_frame_indices)} (scene has {len(frames)} frames)"
+            )
+
+        annotation = self._annotation(segment)
+        all_obj = self._all_object_info(segment)
+        ins_obj = self._insertion_info(segment)
+
+        # ---- images / sky / dynamic ---------------------------------------
+        dynamic_root = _resolve_mask_root(scene_root)
+        image_paths, sky_paths, dyn_paths = [], [], []
+        for f in scene_frame_indices:
+            for cam_id in self.camera_ids:
+                image_paths.append(resolve_image_path(scene_root / "images", f, cam_id))
+                sky_paths.append(resolve_image_path(scene_root / "sky_masks", f, cam_id))
+                dyn_paths.append(
+                    resolve_image_path(dynamic_root, f, cam_id)
+                    if dynamic_root is not None
+                    else ""
+                )
+        images = load_and_preprocess_images(image_paths)
+        sky_masks = load_and_preprocess_images(sky_paths)
+        if all(p and Path(p).is_file() for p in dyn_paths):
+            dynamic_masks = load_and_preprocess_images(dyn_paths)
+        else:
+            dynamic_masks = torch.zeros_like(images)
+        model_hw = (int(images.shape[-2]), int(images.shape[-1]))
+
+        # ---- cameras (views=1: cam 0) -------------------------------------
+        ego_pose_all = np.asarray(annotation["ego_pose"], dtype=np.float32)
+        ego_pose_selected = ego_pose_all[scene_frame_indices]
+        cam_id = self.camera_ids[0]
+        cam_to_world_full = np.asarray(
+            annotation["camera_to_world"][str(cam_id)], dtype=np.float32
+        )
+        camera_to_world = cam_to_world_full[scene_frame_indices]
+        cam_to_ego = np.asarray(
+            annotation["camera_to_ego"][str(cam_id)], dtype=np.float32
+        )
+        camera_to_world_corrected = np.stack(
+            [compose_waymo_camera_to_world(ep, cam_to_ego) for ep in ego_pose_selected],
+            axis=0,
+        )
+        cam_img_path = resolve_image_path(scene_root / "images", scene_frame_indices[0], cam_id)
+        cam_hw = read_image_size(cam_img_path)  # (H, W)
+        intrinsic = build_intrinsic_matrix(
+            annotation["normalized_intrinsics"][str(cam_id)], cam_hw
+        )
+
+        camera_to_world = numpy_like_to_torch(
+            camera_to_world[:, None, ...], dtype=torch.float32
+        )  # [S,1,4,4]
+        camera_to_world_corrected = numpy_like_to_torch(
+            camera_to_world_corrected[:, None, ...], dtype=torch.float32
+        )  # [S,1,4,4]
+        intrinsics = numpy_like_to_torch(
+            np.asarray(intrinsic, dtype=np.float32)[None, ...], dtype=torch.float32
+        )  # [1,3,3]
+        camera_to_ego_t = numpy_like_to_torch(
+            cam_to_ego[None, ...], dtype=torch.float32
+        )  # [1,4,4]
+        ego_pose_t = numpy_like_to_torch(ego_pose_selected, dtype=torch.float32)
+        raw_hw = np.asarray([[cam_hw[0], cam_hw[1]]], dtype=np.int64)  # [1,2]
+
+        # ---- per-slot Waymo boxes from tars -------------------------------
+        od = entry["origin_object_dict"]
+        slot_raw_id = {
+            0: str(od.get("deletion", "")),
+            1: str(od.get("replacement", "")),
+            2: str(od.get("repositioning", "")),
+            3: str(entry.get("insertion_candidates", "")),
+            4: str(entry.get("replacement_candidates", "")),
+            5: str(od.get("repositioning", "")),  # reposition reuses own asset
+        }
+
+        S = self.clip_length
+        obj_to_world = torch.zeros((NUM_SLOTS, S, 4, 4), dtype=torch.float32)
+        box_size = torch.zeros((NUM_SLOTS, S, 3), dtype=torch.float32)
+        box_corners = torch.zeros((NUM_SLOTS, S, 8, 3), dtype=torch.float32)
+        track_valid = torch.zeros((NUM_SLOTS, S), dtype=torch.bool)
+        is_moving_frame = torch.zeros((NUM_SLOTS, S), dtype=torch.bool)
+        bbox_model = torch.zeros((NUM_SLOTS, S, 1, 4), dtype=torch.float32)
+        bbox_present = torch.zeros((NUM_SLOTS, S, 1), dtype=torch.bool)
+
+        def _fill_box(slot: int, j: int, o2w: np.ndarray, lwh: np.ndarray, moving: bool) -> None:
+            corners = build_box_corners_world(o2w, lwh)
+            obj_to_world[slot, j] = numpy_like_to_torch(o2w, dtype=torch.float32)
+            box_size[slot, j] = numpy_like_to_torch(lwh, dtype=torch.float32)
+            box_corners[slot, j] = numpy_like_to_torch(corners, dtype=torch.float32)
+            track_valid[slot, j] = True
+            is_moving_frame[slot, j] = bool(moving)
+            # 2D model-space bbox = projected Waymo corners (same convention as
+            # localize_objects' internal waymo_bbox_model -> consistent target).
+            from dggt.utils.gaussian_edit import (
+                compute_bbox_from_projected_points,
+                project_waymo_box_corners_model,
+            )
+
+            uv, _, valid = project_waymo_box_corners_model(
+                torch.as_tensor(corners, dtype=torch.float32),
+                camera_to_world_corrected[j, 0],
+                intrinsics[0],
+                torch.as_tensor(raw_hw[0]),
+                model_hw,
+            )
+            box = compute_bbox_from_projected_points(uv, valid)
+            if box is not None:
+                bbox_model[slot, j, 0] = box
+                bbox_present[slot, j, 0] = True
+
+        for j, sf in enumerate(scene_frame_indices):
+            frame_objs = all_obj.frame(sf)
+            # delete slots 0..2 + asset slots 4,5 share scene-object boxes
+            for slot in (0, 1, 2):
+                rid = slot_raw_id[slot]
+                info = frame_objs.get(rid)
+                if info is None:
+                    continue
+                _fill_box(
+                    slot,
+                    j,
+                    np.asarray(info["object_to_world"], dtype=np.float32),
+                    np.asarray(info["object_lwh"], dtype=np.float32),
+                    bool(info.get("object_is_moving", False)),
+                )
+            # slot 4 (replacement asset) shares slot-1 (replacement origin) box
+            if track_valid[1, j]:
+                box_size[4, j] = box_size[1, j]
+                obj_to_world[4, j] = obj_to_world[1, j]
+                box_corners[4, j] = box_corners[1, j]
+                track_valid[4, j] = True
+                is_moving_frame[4, j] = is_moving_frame[1, j]
+                bbox_model[4, j] = bbox_model[1, j]
+                bbox_present[4, j] = bbox_present[1, j]
+            # slot 5 (reposition asset) shares slot-2 (reposition origin) box
+            if track_valid[2, j]:
+                box_size[5, j] = box_size[2, j]
+                obj_to_world[5, j] = obj_to_world[2, j]
+                box_corners[5, j] = box_corners[2, j]
+                track_valid[5, j] = True
+                is_moving_frame[5, j] = is_moving_frame[2, j]
+                bbox_model[5, j] = bbox_model[2, j]
+                bbox_present[5, j] = bbox_present[2, j]
+            # slot 3 (insertion) box from insertion tar
+            ins_frame = ins_obj.frame(sf)
+            ins = ins_frame.get("insertion_0")
+            if ins is not None:
+                _fill_box(
+                    3,
+                    j,
+                    np.asarray(ins["object_to_world"], dtype=np.float32),
+                    np.asarray(ins["object_lwh"], dtype=np.float32),
+                    bool(ins.get("object_is_moving", False)),
+                )
+
+        # ---- asset path resolution + missing report -----------------------
+        missing: list[tuple[str, str]] = []
+        object_asset_paths: list[str] = [""] * NUM_SLOTS
+        for slot in DELETE_SLOTS:
+            # truthy string so localize_objects (load_asset=False) does not skip;
+            # file need not exist (asset never loaded for delete slots).
+            object_asset_paths[slot] = self._resolve_asset_path(slot_raw_id[slot])
+        for slot in ASSET_SLOTS:
+            aid = slot_raw_id[slot]
+            path = self._resolve_asset_path(aid)
+            object_asset_paths[slot] = path
+            if bool(track_valid[slot].any().item()) and not Path(path).is_file():
+                missing.append((aid, path))
+        if missing:
+            raise MissingAssetError(missing)
+
+        # ---- scalar / mask object tensors ---------------------------------
+        object_valid_mask = torch.zeros((NUM_SLOTS,), dtype=torch.bool)
+        object_asset_valid_mask = torch.zeros((NUM_SLOTS,), dtype=torch.bool)
+        asset_image_valid = torch.zeros((NUM_SLOTS, S, 1), dtype=torch.bool)
+        for slot in DELETE_SLOTS:
+            object_valid_mask[slot] = bool(track_valid[slot].any().item())
+            object_asset_valid_mask[slot] = True  # not skipped by localize_objects
+        for slot in ASSET_SLOTS:
+            # valid_mask False -> _collect_protected_boxes skips asset slots so
+            # slot-4 (== slot-1 box) does not block deleting the replace source.
+            object_valid_mask[slot] = False
+            object_asset_valid_mask[slot] = bool(track_valid[slot].any().item())
+            asset_image_valid[slot, :, 0] = track_valid[slot]
+
+        editable_object_indices = torch.full((NUM_SLOTS,), -1, dtype=torch.long)
+        present_asset_slots = [s for s in ASSET_SLOTS if bool(track_valid[s].any().item())]
+        for i, s in enumerate(present_asset_slots):
+            editable_object_indices[i] = s
+        editable_object_count = torch.tensor(len(present_asset_slots), dtype=torch.long)
+
+        zeros_o = torch.zeros((NUM_SLOTS,), dtype=torch.float32)
+        sample: dict[str, Any] = {
+            "sample_index": int(idx),
+            "manifest_index": int(entry.get("index", idx)),
+            "num_frames": torch.tensor(S, dtype=torch.long),
+            "images": images,
+            "images_clean": images,
+            "image_paths": image_paths,
+            "timestamps": torch.linspace(0.0, 1.0, S, dtype=torch.float32),
+            "scene_id": scene_idx,
+            "scene_name": f"{self.split}_{scene_dir}",
+            "scene_dir": scene_dir,
+            "scene_base": f"{self.split}_{scene_dir}",
+            "clip_name": clip_name,
+            "clip_index": torch.tensor(clip_index, dtype=torch.long),
+            "cam_ids": torch.tensor(self.camera_ids, dtype=torch.long),
+            "frame_indices": torch.tensor(scene_frame_indices, dtype=torch.long),
+            "local_frame_indices": torch.arange(S, dtype=torch.long),
+            "clip_frame_indices": torch.tensor(scene_frame_indices, dtype=torch.long),
+            "edit_mode": "validation_edit",
+            "masks": sky_masks,
+            "sky_mask": sky_masks,
+            "dynamic_mask": dynamic_masks,
+            "camera_to_world": camera_to_world,
+            "camera_to_world_corrected": camera_to_world_corrected,
+            "camera_to_ego": camera_to_ego_t,
+            "ego_pose": ego_pose_t,
+            "intrinsics": intrinsics,
+            "raw_image_size_hw": torch.tensor(raw_hw, dtype=torch.long),
+            "transfer_image_size_hw": torch.tensor(DEFAULT_TRANSFER_HW, dtype=torch.long),
+            # object tensors (the editor / asset_pass contract)
+            "object_track_valid_mask_selected": track_valid,
+            "object_obj_to_world_selected": obj_to_world,
+            "object_box_size_selected": box_size,
+            "object_box_corners_world_selected": box_corners,
+            "object_is_moving_frame_selected": is_moving_frame,
+            "object_speed_mps_selected": torch.zeros((NUM_SLOTS, S), dtype=torch.float32),
+            "object_is_moving_track": is_moving_frame.any(dim=1),
+            "object_max_speed_mps": zeros_o.clone(),
+            "object_mean_speed_mps": zeros_o.clone(),
+            "object_asset_valid_mask": object_asset_valid_mask,
+            "object_scene_match_scores": torch.ones((NUM_SLOTS,), dtype=torch.float32),
+            "object_scene_raw_ids": [slot_raw_id[s] for s in range(NUM_SLOTS)],
+            "object_asset_ids": [slot_raw_id[s] for s in range(NUM_SLOTS)],
+            "object_asset_paths": object_asset_paths,
+            "object_valid_mask": object_valid_mask,
+            "object_bbox_present_mask_selected": bbox_present,
+            "object_bbox_model_selected": bbox_model,
+            "object_bbox_editable_mask_selected": bbox_present.clone(),
+            "object_front_bbox_present_mask_selected": bbox_present[:, :, 0].clone(),
+            "object_front_bbox_model_selected": bbox_model[:, :, 0].clone(),
+            "object_front_bbox_editable_mask_selected": bbox_present[:, :, 0].clone(),
+            "object_asset_image_valid_mask_selected": asset_image_valid,
+            "editable_object_indices": editable_object_indices,
+            "editable_object_count": editable_object_count,
+            "protected_object_indices": torch.full((NUM_SLOTS,), -1, dtype=torch.long),
+            "protected_object_count": torch.tensor(0, dtype=torch.long),
+            "asset_meta": {"asset_root": str(self.asset_root)},
+            # validation routing payload (consumed by validation_edit_localize)
+            "validation_edit": {
+                "entry_index": int(entry.get("index", idx)),
+                "clip_name": clip_name,
+                "segment": segment,
+                "scene_dir": scene_dir,
+                "clip_index": clip_index,
+                "slot_role": dict(SLOT_ROLE),
+                "slot_raw_id": dict(slot_raw_id),
+                "delete_slots": list(DELETE_SLOTS),
+                "asset_slots": list(present_asset_slots),
+                "asset_source_box_slot": dict(ASSET_SOURCE_BOX_SLOT),
+                "action_for_reposition": str(entry.get("action_for_reposition", "up")),
+                "trajectory": entry.get("trajectory", {}),
+            },
+        }
+        return sample

@@ -12,6 +12,7 @@ export WAYMO_DGGT_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/training
 export WAYMO_DGGT_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation
 export DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
 export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_waymo_views1/ckpt/scene_tokenizer_step_014000.pt
+export FEATURE_STATS=logs/scene_flow_pretrain/feature_stats_pretrain.pt
 ```
 
 注意：
@@ -29,7 +30,7 @@ CUDA_VISIBLE_DEVICES=2 python -u tools/compute_pretrain_feature_stats.py \
     --image_dir $WAYMO_DGGT_ROOT \
     --dggt_ckpt_path $DGGT_CKPT \
     --tokenizer_ckpt_path $TOKENIZER_CKPT \
-    --output_path logs/scene_flow_pretrain/feature_stats_pretrain.pt \
+    --output_path $FEATURE_STATS \
     --scene_start 0 --scene_end 800 \
     --sequence_length 4 \
     --batch_size 1 \
@@ -120,11 +121,26 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 conda run -n dggt --no-capture-output \
 * 如需只记录 latent/mask 诊断图并跳过较慢的 3DGS RGB 渲染，可额外加 `--no_val_render_rgb`。
 * 若当前机器未登录 wandb，可先执行 `wandb login`，或临时去掉 `--wandb` 相关参数。
 
-最终 warm-start 权重路径：
+## 1.5 本轮优化说明（shift / REPA / EMA 验证）
+
+为什么旧版 loss 降了但 RGB 还是糊、且 CFG=2 比 CFG=1 好：
+
+1. **EMA 验证（默认开启，最大影响）**：旧版 `run_validation` 用实时裸权重采样。扩散模型训练中途裸权重单步去噪误差会在 30–50 步推理里累积成糊状；DiT/SD3/Wan/RAE 一律用 EMA 权重出图。现在验证（loss + CFG 采样 + RGB 渲染）默认在 EMA 权重下跑，所有 rank 同步交换参数，DDP 不会失同步。要对比可加 `--no_val_ema`。
+2. **`--shift 3.0`（旧 10–16）**：`logit_normal` 采样下 shift=13 把约 90% 训练样本压在 clean-progress σ<0.15 的纯噪声端，低噪声「清理/细节」regime 几乎没训过 → 出图糊、无细节。RAE 的 shift≈13 是 1.4M step 的渐进最优；预算受限下 shift=3 让结构形成（σ→0）和细节清理（σ→1）都训得到。建议在 EMA 验证上做 `{1, 3}` 两点扫描定档。
+3. **`--lambda_repa 0.5`（旧硬编码 0，现已接 CLI）**：REPA（Yu et al. 2024）把 trunk 中段特征对齐到干净 latent `z_clean_n`，是从头训 DiT 公认最强加速器（~2–17×）。代码早已实现，只是被关掉。同时它让 `repa_proj` 参与反传，修掉 DDP `find_unused_parameters=False` 在 2 卡上的崩溃。
+4. **CFG=2>CFG=1 不是 bug**：`full_scene` 预训练本质是**无条件**生成（z_splat/scaffold 全 0、mask 常量、仅有从目标场景动态 patch 抠出的弱 KV）。欠训期条件输出是弱糊均值，CFG 外推把它推向更锐区域所以更好看；收敛后应回到 s≈1 最优。**预训练阶段不要拿生成结果和某个特定 GT 场景比对来判质量**——它本就不知道该生成哪个场景。看 EMA 样本是否落在 latent 流形（latent PCA 像真 latent、decode 出合理但不同的场景）+ loss 趋势即可，真实编辑质量留到 T1 条件训练再评。
+
+判质量的正确方式：扩散/flow 的 MSE loss 有不可约方差下界（`v_gt=z_clean−eps`，eps 每步重采），从头训的 DiT/ADM/SD/Wan **全都**在 ~1–2K step 后 loss 基本压平、而样本质量再升 100K+ step。**loss 绝对值对扩散模型几乎无诊断价值，只看 EMA 样本。**
+
+仍存在的质量天花板：当前 768-dim tokenizer 只训了 14K step，decoder 欠训会把 SceneFlow 的 latent 误差放大成 grid/糊。**1024-dim 6 万 iter tokenizer 是根因解**；切换时务必重算 feature_stats 并把所有 `--latent_dim` 改 1024（见 §0 注意）。tokenizer 续训时建议跑满 RAE 式 decoder noise augmentation（denoise-recon 阶段），让 decoder 对 SceneFlow latent 误差鲁棒，这直接削 grid。
+
+最终 warm-start 权重路径（完整 checkpoint；warm-start / 推理默认取其中的 `ema_scene_flow`，不要用裸权重 `_weights_only.pt`）：
 
 ```bash
-logs/scene_flow_pretrain/ckpt/pretrain_step100000_weights_only.pt
+logs/scene_flow_pretrain/ckpt/pretrain_step100000.pt
 ```
+
+新训练保存时也会额外导出 `pretrain_step100000_ema_weights_only.pt` 作为便捷 EMA-only state dict；旧产物若只有 `_weights_only.pt`，那只是裸权重，不能代表 EMA 出图质量。
 
 ## 2. 正式训练前置：flow cache manifest
 
@@ -144,6 +160,11 @@ python tools/build_flow_train_manifest.py \
 CUDA_VISIBLE_DEVICES=0,1,2,3 conda run -n dggt --no-capture-output \
     torchrun --nproc_per_node=4 train_scene_flow.py \
     --ckpt_path $DGGT_CKPT \
+    --tokenizer_ckpt_path $TOKENIZER_CKPT \
+    --feature_stats_path $FEATURE_STATS \
+    --latent_dim 768 \
+    --scene_flow_pretrain_path logs/scene_flow_pretrain/ckpt/pretrain_step100000.pt \
+    --scene_flow_pretrain_ema \
     --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
     --log_dir logs/scene_flow_t1 \
     --batch_size 1 \
@@ -181,4 +202,4 @@ CUDA_VISIBLE_DEVICES=2 conda run -n dggt --no-capture-output \
     --log_every 1
 ```
 
-备注：当前 `train_scene_flow.py` 的 CLI 尚未接入 `--scene_flow_pretrain_path` 这类 warm-start 参数；pretrain 产物路径已经固定记录在上面，等正式训练入口支持 warm-start 后应加载 `pretrain_step*_weights_only.pt` 中的 `scene_flow` state dict。
+备注：`train_scene_flow.py --scene_flow_pretrain_path` 默认从完整 `pretrain_step{N}.pt` 读取 `ema_scene_flow` 做 warm-start；如传入没有 EMA 的旧 `_weights_only.pt` 会直接报错。只有明确要复现实验里的裸权重效果时，才加 `--no_scene_flow_pretrain_ema`。

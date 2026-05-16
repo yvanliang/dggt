@@ -111,6 +111,19 @@ def unwrap_ddp(module: nn.Module) -> nn.Module:
     return module.module if isinstance(module, DistributedDataParallel) else module
 
 
+@torch.no_grad()
+def materialize_ema_state_dict(scene_flow: nn.Module, ema: EMAModel) -> dict[str, torch.Tensor]:
+    """Return a named SceneFlow state_dict with EMA parameters and live buffers."""
+    sf = unwrap_ddp(scene_flow)
+    params = list(sf.parameters())
+    ema.store(params)
+    ema.copy_to(params)
+    try:
+        return {key: value.detach().cpu().clone() for key, value in sf.state_dict().items()}
+    finally:
+        ema.restore(params)
+
+
 def freeze_module(module: nn.Module) -> None:
     for param in module.parameters():
         param.requires_grad_(False)
@@ -269,16 +282,27 @@ def save_checkpoint(
     ckpt_dir = log_dir / "ckpt"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     sf = unwrap_ddp(scene_flow)
+    scene_flow_state = sf.state_dict()
+    ema_scene_flow_state = materialize_ema_state_dict(scene_flow, ema)
     payload = {
         "step": int(step),
-        "scene_flow": sf.state_dict(),
+        "scene_flow": scene_flow_state,
         "ema_scene_flow": ema.state_dict(),
+        "ema_scene_flow_state_dict": ema_scene_flow_state,
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
         "args": vars(args),
     }
     torch.save(payload, ckpt_dir / f"pretrain_step{step:06d}.pt")
-    torch.save({"scene_flow": sf.state_dict()}, ckpt_dir / f"pretrain_step{step:06d}_weights_only.pt")
+    torch.save({"scene_flow": scene_flow_state}, ckpt_dir / f"pretrain_step{step:06d}_weights_only.pt")
+    torch.save(
+        {
+            "scene_flow": ema_scene_flow_state,
+            "step": int(step),
+            "is_ema_weights": True,
+        },
+        ckpt_dir / f"pretrain_step{step:06d}_ema_weights_only.pt",
+    )
 
 
 def load_resume_checkpoint(

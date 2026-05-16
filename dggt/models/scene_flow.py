@@ -513,12 +513,6 @@ class WanSceneFlow(WanTransformer3DModel):
         if num_tokens == 0:
             return null.expand(batch_size, 1, -1), None
 
-        # Static-graph anchor for DDP: route null_kv through the autograd graph
-        # on every forward so `find_unused_parameters=False` doesn't trip when
-        # the fast paths below don't otherwise reference it.
-        null_anchor = (null.sum() * 0.0).to(F_asset_tokens.dtype)
-        F_asset_tokens = F_asset_tokens + null_anchor
-
         # No mask provided -> assume all slots valid.
         if encoder_attention_mask is None:
             return F_asset_tokens, None
@@ -584,6 +578,9 @@ class WanSceneFlow(WanTransformer3DModel):
         rotary_emb = self.rope(hidden_5d)
         hidden_states = self.patch_embedding(hidden_5d)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        # Static-graph anchor for DDP: route null_kv through autograd on every
+        # forward without changing asset-token fast-path identity.
+        hidden_states = hidden_states + self.null_kv.sum().to(device=hidden_states.device, dtype=hidden_states.dtype) * 0.0
 
         temb, timestep_proj, encoder_hidden_states, _ = self.condition_embedder(
             timestep,
@@ -636,10 +633,10 @@ class WanSceneFlow(WanTransformer3DModel):
                     head_block,
                     hidden_states,
                     head_temb,
-                    rotary_emb,
+                    None,
                 )
             else:
-                hidden_states = head_block(hidden_states, head_temb, rotary_emb)
+                hidden_states = head_block(hidden_states, head_temb, None)
 
         shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
         shift = shift.to(hidden_states.device)

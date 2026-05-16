@@ -1,12 +1,7 @@
-"""T1 SceneFlow training entry point (Phase 9 skeleton).
+"""T1 SceneFlow training entry point.
 
 Reads the offline Phase-4.5 cache, drives `FlowFeatureAssembler` per step, and
 computes a rectified-flow-style loss against a `SceneFlowMatching` module.
-
-Since Phase 6 (`dggt/models/scene_flow.py`) is not yet implemented, this file
-defines a `StubSceneFlow` that returns `zeros_like(z_init)` so the pipeline is
-runnable end-to-end and loss-shape assertions hold. When the real module lands,
-replace the import + instantiation under the marker `# SceneFlow instantiation`.
 
 DDP scaffolding follows `train_tokenizer.py`. Visualization every `--vis_every`
 steps dumps the same image set as `inference_scene_editor.py --dump_features`.
@@ -28,7 +23,10 @@ from torch.utils.data import DataLoader
 
 from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
+from dggt.models.scene_flow import WanSceneFlow
+from dggt.utils.feature_stats import load_into_buffers
 from dggt.utils.flow_cache_io import load_flow_cache
+from diffusers.training_utils import EMAModel
 
 
 # ---------------------------------------------------------------------- #
@@ -84,6 +82,106 @@ def autocast_context(args, device: torch.device):
     return nullcontext()
 
 
+def unwrap_ddp(module: nn.Module) -> nn.Module:
+    return module.module if isinstance(module, DistributedDataParallel) else module
+
+
+def _strip_module_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
+
+
+def _load_state_dict_checked(
+    module: nn.Module,
+    state: dict[str, torch.Tensor],
+    *,
+    path: str,
+    label: str,
+) -> tuple[int, int]:
+    missing, unexpected = module.load_state_dict(_strip_module_prefix(state), strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"{label} from {path} is incompatible: "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
+    return len(missing), len(unexpected)
+
+
+def load_scene_flow_warm_start(
+    scene_flow: nn.Module,
+    pretrain_path: str | None,
+    *,
+    use_ema: bool = True,
+) -> dict[str, Any] | None:
+    if not pretrain_path:
+        return None
+
+    sf = unwrap_ddp(scene_flow)
+    payload = torch.load(pretrain_path, map_location="cpu")
+    info: dict[str, Any] = {
+        "path": pretrain_path,
+        "step": int(payload.get("step", -1)) if isinstance(payload, dict) else -1,
+        "ema_used": False,
+    }
+
+    if use_ema:
+        if isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
+            _load_state_dict_checked(
+                sf,
+                payload["ema_scene_flow_state_dict"],
+                path=pretrain_path,
+                label="EMA SceneFlow state_dict",
+            )
+            info["ema_used"] = True
+            info["source"] = "ema_scene_flow_state_dict"
+            return info
+
+        if isinstance(payload, dict) and payload.get("is_ema_weights") and "scene_flow" in payload:
+            _load_state_dict_checked(
+                sf,
+                payload["scene_flow"],
+                path=pretrain_path,
+                label="EMA SceneFlow weights-only state_dict",
+            )
+            info["ema_used"] = True
+            info["source"] = "ema_weights_only"
+            return info
+
+        if isinstance(payload, dict) and "ema_scene_flow" in payload:
+            if "scene_flow" not in payload:
+                raise ValueError(f"{pretrain_path} has ema_scene_flow but no scene_flow buffers to initialize.")
+            _load_state_dict_checked(
+                sf,
+                payload["scene_flow"],
+                path=pretrain_path,
+                label="raw SceneFlow state_dict",
+            )
+            ema = EMAModel(sf.parameters())
+            ema.load_state_dict(payload["ema_scene_flow"])
+            ema.copy_to(sf.parameters())
+            info["ema_used"] = True
+            info["source"] = "ema_scene_flow"
+            return info
+
+        raise ValueError(
+            f"{pretrain_path} does not contain EMA SceneFlow weights. "
+            "Use the full pretrain_step{N}.pt checkpoint, a new "
+            "pretrain_step{N}_ema_weights_only.pt export, or pass "
+            "--no_scene_flow_pretrain_ema to explicitly load raw weights."
+        )
+
+    if isinstance(payload, dict) and "scene_flow" in payload:
+        state = payload["scene_flow"]
+        info["source"] = "scene_flow"
+    elif isinstance(payload, dict) and "state_dict" in payload:
+        state = payload["state_dict"]
+        info["source"] = "state_dict"
+    else:
+        state = payload
+        info["source"] = "raw_state_dict"
+    _load_state_dict_checked(sf, state, path=pretrain_path, label="SceneFlow state_dict")
+    return info
+
+
 def _infer_cache_patch_grid(dataset: WaymoFlowCacheDataset) -> tuple[int, int]:
     if len(dataset.entries) == 0:
         raise RuntimeError("Cannot infer patch grid from an empty cache dataset.")
@@ -121,10 +219,10 @@ def _validate_item_patch_grid(
 
 
 # ---------------------------------------------------------------------- #
-# Stub SceneFlow                                                          #
+# Legacy Stub SceneFlow                                                   #
 # ---------------------------------------------------------------------- #
 class StubSceneFlow(nn.Module):
-    """Placeholder for the Phase 6 `SceneFlowMatching` module.
+    """Legacy placeholder kept for old shape tests.
 
     Same API (`forward(z_t, t_tok, z_clean, scaffold_tok, M_preserve, M_source,
     M_dest, F_asset_tokens) -> v_pred`) so training code doesn't change when
@@ -180,6 +278,20 @@ def masked_mse(
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="T1 SceneFlow training (Phase 9).")
     parser.add_argument("--ckpt_path", type=str, required=True, help="Base DGGT checkpoint for tokenizer.")
+    parser.add_argument("--tokenizer_ckpt_path", type=str, default=None,
+                        help="Optional tokenizer checkpoint. Defaults to --ckpt_path.")
+    parser.add_argument("--feature_stats_path", type=str, default=None,
+                        help="Optional latent stats override. Warm-start checkpoints already carry these buffers.")
+    parser.add_argument("--latent_dim", type=int, default=768,
+                        help="Tokenizer latent channels; must match pretrain warm-start and feature stats.")
+    parser.add_argument("--scene_flow_pretrain_path", type=str, default=None,
+                        help="Optional SceneFlow pretrain checkpoint for warm-start.")
+    parser.add_argument("--scene_flow_pretrain_ema", dest="scene_flow_pretrain_ema",
+                        action="store_true", default=True,
+                        help="Load EMA weights from --scene_flow_pretrain_path. Enabled by default.")
+    parser.add_argument("--no_scene_flow_pretrain_ema", dest="scene_flow_pretrain_ema",
+                        action="store_false",
+                        help="Load raw scene_flow weights from --scene_flow_pretrain_path.")
     parser.add_argument("--cache_root", type=str, default=None,
                         help="Offline feature cache root (Phase 4.5 output). Mutually exclusive with --manifest_path.")
     parser.add_argument("--manifest_path", type=str, default=None,
@@ -319,17 +431,22 @@ def train_step(
         phase1_localized_lite=phase1_localized_lite,
         splatted_tok_low_cached=splatted_tok_low_cached,
     )
+    sf = unwrap_ddp(scene_flow)
+    z_init_n = sf.normalize(bundle.z_init)
+    z_clean_n = sf.normalize(bundle.z_clean)
+    z_splat_n = sf.normalize(bundle.z_splat)
+    scaffold_tok_n = sf.normalize(bundle.scaffold_tok)
     v_pred = scene_flow(
-        bundle.z_init,
-        bundle.t_tok,
-        bundle.z_clean,
-        bundle.scaffold_tok,
+        z_init_n,
+        bundle.base_t,
+        z_splat_n,
+        scaffold_tok_n,
         bundle.M_preserve,
         bundle.M_source,
         bundle.M_dest,
         bundle.F_asset_tokens,
     )
-    v_gt = bundle.z_clean - bundle.z_init
+    v_gt = z_clean_n - z_init_n
     edit_weight = 1.0 - bundle.M_preserve
     loss_flow = masked_mse(v_pred, v_gt, edit_weight)
     loss = args.lambda_flow * loss_flow
@@ -432,7 +549,7 @@ def main() -> None:
             flush=True,
         )
 
-    tokenizer = _load_tokenizer(args.ckpt_path, device)
+    tokenizer = _load_tokenizer(args.tokenizer_ckpt_path or args.ckpt_path, device)
     freeze_module(tokenizer)  # T1: encoder frozen; decoder layer_heads/local_refine can be unfrozen later.
 
     # Assembler: scaffold_packer + feature_splatter + soft_mask + noise_scheduler trainable.
@@ -441,6 +558,7 @@ def main() -> None:
         patch_grid=patch_grid,
         H_splat=h_splat,
         W_splat=w_splat,
+        scaffold_out_dim=int(args.latent_dim),
         editor_kwargs={"use_pose_refine": True},
     ).to(device)
     # Freeze inner editor / soft_mask (no params), scaffold packer trainable.
@@ -448,7 +566,22 @@ def main() -> None:
     freeze_module(assembler.soft_mask)  # no params but safe.
     freeze_module(assembler.feature_splatter)
 
-    scene_flow = StubSceneFlow(token_dim=768).to(device)
+    sf_in_channels = 3 * int(args.latent_dim) + 3
+    scene_flow = WanSceneFlow.from_scene_config(
+        bring_up=False,
+        patch_grid=patch_grid,
+        in_channels=sf_in_channels,
+        out_channels=int(args.latent_dim),
+    ).to(device)
+    scene_flow.enable_gradient_checkpointing()
+    load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
+    warm_start_info = load_scene_flow_warm_start(
+        scene_flow,
+        args.scene_flow_pretrain_path,
+        use_ema=bool(args.scene_flow_pretrain_ema),
+    )
+    if is_main_process() and warm_start_info is not None:
+        print(f"[warm-start] {warm_start_info}", flush=True)
 
     params = list(scene_flow.parameters()) + list(assembler.scaffold_packer.parameters())
     optimizer = torch.optim.AdamW(

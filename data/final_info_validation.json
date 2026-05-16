@@ -1,0 +1,662 @@
+[
+  {
+    "index": 0,
+    "clip_name": "10247954040621004675_2180_000_2200_000_0",
+    "origin_object_dict": {
+      "deletion": "J7CS-G2Wt3PxtE5hMrQr9g",
+      "repositioning": "bfSFDE4IX-Cb6y0rOn5Vyg",
+      "replacement": "sai1YKPAr2FbnNH9FWNNNQ"
+    },
+    "replacement_candidates": "6CilFumWs6igCAmldCA1BA",
+    "insertion_candidates": "p-9IinbUxyzjqSMJImwzwQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  },
+  {
+    "index": 1,
+    "clip_name": "10247954040621004675_2180_000_2200_000_1",
+    "origin_object_dict": {
+      "deletion": "J7CS-G2Wt3PxtE5hMrQr9g",
+      "repositioning": "bfSFDE4IX-Cb6y0rOn5Vyg",
+      "replacement": "sai1YKPAr2FbnNH9FWNNNQ"
+    },
+    "replacement_candidates": "6CilFumWs6igCAmldCA1BA",
+    "insertion_candidates": "P_LbIND-azmLWCCU6ZuAOw",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  },
+  {
+    "index": 2,
+    "clip_name": "10247954040621004675_2180_000_2200_000_2",
+    "origin_object_dict": {
+      "deletion": "jMeJvnglImY9nmJ1RO7t6A",
+      "repositioning": "CmhezamqC_cyV2CfzQThPQ",
+      "replacement": "e93p1ac64Ha-T1YyJ-7CVQ"
+    },
+    "replacement_candidates": "zDTurzUbClPOaKw2n9kKEQ",
+    "insertion_candidates": "vE4vePNnRfs5cFSC9xMC3w",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 3,
+    "clip_name": "10247954040621004675_2180_000_2200_000_4",
+    "origin_object_dict": {
+      "deletion": "m3wHtoeqBKWdt3Edb28Tew",
+      "repositioning": "oeXQOCmdR4c_ug7lQh5IrA",
+      "replacement": "l0iAQsQlaxq73j5kNZ8oLQ"
+    },
+    "replacement_candidates": "otv1mrV7gKOtBxgrn5YSMw",
+    "insertion_candidates": "E2VHgP5on6xXxSR8zCPSeg",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  },
+  {
+    "index": 4,
+    "clip_name": "10247954040621004675_2180_000_2200_000_5",
+    "origin_object_dict": {
+      "deletion": "m3wHtoeqBKWdt3Edb28Tew",
+      "repositioning": "oeXQOCmdR4c_ug7lQh5IrA",
+      "replacement": "l0iAQsQlaxq73j5kNZ8oLQ"
+    },
+    "replacement_candidates": "otv1mrV7gKOtBxgrn5YSMw",
+    "insertion_candidates": "_kK3h-EWXWv0bAdvtAgmsw",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  },
+  {
+    "index": 5,
+    "clip_name": "10289507859301986274_4200_000_4220_000_0",
+    "origin_object_dict": {
+      "deletion": "1FYhgDNIPSnptwXSpFrq_g",
+      "repositioning": "fNrjWoqfXfQODUKwOr_Zgg",
+      "replacement": "mj8PLuqIF9vd85osIoRNAA"
+    },
+    "replacement_candidates": "wxggXzN69Jy1fYaNyHJ3EQ",
+    "insertion_candidates": "WTgs_tEfP7JosQ1XVO0VRQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  },
+  {
+    "index": 6,
+    "clip_name": "11356601648124485814_409_000_429_000_0",
+    "origin_object_dict": {
+      "deletion": "qMkzbW5rXI5ruliBNQt44A",
+      "repositioning": "0J9H-ZT-wRuns-ra5718yw",
+      "replacement": "59TtF8br7CmU-JSmKOu1KA"
+    },
+    "replacement_candidates": "o3BtF0hxcLx-njpCUk8PTQ",
+    "insertion_candidates": "PzCFG28ZXXBZpJg2taOxaA",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  },
+  {
+    "index": 7,
+    "clip_name": "11450298750351730790_1431_750_1451_750_2",
+    "origin_object_dict": {
+      "deletion": "4qz81dfnvUevODLzQqVYJg",
+      "repositioning": "4NJ8ngO5h2gZ2SgsyiY7Xg",
+      "replacement": "769a_MfxGnIxzSZvvPzgsg"
+    },
+    "replacement_candidates": "_md0d61Qn6UYicamaGvcYg",
+    "insertion_candidates": "Lwzi11IPAeNN_n7JlToakQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 8,
+    "clip_name": "11450298750351730790_1431_750_1451_750_5",
+    "origin_object_dict": {
+      "deletion": "769a_MfxGnIxzSZvvPzgsg",
+      "repositioning": "4NJ8ngO5h2gZ2SgsyiY7Xg",
+      "replacement": "WMdMZGBRYeeeCRW_-rxSrg"
+    },
+    "replacement_candidates": "4Vad6_ozr6ISXD_RE9gCkw",
+    "insertion_candidates": "CmtJPcDVsKI7hByJfpmfwQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 9,
+    "clip_name": "12306251798468767010_560_000_580_000_1",
+    "origin_object_dict": {
+      "deletion": "cm4jbprEz3N2gHcMBkKkGA",
+      "repositioning": "a2imAQD1B5mrVQEa7POgPQ",
+      "replacement": "o35JKOgT714_T4ceBk6BUg"
+    },
+    "replacement_candidates": "Gm_toXsL1NznfBlsHjmK5w",
+    "insertion_candidates": "cKNI0jqUY8tGPKewVfOHIA",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 10,
+    "clip_name": "12306251798468767010_560_000_580_000_4",
+    "origin_object_dict": {
+      "deletion": "1hZNUQpVjcdG4qVjT5Wp7g",
+      "repositioning": "TNJWi54aVY8CnfYuhF6oTg",
+      "replacement": "wMOyrMmoA2Wr1XWh1qGgVA"
+    },
+    "replacement_candidates": "so2vbpFbTTPYhQ4WeCrTeA",
+    "insertion_candidates": "5m_HgwJAA3kPPej2YmyuZQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "left"
+  },
+  {
+    "index": 11,
+    "clip_name": "12496433400137459534_120_000_140_000_2",
+    "origin_object_dict": {
+      "deletion": "qoREpMSMJJ74peklg0xdZA",
+      "repositioning": "pEg5d7zKV0AsWkGZ1of57Q",
+      "replacement": "gqWA1v5wwagcXnkkMcMDjQ"
+    },
+    "replacement_candidates": "rQ96fNRKVW3KP0n9bcGYQQ",
+    "insertion_candidates": "130oglcKt9X3MNyj9iiJJQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 12,
+    "clip_name": "12496433400137459534_120_000_140_000_3",
+    "origin_object_dict": {
+      "deletion": "qoREpMSMJJ74peklg0xdZA",
+      "repositioning": "pEg5d7zKV0AsWkGZ1of57Q",
+      "replacement": "gqWA1v5wwagcXnkkMcMDjQ"
+    },
+    "replacement_candidates": "40rx-cGAf4D1xJtbV5QaaQ",
+    "insertion_candidates": "4Vad6_ozr6ISXD_RE9gCkw",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 13,
+    "clip_name": "12496433400137459534_120_000_140_000_4",
+    "origin_object_dict": {
+      "deletion": "CFAHlh2zpuW060DgXC2suw",
+      "repositioning": "I3nvWZqez21yr9EY_Kk0nQ",
+      "replacement": "3DRXLSq37RLnykKP_vD7XA"
+    },
+    "replacement_candidates": "w3VYZL6010ftRgJ4qN1uwA",
+    "insertion_candidates": "LGTLbsUC3OnL8EcUnN8yrA",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "left"
+  },
+  {
+    "index": 14,
+    "clip_name": "13178092897340078601_5118_604_5138_604_2",
+    "origin_object_dict": {
+      "deletion": "7FVhiGwy1VWTmAJeapu8zw",
+      "repositioning": "Rk-pngdWW7fZywBJ2l0OpA",
+      "replacement": "CfYg_t0wHHLsMmseDm7jrw"
+    },
+    "replacement_candidates": "4Vad6_ozr6ISXD_RE9gCkw",
+    "insertion_candidates": "5aFAJ7aTtyRct9PDVXQbTg",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 15,
+    "clip_name": "13178092897340078601_5118_604_5138_604_3",
+    "origin_object_dict": {
+      "deletion": "7FVhiGwy1VWTmAJeapu8zw",
+      "repositioning": "Rk-pngdWW7fZywBJ2l0OpA",
+      "replacement": "CfYg_t0wHHLsMmseDm7jrw"
+    },
+    "replacement_candidates": "4Vad6_ozr6ISXD_RE9gCkw",
+    "insertion_candidates": "5aFAJ7aTtyRct9PDVXQbTg",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 16,
+    "clip_name": "13184115878756336167_1354_000_1374_000_0",
+    "origin_object_dict": {
+      "deletion": "3yOGZEv9c2joZA1X5mvq4w",
+      "repositioning": "r-AwlXRM2Yc4wy878P8HkA",
+      "replacement": "ovDSuL5EB4WrLsWF0BNX7g"
+    },
+    "replacement_candidates": "KGe6rzdbkUJr_99clJTrqQ",
+    "insertion_candidates": "Gm_toXsL1NznfBlsHjmK5w",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  },
+  {
+    "index": 17,
+    "clip_name": "13469905891836363794_4429_660_4449_660_0",
+    "origin_object_dict": {
+      "deletion": "tXTOOiOMSSS_bo1A0X8uCw",
+      "repositioning": "vMzUlQj_XwTvVljJ1bl1Pg",
+      "replacement": "-s9XCqr75KNKS-W5TH2GpQ"
+    },
+    "replacement_candidates": "B0o2b6saPiVug0F7ETjzCw",
+    "insertion_candidates": "iM3cYXB1RpdBPWk-VUFHNw",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 18,
+    "clip_name": "13469905891836363794_4429_660_4449_660_1",
+    "origin_object_dict": {
+      "deletion": "tXTOOiOMSSS_bo1A0X8uCw",
+      "repositioning": "vMzUlQj_XwTvVljJ1bl1Pg",
+      "replacement": "-s9XCqr75KNKS-W5TH2GpQ"
+    },
+    "replacement_candidates": "cSoDUfM4Baf1s7FVFO2qQA",
+    "insertion_candidates": "zDTurzUbClPOaKw2n9kKEQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 19,
+    "clip_name": "14262448332225315249_1280_000_1300_000_4",
+    "origin_object_dict": {
+      "deletion": "HfxX_d_DOFcSam1ISnMbug",
+      "repositioning": "Ji3yclrX3tdnR3fT0g9VJA",
+      "replacement": "ZGnr2R1vj-W9XtX4tOUuqQ"
+    },
+    "replacement_candidates": "1_HUZ8bX1rrUwoqC45bqTw",
+    "insertion_candidates": "ZsTQjr8D-OBjiSMNAnPtlQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  },
+  {
+    "index": 20,
+    "clip_name": "14333744981238305769_5658_260_5678_260_0",
+    "origin_object_dict": {
+      "deletion": "TJ_FYKMexzQZyCpu8oelWw",
+      "repositioning": "0kbhbJTxXwvPPnvIenr8sw",
+      "replacement": "w9u1VHMbLdJKleJoeDENIg"
+    },
+    "replacement_candidates": "hl1qkhTZcPl-qsRTJjKUIA",
+    "insertion_candidates": "uNgngjjMMK5dwRoxvSZcCA",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 21,
+    "clip_name": "14333744981238305769_5658_260_5678_260_1",
+    "origin_object_dict": {
+      "deletion": "TJ_FYKMexzQZyCpu8oelWw",
+      "repositioning": "0kbhbJTxXwvPPnvIenr8sw",
+      "replacement": "w9u1VHMbLdJKleJoeDENIg"
+    },
+    "replacement_candidates": "uTw1Mpqot3I1JUFSYRHQxQ",
+    "insertion_candidates": "8zY4UJmN9yTp2ItEGnnXSQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 22,
+    "clip_name": "14333744981238305769_5658_260_5678_260_2",
+    "origin_object_dict": {
+      "deletion": "vlPoeuE6YE_CqDX4xeY6uA",
+      "repositioning": "jFVzupkMlVVUy-ba89oVvA",
+      "replacement": "LgW3frwr_ZKgP7NOGkr2Xg"
+    },
+    "replacement_candidates": "VIgfW057J6zNoT8MSku42Q",
+    "insertion_candidates": "dyj9JbpqIh7UGP4xUfQAGg",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "left"
+  },
+  {
+    "index": 23,
+    "clip_name": "15948509588157321530_7187_290_7207_290_3",
+    "origin_object_dict": {
+      "deletion": "nfI6HZQ66EstCS02zjKDGQ",
+      "repositioning": "NuRsE4IbSwb-OwxPM6bPxw",
+      "replacement": "Bk0Vueq63veA3zYtN6dMBA"
+    },
+    "replacement_candidates": "9v_jbV0IgWPSNVmYLBc8JA",
+    "insertion_candidates": "-422MSARHFFyRQGvWIYPuw",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 24,
+    "clip_name": "17136314889476348164_979_560_999_560_4",
+    "origin_object_dict": {
+      "deletion": "euUSj9BOcSCFk9Z2a3eQqg",
+      "repositioning": "8JAskcWLM3954YpVFxZvdQ",
+      "replacement": "l6pzXqwUxAd8_pjfHoRSng"
+    },
+    "replacement_candidates": "WTgs_tEfP7JosQ1XVO0VRQ",
+    "insertion_candidates": "1j2Wzc-XIPgTnFakbzUQ0w",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 25,
+    "clip_name": "17152649515605309595_3440_000_3460_000_2",
+    "origin_object_dict": {
+      "deletion": "roiUBwuY1qPEQbb3PyaDWA",
+      "repositioning": "yo_dSVIhAoMKoL_0SlPYcQ",
+      "replacement": "ZkmQWhOuP3DnHK5XtikHcg"
+    },
+    "replacement_candidates": "TVGAnPXxFlf-8TCrSknaPA",
+    "insertion_candidates": "4_H50n95aUV00XeLtpbbIQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 26,
+    "clip_name": "17626999143001784258_2760_000_2780_000_3",
+    "origin_object_dict": {
+      "deletion": "USTDXg4sZKN-WmhAHIP2Zg",
+      "repositioning": "gbHnOw_o0hb1QqjhU2Z81w",
+      "replacement": "Y_S41hJFubh6_ejx3te5rg"
+    },
+    "replacement_candidates": "YWOFbsvP86SwJaJiLTZziA",
+    "insertion_candidates": "mOfLU9KDjx_FDL4_msDuug",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 27,
+    "clip_name": "17860546506509760757_6040_000_6060_000_3",
+    "origin_object_dict": {
+      "deletion": "EarGIR6sFaR5kBj3VYik6w",
+      "repositioning": "cq9e1vWU23C9oCre1iBaLQ",
+      "replacement": "Xxvt8-g0aNOnnZ3GcpxPaw"
+    },
+    "replacement_candidates": "gTjsHmW8T6cFl3SjCZJ9aA",
+    "insertion_candidates": "Lwzi11IPAeNN_n7JlToakQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "left"
+  },
+  {
+    "index": 28,
+    "clip_name": "3651243243762122041_3920_000_3940_000_5",
+    "origin_object_dict": {
+      "deletion": "_vsQvM4OMTXn9WrX1ZePEQ",
+      "repositioning": "-yzAFqbkHzL3s1STOdTCSA",
+      "replacement": "yofdLzcow4WJmZAFfqNoEw"
+    },
+    "replacement_candidates": "r9Ug86FDXkCrzN_QPkcEdw",
+    "insertion_candidates": "ABdhn_yuVAzFEQHM877K1A",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "left"
+  },
+  {
+    "index": 29,
+    "clip_name": "4013125682946523088_3540_000_3560_000_3",
+    "origin_object_dict": {
+      "deletion": "CeZhXP6jarcUKOhfX0HuoQ",
+      "repositioning": "e6eXFZi1CoztEnr7G-QznA",
+      "replacement": "A_bqH2obDP_lmxPlTSaxXA"
+    },
+    "replacement_candidates": "vEz_rgME9Y1TRXny5_J7Ww",
+    "insertion_candidates": "tSq77gtKFT7XlBjx1bbcBA",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "left"
+  },
+  {
+    "index": 30,
+    "clip_name": "4575389405178805994_4900_000_4920_000_1",
+    "origin_object_dict": {
+      "deletion": "81bvPUkTk0gmcqsE73PWiw",
+      "repositioning": "c6uM7BZiWzkKeyV32v8HSw",
+      "replacement": "U5A8nnr2bk2ymzMwAxXq1g"
+    },
+    "replacement_candidates": "kuVzvvckHZ9Tm5Sqa9Nt1Q",
+    "insertion_candidates": "GAiJFZcpDqK2qQ0PlMuSQA",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "down"
+  },
+  {
+    "index": 31,
+    "clip_name": "6680764940003341232_2260_000_2280_000_1",
+    "origin_object_dict": {
+      "deletion": "u1pu5OMo0Pe3pIBQCJoXfg",
+      "repositioning": "4JU4mEHXL6x3od3KkD7mnA",
+      "replacement": "sYBzUUjXdbo5Q3B5MSeS4Q"
+    },
+    "replacement_candidates": "8HOUq2TsTE5tpwoRNAyUgg",
+    "insertion_candidates": "QfDnatIiymuN8iruRfOL3w",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "right"
+  },
+  {
+    "index": 32,
+    "clip_name": "9243656068381062947_1297_428_1317_428_3",
+    "origin_object_dict": {
+      "deletion": "jeWxRfHIbSEbUD9cqP7pYQ",
+      "repositioning": "Wl4uKTHEIYSqccLJBl3qcA",
+      "replacement": "EzsrioLcAMmFJ0plGNpq7A"
+    },
+    "replacement_candidates": "REFt1ObDqUdUjQPDgGEA7g",
+    "insertion_candidates": "W87YzXgn5FuxeXUS0GyKcQ",
+    "method": "object",
+    "trajectory": {
+      "do_back_project": false,
+      "shift": 0.0,
+      "longitudinal": 0.0,
+      "action_for_seg": "skip",
+      "use_fixed_motion": false
+    },
+    "action_for_reposition": "up"
+  }
+]
