@@ -957,8 +957,9 @@ def train_step(
 
     z_splat = torch.zeros_like(bundle.z_clean_n)
     scaffold_tok = torch.zeros_like(bundle.z_clean_n)
+    use_repa = float(args.lambda_repa) != 0.0
     with autocast_context(args, device):
-        v_pred = scene_flow(
+        out = scene_flow(
             target.z_t,
             target.sigmas,
             z_splat,
@@ -968,17 +969,22 @@ def train_step(
             bundle.M_dest,
             bundle.F_asset_tokens,
             encoder_attention_mask=bundle.encoder_attention_mask,
-            return_mid=False,
+            return_mid=use_repa,
         )
+        if use_repa:
+            v_pred, mid_repa = out
+        else:
+            v_pred, mid_repa = out, None
         loss, logs = compute_total_loss(
             v_pred=v_pred,
             v_gt=target.v_gt,
             eps=target.eps,
             bundle=bundle,
             sd3_weights=target.weights,
+            mid_repa=mid_repa,
             lambda_flow=args.lambda_flow,
             lambda_preserve=args.lambda_preserve,
-            lambda_repa=0.0,
+            lambda_repa=args.lambda_repa,
             lambda_identity=0.0,
             identity_batch=False,
             preserve_floor=args.preserve_floor,
@@ -1072,9 +1078,20 @@ def run_validation(
     step: int,
     log_dir: Path,
     wandb_run,
+    ema: EMAModel | None = None,
 ) -> dict[str, float]:
     scene_flow_was_training = scene_flow.training
     scene_flow.eval()
+
+    # Validate under EMA weights (DiT/SD3/Wan/RAE all sample from EMA).
+    # Raw mid-training weights give drastically worse diffusion samples.
+    # Every rank performs the identical param swap so DDP stays in sync.
+    use_val_ema = ema is not None and not args.no_val_ema
+    ema_params = list(unwrap_ddp(scene_flow).parameters()) if use_val_ema else None
+    if use_val_ema:
+        ema.store(ema_params)
+        ema.copy_to(ema_params)
+
     sums: dict[str, float] = {}
     count = 0
     first_batch: dict[str, Any] | None = None
@@ -1207,6 +1224,8 @@ def run_validation(
         print(f"[validation {step:06d}] {metrics_text}", flush=True)
         log_wandb(wandb_run, metrics, step, "validation")
 
+    if use_val_ema:
+        ema.restore(ema_params)
     if scene_flow_was_training:
         scene_flow.train()
     # Rank 0 does CFG sampling + RGB rendering after the metric loop, which
@@ -1265,6 +1284,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--val_log_images", type=int, default=4)
     parser.add_argument("--val_sample_steps", type=int, default=30)
     parser.add_argument("--no_val_render_rgb", action="store_true")
+    parser.add_argument(
+        "--no_val_ema",
+        action="store_true",
+        help=(
+            "Disable EMA weights for validation. By default validation "
+            "(loss + CFG samples + RGB render) runs under EMA weights, "
+            "which is mandatory for meaningful diffusion samples — raw "
+            "mid-training weights produce far worse samples than the model "
+            "actually is. All ranks swap identically so DDP stays in sync."
+        ),
+    )
 
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.0,
@@ -1275,21 +1305,36 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--shift",
         type=float,
-        default=11.0,
+        default=3.0,
         help=(
-            "FlowMatch noise-schedule shift. Per RAE (arxiv 2510.11690) "
-            "shift = sqrt(m / m_ref). m_ref=4096. Per-frame "
-            "m = patch_h * patch_w * latent_dim (e.g. 25*37*1024 = 947200 "
-            "-> alpha ~= 15.2; or 25*37*768 = 710400 -> ~= 13.2). "
-            "Per-clip multiplies by S. RAE-style theoretical shift can be "
-            "10-15; under our limited training budget (vs RAE's 1.4M steps) "
-            "shift=10 keeps the sigma distribution more balanced so "
-            "mid-/clean-sigma samples are seen too. Lower it (e.g. 6-8) "
-            "if validation cleanup steps remain undertrained."
+            "FlowMatch noise-schedule shift. RAE's dimension-aware formula "
+            "shift = sqrt(m / 4096) gives ~13 (768-D) / ~15 (1024-D) per "
+            "frame, but that is the *asymptotic* optimum for RAE's 1.4M-step "
+            "budget. With logit_normal sampling, shift=13 puts ~90%% of mass "
+            "at clean-progress sigma < 0.15 (noise side), starving the "
+            "low-noise cleanup regime -> blurry, detail-free samples under a "
+            "limited step budget. shift=3 -> median sigma ~= 0.25 so BOTH "
+            "the structure-forming (sigma->0) and cleanup (sigma->1) regimes "
+            "get trained. Sweep {1, 3} on EMA validation; raise toward "
+            "10-13 only once you have RAE-scale steps and EMA samples show "
+            "the noise regime is the bottleneck."
         ),
     )
     parser.add_argument("--lambda_flow", type=float, default=1.0)
     parser.add_argument("--lambda_preserve", type=float, default=1.0)
+    parser.add_argument(
+        "--lambda_repa",
+        type=float,
+        default=0.5,
+        help=(
+            "REPA (Yu et al. 2024) representation-alignment weight. >0 enables "
+            "return_mid and aligns the trunk's mid-block features "
+            "(repa_block_idx) to the clean latent z_clean_n via cosine loss. "
+            "This is the strongest known accelerator for from-scratch DiT "
+            "(~2-17x). Also exercises repa_proj so DDP "
+            "find_unused_parameters=False does not trip. 0.0 disables it."
+        ),
+    )
     parser.add_argument("--preserve_floor", type=float, default=0.2)
 
     parser.add_argument("--K_max", type=int, default=3)
@@ -1546,6 +1591,7 @@ def main() -> None:
                         global_step,
                         log_dir,
                         wandb_run,
+                        ema,
                     )
 
                 if global_step > 0 and global_step % args.save_every == 0:
