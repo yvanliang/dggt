@@ -39,12 +39,31 @@ from dggt.utils.flow_cache_io import load_flow_cache
 from dggt.utils.gaussian_edit import Sim3Transform
 
 
+def _parse_cache_root_spec(cache_root: str | Path) -> tuple[Path, str]:
+    """Accept `path`, `path:mode_a`, `path:mode_b`, or `path:auto`."""
+    raw = str(cache_root)
+    if ":" in raw:
+        path_str, mode_pin = raw.rsplit(":", 1)
+        if mode_pin in ("mode_a", "mode_b", "auto"):
+            return Path(path_str), mode_pin
+    path = Path(raw)
+    parts = set(path.parts)
+    if "flow_cache_mode_a" in parts:
+        return path, "mode_a"
+    if "flow_cache_mode_b" in parts:
+        return path, "mode_b"
+    return path, "auto"
+
+
 def _list_cache_files(cache_root: Path, split: str) -> list[Path]:
-    root = cache_root / split
-    if not root.is_dir():
-        raise FileNotFoundError(f"Cache root not found: {root}")
-    # v6 caches are flat: {cache_root}/{split}/{manifest_index:06d}.pt.
-    return sorted(root.glob("*.pt"))
+    split_root = cache_root / split
+    if split_root.is_dir():
+        root = split_root
+    elif cache_root.is_dir():
+        root = cache_root
+    else:
+        raise FileNotFoundError(f"Cache root not found: {split_root} or {cache_root}")
+    return sorted(root.rglob("*.pt"))
 
 
 def _read_manifest(path: Path) -> list[dict[str, Any]]:
@@ -112,14 +131,27 @@ class WaymoFlowCacheDataset(Dataset):
         else:
             if cache_root is None:
                 raise ValueError("Either `cache_root` or `manifest_path` must be provided.")
-            self.cache_root = Path(cache_root)
-            files = _list_cache_files(self.cache_root, self.split)
+            cache_roots: list[str | Path]
+            if isinstance(cache_root, (list, tuple)):
+                cache_roots = list(cache_root)
+            else:
+                cache_roots = [cache_root]
+            entries: list[dict[str, Any]] = []
+            allowed = {str(m) for m in mode_filter} if mode_filter is not None else None
+            for raw_root in cache_roots:
+                root_path, mode_pin = _parse_cache_root_spec(raw_root)
+                if allowed is not None and mode_pin in ("mode_a", "mode_b") and mode_pin not in allowed:
+                    continue
+                files = _list_cache_files(root_path, self.split)
+                entry_mode = mode_pin if mode_pin in ("mode_a", "mode_b") else "unknown"
+                entries.extend({"cache_path": str(f), "mode_kind": entry_mode} for f in files)
+            files = [Path(entry["cache_path"]) for entry in entries]
             if len(files) == 0:
                 raise RuntimeError(
-                    f"No cache files under {self.cache_root / self.split}. "
+                    f"No cache files under {cache_roots} split={self.split}. "
                     "Run tools/precompute_flow_features.py first."
                 )
-            self.entries = [{"cache_path": str(f), "mode_kind": "unknown"} for f in files]
+            self.entries = entries
 
     def __len__(self) -> int:
         return len(self.entries)

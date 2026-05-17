@@ -179,12 +179,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate_path", type=str, default=None)
     parser.add_argument(
         "--cache_dir",
+        action="append",
         type=str,
         default=None,
         help=(
-            "Use v6 FlowDGGT .pt cache as tokenizer teacher data. This should point "
-            "to one cache root containing {split}/*.pt, e.g. flow_cache_mode_a or "
-            "flow_cache_mode_b. Use --cache_manifest_path for mixed Mode-A/B."
+            "Use v6 FlowDGGT .pt cache as tokenizer teacher data. Can be repeated. "
+            "Each value may be a cache root, a split directory, or path:mode_a/mode_b/auto."
         ),
     )
     parser.add_argument(
@@ -207,6 +207,20 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cache_split", type=str, default="training")
     parser.add_argument("--cache_val_split", type=str, default="validation")
+    parser.add_argument(
+        "--stage_b_mix_raw",
+        action="store_true",
+        help=(
+            "Stage-B mixed training: cycle raw, mode_a cache, raw, mode_b cache "
+            "microbatches for an approximate 50/25/25 mix."
+        ),
+    )
+    parser.add_argument(
+        "--raw_batch_size",
+        type=int,
+        default=1,
+        help="Per-rank raw-data batch size in --stage_b_mix_raw mode.",
+    )
     parser.add_argument(
         "--cache_mode_filter",
         type=str,
@@ -1798,7 +1812,47 @@ def parse_cache_mode_filter(value: str | None) -> list[str] | None:
     return modes
 
 
-def build_cached_dataset(args: argparse.Namespace, *, validation: bool = False) -> Any:
+def normalize_cache_dirs(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [str(value)]
+    return [str(item) for item in value if item is not None]
+
+
+def default_stage_b_mix_cache_dirs(args: argparse.Namespace) -> list[str]:
+    root = Path(args.processed_root)
+    return [
+        f"{root / 'flow_cache_mode_a' / args.cache_split}:mode_a",
+        f"{root / 'flow_cache_mode_b' / args.cache_split}:mode_b",
+    ]
+
+
+class RoundRobinDatasetView:
+    """Small index adapter used to balance multiple datasets during stats passes."""
+
+    def __init__(self, datasets: list[Any]) -> None:
+        if len(datasets) == 0:
+            raise ValueError("RoundRobinDatasetView requires at least one dataset")
+        if any(len(dataset) == 0 for dataset in datasets):
+            raise ValueError("RoundRobinDatasetView does not support empty datasets")
+        self.datasets = list(datasets)
+
+    def __len__(self) -> int:
+        return max(len(dataset) for dataset in self.datasets) * len(self.datasets)
+
+    def __getitem__(self, idx: int) -> Any:
+        dataset_idx = int(idx) % len(self.datasets)
+        item_idx = (int(idx) // len(self.datasets)) % len(self.datasets[dataset_idx])
+        return self.datasets[dataset_idx][item_idx]
+
+
+def build_cached_dataset(
+    args: argparse.Namespace,
+    *,
+    validation: bool = False,
+    mode_filter: list[str] | None = None,
+) -> Any:
     from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
     from dggt.utils.flow_cache_io import load_flow_cache
 
@@ -1832,17 +1886,17 @@ def build_cached_dataset(args: argparse.Namespace, *, validation: bool = False) 
             }
 
     manifest_path = args.cache_val_manifest_path if validation else args.cache_manifest_path
-    cache_root = args.cache_val_dir if validation else args.cache_dir
+    cache_root = normalize_cache_dirs(args.cache_val_dir if validation else args.cache_dir)
     split = args.cache_val_split if validation else args.cache_split
-    if validation and manifest_path is None and cache_root is None:
+    if validation and manifest_path is None and len(cache_root) == 0:
         manifest_path = args.cache_manifest_path
-        cache_root = args.cache_dir
+        cache_root = normalize_cache_dirs(args.cache_dir)
         split = args.cache_split
-    if manifest_path is None and cache_root is None:
+    if manifest_path is None and len(cache_root) == 0:
         raise ValueError("Cached tokenizer training requires --cache_dir or --cache_manifest_path")
 
     return TokenizerFlowCacheDataset(
-        cache_root=cache_root,
+        cache_root=cache_root if len(cache_root) != 1 else cache_root[0],
         manifest_path=manifest_path,
         split=split,
         # Tokenizer heads require all samples in a batch to have the same S.
@@ -1851,7 +1905,7 @@ def build_cached_dataset(args: argparse.Namespace, *, validation: bool = False) 
         max_frames=args.max_frames,
         seed=args.seed + (100000 if validation else 0),
         lut_dtype=torch.bfloat16 if args.precision == "bf16" else torch.float32,
-        mode_filter=parse_cache_mode_filter(args.cache_mode_filter),
+        mode_filter=mode_filter if mode_filter is not None else parse_cache_mode_filter(args.cache_mode_filter),
     )
 
 
@@ -1863,13 +1917,24 @@ def main() -> None:
 
     if args.batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if args.raw_batch_size < 1:
+        raise ValueError("raw_batch_size must be positive")
     if args.grad_accum_steps < 1:
         raise ValueError("grad_accum_steps must be positive")
     if args.min_frames < 1 or args.max_frames < args.min_frames:
         raise ValueError("Invalid frame range")
-    use_cached_teacher = args.cache_dir is not None or args.cache_manifest_path is not None
-    if args.cache_dir is not None and args.cache_manifest_path is not None:
+    cache_dirs = normalize_cache_dirs(args.cache_dir)
+    if args.stage_b_mix_raw and len(cache_dirs) == 0 and args.cache_manifest_path is None:
+        args.cache_dir = default_stage_b_mix_cache_dirs(args)
+        cache_dirs = normalize_cache_dirs(args.cache_dir)
+    use_mixed_teacher = bool(args.stage_b_mix_raw)
+    use_cached_teacher = (not use_mixed_teacher) and (len(cache_dirs) > 0 or args.cache_manifest_path is not None)
+    if len(cache_dirs) > 0 and args.cache_manifest_path is not None:
         raise ValueError("Use either --cache_dir or --cache_manifest_path, not both")
+    if use_mixed_teacher:
+        requested_modes = parse_cache_mode_filter(args.cache_mode_filter)
+        if requested_modes is not None and set(requested_modes) != {"mode_a", "mode_b"}:
+            raise ValueError("--stage_b_mix_raw requires both cache modes; do not narrow --cache_mode_filter")
 
     log_dir = Path(args.log_dir)
     feature_stats_path = Path(args.feature_stats_path) if args.feature_stats_path else log_dir / "feature_stats.pt"
@@ -1879,14 +1944,39 @@ def main() -> None:
         with (log_dir / "config.json").open("w") as f:
             json.dump(vars(args), f, indent=2)
 
-    if use_cached_teacher:
+    if use_mixed_teacher:
+        train_datasets = {
+            "raw": build_dataset(args, split="training"),
+            "cache_mode_a": build_cached_dataset(args, validation=False, mode_filter=["mode_a"]),
+            "cache_mode_b": build_cached_dataset(args, validation=False, mode_filter=["mode_b"]),
+        }
+        test_datasets = {
+            "raw": build_dataset(args, split="validation"),
+            "cache_mode_a": build_cached_dataset(args, validation=True, mode_filter=["mode_a"]),
+            "cache_mode_b": build_cached_dataset(args, validation=True, mode_filter=["mode_b"]),
+        }
+        train_dataset = train_datasets["raw"]
+        test_dataset = test_datasets["raw"]
+    elif use_cached_teacher:
         train_dataset = build_cached_dataset(args, validation=False)
         test_dataset = build_cached_dataset(args, validation=True)
     else:
         train_dataset = build_dataset(args, split="training")
         test_dataset = build_dataset(args, split="validation")
 
-    if is_main_process() and hasattr(train_dataset, "clean_sample_stats"):
+    if is_main_process() and use_mixed_teacher:
+        raw_stats = train_datasets["raw"].clean_sample_stats
+        print(
+            f"[dataset/mixed] raw_train={len(train_datasets['raw'])} raw_val={len(test_datasets['raw'])} "
+            f"cache_mode_a_train={len(train_datasets['cache_mode_a'])} "
+            f"cache_mode_b_train={len(train_datasets['cache_mode_b'])} "
+            f"cache_mode_a_val={len(test_datasets['cache_mode_a'])} "
+            f"cache_mode_b_val={len(test_datasets['cache_mode_b'])} "
+            f"schedule=raw,mode_a,raw,mode_b raw_batch_size={args.raw_batch_size} "
+            f"cache_batch_size={args.batch_size} raw_clean={raw_stats.get('clean_total', 0)}",
+            flush=True,
+        )
+    elif is_main_process() and hasattr(train_dataset, "clean_sample_stats"):
         stats = train_dataset.clean_sample_stats
         print(
             f"[dataset] clean={stats.get('clean_total', 0)} edited={stats.get('edited_total', 0)} "
@@ -1901,56 +1991,72 @@ def main() -> None:
             flush=True,
         )
 
-    if use_cached_teacher:
-        if world_size > 1:
-            sampler = DistributedSampler(
-                train_dataset,
-                num_replicas=world_size,
-                rank=get_rank(),
-                shuffle=True,
-                seed=args.seed,
-                drop_last=False,
-            )
-        else:
-            sampler = DistributedSampler(
-                train_dataset,
-                num_replicas=1,
-                rank=0,
-                shuffle=True,
-                seed=args.seed,
-                drop_last=False,
-            )
+    def make_raw_sampler(dataset: Any, *, batch_size: int, seed_offset: int = 0):
+        return VariableLengthDistributedSampler(
+            dataset,
+            min_num_frames=args.min_frames,
+            max_num_frames=args.max_frames,
+            batch_size=batch_size,
+            num_replicas=world_size,
+            rank=get_rank(),
+            shuffle=True,
+            seed=args.seed + seed_offset,
+        )
+
+    def make_cache_sampler(dataset: Any, *, seed_offset: int = 0):
+        return DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=get_rank(),
+            shuffle=True,
+            seed=args.seed + seed_offset,
+            drop_last=False,
+        )
+
+    def make_loader(dataset: Any, sampler_obj: Any, *, batch_size: int, collate_fn: Any) -> DataLoader:
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            sampler=sampler_obj,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_fn,
+        )
+
+    if use_mixed_teacher:
+        samplers = {
+            "raw": make_raw_sampler(train_datasets["raw"], batch_size=args.raw_batch_size, seed_offset=0),
+            "cache_mode_a": make_cache_sampler(train_datasets["cache_mode_a"], seed_offset=11),
+            "cache_mode_b": make_cache_sampler(train_datasets["cache_mode_b"], seed_offset=23),
+        }
+        dataloaders = {
+            "raw": make_loader(
+                train_datasets["raw"],
+                samplers["raw"],
+                batch_size=args.raw_batch_size,
+                collate_fn=tokenizer_collate_fn,
+            ),
+            "cache_mode_a": make_loader(
+                train_datasets["cache_mode_a"],
+                samplers["cache_mode_a"],
+                batch_size=args.batch_size,
+                collate_fn=tokenizer_cache_collate_fn,
+            ),
+            "cache_mode_b": make_loader(
+                train_datasets["cache_mode_b"],
+                samplers["cache_mode_b"],
+                batch_size=args.batch_size,
+                collate_fn=tokenizer_cache_collate_fn,
+            ),
+        }
+    elif use_cached_teacher:
+        sampler = make_cache_sampler(train_dataset)
         collate_fn = tokenizer_cache_collate_fn
-    elif world_size > 1:
-        sampler = VariableLengthDistributedSampler(
-            train_dataset,
-            min_num_frames=args.min_frames,
-            max_num_frames=args.max_frames,
-            batch_size=args.batch_size,
-            shuffle=True,
-            seed=args.seed,
-        )
-        collate_fn = tokenizer_collate_fn
+        dataloader = make_loader(train_dataset, sampler, batch_size=args.batch_size, collate_fn=collate_fn)
     else:
-        sampler = VariableLengthDistributedSampler(
-            train_dataset,
-            min_num_frames=args.min_frames,
-            max_num_frames=args.max_frames,
-            batch_size=args.batch_size,
-            num_replicas=1,
-            rank=0,
-            shuffle=True,
-            seed=args.seed,
-        )
+        sampler = make_raw_sampler(train_dataset, batch_size=args.batch_size)
         collate_fn = tokenizer_collate_fn
-    dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        collate_fn=collate_fn,
-    )
+        dataloader = make_loader(train_dataset, sampler, batch_size=args.batch_size, collate_fn=collate_fn)
 
     if lpips is None:
         raise ModuleNotFoundError(
@@ -1980,7 +2086,10 @@ def main() -> None:
     levels = extract_levels(model)
     if is_main_process():
         print(f"[init] tokenizer levels={levels}", flush=True)
-    if use_cached_teacher:
+    if use_mixed_teacher:
+        stats_dataset = RoundRobinDatasetView([train_datasets["cache_mode_a"], train_datasets["cache_mode_b"]])
+        feature_stats = get_feature_stats_from_cache(stats_dataset, args, device, levels, feature_stats_path)
+    elif use_cached_teacher:
         feature_stats = get_feature_stats_from_cache(train_dataset, args, device, levels, feature_stats_path)
     else:
         feature_stats = get_feature_stats(model, train_dataset, args, device, levels, feature_stats_path)
@@ -2045,218 +2154,270 @@ def main() -> None:
                 dynamic_ncols=True,
                 leave=True,
             )
-        while global_step < args.max_steps:
+        mixed_schedule = ("raw", "cache_mode_a", "raw", "cache_mode_b")
+        mixed_step = 0
+        mixed_epochs = {name: 0 for name in mixed_schedule}
+        mixed_iters: dict[str, Any] = {}
+        if use_mixed_teacher:
+            for name, sampler_obj in samplers.items():
+                sampler_obj.set_epoch(0)
+                mixed_iters[name] = iter(dataloaders[name])
+        else:
+            epoch = 0
             sampler.set_epoch(epoch)
+            dataloader_iter = iter(dataloader)
             num_batches = len(dataloader)
-            for batch_idx, sample in enumerate(dataloader):
-                if global_step >= args.max_steps:
-                    break
+            batch_idx = 0
 
-                if use_cached_teacher:
-                    train_sample = sample["sample"]
-                    cached_predictions = sample["predictions"]
-                else:
-                    train_sample = sample
-                    cached_predictions = None
+        def next_mixed_batch(source_name: str) -> Any:
+            try:
+                return next(mixed_iters[source_name])
+            except StopIteration:
+                mixed_epochs[source_name] += 1
+                samplers[source_name].set_epoch(mixed_epochs[source_name])
+                mixed_iters[source_name] = iter(dataloaders[source_name])
+                return next(mixed_iters[source_name])
 
-                images = unwrap_tensor(train_sample["images_clean"]).to(device)
-                local_batch_size = int(images.shape[0])
-                num_frames = images.shape[1]
+        accum_source_counts: dict[str, int] = {}
+        while global_step < args.max_steps:
+            if use_mixed_teacher:
+                source_name = mixed_schedule[mixed_step % len(mixed_schedule)]
+                mixed_step += 1
+                sample = next_mixed_batch(source_name)
+                is_last_microbatch = False
+            else:
+                try:
+                    sample = next(dataloader_iter)
+                except StopIteration:
+                    epoch += 1
+                    sampler.set_epoch(epoch)
+                    dataloader_iter = iter(dataloader)
+                    num_batches = len(dataloader)
+                    batch_idx = 0
+                    sample = next(dataloader_iter)
+                source_name = "cache" if use_cached_teacher else "raw"
+                batch_idx += 1
+                is_last_microbatch = batch_idx == num_batches
 
-                accum_count += 1
-                is_last_microbatch = batch_idx + 1 == num_batches
-                should_step = accum_count >= args.grad_accum_steps or is_last_microbatch
+            use_cache_batch = source_name.startswith("cache")
+            if use_cache_batch:
+                train_sample = sample["sample"]
+                cached_predictions = sample["predictions"]
+            else:
+                train_sample = sample
+                cached_predictions = None
 
-                sync_context = nullcontext()
-                if world_size > 1 and not should_step:
-                    sync_context = tokenizer_runner.no_sync()
+            images = unwrap_tensor(train_sample["images_clean"]).to(device)
+            local_batch_size = int(images.shape[0])
+            num_frames = images.shape[1]
 
-                with sync_context:
-                    if use_cached_teacher:
-                        teacher = get_cached_teacher_outputs(cached_predictions, levels, device)
-                        student = build_student_outputs_from_patch_teacher(
-                            model,
-                            tokenizer_runner,
-                            images,
-                            levels,
-                            teacher,
-                            autocast_context(args, device),
-                            args,
-                        )
-                    else:
-                        teacher = get_teacher_outputs(model, images, levels, args, device)
-                        student = build_student_outputs(
-                            model,
-                            tokenizer_runner,
-                            images,
-                            levels,
-                            teacher,
-                            autocast_context(args, device),
-                            args,
-                        )
-                    total_loss, scalar_logs, aux = compute_losses(
+            accum_count += 1
+            accum_source_counts[source_name] = accum_source_counts.get(source_name, 0) + 1
+            should_step = accum_count >= args.grad_accum_steps or is_last_microbatch
+
+            sync_context = nullcontext()
+            if world_size > 1 and not should_step:
+                sync_context = tokenizer_runner.no_sync()
+
+            with sync_context:
+                if use_cache_batch:
+                    teacher = get_cached_teacher_outputs(cached_predictions, levels, device)
+                    student = build_student_outputs_from_patch_teacher(
                         model,
-                        train_sample,
-                        args,
-                        feature_stats,
+                        tokenizer_runner,
+                        images,
+                        levels,
                         teacher,
-                        student,
-                        global_step,
-                    )
-                    del aux
-                    (total_loss / float(args.grad_accum_steps)).backward()
-                    noisy_weight = scalar_logs["noisy_weight"]
-                    if noisy_weight > 0.0:
-                        z_detached = student["z"].detach()
-                        teacher_image_patch = teacher["image_patch"]
-                        patch_grid = infer_patch_grid(images, teacher_image_patch[0].shape[2])
-                        del teacher, student, total_loss
-                        noisy_loss = compute_noisy_decoder_loss(
-                            tokenizer_runner,
-                            z_detached,
-                            teacher_image_patch,
-                            feature_stats["std"],
-                            patch_grid,
-                            autocast_context(args, device),
-                            decoder_noise_tau=args.decoder_noise_tau,
-                            decoder_noise_distribution=args.decoder_noise_distribution,
-                        )
-                        scalar_logs["noisy"] = float(noisy_loss.detach().item())
-                        scalar_logs["loss"] += noisy_weight * scalar_logs["noisy"]
-                        (noisy_weight * noisy_loss / float(args.grad_accum_steps)).backward()
-                        del noisy_loss, z_detached, teacher_image_patch
-                    else:
-                        del teacher, student, total_loss
-
-                for key, value in scalar_logs.items():
-                    accum_log_sums[key] = accum_log_sums.get(key, 0.0) + float(value)
-                accum_num_frames += float(num_frames)
-                accum_local_batch += float(local_batch_size)
-
-                if not should_step:
-                    continue
-
-                if args.grad_clip_norm > 0.0:
-                    clip_grad_norm_(model.scene_tokenizer.parameters(), max_norm=args.grad_clip_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-                step_logs = {key: value / float(accum_count) for key, value in accum_log_sums.items()}
-                step_num_frames = accum_num_frames / float(accum_count)
-                step_local_batch = accum_local_batch
-
-                if train_pbar is not None:
-                    train_pbar.set_postfix(
-                        batch=f"{step_local_batch:.0f}",
-                        frames=f"{step_num_frames:.1f}",
-                        loss=f"{step_logs['loss']:.4g}",
-                        tok=f"{step_logs['tok_rec']:.4g}",
-                        head=f"{step_logs['gs_anchor'] + step_logs['geom_anchor'] + step_logs['dyn_anchor']:.4g}",
-                        dynb=f"{step_logs['dynamic_bce']:.4g}",
-                        life=f"{step_logs['gs_lifespan']:.4g}",
-                        ghost=f"{step_logs['ghost_static']:.4g}",
-                        hwt=f"{step_logs['head_weight']:.3f}",
-                        lr=f"{scheduler.get_last_lr()[0]:.2e}",
-                    )
-
-                if is_main_process() and global_step % args.log_every == 0:
-                    elapsed = time.time() - start_time
-                    log_metrics = dict(step_logs)
-                    log_metrics["lr"] = float(scheduler.get_last_lr()[0])
-                    log_metrics["batch_size"] = float(step_local_batch)
-                    log_metrics["micro_batch_size"] = float(local_batch_size)
-                    log_metrics["grad_accum_steps"] = float(accum_count)
-                    log_metrics["num_frames"] = float(step_num_frames)
-                    log_metrics["elapsed_sec"] = float(elapsed)
-                    log_wandb_scalars(wandb_run, log_metrics, global_step)
-
-                should_run_vis = len(test_dataset) > 0 and global_step % args.vis_every == 0
-                if use_cached_teacher and global_step == 0:
-                    should_run_vis = False
-                if should_run_vis and is_distributed():
-                    dist.barrier()
-                if is_main_process() and should_run_vis:
-                    vis_index = (int(args.vis_test_index) + (global_step // args.vis_every)) % len(test_dataset)
-                    if use_cached_teacher:
-                        vis_sample = tokenizer_cache_collate_fn([test_dataset[vis_index]])
-                    else:
-                        vis_sample = tokenizer_collate_fn([test_dataset[(vis_index, args.max_frames)]])
-                    with torch.no_grad():
-                        if use_cached_teacher:
-                            grid, vis_logs = run_cached_visualization_eval(
-                                model,
-                                vis_tokenizer_runner,
-                                vis_sample,
-                                args,
-                                feature_stats,
-                                levels,
-                                global_step,
-                                device,
-                            )
-                        else:
-                            grid, vis_logs = run_visualization_eval(
-                                model,
-                                vis_tokenizer_runner,
-                                vis_sample,
-                                args,
-                                feature_stats,
-                                levels,
-                                global_step,
-                                device,
-                            )
-                    if grid is not None:
-                        grid.save(dirs["vis"] / f"validation_step_{global_step:06d}_sample_{vis_index:06d}.png")
-                        vis_num_frames = int(
-                            vis_sample["sample"]["num_frames"][0].item()
-                            if use_cached_teacher
-                            else vis_sample["num_frames"][0].item()
-                        )
-                        log_wandb_visual(
-                            wandb_run,
-                            grid,
-                            global_step,
-                            vis_num_frames,
-                            prefix="validation",
-                            sample_index=vis_index,
-                        )
-                    if vis_logs:
-                        vis_logs["sample_index"] = float(vis_index)
-                        vis_logs["num_frames"] = float(
-                            vis_sample["sample"]["num_frames"][0].item()
-                            if use_cached_teacher
-                            else vis_sample["num_frames"][0].item()
-                        )
-                        log_wandb_scalars(
-                            wandb_run,
-                            vis_logs,
-                            global_step,
-                            prefix="validation",
-                        )
-                if should_run_vis and is_distributed():
-                    dist.barrier()
-
-                if is_main_process() and global_step > 0 and global_step % args.save_every == 0:
-                    save_checkpoint(
-                        model.scene_tokenizer,
-                        optimizer,
-                        scheduler,
-                        global_step,
+                        autocast_context(args, device),
                         args,
-                        feature_stats_path,
-                        dirs["ckpt"] / f"scene_tokenizer_step_{global_step:06d}.pt",
                     )
+                else:
+                    teacher = get_teacher_outputs(model, images, levels, args, device)
+                    student = build_student_outputs(
+                        model,
+                        tokenizer_runner,
+                        images,
+                        levels,
+                        teacher,
+                        autocast_context(args, device),
+                        args,
+                    )
+                total_loss, scalar_logs, aux = compute_losses(
+                    model,
+                    train_sample,
+                    args,
+                    feature_stats,
+                    teacher,
+                    student,
+                    global_step,
+                )
+                del aux
+                (total_loss / float(args.grad_accum_steps)).backward()
+                noisy_weight = scalar_logs["noisy_weight"]
+                if noisy_weight > 0.0:
+                    z_detached = student["z"].detach()
+                    teacher_image_patch = teacher["image_patch"]
+                    patch_grid = infer_patch_grid(images, teacher_image_patch[0].shape[2])
+                    del teacher, student, total_loss
+                    noisy_loss = compute_noisy_decoder_loss(
+                        tokenizer_runner,
+                        z_detached,
+                        teacher_image_patch,
+                        feature_stats["std"],
+                        patch_grid,
+                        autocast_context(args, device),
+                        decoder_noise_tau=args.decoder_noise_tau,
+                        decoder_noise_distribution=args.decoder_noise_distribution,
+                    )
+                    scalar_logs["noisy"] = float(noisy_loss.detach().item())
+                    scalar_logs["loss"] += noisy_weight * scalar_logs["noisy"]
+                    (noisy_weight * noisy_loss / float(args.grad_accum_steps)).backward()
+                    del noisy_loss, z_detached, teacher_image_patch
+                else:
+                    del teacher, student, total_loss
 
-                global_step += 1
-                if train_pbar is not None:
-                    train_pbar.update(1)
+            for key, value in scalar_logs.items():
+                accum_log_sums[key] = accum_log_sums.get(key, 0.0) + float(value)
+            accum_num_frames += float(num_frames)
+            accum_local_batch += float(local_batch_size)
 
-                accum_count = 0
-                accum_log_sums = {}
-                accum_num_frames = 0.0
-                accum_local_batch = 0.0
+            if not should_step:
+                continue
 
-            epoch += 1
+            if args.grad_clip_norm > 0.0:
+                clip_grad_norm_(model.scene_tokenizer.parameters(), max_norm=args.grad_clip_norm)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            step_logs = {key: value / float(accum_count) for key, value in accum_log_sums.items()}
+            step_num_frames = accum_num_frames / float(accum_count)
+            step_local_batch = accum_local_batch
+
+            if train_pbar is not None:
+                train_pbar.set_postfix(
+                    batch=f"{step_local_batch:.0f}",
+                    frames=f"{step_num_frames:.1f}",
+                    loss=f"{step_logs['loss']:.4g}",
+                    tok=f"{step_logs['tok_rec']:.4g}",
+                    head=f"{step_logs['gs_anchor'] + step_logs['geom_anchor'] + step_logs['dyn_anchor']:.4g}",
+                    dynb=f"{step_logs['dynamic_bce']:.4g}",
+                    life=f"{step_logs['gs_lifespan']:.4g}",
+                    ghost=f"{step_logs['ghost_static']:.4g}",
+                    hwt=f"{step_logs['head_weight']:.3f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                )
+
+            if is_main_process() and global_step % args.log_every == 0:
+                elapsed = time.time() - start_time
+                log_metrics = dict(step_logs)
+                log_metrics["lr"] = float(scheduler.get_last_lr()[0])
+                log_metrics["batch_size"] = float(step_local_batch)
+                log_metrics["micro_batch_size"] = float(local_batch_size)
+                log_metrics["grad_accum_steps"] = float(accum_count)
+                log_metrics["num_frames"] = float(step_num_frames)
+                log_metrics["elapsed_sec"] = float(elapsed)
+                for name, count in accum_source_counts.items():
+                    log_metrics[f"source_{name}_microbatches"] = float(count)
+                log_wandb_scalars(wandb_run, log_metrics, global_step)
+
+            if use_mixed_teacher:
+                vis_source = mixed_schedule[(global_step // max(args.vis_every, 1)) % len(mixed_schedule)]
+                vis_dataset = test_datasets[vis_source]
+                vis_is_cache = vis_source.startswith("cache")
+            else:
+                vis_source = "cache" if use_cached_teacher else "raw"
+                vis_dataset = test_dataset
+                vis_is_cache = use_cached_teacher
+
+            should_run_vis = len(vis_dataset) > 0 and global_step % args.vis_every == 0
+            if use_cached_teacher and not use_mixed_teacher and global_step == 0:
+                should_run_vis = False
+            if should_run_vis and is_distributed():
+                dist.barrier()
+            if is_main_process() and should_run_vis:
+                vis_index = (int(args.vis_test_index) + (global_step // args.vis_every)) % len(vis_dataset)
+                if vis_is_cache:
+                    vis_sample = tokenizer_cache_collate_fn([vis_dataset[vis_index]])
+                else:
+                    vis_sample = tokenizer_collate_fn([vis_dataset[(vis_index, args.max_frames)]])
+                with torch.no_grad():
+                    if vis_is_cache:
+                        grid, vis_logs = run_cached_visualization_eval(
+                            model,
+                            vis_tokenizer_runner,
+                            vis_sample,
+                            args,
+                            feature_stats,
+                            levels,
+                            global_step,
+                            device,
+                        )
+                    else:
+                        grid, vis_logs = run_visualization_eval(
+                            model,
+                            vis_tokenizer_runner,
+                            vis_sample,
+                            args,
+                            feature_stats,
+                            levels,
+                            global_step,
+                            device,
+                        )
+                if grid is not None:
+                    grid.save(
+                        dirs["vis"]
+                        / f"validation_{vis_source}_step_{global_step:06d}_sample_{vis_index:06d}.png"
+                    )
+                    vis_num_frames = int(
+                        vis_sample["sample"]["num_frames"][0].item()
+                        if vis_is_cache
+                        else vis_sample["num_frames"][0].item()
+                    )
+                    log_wandb_visual(
+                        wandb_run,
+                        grid,
+                        global_step,
+                        vis_num_frames,
+                        prefix="validation",
+                        sample_index=vis_index,
+                    )
+                if vis_logs:
+                    vis_logs["sample_index"] = float(vis_index)
+                    vis_logs["num_frames"] = float(
+                        vis_sample["sample"]["num_frames"][0].item()
+                        if vis_is_cache
+                        else vis_sample["num_frames"][0].item()
+                    )
+                    log_wandb_scalars(
+                        wandb_run,
+                        vis_logs,
+                        global_step,
+                        prefix="validation",
+                    )
+            if should_run_vis and is_distributed():
+                dist.barrier()
+
+            if is_main_process() and global_step > 0 and global_step % args.save_every == 0:
+                save_checkpoint(
+                    model.scene_tokenizer,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    args,
+                    feature_stats_path,
+                    dirs["ckpt"] / f"scene_tokenizer_step_{global_step:06d}.pt",
+                )
+
+            global_step += 1
+            if train_pbar is not None:
+                train_pbar.update(1)
+
+            accum_count = 0
+            accum_log_sums = {}
+            accum_num_frames = 0.0
+            accum_local_batch = 0.0
+            accum_source_counts = {}
 
         if is_main_process():
             save_checkpoint(
