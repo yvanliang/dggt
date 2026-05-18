@@ -11,8 +11,9 @@
 export WAYMO_DGGT_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/training
 export WAYMO_DGGT_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation
 export DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
-export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_waymo_views1/ckpt/scene_tokenizer_step_014000.pt
-export FEATURE_STATS=logs/scene_flow_pretrain/feature_stats_pretrain.pt
+export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_stageA/ckpt/scene_tokenizer_step_060000.pt
+export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain.pt
+export SCENE_FLOW_PRETRAIN_CKPT=logs/scene_flow_pretrain_1024/ckpt/pretrain_step100000.pt
 ```
 
 注意：
@@ -20,8 +21,8 @@ export FEATURE_STATS=logs/scene_flow_pretrain/feature_stats_pretrain.pt
 * `pretrained/model__latest_waymo.pt` 当前是断链，不要用它；使用上面的 `$DGGT_CKPT`。
 * 这份 DGGT Waymo 数据的 tokenizer patch grid 是 `25x37`，pretrain 必须传 `--patch_grid_h 25 --patch_grid_w 37`。
 * `logs/tokenizer_t0_waymo_views1/feature_stats.pt` 是 tokenizer 训练用的 `4x3072` aggregator stats，不能直接给 SceneFlow pretrain；SceneFlow 需要下面重新计算的 latent stats（维度 = tokenizer latent dim）。
-* **`--latent_dim` 必须等于 tokenizer 的 latent 输出维度**，且 `--feature_stats_path` 指向的 stats 必须是同维度（compute 脚本会按所用 `$TOKENIZER_CKPT` 自动产出对应维度的 stats）。当前 768-dim tokenizer → `--latent_dim 768` + 768-dim stats；切到 1024-dim 6 万 iter tokenizer 后 → 改 `$TOKENIZER_CKPT`、**重新跑 compute_pretrain_feature_stats** 生成 1024-dim stats、并把命令里所有 `--latent_dim 768` 改成 `--latent_dim 1024`。三者维度不一致会在 `load_into_buffers`/`set_latent_stats` 直接报错。
-* `--shift 3.0`、`--lambda_repa 0.5`、EMA 验证默认开启 —— 详见文末「优化说明」。
+* **正式 pretrain 和正式训练统一使用 1024-dim tokenizer latent**：`$TOKENIZER_CKPT`、`$FEATURE_STATS`、`--latent_dim 1024`、`$SCENE_FLOW_PRETRAIN_CKPT` 必须来自同一套 1024 tokenizer / SceneFlow pretrain。三者维度不一致会在 `load_into_buffers`/`set_latent_stats` 或 warm-start 时直接报错。
+* `--shift 3.0`、`--lambda_repa 0.5`、EMA 验证默认开启 —— pretrain 和正式训练保持一致，详见文末「优化说明」。
 
 ## 1. Pretrain 正式参数
 
@@ -34,7 +35,7 @@ CUDA_VISIBLE_DEVICES=2 python -u tools/compute_pretrain_feature_stats.py \
     --tokenizer_ckpt_path $TOKENIZER_CKPT \
     --output_path $FEATURE_STATS \
     --scene_start 0 --scene_end 800 \
-    --sequence_length 4 \
+    --sequence_length 8 \
     --batch_size 1 \
     --num_workers 2 \
     --max_batches 800 \
@@ -49,12 +50,13 @@ CUDA_VISIBLE_DEVICES=2 python -u train_scene_flow_pretrain.py \
     --val_image_dir $WAYMO_DGGT_VAL_ROOT \
     --dggt_ckpt_path $DGGT_CKPT \
     --tokenizer_ckpt_path $TOKENIZER_CKPT \
-    --feature_stats_path logs/scene_flow_pretrain/feature_stats_pretrain.pt \
-    --log_dir logs/scene_flow_pretrain \
+    --feature_stats_path $FEATURE_STATS \
+    --log_dir logs/scene_flow_pretrain_1024 \
     --scene_start 0 --scene_end 800 \
     --sequence_length 8 \
     --pretrain_task full_scene \
     --patch_grid_h 25 --patch_grid_w 37 \
+    --latent_dim 1024 \
     --batch_size 2 \
     --grad_accum_steps 4 \
     --num_workers 8 \
@@ -84,12 +86,13 @@ CUDA_VISIBLE_DEVICES=0,1 conda run -n dggt --no-capture-output \
     --val_image_dir $WAYMO_DGGT_VAL_ROOT \
     --dggt_ckpt_path $DGGT_CKPT \
     --tokenizer_ckpt_path $TOKENIZER_CKPT \
-    --feature_stats_path logs/scene_flow_pretrain/feature_stats_pretrain.pt \
-    --log_dir logs/scene_flow_pretrain \
+    --feature_stats_path $FEATURE_STATS \
+    --log_dir logs/scene_flow_pretrain_1024 \
     --scene_start 0 --scene_end 800 \
     --sequence_length 8 \
     --pretrain_task full_scene \
     --patch_grid_h 25 --patch_grid_w 37 \
+    --latent_dim 1024 \
     --batch_size 2 \
     --grad_accum_steps 4 \
     --num_workers 8 \
@@ -146,7 +149,7 @@ CUDA_VISIBLE_DEVICES=0,1 conda run -n dggt --no-capture-output \
 * `--val_every 1000` 表示每 1000 个 optimizer step 跑一次 validation；不是每 1000 个 batch，也不是每 1000 个 epoch。
 * `--val_batches 8` 表示每次 validation 只遍历 8 个 validation batch 估计 loss，用来控制验证耗时；它不会限制训练数据量。
 * `--pretrain_task full_scene` 是默认/推荐语义：`M_preserve=0, M_dest=1`，训练目标是从纯噪声重新生成完整 scene latent，而不是局部编辑填补。当前实现会保留由 dynamic mask 提取的 pseudo-asset `F_asset_tokens` 作为弱 cross-attn 条件，并通过 `--uncond_drop_prob` 训练 null-KV 路径；`pseudo_edit` 只作为兼容旧实验的可选模式保留。
-* validation 图像会保存到 `logs/scene_flow_pretrain/validation/step_xxxxxx/`；默认包含 `generated_raw_3dgs_rgb__cfg*.jpg`（纯噪声经 SceneFlow 采样、tokenizer decode，并用 decoded token 派生的 DGGT `camera_head/depth_head/instance_head/semantic_head/gs_head` 输出；sky/non-sky mask 来自 generated semantic logits，不使用 GT sky mask、GT sky background、GT depth 或 GT dynamic）、`generated_pred_sky_mask__cfg*.jpg`（generated semantic sky mask 诊断图）、`dggt_clean_3dgs_rgb.jpg`（原始 DGGT clean 3DGS render）、`input_rgb_gt.jpg`、latent PCA、误差图和 mask 图。
+* validation 图像会保存到 `logs/scene_flow_pretrain_1024/validation/step_xxxxxx/`；默认包含 `generated_raw_3dgs_rgb__cfg*.jpg`（纯噪声经 SceneFlow 采样、tokenizer decode，并用 decoded token 派生的 DGGT `camera_head/depth_head/instance_head/semantic_head/gs_head` 输出；sky/non-sky mask 来自 generated semantic logits，不使用 GT sky mask、GT sky background、GT depth 或 GT dynamic）、`generated_pred_sky_mask__cfg*.jpg`（generated semantic sky mask 诊断图）、`dggt_clean_3dgs_rgb.jpg`（原始 DGGT clean 3DGS render）、`input_rgb_gt.jpg`、latent PCA、误差图和 mask 图。
 * 当前 tokenizer latent 只覆盖 patch tokens，不覆盖 camera/register special tokens；因此 `generated_raw_3dgs_rgb.jpg` 的相机 special token 仍来自 validation batch，用于定义要渲染的参考视角。它不是 GT 图像内容、GT depth 或 GT dynamic。
 * `--val_sample_steps` 只控制 validation 图像采样步数，不影响训练本身。`15` 偏少，适合 smoke test；正式看图建议先用 `30`，需要更稳定的样本再用 `50`。Wan/FlowMatch 的生成采样也不是训练时的 1000 timestep 全跑，而是在 scheduler timestep 上做几十步推理。
 * 如需只记录 latent/mask 诊断图并跳过较慢的 3DGS RGB 渲染，可额外加 `--no_val_render_rgb`。
@@ -163,12 +166,12 @@ CUDA_VISIBLE_DEVICES=0,1 conda run -n dggt --no-capture-output \
 
 判质量的正确方式：扩散/flow 的 MSE loss 有不可约方差下界（`v_gt=z_clean−eps`，eps 每步重采），从头训的 DiT/ADM/SD/Wan **全都**在 ~1–2K step 后 loss 基本压平、而样本质量再升 100K+ step。**loss 绝对值对扩散模型几乎无诊断价值，只看 EMA 样本。**
 
-仍存在的质量天花板：当前 768-dim tokenizer 只训了 14K step，decoder 欠训会把 SceneFlow 的 latent 误差放大成 grid/糊。**1024-dim 6 万 iter tokenizer 是根因解**；切换时务必重算 feature_stats 并把所有 `--latent_dim` 改 1024（见 §0 注意）。tokenizer 续训时建议跑满 RAE 式 decoder noise augmentation（denoise-recon 阶段），让 decoder 对 SceneFlow latent 误差鲁棒，这直接削 grid。
+正式配置已切到 **1024-dim 6 万 iter tokenizer**。切 tokenizer 时务必重算 `$FEATURE_STATS`，并保持 pretrain / T1 的 `--latent_dim 1024` 与 warm-start checkpoint 维度一致。tokenizer 续训时建议跑满 RAE 式 decoder noise augmentation（denoise-recon 阶段），让 decoder 对 SceneFlow latent 误差鲁棒，这直接削 grid。
 
 最终 warm-start 权重路径（完整 checkpoint；warm-start / 推理默认取其中的 `ema_scene_flow`，不要用裸权重 `_weights_only.pt`）：
 
 ```bash
-logs/scene_flow_pretrain/ckpt/pretrain_step100000.pt
+$SCENE_FLOW_PRETRAIN_CKPT
 ```
 
 新训练保存时也会额外导出 `pretrain_step100000_ema_weights_only.pt` 作为便捷 EMA-only state dict；旧产物若只有 `_weights_only.pt`，那只是裸权重，不能代表 EMA 出图质量。
@@ -185,48 +188,76 @@ python tools/build_flow_train_manifest.py \
     --out_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl
 ```
 
+正式训练不需要单独的 validation manifest。`train_scene_flow.py` 会把 training manifest 按 `--val_fraction 0.1` 做确定性 9:1 entries 切分：90% 用于训练，10% holdout 用于轻量 validation；两边都使用同样的 8 帧窗口、sigma、REPA/EMA 配置。
+
 ## 3. 正式训练参数
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 conda run -n dggt --no-capture-output \
-    torchrun --nproc_per_node=2 train_scene_flow.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
     --ckpt_path $DGGT_CKPT \
     --tokenizer_ckpt_path $TOKENIZER_CKPT \
     --feature_stats_path $FEATURE_STATS \
-    --scene_flow_pretrain_path logs/scene_flow_pretrain/ckpt/pretrain_step100000.pt \
+    --latent_dim 1024 \
+    --scene_flow_pretrain_path $SCENE_FLOW_PRETRAIN_CKPT \
     --scene_flow_pretrain_ema \
     --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
-    --log_dir logs/scene_flow_t1 \
+    --log_dir logs/scene_flow_t1_1024 \
+    --sequence_length 8 \
     --batch_size 2 \
     --grad_accum_steps 4 \
-    --num_workers 8 \
-    --min_frames 4 \
-    --max_frames 8 \
-    --max_steps 100000 \
+    --num_workers 4 \
+    --prefetch_factor 1 \
+    --lr 2e-4 \
+    --weight_decay 0.0 \
+    --ema_decay 0.9995 \
+    --warmup_steps 3000 \
+    --max_steps 150000 \
     --save_every 5000 \
     --vis_every 1000 \
     --log_every 20 \
-    --lr 2e-4 \
-    --weight_decay 0.0 \
-    --warmup_steps 3000 \
+    --wandb_log_every 50 \
+    --shift 3.0 \
+    --weighting_scheme logit_normal \
+    --logit_mean 0.0 --logit_std 1.0 \
+    --loss_weighting_scheme none \
+    --lambda_repa 0.5 \
+    --uncond_drop_prob 0.1 \
+    --guidance_scale 1.0 \
+    --val_guidance_scales "1.0,2.0,4.0" \
+    --val_every 1000 \
+    --val_fraction 0.1 \
+    --val_batches 8 \
+    --val_log_images 4 \
+    --val_sample_steps 50 \
     --grad_clip_norm 1.0 \
     --seed 0 \
-    --precision bf16
+    --precision bf16 \
+    --wandb \
+    --wandb_project dggt-flow \
+    --wandb_name scene_flow_t1_waymo_2a100
 ```
 
-有效 batch / 学习率 / schedule 取值依据（对齐上面的 2×80GB A100 pretrain 配置）：
+正式训练与 2×80GB A100 正式 pretrain 的对齐项：
 
-| 参数 | 取值 | 依据 |
+| 项 | 正式训练取值 | 对齐方式 |
 |---|---|---|
-| 有效 batch | `2 GPU × batch_size 1 × grad_accum 8 = 16` clip/optimizer update | `train_scene_flow.py` 当前 `collate_fn` 只取单样本，正式训练保持每卡 `batch_size=1`，用梯度累积对齐 pretrain 的有效 batch=16 |
-| `--lr 2e-4` | AdamW, β=(0.9,0.95), `--weight_decay 0.0` | 从 EMA pretrain warm-start 后继续训练 SceneFlow + scaffold_packer；沿用 pretrain 的 latent diffusion 学习率，避免对预训练权重施加额外 weight decay |
-| `--warmup_steps 3000` | 与 pretrain 一致 | 当前正式训练脚本只记录该参数，训练循环尚未接 scheduler；后续接入 warmup/cosine 时不需要改命令 |
-| `--max_steps 150000` | 与 pretrain 一致的长跑上限 | 作为正式训练预算上限；中途可按验证效果提前停，不建议把上限设得过低 |
-| `--save_every 5000` / `--vis_every 1000` | 与 pretrain 验证节奏接近 | checkpoint 不要过密；可视化保持每 1000 step 观察 Mode A/B 特征和 mask |
+| tokenizer latent | `--latent_dim 1024` + `$TOKENIZER_CKPT` + `$FEATURE_STATS` | 与 pretrain 使用同一个 1024 tokenizer / latent stats |
+| warm-start | `$SCENE_FLOW_PRETRAIN_CKPT` + `--scene_flow_pretrain_ema` | 从正式 pretrain 的 EMA SceneFlow 权重继续训练 |
+| 帧数 | `--sequence_length 8` | 固定 8 帧，和 pretrain `--sequence_length 8` 一致 |
+| 有效 batch | `2 GPU × batch_size 2 × grad_accum 4 = 16` clip/optimizer update | 与 pretrain 完全一致；DataLoader 现在返回完整 micro-batch list，不再丢弃 `batch[1:]` |
+| DataLoader | `--num_workers 4 --prefetch_factor 1`，默认不启用 `pin_memory` | 每个 cache 文件平均约 651MB，低 prefetch 避免 8 workers × 2 prefetch × batch_size 2 造成几十个大文件并发读；GB 级 batch 走 pin-memory 线程容易触发 `received 0 items of ancdata` |
+| worker tensor sharing | 默认 `--mp_sharing_strategy file_system` | 减少 multiprocessing 通过大量 fd 传递超大 tensor 时的稳定性问题；若系统 `/dev/shm`/临时目录策略特殊，可显式改回 `file_descriptor` |
+| sigma / target | `--shift 3.0 --weighting_scheme logit_normal --logit_mean 0.0 --logit_std 1.0 --loss_weighting_scheme none` | 正式训练代码已改为和 pretrain 一样调用 `build_rectified_flow_target`，用 clean-progress sigma 训练 `v=z_clean-eps` |
+| REPA | `--lambda_repa 0.5` | 正式训练已启用 `return_mid` + `compute_total_loss(... lambda_repa=0.5)` |
+| EMA | `--ema_decay 0.9995`，validation 默认用 EMA | checkpoint 同时保存 raw / full / EMA-only 权重 |
+| validation | `--val_fraction 0.1 --val_every 1000 --val_batches 8 --val_log_images 4 --val_sample_steps 50 --guidance_scale 1.0 --val_guidance_scales "1.0,2.0,4.0"` | 从 training manifest 内部 9:1 holdout，cadence / CFG scales / sampling steps 与正式 pretrain 一致 |
+| schedule | `--lr 2e-4 --weight_decay 0.0 --warmup_steps 3000 --max_steps 150000` | 与正式 pretrain 的 optimizer / warmup / cosine horizon 一致 |
 
-注意：`train_scene_flow.py` 当前的 `step` 计数是 dataloader micro-step，不是 optimizer update；因此 `--grad_accum_steps 8` 下每 8 个 step 更新一次参数，`--max_steps/--save_every/--vis_every` 也按 micro-step 触发。
+注意：`train_scene_flow.py` 的 `global_step` 现在和 pretrain 一样是 optimizer update 口径；`--max_steps/--save_every/--vis_every/--val_every` 都按 optimizer update 触发。
 
-注意：正式训练入口当前没有 pretrain 的 `--shift`、`--weighting_scheme`、`--lambda_repa`、`--ema_decay`、`--guidance_scale`、`--val_guidance_scales` 等 CLI 参数，不要照搬到 `train_scene_flow.py` 命令里。
+注意：正式训练 validation 会保存 loss 标量、latent PCA / mask / CFG 采样诊断图到 `logs/scene_flow_t1_1024/validation/step_xxxxxx/` 并写入 wandb。T1 的完整 3DGS RGB validation 仍建议用 `inference_scene_flow_validation.py` 在 checkpoint 上离线跑；训练内 validation 保持轻量，避免每 1000 step 做 3DGS 渲染拖慢训练。
+
+注意：正式训练 wandb 会在 rank-0 按 `--wandb_log_every` 记录 averaged `train/loss`、`train/loss_flow`、`train/loss_repa`、`train/sigma_mean`、`train/lr` 等标量；如果机器未登录 wandb，可先执行 `wandb login`，或临时去掉 `--wandb` 相关参数。
 
 调试只跑 Mode A：
 
@@ -234,14 +265,17 @@ CUDA_VISIBLE_DEVICES=0,1 conda run -n dggt --no-capture-output \
 CUDA_VISIBLE_DEVICES=2 conda run -n dggt --no-capture-output \
     python -u train_scene_flow.py \
     --ckpt_path $DGGT_CKPT \
+    --tokenizer_ckpt_path $TOKENIZER_CKPT \
+    --feature_stats_path $FEATURE_STATS \
+    --latent_dim 1024 \
+    --scene_flow_pretrain_path $SCENE_FLOW_PRETRAIN_CKPT \
     --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
     --mode_filter mode_a \
     --log_dir logs/scene_flow_t1_mode_a_smoke \
+    --sequence_length 8 \
     --batch_size 1 \
     --grad_accum_steps 1 \
     --num_workers 0 \
-    --min_frames 4 \
-    --max_frames 4 \
     --max_steps 5 \
     --vis_every 2 \
     --log_every 1
