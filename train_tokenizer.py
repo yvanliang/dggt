@@ -97,7 +97,7 @@ NCCL_P2P_DISABLE=1 torchrun \
     --nproc_per_node=2 \
     --master_port=29501 \
     train_tokenizer.py \
-    --resume_path logs/tokenizer_t0_stageA/ckpt/scene_tokenizer_step_060000.pt \
+    --init_tokenizer_path logs/tokenizer_t0_stageA/ckpt/scene_tokenizer_step_060000.pt \
     --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
     --cache_dir /data/disk2/lyy_dataset/tokenizer_cache_pt \
     --cache_split training \
@@ -161,7 +161,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="T0 JointSceneTokenizer pretraining.")
     parser.add_argument("--ckpt_path", type=str, required=True, help="Base DGGT checkpoint.")
     parser.add_argument("--log_dir", type=str, required=True)
-    parser.add_argument("--resume_path", type=str, default=None)
+    parser.add_argument(
+        "--init_tokenizer_path",
+        type=str,
+        default=None,
+        help="Load scene_tokenizer weights only, leaving optimizer/scheduler/global_step freshly initialized.",
+    )
+    parser.add_argument(
+        "--resume_path",
+        type=str,
+        default=None,
+        help="Resume a tokenizer training run, including optimizer, scheduler, and global_step.",
+    )
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging on rank 0.")
     parser.add_argument("--wandb_project", type=str, default="dggt-tokenizer")
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -441,6 +452,13 @@ def load_model_checkpoint(model: VGGT, ckpt_path: str) -> None:
         new_key = key[7:] if key.startswith("module.") else key
         cleaned[new_key] = value
     model.load_state_dict(cleaned, strict=False)
+
+
+def extract_scene_tokenizer_state_dict(payload: Any, ckpt_path: str) -> dict[str, torch.Tensor]:
+    state_dict = payload.get("scene_tokenizer", payload) if isinstance(payload, dict) else payload
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"Unsupported scene_tokenizer checkpoint format: {ckpt_path}")
+    return state_dict
 
 
 def freeze_model_for_t0(model: VGGT) -> None:
@@ -1923,6 +1941,8 @@ def main() -> None:
         raise ValueError("grad_accum_steps must be positive")
     if args.min_frames < 1 or args.max_frames < args.min_frames:
         raise ValueError("Invalid frame range")
+    if args.init_tokenizer_path and args.resume_path:
+        raise ValueError("Use either --init_tokenizer_path or --resume_path, not both")
     cache_dirs = normalize_cache_dirs(args.cache_dir)
     if args.stage_b_mix_raw and len(cache_dirs) == 0 and args.cache_manifest_path is None:
         args.cache_dir = default_stage_b_mix_cache_dirs(args)
@@ -2127,15 +2147,29 @@ def main() -> None:
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
     global_step = 0
 
-    if args.resume_path:
-        resume_payload = torch.load(args.resume_path, map_location="cpu")
-        state_dict = resume_payload.get("scene_tokenizer", resume_payload)
+    if args.init_tokenizer_path:
+        if is_main_process():
+            print(f"[init] loading tokenizer weights: {args.init_tokenizer_path}", flush=True)
+        init_payload = torch.load(args.init_tokenizer_path, map_location="cpu")
+        state_dict = extract_scene_tokenizer_state_dict(init_payload, args.init_tokenizer_path)
         model.scene_tokenizer.load_state_dict(state_dict, strict=True)
-        if "optimizer" in resume_payload:
-            optimizer.load_state_dict(resume_payload["optimizer"])
-        if "scheduler" in resume_payload:
-            scheduler.load_state_dict(resume_payload["scheduler"])
-        global_step = int(resume_payload.get("global_step", 0))
+
+    elif args.resume_path:
+        if is_main_process():
+            print(f"[resume] loading training state: {args.resume_path}", flush=True)
+        resume_payload = torch.load(args.resume_path, map_location="cpu")
+        required_keys = {"scene_tokenizer", "optimizer", "scheduler", "global_step"}
+        if not isinstance(resume_payload, dict) or not required_keys.issubset(resume_payload.keys()):
+            missing = sorted(required_keys.difference(resume_payload.keys() if isinstance(resume_payload, dict) else ()))
+            raise ValueError(
+                f"--resume_path requires a full training checkpoint with {sorted(required_keys)}; "
+                f"missing {missing}. Use --init_tokenizer_path to load tokenizer weights only."
+            )
+        state_dict = extract_scene_tokenizer_state_dict(resume_payload, args.resume_path)
+        model.scene_tokenizer.load_state_dict(state_dict, strict=True)
+        optimizer.load_state_dict(resume_payload["optimizer"])
+        scheduler.load_state_dict(resume_payload["scheduler"])
+        global_step = int(resume_payload["global_step"])
 
     try:
         start_time = time.time()
@@ -2398,6 +2432,10 @@ def main() -> None:
             if should_run_vis and is_distributed():
                 dist.barrier()
 
+            global_step += 1
+            if train_pbar is not None:
+                train_pbar.update(1)
+
             if is_main_process() and global_step > 0 and global_step % args.save_every == 0:
                 save_checkpoint(
                     model.scene_tokenizer,
@@ -2408,10 +2446,6 @@ def main() -> None:
                     feature_stats_path,
                     dirs["ckpt"] / f"scene_tokenizer_step_{global_step:06d}.pt",
                 )
-
-            global_step += 1
-            if train_pbar is not None:
-                train_pbar.update(1)
 
             accum_count = 0
             accum_log_sums = {}
