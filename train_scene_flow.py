@@ -369,6 +369,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--mp_sharing_strategy", type=str, default="file_system",
                         choices=("file_system", "file_descriptor"),
                         help="Torch multiprocessing tensor sharing strategy for DataLoader workers.")
+    parser.add_argument("--no_mmap_plain_cache", action="store_true",
+                        help="Disable mmap=True when reading uncompressed torch cache files.")
     parser.add_argument("--max_steps", type=int, default=40000)
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--vis_every", type=int, default=1000)
@@ -900,6 +902,7 @@ def main() -> None:
         min_frames=args.sequence_length,
         max_frames=args.sequence_length,
         seed=args.seed,
+        mmap_plain_cache=not bool(args.no_mmap_plain_cache),
     )
     val_ds = split_train_val_entries(
         train_ds,

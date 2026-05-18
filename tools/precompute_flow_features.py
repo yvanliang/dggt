@@ -90,10 +90,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--force_overwrite", action="store_true")
     p.add_argument("--dataset_mode", type=int, default=2, help="2 = deterministic")
     p.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16")
-    p.add_argument("--save_compression", choices=["gzip", "none"], default="gzip",
-                   help="Cache file compression. gzip keeps .pt paths but wraps torch serialization.")
+    p.add_argument("--save_compression", choices=["gzip", "zstd", "none"], default="zstd",
+                   help="Cache file compression. gzip/zstd keep .pt paths but wrap torch serialization.")
     p.add_argument("--gzip_level", type=int, default=1,
-                   help="gzip compression level for --save_compression gzip (0-9).")
+                   help="Compression level: gzip level for gzip, zstd level for zstd. Default 1.")
     p.add_argument("--sync_save", action="store_true",
                    help="Save cache on the main thread instead of the default async background writer.")
     p.add_argument("--max_save_threads", type=int, default=0,

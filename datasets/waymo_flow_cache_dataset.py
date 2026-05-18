@@ -93,6 +93,30 @@ def _empty_asset_pass(patch_grid: tuple[int, int], patch_start_idx: int) -> Asse
     )
 
 
+def _dequantize_nplc_subset(
+    *,
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    subset: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Select target frames before dequantizing a `[N, P, L, C]` int8 LUT."""
+    q = QuantizedTokens(
+        data=data.index_select(0, subset),
+        scale=scale.index_select(0, subset),
+        layout="NPLC",
+    )
+    return dequantize_tokens(q, dtype=dtype)
+
+
+def _split_nplc_levels(x: torch.Tensor) -> list[torch.Tensor]:
+    """Convert `[S, P, L, C]` into level tensors `[1, S, P, C]`."""
+    return [
+        x[:, :, level, :].unsqueeze(0).contiguous()
+        for level in range(int(x.shape[2]))
+    ]
+
+
 class WaymoFlowCacheDataset(Dataset):
     """Index-based dataset reading pre-computed FlowDGGT clip caches."""
 
@@ -106,6 +130,8 @@ class WaymoFlowCacheDataset(Dataset):
         lut_dtype: torch.dtype = torch.float16,
         manifest_path: str | Path | None = None,
         mode_filter: list[str] | None = None,
+        include_aux_tokens: bool = False,
+        mmap_plain_cache: bool = True,
     ) -> None:
         super().__init__()
         if min_frames <= 0 or max_frames < min_frames:
@@ -115,6 +141,8 @@ class WaymoFlowCacheDataset(Dataset):
         self._rng = random.Random(int(seed))
         self.lut_dtype = lut_dtype
         self.split = str(split)
+        self.include_aux_tokens = bool(include_aux_tokens)
+        self.mmap_plain_cache = bool(mmap_plain_cache)
 
         if manifest_path is not None:
             self.manifest_path = Path(manifest_path)
@@ -160,7 +188,12 @@ class WaymoFlowCacheDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         entry = self.entries[idx]
         cache_path = Path(entry["cache_path"])
-        payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
+        payload = load_flow_cache(
+            cache_path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=self.mmap_plain_cache,
+        )
         self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
         mode_kind = str(payload["mode_kind"])
         meta = payload["meta"]
@@ -381,44 +414,32 @@ class WaymoFlowCacheDataset(Dataset):
         if sem is not None:
             sem = _sub(sem).unsqueeze(0)
 
-        lut_full = dequantize_tokens(
-            QuantizedTokens(
-                data=pass1["F_g_lut_scene_int8"],
-                scale=pass1["F_g_lut_scene_scale"],
-                layout="NPLC",
-            ),
+        lut_sub = _dequantize_nplc_subset(
+            data=pass1["F_g_lut_scene_int8"],
+            scale=pass1["F_g_lut_scene_scale"],
+            subset=subset,
             dtype=self.lut_dtype,
         )
-        lut_sub = lut_full.index_select(0, subset)
-        _, P, L, C = lut_sub.shape
-        image_tokens_levels = [
-            lut_sub[:, :, l, :].unsqueeze(0).contiguous() for l in range(L)
-        ]
+        image_tokens_levels = _split_nplc_levels(lut_sub)
 
         agg_levels = None
-        if pass1.get("aggregated_tokens_patch_int8") is not None:
-            agg_full = dequantize_tokens(
-                QuantizedTokens(
-                    data=pass1["aggregated_tokens_patch_int8"],
-                    scale=pass1["aggregated_tokens_patch_scale"],
-                    layout="NPLC",
-                ),
+        if self.include_aux_tokens and pass1.get("aggregated_tokens_patch_int8") is not None:
+            agg_sub = _dequantize_nplc_subset(
+                data=pass1["aggregated_tokens_patch_int8"],
+                scale=pass1["aggregated_tokens_patch_scale"],
+                subset=subset,
                 dtype=self.lut_dtype,
             )
-            agg_sub = agg_full.index_select(0, subset)
-            agg_levels = [agg_sub[:, :, l, :].unsqueeze(0).contiguous() for l in range(agg_sub.shape[2])]
+            agg_levels = _split_nplc_levels(agg_sub)
         dino_levels = None
-        if pass1.get("dino_tokens_patch_int8") is not None:
-            dino_full = dequantize_tokens(
-                QuantizedTokens(
-                    data=pass1["dino_tokens_patch_int8"],
-                    scale=pass1["dino_tokens_patch_scale"],
-                    layout="NPLC",
-                ),
+        if self.include_aux_tokens and pass1.get("dino_tokens_patch_int8") is not None:
+            dino_sub = _dequantize_nplc_subset(
+                data=pass1["dino_tokens_patch_int8"],
+                scale=pass1["dino_tokens_patch_scale"],
+                subset=subset,
                 dtype=self.lut_dtype,
             )
-            dino_sub = dino_full.index_select(0, subset)
-            dino_levels = [dino_sub[:, :, l, :].unsqueeze(0).contiguous() for l in range(dino_sub.shape[2])]
+            dino_levels = _split_nplc_levels(dino_sub)
 
         return {
             "pose_enc": pose_enc,
@@ -460,17 +481,13 @@ class WaymoFlowCacheDataset(Dataset):
 
         for k in object_keys:
             entry = asset[k]
-            F_full = dequantize_tokens(
-                QuantizedTokens(
-                    data=entry["F_g_lut_asset_int8"],
-                    scale=entry["F_g_lut_asset_scale"],
-                    layout="NPLC",
-                ),
+            F_sub = _dequantize_nplc_subset(
+                data=entry["F_g_lut_asset_int8"],
+                scale=entry["F_g_lut_asset_scale"],
+                subset=subset,
                 dtype=self.lut_dtype,
             )
-            F_sub = F_full.index_select(0, subset)
-            L = F_sub.shape[2]
-            F_g_lut_asset[k] = [F_sub[:, :, l, :].unsqueeze(0).contiguous() for l in range(L)]
+            F_g_lut_asset[k] = _split_nplc_levels(F_sub)
 
             subset_list = subset.tolist()
             remap = {n: i for i, n in enumerate(subset_list)}
@@ -719,17 +736,13 @@ class WaymoFlowCacheDataset(Dataset):
         ``index_select`` below slices target frames only; it deliberately does
         not reproduce live splatting on a subsetted source-Gaussian set.
         """
-        from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
-
-        q = QuantizedTokens(
-            data=payload["splatted_tok_low_int8"],   # [N_frames, P, L, C]
-            scale=payload["splatted_tok_low_scale"], # [N_frames, L]
-            layout="NPLC",
+        sub = _dequantize_nplc_subset(
+            data=payload["splatted_tok_low_int8"],     # [N_frames, P, L, C]
+            scale=payload["splatted_tok_low_scale"],   # [N_frames, L]
+            subset=subset,
+            dtype=dtype,
         )
-        full = dequantize_tokens(q, dtype=dtype)              # [N, P, L, C]
-        sub = full.index_select(0, subset)                    # [|subset|, P, L, C]
-        L = int(sub.shape[2])
-        return [sub[:, :, l, :].unsqueeze(0).contiguous() for l in range(L)]
+        return _split_nplc_levels(sub)
 
     # ------------------------------------------------------------------ #
     @staticmethod

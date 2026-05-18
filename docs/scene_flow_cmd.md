@@ -247,6 +247,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 | 有效 batch | `2 GPU × batch_size 2 × grad_accum 4 = 16` clip/optimizer update | 与 pretrain 完全一致；DataLoader 现在返回完整 micro-batch list，不再丢弃 `batch[1:]` |
 | DataLoader | `--num_workers 4 --prefetch_factor 1`，默认不启用 `pin_memory` | 每个 cache 文件平均约 651MB，低 prefetch 避免 8 workers × 2 prefetch × batch_size 2 造成几十个大文件并发读；GB 级 batch 走 pin-memory 线程容易触发 `received 0 items of ancdata` |
 | worker tensor sharing | 默认 `--mp_sharing_strategy file_system` | 减少 multiprocessing 通过大量 fd 传递超大 tensor 时的稳定性问题；若系统 `/dev/shm`/临时目录策略特殊，可显式改回 `file_descriptor` |
+| cache 读取 | zstd / gzip / plain 均自动识别；plain torch cache 默认 `mmap=True` | 空间不足时优先把现有 gzip cache 原地转 zstd：同样保留 `.pt` 路径，实测更小且解压显著更快；plain+mmap 最快但空间约翻倍 |
 | sigma / target | `--shift 3.0 --weighting_scheme logit_normal --logit_mean 0.0 --logit_std 1.0 --loss_weighting_scheme none` | 正式训练代码已改为和 pretrain 一样调用 `build_rectified_flow_target`，用 clean-progress sigma 训练 `v=z_clean-eps` |
 | REPA | `--lambda_repa 0.5` | 正式训练已启用 `return_mid` + `compute_total_loss(... lambda_repa=0.5)` |
 | EMA | `--ema_decay 0.9995`，validation 默认用 EMA | checkpoint 同时保存 raw / full / EMA-only 权重 |
@@ -256,6 +257,18 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 注意：`train_scene_flow.py` 的 `global_step` 现在和 pretrain 一样是 optimizer update 口径；`--max_steps/--save_every/--vis_every/--val_every` 都按 optimizer update 触发。
 
 注意：正式训练 validation 会保存 loss 标量、latent PCA / mask / CFG 采样诊断图到 `logs/scene_flow_t1_1024/validation/step_xxxxxx/` 并写入 wandb。T1 的完整 3DGS RGB validation 仍建议用 `inference_scene_flow_validation.py` 在 checkpoint 上离线跑；训练内 validation 保持轻量，避免每 1000 step 做 3DGS 渲染拖慢训练。
+
+空间不足时的 cache 提速建议：
+
+```bash
+conda run -n dggt --no-capture-output python tools/recompress_flow_cache.py \
+    --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
+    --compression zstd \
+    --gzip_level 1 \
+    --workers 1
+```
+
+该命令逐文件原地替换，manifest 不需要改；峰值额外空间约为当前正在转换的一个 zstd 临时文件。后续重新 precompute cache 时可直接使用 `--save_compression zstd --gzip_level 1`。
 
 注意：正式训练 wandb 会在 rank-0 按 `--wandb_log_every` 记录 averaged `train/loss`、`train/loss_flow`、`train/loss_repa`、`train/sigma_mean`、`train/lr` 等标量；如果机器未登录 wandb，可先执行 `wandb login`，或临时去掉 `--wandb` 相关参数。
 

@@ -99,12 +99,13 @@ NCCL_P2P_DISABLE=1 torchrun \
     train_tokenizer.py \
     --init_tokenizer_path logs/tokenizer_t0_stageA/ckpt/scene_tokenizer_step_060000.pt \
     --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
-    --cache_dir /data/disk2/lyy_dataset/tokenizer_cache_pt \
+    --cache_manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
     --cache_split training \
     --log_dir logs/tokenizer_t0_stageB \
     --batch_size 4 \
     --grad_accum_steps 2 \
-    --num_workers 16 \
+    --num_workers 4 \
+    --prefetch_factor 1 \
     --max_steps 30000 \
     --save_every 2500 \
     --vis_every 1000 \
@@ -138,8 +139,9 @@ NCCL_P2P_DISABLE=1 torchrun \
     --wandb_project dggt-tokenizer \
     --wandb_name t0_stageB_cached_dz1024
 
-For mixed Mode-A/Mode-B flow caches, replace --cache_dir with:
-    --cache_manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl
+For efficient cached training, recompress existing gzip flow caches to zstd
+with tools/recompress_flow_cache.py and write new caches with
+tools/precompute_flow_features.py --save_compression zstd --gzip_level 1.
 '''
 
 
@@ -246,6 +248,30 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=1,
+        help="DataLoader batches prefetched per worker. Keep low for GB-scale cache items.",
+    )
+    parser.add_argument("--no_persistent_workers", action="store_true")
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help="Enable DataLoader pin_memory. Disabled by default for cached tokenizer training.",
+    )
+    parser.add_argument(
+        "--mp_sharing_strategy",
+        type=str,
+        default="file_system",
+        choices=("file_system", "file_descriptor"),
+        help="Torch multiprocessing tensor sharing strategy for DataLoader workers.",
+    )
+    parser.add_argument(
+        "--no_mmap_plain_cache",
+        action="store_true",
+        help="Disable mmap=True when reading uncompressed torch cache files.",
+    )
     parser.add_argument("--max_steps", type=int, default=60000)
     parser.add_argument("--save_every", type=int, default=1000)
     parser.add_argument("--vis_every", type=int, default=1000)
@@ -585,6 +611,15 @@ def tokenizer_cache_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "predictions": predictions,
         "mode_kind": [str(item.get("mode_kind", "")) for item in batch],
         "cache_path": [str(item.get("cache_path", "")) for item in batch],
+    }
+
+
+def dataloader_runtime_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    if int(args.num_workers) <= 0:
+        return {}
+    return {
+        "prefetch_factor": max(1, int(args.prefetch_factor)),
+        "persistent_workers": not bool(args.no_persistent_workers),
     }
 
 
@@ -1880,7 +1915,12 @@ def build_cached_dataset(
         def __getitem__(self, idx: int) -> dict[str, Any]:
             entry = self.entries[idx]
             cache_path = Path(entry["cache_path"])
-            payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
+            payload = load_flow_cache(
+                cache_path,
+                map_location="cpu",
+                weights_only=False,
+                mmap=self.mmap_plain_cache,
+            )
             self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
             mode_kind = str(payload["mode_kind"])
             meta = payload["meta"]
@@ -1924,6 +1964,7 @@ def build_cached_dataset(
         seed=args.seed + (100000 if validation else 0),
         lut_dtype=torch.bfloat16 if args.precision == "bf16" else torch.float32,
         mode_filter=mode_filter if mode_filter is not None else parse_cache_mode_filter(args.cache_mode_filter),
+        mmap_plain_cache=not bool(args.no_mmap_plain_cache),
     )
 
 
@@ -1931,6 +1972,8 @@ def main() -> None:
     args = build_argparser().parse_args()
 
     device, local_rank, world_size = setup_distributed(args)
+    if int(args.num_workers) > 0:
+        torch.multiprocessing.set_sharing_strategy(str(args.mp_sharing_strategy))
     seed_everything(args.seed + get_rank())
 
     if args.batch_size < 1:
@@ -2039,8 +2082,9 @@ def main() -> None:
             batch_size=batch_size,
             sampler=sampler_obj,
             num_workers=args.num_workers,
-            pin_memory=device.type == "cuda",
+            pin_memory=bool(args.pin_memory) and device.type == "cuda",
             collate_fn=collate_fn,
+            **dataloader_runtime_kwargs(args),
         )
 
     if use_mixed_teacher:

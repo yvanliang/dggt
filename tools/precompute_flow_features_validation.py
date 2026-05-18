@@ -105,8 +105,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--save_fit_metrics", action="store_true")
     p.add_argument("--max_pose_refine_yaw_deg", type=float, default=15.0)
     p.add_argument("--asset_yaw_correction_deg", type=float, default=180.0)
-    p.add_argument("--save_compression", choices=["gzip", "none"], default="gzip")
-    p.add_argument("--gzip_level", type=int, default=1)
+    p.add_argument("--save_compression", choices=["gzip", "zstd", "none"], default="zstd")
+    p.add_argument("--gzip_level", type=int, default=1,
+                   help="Compression level: gzip level for gzip, zstd level for zstd. Default 1.")
     p.add_argument("--sync_save", action="store_true")
     p.add_argument("--max_save_threads", type=int, default=0)
     p.add_argument("--chunk_channels", type=int, default=64)
