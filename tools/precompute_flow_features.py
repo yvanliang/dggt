@@ -58,12 +58,14 @@ from datasets.waymo_edit_dataset import (
 from dggt.models.asset_pass import AssetAggregatorPass
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens, quantize_tokens
-from dggt.utils.flow_cache_io import save_flow_cache
+from dggt.utils.flow_cache_io import load_flow_cache, save_flow_cache
 from dggt.utils.gaussian_edit import parse_object_slots
 from dggt.utils.tokens import select_patch_pyramid
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
+CACHE_SCHEMA_VERSION = 7
+GS_CONF_REPAIR_VALUE = 1_000_000.0
 CLIP_LENGTH = 29
 
 
@@ -88,6 +90,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--start_clip_idx", type=int, default=0)
     p.add_argument("--end_clip_idx", type=int, default=-1, help="-1 for all")
     p.add_argument("--force_overwrite", action="store_true")
+    p.add_argument(
+        "--overwrite_v6",
+        action="store_true",
+        help=(
+            "If an output .pt already exists, keep it only when it is already the "
+            f"latest schema v{CACHE_SCHEMA_VERSION}; otherwise regenerate and overwrite it."
+        ),
+    )
     p.add_argument("--dataset_mode", type=int, default=2, help="2 = deterministic")
     p.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16")
     p.add_argument("--save_compression", choices=["gzip", "zstd", "none"], default="zstd",
@@ -175,6 +185,42 @@ def _assert_no_nan_tensor(name: str, tensor: torch.Tensor | None, *, require_fin
         raise RuntimeError(f"{name} contains NaN")
     if require_finite and torch.isinf(tensor).any().item():
         raise RuntimeError(f"{name} contains Inf")
+
+
+def _finite_gs_conf_for_cache(gs_conf: torch.Tensor) -> torch.Tensor:
+    """Store pass1.gs_conf without fp16 overflow in schema v7 caches."""
+    return torch.nan_to_num(
+        gs_conf.detach().float(),
+        nan=GS_CONF_REPAIR_VALUE,
+        posinf=GS_CONF_REPAIR_VALUE,
+        neginf=GS_CONF_REPAIR_VALUE,
+    ).cpu()
+
+
+def _read_cache_schema_version(path: Path) -> int | None:
+    try:
+        payload = load_flow_cache(path, map_location="cpu", weights_only=False, mmap=False)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return int(payload.get("schema_version", 0))
+    except Exception:
+        return None
+
+
+def _should_skip_existing_cache(path: Path, args: argparse.Namespace) -> tuple[bool, str]:
+    if not path.is_file():
+        return False, "missing"
+    if bool(args.force_overwrite):
+        return False, "force_overwrite"
+    if bool(getattr(args, "overwrite_v6", False)):
+        version = _read_cache_schema_version(path)
+        if version == CACHE_SCHEMA_VERSION:
+            return True, f"schema_v{CACHE_SCHEMA_VERSION}"
+        return False, f"schema_v{version if version is not None else 'unreadable'}"
+    return True, "exists"
 
 
 def _assert_valid_mode_b_payload(payload: dict[str, Any]) -> None:
@@ -1177,7 +1223,7 @@ def precompute_one_clip(
     gs_map = predictions["gs_map"][0].to(torch.float16).cpu()
     depth = predictions["depth"][0].to(torch.float16).cpu()
     dynamic_conf = predictions["dynamic_conf"][0].to(torch.float16).cpu()
-    gs_conf = predictions["gs_conf"][0].to(torch.float16).cpu()
+    gs_conf = _finite_gs_conf_for_cache(predictions["gs_conf"][0])
     pose_enc = predictions["pose_enc"][0].to(torch.float16).cpu()
     semantic_logits = predictions.get("semantic_logits")
     if semantic_logits is not None:
@@ -1185,7 +1231,7 @@ def precompute_one_clip(
     _assert_no_nan_tensor("pass1.gs_map", gs_map)
     _assert_no_nan_tensor("pass1.depth", depth)
     _assert_no_nan_tensor("pass1.dynamic_conf", dynamic_conf)
-    _assert_no_nan_tensor("pass1.gs_conf", gs_conf)
+    _assert_no_nan_tensor("pass1.gs_conf", gs_conf, require_finite=True)
     _assert_no_nan_tensor("pass1.pose_enc", pose_enc, require_finite=True)
     _assert_no_nan_tensor("pass1.semantic_logits", semantic_logits)
 
@@ -1303,7 +1349,7 @@ def precompute_one_clip(
     object_meta = _build_object_meta(sample)
 
     payload: dict[str, Any] = {
-        "schema_version": 6,
+        "schema_version": CACHE_SCHEMA_VERSION,
         "mode_kind": args.edit_mode,
         "meta": {
             "manifest_index": _sample_manifest_index(sample, int(sample.get("sample_index", 0))),
@@ -1483,11 +1529,17 @@ def main() -> None:
                 del sample, record
                 progress.set_postfix(done=done_count, saved=saved_count, skip=skip_count, err=err_count)
                 continue
-            if out_path.is_file() and not args.force_overwrite:
+            skip_existing, skip_reason = _should_skip_existing_cache(out_path, args)
+            if skip_existing:
                 skip_count += 1
                 del sample, record
                 progress.set_postfix(done=done_count, saved=saved_count, skip=skip_count, err=err_count)
                 continue
+            if out_path.is_file() and args.overwrite_v6 and not args.force_overwrite:
+                progress.write(
+                    f"[regen] idx={idx:05d} manifest={manifest_index:06d} "
+                    f"existing={skip_reason} -> schema_v{CACHE_SCHEMA_VERSION}"
+                )
 
             t0 = time.time()
             try:

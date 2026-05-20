@@ -7,7 +7,7 @@ decoupled localization ONCE, then derive 5 variant caches:
   insert {insertion, replacement, reposition} (all 4 edits in one scene).
 * ``delete`` / ``add`` / ``replace`` / ``move`` -- single-edit-type caches.
 
-Output (schema-identical to Mode A v6, ``mode_kind="mode_a"``; FLAT layout so
+Output (schema-identical to Mode A v7, ``mode_kind="mode_a"``; FLAT layout so
 the unmodified Mode-A toolchain works -- ``index = entry_index*5 + variant_ord``,
 ``variant_ord`` = combined0/delete1/add2/replace3/move4):
 
@@ -55,17 +55,20 @@ from dggt.utils.validation_edit_localize import (
 from tools.precompute_flow_features import (
     DEFAULT_PROCESSED_ROOT,
     AsyncFlowCacheWriter,
+    CACHE_SCHEMA_VERSION,
     _as_homogeneous_viewmats,
     _assert_no_nan_tensor,
     _build_object_meta,
     _build_training_predictions_from_cache_payload,
     _cleanup_cuda,
     _compute_and_pack_pass2_splatted_tok_low,
+    _finite_gs_conf_for_cache,
     _load_vggt,
     _pack_mode_a_asset_pass_result,
     _pack_pass1_tokens,
     _pack_phase1_localized,
     _replace_asset_luts_with_cached_dtype,
+    _should_skip_existing_cache,
 )
 
 ALL_VARIANTS = ["combined", "delete", "add", "replace", "move"]
@@ -101,6 +104,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--start", type=int, default=None, help="entry index, inclusive")
     p.add_argument("--end", type=int, default=None, help="entry index, exclusive")
     p.add_argument("--force_overwrite", action="store_true")
+    p.add_argument(
+        "--overwrite_v6",
+        action="store_true",
+        help=(
+            "If an output .pt already exists, keep it only when it is already the "
+            f"latest schema v{CACHE_SCHEMA_VERSION}; otherwise regenerate and overwrite it."
+        ),
+    )
     p.add_argument("--asset_batch_size", type=int, default=1)
     p.add_argument("--save_fit_metrics", action="store_true")
     p.add_argument("--max_pose_refine_yaw_deg", type=float, default=15.0)
@@ -157,7 +168,7 @@ def _assemble_payload(
 ) -> dict[str, Any]:
     ve = sample_cached["validation_edit"]
     return {
-        "schema_version": 6,
+        "schema_version": CACHE_SCHEMA_VERSION,
         "mode_kind": "mode_a",
         "meta": {
             "manifest_index": int(ve["entry_index"]),
@@ -242,7 +253,7 @@ def precompute_one_entry(
     gs_map = predictions["gs_map"][0].to(torch.float16).cpu()
     depth = predictions["depth"][0].to(torch.float16).cpu()
     dynamic_conf = predictions["dynamic_conf"][0].to(torch.float16).cpu()
-    gs_conf = predictions["gs_conf"][0].to(torch.float16).cpu()
+    gs_conf = _finite_gs_conf_for_cache(predictions["gs_conf"][0])
     pose_enc = predictions["pose_enc"][0].to(torch.float16).cpu()
     semantic_logits = predictions.get("semantic_logits")
     if semantic_logits is not None:
@@ -250,7 +261,7 @@ def precompute_one_entry(
     _assert_no_nan_tensor("pass1.gs_map", gs_map)
     _assert_no_nan_tensor("pass1.depth", depth)
     _assert_no_nan_tensor("pass1.dynamic_conf", dynamic_conf)
-    _assert_no_nan_tensor("pass1.gs_conf", gs_conf)
+    _assert_no_nan_tensor("pass1.gs_conf", gs_conf, require_finite=True)
     _assert_no_nan_tensor("pass1.pose_enc", pose_enc, require_finite=True)
     _assert_no_nan_tensor("pass1.semantic_logits", semantic_logits)
 
@@ -436,11 +447,18 @@ def main() -> None:
             entry = dataset.entries[idx]
             clip_name = str(entry.get("clip_name", ""))
             entry_index = int(entry.get("index", idx))
-            todo = [
-                v for v in variants
-                if args.force_overwrite
-                or not (split_root / f"{variant_cache_index(entry_index, v):06d}.pt").is_file()
-            ]
+            todo = []
+            for variant in variants:
+                out_path = split_root / f"{variant_cache_index(entry_index, variant):06d}.pt"
+                skip_existing, skip_reason = _should_skip_existing_cache(out_path, args)
+                if skip_existing:
+                    continue
+                if out_path.is_file() and args.overwrite_v6 and not args.force_overwrite:
+                    progress.write(
+                        f"[regen] entry={idx:03d} variant={variant} "
+                        f"existing={skip_reason} -> schema_v{CACHE_SCHEMA_VERSION}"
+                    )
+                todo.append(variant)
             if not todo:
                 continue
 

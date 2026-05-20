@@ -40,6 +40,7 @@ from dggt.utils.flow_cache_io import load_flow_cache
 from dggt.utils.gaussian_edit import Sim3Transform
 
 
+SUPPORTED_CACHE_SCHEMA_VERSIONS = (6, 7)
 GS_CONF_REPAIR_VALUE = 1_000_000.0
 
 
@@ -61,6 +62,17 @@ def repair_cached_gs_conf(gs_conf: torch.Tensor) -> torch.Tensor:
         posinf=GS_CONF_REPAIR_VALUE,
         neginf=GS_CONF_REPAIR_VALUE,
     )
+
+
+def prepare_cached_gs_conf(gs_conf: torch.Tensor, schema_version: int) -> torch.Tensor:
+    """Return cache gs_conf in the representation expected by training.
+
+    Schema v6 stored this field as fp16 and may contain overflowed infinities.
+    Schema v7 stores it directly as finite float32, so it is passed through.
+    """
+    if int(schema_version) < 7:
+        return repair_cached_gs_conf(gs_conf)
+    return gs_conf
 
 
 def _parse_cache_root_spec(cache_root: str | Path) -> tuple[Path, str]:
@@ -238,7 +250,7 @@ class WaymoFlowCacheDataset(Dataset):
         cameras_dggt = self._build_cameras_dggt(payload, subset_t)
         alignment = self._build_alignment(payload)
 
-        # Schema v6 fast-path inputs.
+        # Schema v6/v7 fast-path inputs.
         # * phase1_localized          — Mode A only (Mode B doesn't run editor.localize).
         # * pass2_splatted_tok_low    — both modes (precomputed splat→blend output,
         #                               i.e. the *input* to tokenizer.encode).
@@ -253,7 +265,7 @@ class WaymoFlowCacheDataset(Dataset):
             phase1_payload = payload.get("phase1_localized")
             if phase1_payload is None:
                 raise RuntimeError(
-                    f"Mode-A cache {cache_path} missing phase1_localized payload (schema v6)."
+                    f"Mode-A cache {cache_path} missing phase1_localized payload (schema v6/v7)."
                 )
             phase1_localized_subset = self._subset_phase1_localized(
                 phase1_payload, subset_t
@@ -262,7 +274,7 @@ class WaymoFlowCacheDataset(Dataset):
         if pass2_payload is None:
             raise RuntimeError(
                 f"Cache {cache_path} missing pass2_splatted_tok_low payload "
-                "(schema v6). Re-run tools/precompute_flow_features.py."
+                "(schema v6/v7). Re-run tools/precompute_flow_features.py."
             )
         splatted_tok_low_cached = self._subset_pass2_splatted_tok_low(
             pass2_payload, subset_t, dtype=self.lut_dtype,
@@ -356,19 +368,19 @@ class WaymoFlowCacheDataset(Dataset):
         cache_path: Path,
         entry: dict[str, Any],
     ) -> None:
-        """Fail early unless the payload is the latest v6 training cache."""
+        """Fail early unless the payload is a supported training cache."""
         schema_version = int(payload.get("schema_version", 0))
-        if schema_version != 6:
+        if schema_version not in SUPPORTED_CACHE_SCHEMA_VERSIONS:
             raise RuntimeError(
                 f"Cache {cache_path} has schema_version={schema_version}; "
-                "training now supports only schema_version == 6. "
+                f"training supports only schema_version in {SUPPORTED_CACHE_SCHEMA_VERSIONS}. "
                 "Re-run tools/precompute_flow_features.py."
             )
         mode_kind = payload.get("mode_kind")
         if mode_kind not in ("mode_a", "mode_b"):
             raise RuntimeError(
                 f"Cache {cache_path} has invalid mode_kind={mode_kind!r}; "
-                "v6 training caches must set 'mode_a' or 'mode_b'."
+                "training caches must set 'mode_a' or 'mode_b'."
             )
         entry_mode = entry.get("mode_kind")
         if entry_mode not in (None, "", "unknown") and str(entry_mode) != str(mode_kind):
@@ -379,17 +391,17 @@ class WaymoFlowCacheDataset(Dataset):
         if payload.get("pass2_splatted_tok_low") is None:
             raise RuntimeError(
                 f"Cache {cache_path} missing pass2_splatted_tok_low; "
-                "v6 training requires pre-tokenizer pass2 cache."
+                "training requires pre-tokenizer pass2 cache."
             )
         if payload.get("pass2_z_splat") is not None:
             raise RuntimeError(
                 f"Cache {cache_path} still carries legacy pass2_z_splat; "
-                "regenerate as schema v6 without tokenizer-output cache."
+                "regenerate as schema v7 without tokenizer-output cache."
             )
         if mode_kind == "mode_a" and payload.get("phase1_localized") is None:
             raise RuntimeError(
                 f"Mode-A cache {cache_path} missing phase1_localized; "
-                "v6 training requires cached Phase-1 localization."
+                "training requires cached Phase-1 localization."
             )
         if mode_kind == "mode_b" and payload.get("phase1_localized") is not None:
             raise RuntimeError(
@@ -487,6 +499,7 @@ class WaymoFlowCacheDataset(Dataset):
     # ------------------------------------------------------------------ #
     def _build_predictions(self, payload: dict[str, Any], subset: torch.Tensor) -> dict[str, torch.Tensor]:
         pass1 = payload["pass1"]
+        schema_version = int(payload["schema_version"])
 
         def _sub(t: torch.Tensor) -> torch.Tensor:
             return t.index_select(0, subset)
@@ -494,7 +507,7 @@ class WaymoFlowCacheDataset(Dataset):
         gs_map = _sub(pass1["gs_map"]).unsqueeze(0)
         depth = _sub(pass1["depth"]).unsqueeze(0)
         dyn = _sub(pass1["dynamic_conf"]).unsqueeze(0)
-        gs_conf = repair_cached_gs_conf(_sub(pass1["gs_conf"])).unsqueeze(0)
+        gs_conf = prepare_cached_gs_conf(_sub(pass1["gs_conf"]), schema_version).unsqueeze(0)
         pose_enc = _sub(pass1["pose_enc"]).unsqueeze(0)
         sem = pass1.get("semantic_logits")
         if sem is not None:

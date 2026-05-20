@@ -26,7 +26,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
-from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
+from datasets.waymo_flow_cache_dataset import SUPPORTED_CACHE_SCHEMA_VERSIONS, WaymoFlowCacheDataset
 from dggt.losses.flow_losses import build_rectified_flow_target, compute_total_loss
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
@@ -436,10 +436,11 @@ def _move_v6_fast_path_inputs(
     device: torch.device,
 ) -> tuple[dict[str, Any] | None, list[torch.Tensor]]:
     schema_version = int(item.get("cache_schema_version", 0))
-    if schema_version != 6:
+    if schema_version not in SUPPORTED_CACHE_SCHEMA_VERSIONS:
         raise RuntimeError(
             f"Training item {item.get('cache_path', '<unknown>')} has "
-            f"cache_schema_version={schema_version}; only v6 cache is supported."
+            f"cache_schema_version={schema_version}; supported versions are "
+            f"{SUPPORTED_CACHE_SCHEMA_VERSIONS}."
         )
 
     if mode_kind not in ("mode_a", "mode_b"):
@@ -452,7 +453,7 @@ def _move_v6_fast_path_inputs(
     if mode_kind == "mode_a":
         if phase1_localized_lite is None:
             raise RuntimeError(
-                f"Mode-A v6 item {item.get('cache_path', '<unknown>')} missing phase1_localized."
+                f"Mode-A cache item {item.get('cache_path', '<unknown>')} missing phase1_localized."
             )
         phase1_localized_lite = {
             k: v.to(device) if torch.is_tensor(v) else v
