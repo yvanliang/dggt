@@ -154,6 +154,7 @@ python tools/build_flow_train_manifest.py \
 torchrun --nproc_per_node=8 train_scene_flow.py \
     --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
     --manifest_path /data/flow_cache/training_manifest.jsonl \
+    --val_manifest_path /data/flow_cache/validation_manifest.jsonl \
     --log_dir runs/flow_t1 \
     --batch_size 1 --grad_accum_steps 2 \
     --min_frames 4 --max_frames 8 \

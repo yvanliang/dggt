@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -102,11 +103,15 @@ NCCL_P2P_DISABLE=1 torchrun \
     --cache_manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
     --cache_split training \
     --log_dir logs/tokenizer_t0_stageB \
+    --stage_b_mix_raw \
+    --min_frames 10 \
+    --max_frames 10 \
     --batch_size 4 \
+    --raw_batch_size 4 \
     --grad_accum_steps 2 \
     --num_workers 4 \
     --prefetch_factor 1 \
-    --max_steps 30000 \
+    --max_steps 40000 \
     --save_every 2500 \
     --vis_every 1000 \
     --log_every 50 \
@@ -206,20 +211,7 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Merged v6 flow-cache manifest JSONL for cached tokenizer training.",
     )
-    parser.add_argument(
-        "--cache_val_dir",
-        type=str,
-        default=None,
-        help="Optional validation cache root. Defaults to the training cache source.",
-    )
-    parser.add_argument(
-        "--cache_val_manifest_path",
-        type=str,
-        default=None,
-        help="Optional validation cache manifest. Defaults to the training cache source.",
-    )
     parser.add_argument("--cache_split", type=str, default="training")
-    parser.add_argument("--cache_val_split", type=str, default="validation")
     parser.add_argument(
         "--stage_b_mix_raw",
         action="store_true",
@@ -581,6 +573,19 @@ def _collate_cache_predictions(predictions: list[dict[str, Any]]) -> dict[str, A
     return out
 
 
+def _collate_cache_level_list(items: list[list[torch.Tensor]], *, key: str) -> list[torch.Tensor]:
+    if len(items) == 0:
+        raise ValueError(f"Received an empty cached level list for {key!r}")
+    num_levels = len(items[0])
+    for levels in items:
+        if len(levels) != num_levels:
+            raise ValueError(f"Cached samples disagree on {key} level count: {len(levels)} vs {num_levels}")
+    return [
+        torch.cat([unwrap_tensor(levels[level_idx]) for levels in items], dim=0)
+        for level_idx in range(num_levels)
+    ]
+
+
 def tokenizer_cache_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     """Collate the small subset of `WaymoFlowCacheDataset` needed by T0 training."""
     if len(batch) == 0:
@@ -606,11 +611,25 @@ def tokenizer_cache_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     samples["num_frames"] = torch.tensor(frame_counts, dtype=torch.long)
 
     predictions = _collate_cache_predictions([item["predictions"] for item in batch])
+    teacher_values = [
+        item.get("tokenizer_teacher_levels", item.get("splatted_tok_low_cached"))
+        for item in batch
+    ]
+    if any(value is None for value in teacher_values):
+        raise KeyError(
+            "Cached tokenizer item is missing `tokenizer_teacher_levels`; "
+            "Stage-B requires pass2_splatted_tok_low from the flow cache."
+        )
+    predictions["tokenizer_teacher_levels"] = _collate_cache_level_list(
+        teacher_values,
+        key="tokenizer_teacher_levels",
+    )
     return {
         "sample": samples,
         "predictions": predictions,
         "mode_kind": [str(item.get("mode_kind", "")) for item in batch],
         "cache_path": [str(item.get("cache_path", "")) for item in batch],
+        "subset_frames": [item.get("subset_frames") for item in batch],
     }
 
 
@@ -683,33 +702,28 @@ def make_grid(images: list[Image.Image], cols: int) -> Image.Image:
 
 
 def build_triplet_grid(
-    teacher: torch.Tensor,
-    student: torch.Tensor,
-    max_frames: int = 4,
+    gt: torch.Tensor,
+    pred: torch.Tensor,
+    max_frames: int = 8,
 ) -> Image.Image:
-    teacher = teacher.detach().cpu().float().clamp(0.0, 1.0)
-    student = student.detach().cpu().float().clamp(0.0, 1.0)
-    diff = (student - teacher).abs().clamp(0.0, 1.0)
-    num_frames = min(max_frames, teacher.shape[0])
+    gt = gt.detach().cpu().float().clamp(0.0, 1.0)
+    pred = pred.detach().cpu().float().clamp(0.0, 1.0)
+    diff = (pred - gt).abs().clamp(0.0, 1.0)
+    num_frames = min(int(max_frames), int(gt.shape[0]), int(pred.shape[0]))
     pil_images: list[Image.Image] = []
-    for frame_idx in range(num_frames):
-        pil_images.extend(
-            [
-                tensor_to_pil_rgb(teacher[frame_idx]),
-                tensor_to_pil_rgb(student[frame_idx]),
-                tensor_to_pil_rgb(diff[frame_idx]),
-            ]
-        )
-    return make_grid(pil_images, cols=3)
+    for row in (pred, gt, diff):
+        for frame_idx in range(num_frames):
+            pil_images.append(tensor_to_pil_rgb(row[frame_idx]))
+    return make_grid(pil_images, cols=num_frames)
 
 
 def save_triplet_grid(
-    teacher: torch.Tensor,
-    student: torch.Tensor,
+    gt: torch.Tensor,
+    pred: torch.Tensor,
     path: Path,
-    max_frames: int = 4,
+    max_frames: int = 8,
 ) -> Image.Image:
-    grid = build_triplet_grid(teacher, student, max_frames=max_frames)
+    grid = build_triplet_grid(gt, pred, max_frames=max_frames)
     grid.save(path)
     return grid
 
@@ -991,10 +1005,13 @@ def _render_scene_single_from_outputs(
     point_map = unproject_depth_map_to_point_map_torch(depth.float(), extrinsics_3x4.float(), intrinsics.float())
 
     sky_mask_hw = sky_mask.permute(0, 1, 3, 4, 2)
-    non_sky_mask = (sky_mask_hw == 0).any(dim=-1)
-    dynamic_prob = torch.sigmoid(dynamic_conf.float().squeeze(-1))
+    non_sky_mask = (sky_mask_hw < 0.5).any(dim=-1)
+    dynamic_logits = dynamic_conf.float().squeeze(-1)
+    dynamic_prob = torch.sigmoid(dynamic_logits)
 
-    static_mask = torch.ones_like(non_sky_mask, dtype=torch.bool)
+    # Match DGGT inference: split static/dynamic with the raw dynamic logit,
+    # then use sigmoid(dynamic_logit) as the opacity mixing weight.
+    static_mask = non_sky_mask & (dynamic_logits < 0.5)
     static_points = point_map[static_mask].reshape(-1, 3)
     static_rgbs, static_opacity, static_scales, static_rotations = split_gs_with_mask(gs_map.float(), static_mask)
     static_opacity = static_opacity * (1.0 - dynamic_prob[static_mask])
@@ -1194,7 +1211,11 @@ def compute_feature_stats_from_cache(
 
     for sample_idx in local_indices:
         item = dataset[sample_idx]
-        image_patch = item["predictions"]["image_tokens_levels"]
+        image_patch = item.get("tokenizer_teacher_levels")
+        if image_patch is None:
+            image_patch = item["predictions"].get("tokenizer_teacher_levels")
+        if image_patch is None:
+            image_patch = item["predictions"]["image_tokens_levels"]
         if len(image_patch) != len(levels):
             raise ValueError(
                 f"Cached item has {len(image_patch)} levels, but tokenizer expects {len(levels)}"
@@ -1251,6 +1272,198 @@ def get_feature_stats_from_cache(
     return torch.load(stats_path, map_location="cpu")
 
 
+def _cache_teacher_levels_from_item(item: dict[str, Any]) -> list[torch.Tensor]:
+    image_patch = item.get("tokenizer_teacher_levels")
+    if image_patch is None:
+        image_patch = item["predictions"].get("tokenizer_teacher_levels")
+    if image_patch is None:
+        image_patch = item["predictions"]["image_tokens_levels"]
+    return image_patch
+
+
+def _accumulate_feature_levels(
+    image_patch: list[torch.Tensor],
+    *,
+    levels: tuple[int, ...],
+    device: torch.device,
+    sum_acc: torch.Tensor | None,
+    sum_sq_acc: torch.Tensor | None,
+    count_acc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if len(image_patch) != len(levels):
+        raise ValueError(
+            f"Feature stats item has {len(image_patch)} levels, but tokenizer expects {len(levels)}"
+        )
+    channels = int(image_patch[0].shape[-1])
+    if sum_acc is None:
+        sum_acc = torch.zeros((len(levels), channels), dtype=torch.float64, device=device)
+        sum_sq_acc = torch.zeros_like(sum_acc)
+    if sum_sq_acc is None:
+        raise RuntimeError("sum_sq_acc unexpectedly None after sum_acc initialization")
+    for level_idx, tokens in enumerate(image_patch):
+        flat = tokens.reshape(-1, tokens.shape[-1]).to(device=device, dtype=torch.float64)
+        sum_acc[level_idx] += flat.sum(dim=0)
+        sum_sq_acc[level_idx] += (flat * flat).sum(dim=0)
+        count_acc[level_idx] += flat.shape[0]
+    return sum_acc, sum_sq_acc
+
+
+def compute_feature_stats_mixed(
+    model: VGGT,
+    datasets: dict[str, Any],
+    args: argparse.Namespace,
+    device: torch.device,
+    levels: tuple[int, ...],
+    stats_path: Path,
+) -> dict[str, torch.Tensor]:
+    schedule = ("raw", "cache_mode_a", "raw", "cache_mode_b")
+    for name in schedule:
+        if name not in datasets or len(datasets[name]) == 0:
+            raise ValueError(f"Mixed feature stats require non-empty dataset {name!r}")
+
+    sum_acc: torch.Tensor | None = None
+    sum_sq_acc: torch.Tensor | None = None
+    count_acc = torch.zeros((len(levels),), dtype=torch.float64, device=device)
+
+    max_items = int(args.stats_steps)
+    rank = get_rank()
+    dist_world_size = dist.get_world_size() if is_distributed() else 1
+    if max_items < 1:
+        raise ValueError("--stats_steps must be positive for mixed feature stats")
+    local_total = int(math.ceil(max_items / float(dist_world_size)))
+    stats_pbar = None
+    if is_main_process():
+        print(
+            f"[feature_stats/mixed] start: requested_total_items={max_items} "
+            f"world_size={dist_world_size} items_per_rank={local_total} "
+            "schedule=raw,mode_a,raw,mode_b ",
+            flush=True,
+        )
+        stats_pbar = tqdm(
+            total=local_total,
+            desc="feature_stats_mixed(rank0)",
+            dynamic_ncols=True,
+            leave=True,
+        )
+
+    model.eval()
+    error_message = None
+    try:
+        for local_idx in range(local_total):
+            source_name = schedule[int(local_idx) % len(schedule)]
+            source_dataset = datasets[source_name]
+            item_idx = ((int(local_idx) // len(schedule)) * dist_world_size + rank) % len(source_dataset)
+            if source_name == "raw":
+                sample = source_dataset[(item_idx, args.max_frames)]
+                images = unwrap_tensor(sample["images_clean"]).unsqueeze(0).to(device)
+                with torch.no_grad(), autocast_context(args, device):
+                    if hasattr(model, "extract_scene_tokens"):
+                        agg_all, image_all, dino_all, _, patch_start_idx = model.extract_scene_tokens(images)
+                    else:
+                        agg_all, image_all, dino_all, _, patch_start_idx = model.aggregator(images)
+                    del agg_all, dino_all
+                    image_patch = select_patch_pyramid(image_all, levels, patch_start_idx)
+            else:
+                item = source_dataset[item_idx]
+                image_patch = _cache_teacher_levels_from_item(item)
+            sum_acc, sum_sq_acc = _accumulate_feature_levels(
+                image_patch,
+                levels=levels,
+                device=device,
+                sum_acc=sum_acc,
+                sum_sq_acc=sum_sq_acc,
+                count_acc=count_acc,
+            )
+            if stats_pbar is not None:
+                stats_pbar.update(1)
+    except Exception as exc:
+        error_message = (
+            f"[feature_stats/mixed] rank={rank}/{dist_world_size} failed "
+            f"source={locals().get('source_name', 'unknown')} "
+            f"item_idx={locals().get('item_idx', 'unknown')}: {type(exc).__name__}: {exc}"
+        )
+    finally:
+        if stats_pbar is not None:
+            stats_pbar.close()
+
+    print(
+        f"[feature_stats/mixed] rank={rank}/{dist_world_size} local loop finished; syncing error status...",
+        flush=True,
+    )
+    status = torch.tensor(1 if error_message is not None else 0, dtype=torch.int32, device=device)
+    if is_distributed():
+        dist.all_reduce(status, op=dist.ReduceOp.MAX)
+    if int(status.item()) != 0:
+        if error_message is not None:
+            print(error_message, flush=True)
+        raise RuntimeError("Mixed feature stats failed on at least one rank; see rank logs above.")
+
+    if sum_acc is None or sum_sq_acc is None:
+        raise RuntimeError("Could not compute feature stats from empty mixed datasets")
+
+    print(
+        f"[feature_stats/mixed] rank={rank}/{dist_world_size} local accumulation done "
+        f"items={local_total} count={count_acc.detach().cpu().tolist()}",
+        flush=True,
+    )
+    if is_distributed():
+        if is_main_process():
+            print("[feature_stats/mixed] reducing stats across ranks...", flush=True)
+        dist.all_reduce(sum_acc, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sum_sq_acc, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count_acc, op=dist.ReduceOp.SUM)
+        if is_main_process():
+            print(
+                f"[feature_stats/mixed] reduce done global_count={count_acc.detach().cpu().tolist()}",
+                flush=True,
+            )
+
+    mean = sum_acc / count_acc.view(-1, 1).clamp_min(1.0)
+    var = sum_sq_acc / count_acc.view(-1, 1).clamp_min(1.0) - mean * mean
+    std = var.clamp_min(1e-6).sqrt()
+    payload = {
+        "levels": torch.tensor(levels, dtype=torch.long),
+        "mean": mean.cpu().float(),
+        "std": std.cpu().float(),
+        "source_mix": {
+            "schedule": list(schedule),
+            "raw": 0.5,
+            "mode_a": 0.25,
+            "mode_b": 0.25,
+        },
+    }
+    if is_main_process():
+        print(f"[feature_stats/mixed] saving to {stats_path}", flush=True)
+        torch.save(payload, stats_path)
+        print(f"[feature_stats/mixed] saved to {stats_path}", flush=True)
+    return payload
+
+
+def get_feature_stats_mixed(
+    model: VGGT,
+    datasets: dict[str, Any],
+    args: argparse.Namespace,
+    device: torch.device,
+    levels: tuple[int, ...],
+    stats_path: Path,
+) -> dict[str, torch.Tensor]:
+    if is_distributed():
+        compute_flag = torch.tensor(
+            1 if (is_main_process() and not stats_path.is_file()) else 0,
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.broadcast(compute_flag, src=0)
+        if int(compute_flag.item()) != 0:
+            compute_feature_stats_mixed(model, datasets, args, device, levels, stats_path)
+        dist.barrier()
+    elif not stats_path.is_file():
+        compute_feature_stats_mixed(model, datasets, args, device, levels, stats_path)
+    if not stats_path.is_file():
+        raise FileNotFoundError(f"Mixed feature stats file was not created: {stats_path}")
+    return torch.load(stats_path, map_location="cpu")
+
+
 def get_teacher_outputs(
     model: VGGT,
     images: torch.Tensor,
@@ -1276,6 +1489,7 @@ def get_teacher_outputs(
         "image_levels": image_levels,
         "patch_start_idx": patch_start_idx,
         "image_patch": image_patch,
+        "head_targets_valid": True,
         "pose_enc": pose_enc,
         "gs_map": gs_map,
         "gs_conf": gs_conf,
@@ -1290,7 +1504,10 @@ def get_cached_teacher_outputs(
     levels: tuple[int, ...],
     device: torch.device,
 ) -> dict[str, Any]:
-    image_patch = [unwrap_tensor(t).to(device, non_blocking=True) for t in predictions["image_tokens_levels"]]
+    teacher_levels = predictions.get("tokenizer_teacher_levels")
+    if teacher_levels is None:
+        teacher_levels = predictions["image_tokens_levels"]
+    image_patch = [unwrap_tensor(t).to(device, non_blocking=True) for t in teacher_levels]
     if len(image_patch) != len(levels):
         raise ValueError(
             f"Cached predictions contain {len(image_patch)} feature levels, "
@@ -1302,6 +1519,7 @@ def get_cached_teacher_outputs(
         # Cached pass1 only stores patch tokens for the selected levels. Student
         # heads therefore receive patch-only sparse level lists with start index 0.
         "patch_start_idx": 0,
+        "head_targets_valid": False,
         "pose_enc": unwrap_tensor(predictions["pose_enc"]).to(device, non_blocking=True),
         "gs_map": unwrap_tensor(predictions["gs_map"]).to(device, non_blocking=True),
         "gs_conf": unwrap_tensor(predictions["gs_conf"]).to(device, non_blocking=True),
@@ -1310,6 +1528,48 @@ def get_cached_teacher_outputs(
         "dynamic_conf": unwrap_tensor(predictions["dynamic_conf"]).to(device, non_blocking=True),
     }
     return teacher
+
+
+def build_head_outputs_from_patch_features(
+    model: VGGT,
+    images: torch.Tensor,
+    levels: tuple[int, ...],
+    teacher: dict[str, Any],
+    patch_features: list[torch.Tensor],
+) -> dict[str, torch.Tensor | None]:
+    patch_start_idx = int(teacher.get("patch_start_idx", 0))
+    if "image_levels" in teacher:
+        image_features = reattach_special_tokens_from_selected(
+            teacher["image_levels"],
+            patch_start_idx,
+            patch_features,
+        )
+    elif patch_start_idx == 0:
+        image_features = patch_features
+    else:
+        raise RuntimeError("Cannot decode patch features with special tokens when teacher['image_levels'] is absent")
+
+    dino_features = []
+    agg_features = []
+    for joint_tokens in image_features:
+        dino_tokens, frame_tokens, global_tokens = split_joint_channels(joint_tokens)
+        dino_features.append(dino_tokens)
+        agg_features.append(torch.cat([frame_tokens, global_tokens], dim=-1))
+
+    image_all = build_sparse_level_list(teacher["num_levels"], levels, image_features)
+    dino_all = build_sparse_level_list(teacher["num_levels"], levels, dino_features)
+    agg_all = build_sparse_level_list(teacher["num_levels"], levels, agg_features)
+
+    gs_map, gs_conf = model.gs_head(image_all, images, patch_start_idx)
+    depth, depth_conf = model.depth_head(agg_all, images, patch_start_idx)
+    dynamic_conf, _ = model.instance_head(dino_all, images, patch_start_idx)
+    return {
+        "gs_map": gs_map,
+        "gs_conf": gs_conf,
+        "depth": depth,
+        "depth_conf": depth_conf,
+        "dynamic_conf": dynamic_conf,
+    }
 
 
 def build_student_outputs(
@@ -1329,35 +1589,18 @@ def build_student_outputs(
             decoder_noise_tau=args.decoder_noise_tau,
             decoder_noise_distribution=args.decoder_noise_distribution,
         )
-        image_hat_4 = reattach_special_tokens_from_selected(
-            teacher["image_levels"],
-            teacher["patch_start_idx"],
+        head_outputs = build_head_outputs_from_patch_features(
+            model,
+            images,
+            levels,
+            teacher,
             decoded_patch,
         )
-        dino_hat_4 = []
-        agg_hat_4 = []
-        for joint_tokens in image_hat_4:
-            dino_hat, frame_hat, global_hat = split_joint_channels(joint_tokens)
-            dino_hat_4.append(dino_hat)
-            agg_hat_4.append(torch.cat([frame_hat, global_hat], dim=-1))
-
-        image_hat_all = build_sparse_level_list(teacher["num_levels"], levels, image_hat_4)
-        dino_hat_all = build_sparse_level_list(teacher["num_levels"], levels, dino_hat_4)
-        agg_hat_all = build_sparse_level_list(teacher["num_levels"], levels, agg_hat_4)
-
-        gs_map_hat, gs_conf_hat = model.gs_head(image_hat_all, images, teacher["patch_start_idx"])
-        depth_hat, depth_conf_hat = model.depth_head(agg_hat_all, images, teacher["patch_start_idx"])
-        dynamic_hat, _ = model.instance_head(dino_hat_all, images, teacher["patch_start_idx"])
-        del image_hat_all, dino_hat_all, agg_hat_all
 
     return {
         "z": z,
         "decoded_patch": decoded_patch,
-        "gs_map": gs_map_hat,
-        "gs_conf": gs_conf_hat,
-        "depth": depth_hat,
-        "depth_conf": depth_conf_hat,
-        "dynamic_conf": dynamic_hat,
+        **head_outputs,
     }
 
 
@@ -1369,6 +1612,8 @@ def build_student_outputs_from_patch_teacher(
     teacher: dict[str, Any],
     autocast_enabled,
     args: argparse.Namespace,
+    *,
+    force_decode_heads: bool = False,
 ) -> dict[str, Any]:
     patch_grid = infer_patch_grid(images, teacher["image_patch"][0].shape[2])
     with autocast_enabled:
@@ -1378,30 +1623,23 @@ def build_student_outputs_from_patch_teacher(
             decoder_noise_tau=args.decoder_noise_tau,
             decoder_noise_distribution=args.decoder_noise_distribution,
         )
-        dino_hat_4 = []
-        agg_hat_4 = []
-        for joint_tokens in decoded_patch:
-            dino_hat, frame_hat, global_hat = split_joint_channels(joint_tokens)
-            dino_hat_4.append(dino_hat)
-            agg_hat_4.append(torch.cat([frame_hat, global_hat], dim=-1))
-
-        image_hat_all = build_sparse_level_list(teacher["num_levels"], levels, decoded_patch)
-        dino_hat_all = build_sparse_level_list(teacher["num_levels"], levels, dino_hat_4)
-        agg_hat_all = build_sparse_level_list(teacher["num_levels"], levels, agg_hat_4)
-
-        gs_map_hat, gs_conf_hat = model.gs_head(image_hat_all, images, 0)
-        depth_hat, depth_conf_hat = model.depth_head(agg_hat_all, images, 0)
-        dynamic_hat, _ = model.instance_head(dino_hat_all, images, 0)
-        del image_hat_all, dino_hat_all, agg_hat_all
+        if not force_decode_heads and not bool(teacher.get("head_targets_valid", True)):
+            return {
+                "z": z,
+                "decoded_patch": decoded_patch,
+            }
+        head_outputs = build_head_outputs_from_patch_features(
+            model,
+            images,
+            levels,
+            teacher,
+            decoded_patch,
+        )
 
     return {
         "z": z,
         "decoded_patch": decoded_patch,
-        "gs_map": gs_map_hat,
-        "gs_conf": gs_conf_hat,
-        "depth": depth_hat,
-        "depth_conf": depth_conf_hat,
-        "dynamic_conf": dynamic_hat,
+        **head_outputs,
     }
 
 
@@ -1450,7 +1688,7 @@ def compute_losses(
     std_stats = feature_stats["std"]
     losses: dict[str, torch.Tensor] = {}
     dynamic_mask = unwrap_tensor(sample["dynamic_mask"]).to(student["z"].device) if "dynamic_mask" in sample else None
-    sky_mask = unwrap_tensor(sample.get("sky_mask", sample["masks"])).to(student["z"].device)
+    sky_mask = unwrap_tensor(sample["sky_mask"] if "sky_mask" in sample else sample["masks"]).to(student["z"].device)
 
     patch_weight = None
     if dynamic_mask is not None and args.dyn_patch_alpha > 1.0:
@@ -1467,42 +1705,54 @@ def compute_losses(
     )
     losses["tok_cos"] = token_cosine_loss(student["decoded_patch"], teacher["image_patch"])
 
-    gs_anchor = normalized_huber_loss(student["gs_map"], teacher["gs_map"]) + 0.1 * normalized_huber_loss(
-        student["gs_conf"], teacher["gs_conf"]
-    )
-    geom_anchor = normalized_huber_loss(student["depth"], teacher["depth"])
-    if teacher.get("depth_conf") is not None:
-        geom_anchor = geom_anchor + 0.1 * normalized_huber_loss(
-            student["depth_conf"], teacher["depth_conf"]
-        )
-    if dynamic_mask is not None and args.dyn_pixel_alpha > 1.0:
-        # student["dynamic_conf"] is [B, S, H, W, 1]; build matching pixel weight.
-        dyn_logits = student["dynamic_conf"]
-        target_hw = dyn_logits.shape[2:4]
-        dyn_pix = dynamic_mask[:, :, 0:1].float().flatten(0, 1)  # [B*S, 1, H, W]
-        if dyn_pix.shape[-2:] != target_hw:
-            dyn_pix = F.interpolate(dyn_pix, size=target_hw, mode="bilinear", align_corners=False)
-        dyn_pix = dyn_pix.view(*dyn_logits.shape[:2], target_hw[0], target_hw[1], 1)
-        pix_weight = 1.0 + (args.dyn_pixel_alpha - 1.0) * dyn_pix
-        dyn_anchor = masked_huber_loss(student["dynamic_conf"], teacher["dynamic_conf"], pix_weight)
-    else:
-        dyn_anchor = normalized_huber_loss(student["dynamic_conf"], teacher["dynamic_conf"])
-    losses["gs_anchor"] = gs_anchor
-    losses["geom_anchor"] = geom_anchor
-    losses["dyn_anchor"] = dyn_anchor
-    losses["head_anchor"] = gs_anchor + geom_anchor + dyn_anchor
+    head_targets_valid = bool(teacher.get("head_targets_valid", True))
+    zero = student["z"].new_tensor(0.0)
+    losses["gs_anchor"] = zero
+    losses["geom_anchor"] = zero
+    losses["dyn_anchor"] = zero
+    losses["head_anchor"] = zero
     losses["dynamic_bce"] = student["z"].new_tensor(0.0)
-    if dynamic_mask is not None:
-        losses["dynamic_bce"] = dynamic_mask_bce_loss(student["dynamic_conf"], dynamic_mask)
-    losses["gs_lifespan"] = compute_lifespan_loss(student["gs_conf"], dynamic_mask=dynamic_mask, sky_mask=sky_mask)
+    losses["gs_lifespan"] = zero
     losses["ghost_static"] = student["z"].new_tensor(0.0)
-    if dynamic_mask is not None:
-        losses["ghost_static"] = ghost_static_loss(
-            student["gs_map"],
-            student["dynamic_conf"],
-            dynamic_mask,
+    if head_targets_valid:
+        gs_anchor = normalized_huber_loss(student["gs_map"], teacher["gs_map"]) + 0.1 * normalized_huber_loss(
+            student["gs_conf"], teacher["gs_conf"]
+        )
+        geom_anchor = normalized_huber_loss(student["depth"], teacher["depth"])
+        if teacher.get("depth_conf") is not None:
+            geom_anchor = geom_anchor + 0.1 * normalized_huber_loss(
+                student["depth_conf"], teacher["depth_conf"]
+            )
+        if dynamic_mask is not None and args.dyn_pixel_alpha > 1.0:
+            # student["dynamic_conf"] is [B, S, H, W, 1]; build matching pixel weight.
+            dyn_logits = student["dynamic_conf"]
+            target_hw = dyn_logits.shape[2:4]
+            dyn_pix = dynamic_mask[:, :, 0:1].float().flatten(0, 1)  # [B*S, 1, H, W]
+            if dyn_pix.shape[-2:] != target_hw:
+                dyn_pix = F.interpolate(dyn_pix, size=target_hw, mode="bilinear", align_corners=False)
+            dyn_pix = dyn_pix.view(*dyn_logits.shape[:2], target_hw[0], target_hw[1], 1)
+            pix_weight = 1.0 + (args.dyn_pixel_alpha - 1.0) * dyn_pix
+            dyn_anchor = masked_huber_loss(student["dynamic_conf"], teacher["dynamic_conf"], pix_weight)
+        else:
+            dyn_anchor = normalized_huber_loss(student["dynamic_conf"], teacher["dynamic_conf"])
+        losses["gs_anchor"] = gs_anchor
+        losses["geom_anchor"] = geom_anchor
+        losses["dyn_anchor"] = dyn_anchor
+        losses["head_anchor"] = gs_anchor + geom_anchor + dyn_anchor
+        if dynamic_mask is not None:
+            losses["dynamic_bce"] = dynamic_mask_bce_loss(student["dynamic_conf"], dynamic_mask)
+        losses["gs_lifespan"] = compute_lifespan_loss(
+            student["gs_conf"],
+            dynamic_mask=dynamic_mask,
             sky_mask=sky_mask,
         )
+        if dynamic_mask is not None:
+            losses["ghost_static"] = ghost_static_loss(
+                student["gs_map"],
+                student["dynamic_conf"],
+                dynamic_mask,
+                sky_mask=sky_mask,
+            )
 
     losses["lat_stat"] = latent_stat_loss(student["z"])
 
@@ -1512,7 +1762,7 @@ def compute_losses(
     losses["render_lpips"] = student["z"].new_tensor(0.0)
     losses["render_gt"] = student["z"].new_tensor(0.0)
 
-    if global_step >= args.render_start_step:
+    if head_targets_valid and global_step >= args.render_start_step:
         if model.lpips_loss_fn is None:
             raise RuntimeError("Render anchor is active but LPIPS has not been initialized")
         timestamps = unwrap_tensor(sample["timestamps"]).to(student["z"].device)
@@ -1740,6 +1990,29 @@ def log_wandb_visual(
     )
 
 
+def render_head_outputs_for_visual(
+    model: VGGT,
+    images: torch.Tensor,
+    sample: dict[str, Any],
+    pose_enc: torch.Tensor,
+    outputs: dict[str, torch.Tensor | None],
+    device: torch.device,
+) -> torch.Tensor:
+    sky_mask = unwrap_tensor(sample["sky_mask"] if "sky_mask" in sample else sample["masks"]).to(device)
+    timestamps = unwrap_tensor(sample["timestamps"]).to(device)
+    return render_scene_from_outputs(
+        model,
+        images,
+        sky_mask,
+        timestamps,
+        pose_enc.float(),
+        outputs["depth"].float(),
+        outputs["gs_map"].float(),
+        outputs["gs_conf"].float(),
+        outputs["dynamic_conf"].float(),
+    )
+
+
 def run_visualization_eval(
     model: VGGT,
     tokenizer_runner: nn.Module,
@@ -1765,7 +2038,7 @@ def run_visualization_eval(
     )
     if was_training:
         tokenizer_runner.train()
-    _, scalar_logs, aux = compute_losses(model, sample, args, feature_stats, teacher, student, global_step)
+    _, scalar_logs, _ = compute_losses(model, sample, args, feature_stats, teacher, student, global_step)
     noisy_weight = scalar_logs["noisy_weight"]
     if noisy_weight > 0.0:
         patch_grid = infer_patch_grid(images, teacher["image_patch"][0].shape[2])
@@ -1781,9 +2054,33 @@ def run_visualization_eval(
         )
         scalar_logs["noisy"] = float(noisy_loss.detach().item())
         scalar_logs["loss"] += noisy_weight * scalar_logs["noisy"]
-    if not aux:
+    if not all(key in student for key in ("depth", "gs_map", "gs_conf", "dynamic_conf")):
         return None, scalar_logs
-    grid = build_triplet_grid(aux["render_ref"][0], aux["render_hat"][0])
+    with torch.no_grad(), autocast_context(args, device):
+        gt_outputs = build_head_outputs_from_patch_features(
+            model,
+            images,
+            levels,
+            teacher,
+            teacher["image_patch"],
+        )
+        render_gt = render_head_outputs_for_visual(
+            model,
+            images,
+            sample,
+            teacher["pose_enc"],
+            gt_outputs,
+            device,
+        )
+        render_pred = render_head_outputs_for_visual(
+            model,
+            images,
+            sample,
+            teacher["pose_enc"],
+            student,
+            device,
+        )
+    grid = build_triplet_grid(render_gt[0], render_pred[0], max_frames=args.max_frames)
     return grid, scalar_logs
 
 
@@ -1811,10 +2108,11 @@ def run_cached_visualization_eval(
         teacher,
         autocast_context(args, device),
         args,
+        force_decode_heads=True,
     )
     if was_training:
         tokenizer_runner.train()
-    _, scalar_logs, aux = compute_losses(model, sample, args, feature_stats, teacher, student, global_step)
+    _, scalar_logs, _ = compute_losses(model, sample, args, feature_stats, teacher, student, global_step)
     noisy_weight = scalar_logs["noisy_weight"]
     if noisy_weight > 0.0:
         patch_grid = infer_patch_grid(images, teacher["image_patch"][0].shape[2])
@@ -1830,9 +2128,33 @@ def run_cached_visualization_eval(
         )
         scalar_logs["noisy"] = float(noisy_loss.detach().item())
         scalar_logs["loss"] += noisy_weight * scalar_logs["noisy"]
-    if not aux:
+    if not all(key in student for key in ("depth", "gs_map", "gs_conf", "dynamic_conf")):
         return None, scalar_logs
-    grid = build_triplet_grid(aux["render_ref"][0], aux["render_hat"][0])
+    with torch.no_grad(), autocast_context(args, device):
+        gt_outputs = build_head_outputs_from_patch_features(
+            model,
+            images,
+            levels,
+            teacher,
+            teacher["image_patch"],
+        )
+        render_gt = render_head_outputs_for_visual(
+            model,
+            images,
+            sample,
+            teacher["pose_enc"],
+            gt_outputs,
+            device,
+        )
+        render_pred = render_head_outputs_for_visual(
+            model,
+            images,
+            sample,
+            teacher["pose_enc"],
+            student,
+            device,
+        )
+    grid = build_triplet_grid(render_gt[0], render_pred[0], max_frames=args.max_frames)
     return grid, scalar_logs
 
 
@@ -1873,14 +2195,6 @@ def normalize_cache_dirs(value: Any) -> list[str]:
     return [str(item) for item in value if item is not None]
 
 
-def default_stage_b_mix_cache_dirs(args: argparse.Namespace) -> list[str]:
-    root = Path(args.processed_root)
-    return [
-        f"{root / 'flow_cache_mode_a' / args.cache_split}:mode_a",
-        f"{root / 'flow_cache_mode_b' / args.cache_split}:mode_b",
-    ]
-
-
 class RoundRobinDatasetView:
     """Small index adapter used to balance multiple datasets during stats passes."""
 
@@ -1898,6 +2212,32 @@ class RoundRobinDatasetView:
         dataset_idx = int(idx) % len(self.datasets)
         item_idx = (int(idx) // len(self.datasets)) % len(self.datasets[dataset_idx])
         return self.datasets[dataset_idx][item_idx]
+
+
+def deterministic_vis_index(
+    *,
+    base_seed: int,
+    vis_test_index: int,
+    vis_count: int,
+    source_name: str,
+    dataset_len: int,
+) -> int:
+    if dataset_len <= 0:
+        raise ValueError("dataset_len must be positive")
+    source_offsets = {
+        "raw": 101,
+        "cache": 151,
+        "cache_mode_a": 211,
+        "cache_mode_b": 307,
+    }
+    generator = torch.Generator()
+    generator.manual_seed(
+        int(base_seed)
+        + 1_000_003 * int(vis_count + 1)
+        + 10_007 * int(vis_test_index)
+        + source_offsets.get(str(source_name), 401)
+    )
+    return int(torch.randint(0, int(dataset_len), (1,), generator=generator).item())
 
 
 def build_cached_dataset(
@@ -1931,27 +2271,40 @@ def build_cached_dataset(
             sample["mode_kind"] = mode_kind
             sample["cache_index"] = int(entry.get("index", payload.get("meta", {}).get("manifest_index", idx)))
             predictions = self._build_predictions(payload, subset_t)
+            pass2_payload = payload.get("pass2_splatted_tok_low")
+            if pass2_payload is None:
+                raise RuntimeError(
+                    f"Cache {cache_path} missing pass2_splatted_tok_low payload; "
+                    "Stage-B tokenizer training requires edited splat/blend tokens."
+                )
+            tokenizer_teacher_levels = self._subset_pass2_splatted_tok_low(
+                pass2_payload,
+                subset_t,
+                dtype=self.lut_dtype,
+            )
             return {
                 "sample": sample,
                 "predictions": predictions,
+                "tokenizer_teacher_levels": tokenizer_teacher_levels,
                 "mode_kind": mode_kind,
                 "subset_frames": subset_t,
                 "cache_path": str(cache_path),
                 "cache_schema_version": int(payload["schema_version"]),
             }
 
-    manifest_path = args.cache_val_manifest_path if validation else args.cache_manifest_path
-    cache_root = normalize_cache_dirs(args.cache_val_dir if validation else args.cache_dir)
-    split = args.cache_val_split if validation else args.cache_split
-    if validation and manifest_path is None and len(cache_root) == 0:
-        manifest_path = args.cache_manifest_path
-        cache_root = normalize_cache_dirs(args.cache_dir)
-        split = args.cache_split
-    if manifest_path is None and len(cache_root) == 0:
-        raise ValueError("Cached tokenizer training requires --cache_dir or --cache_manifest_path")
+    manifest_path = args.cache_manifest_path
+    cache_root = normalize_cache_dirs(args.cache_dir)
+    split = args.cache_split
+    if len(cache_root) > 0:
+        raise ValueError(
+            "Cached tokenizer Stage-B requires explicit JSONL manifests; "
+            "use --cache_manifest_path instead of --cache_dir."
+        )
+    if manifest_path is None:
+        raise ValueError("Cached tokenizer Stage-B requires explicit --cache_manifest_path.")
 
     return TokenizerFlowCacheDataset(
-        cache_root=cache_root if len(cache_root) != 1 else cache_root[0],
+        cache_root=None,
         manifest_path=manifest_path,
         split=split,
         # Tokenizer heads require all samples in a batch to have the same S.
@@ -1984,13 +2337,16 @@ def main() -> None:
     if args.init_tokenizer_path and args.resume_path:
         raise ValueError("Use either --init_tokenizer_path or --resume_path, not both")
     cache_dirs = normalize_cache_dirs(args.cache_dir)
-    if args.stage_b_mix_raw and len(cache_dirs) == 0 and args.cache_manifest_path is None:
-        args.cache_dir = default_stage_b_mix_cache_dirs(args)
-        cache_dirs = normalize_cache_dirs(args.cache_dir)
     use_mixed_teacher = bool(args.stage_b_mix_raw)
-    use_cached_teacher = (not use_mixed_teacher) and (len(cache_dirs) > 0 or args.cache_manifest_path is not None)
-    if len(cache_dirs) > 0 and args.cache_manifest_path is not None:
-        raise ValueError("Use either --cache_dir or --cache_manifest_path, not both")
+    if len(cache_dirs) > 0:
+        raise ValueError(
+            "Cached tokenizer Stage-B no longer supports cache directory discovery; "
+            "pass --cache_manifest_path explicitly."
+        )
+    use_cached_teacher = (not use_mixed_teacher) and (args.cache_manifest_path is not None)
+    if use_mixed_teacher or use_cached_teacher:
+        if args.cache_manifest_path is None:
+            raise ValueError("Cached tokenizer Stage-B requires --cache_manifest_path.")
     if use_mixed_teacher:
         requested_modes = parse_cache_mode_filter(args.cache_mode_filter)
         if requested_modes is not None and set(requested_modes) != {"mode_a", "mode_b"}:
@@ -2012,8 +2368,6 @@ def main() -> None:
         }
         test_datasets = {
             "raw": build_dataset(args, split="validation"),
-            "cache_mode_a": build_cached_dataset(args, validation=True, mode_filter=["mode_a"]),
-            "cache_mode_b": build_cached_dataset(args, validation=True, mode_filter=["mode_b"]),
         }
         train_dataset = train_datasets["raw"]
         test_dataset = test_datasets["raw"]
@@ -2024,14 +2378,45 @@ def main() -> None:
         train_dataset = build_dataset(args, split="training")
         test_dataset = build_dataset(args, split="validation")
 
+    def try_build_cached_vis_dataset(mode_kind: str) -> Any | None:
+        try:
+            return build_cached_dataset(args, validation=False, mode_filter=[mode_kind])
+        except (RuntimeError, ValueError) as exc:
+            if is_main_process():
+                print(f"[vis] skipping {mode_kind}: {exc}", flush=True)
+            return None
+
+    vis_datasets: dict[str, tuple[Any, bool]] = {}
+    if use_mixed_teacher:
+        mode_a_vis_dataset = try_build_cached_vis_dataset("mode_a")
+        mode_b_vis_dataset = try_build_cached_vis_dataset("mode_b")
+        vis_datasets = {
+            "raw": (train_datasets["raw"], False),
+        }
+        if mode_a_vis_dataset is not None:
+            vis_datasets["cache_mode_a"] = (mode_a_vis_dataset, True)
+        if mode_b_vis_dataset is not None:
+            vis_datasets["cache_mode_b"] = (mode_b_vis_dataset, True)
+    elif use_cached_teacher:
+        raw_vis_dataset = build_dataset(args, split="training")
+        mode_a_vis_dataset = try_build_cached_vis_dataset("mode_a")
+        mode_b_vis_dataset = try_build_cached_vis_dataset("mode_b")
+        vis_datasets["raw"] = (raw_vis_dataset, False)
+        if mode_a_vis_dataset is not None:
+            vis_datasets["cache_mode_a"] = (mode_a_vis_dataset, True)
+        if mode_b_vis_dataset is not None:
+            vis_datasets["cache_mode_b"] = (mode_b_vis_dataset, True)
+    else:
+        vis_datasets = {"raw": (test_dataset, False)}
+    vis_schedule = tuple(name for name in ("raw", "cache_mode_a", "cache_mode_b") if name in vis_datasets)
+
     if is_main_process() and use_mixed_teacher:
         raw_stats = train_datasets["raw"].clean_sample_stats
         print(
             f"[dataset/mixed] raw_train={len(train_datasets['raw'])} raw_val={len(test_datasets['raw'])} "
             f"cache_mode_a_train={len(train_datasets['cache_mode_a'])} "
             f"cache_mode_b_train={len(train_datasets['cache_mode_b'])} "
-            f"cache_mode_a_val={len(test_datasets['cache_mode_a'])} "
-            f"cache_mode_b_val={len(test_datasets['cache_mode_b'])} "
+            "cache_vis_source=train_manifest "
             f"schedule=raw,mode_a,raw,mode_b raw_batch_size={args.raw_batch_size} "
             f"cache_batch_size={args.batch_size} raw_clean={raw_stats.get('clean_total', 0)}",
             flush=True,
@@ -2148,8 +2533,7 @@ def main() -> None:
     if is_main_process():
         print(f"[init] tokenizer levels={levels}", flush=True)
     if use_mixed_teacher:
-        stats_dataset = RoundRobinDatasetView([train_datasets["cache_mode_a"], train_datasets["cache_mode_b"]])
-        feature_stats = get_feature_stats_from_cache(stats_dataset, args, device, levels, feature_stats_path)
+        feature_stats = get_feature_stats_mixed(model, train_datasets, args, device, levels, feature_stats_path)
     elif use_cached_teacher:
         feature_stats = get_feature_stats_from_cache(train_dataset, args, device, levels, feature_stats_path)
     else:
@@ -2157,10 +2541,13 @@ def main() -> None:
     if is_main_process():
         print("[init] feature stats ready", flush=True)
 
-    if is_main_process() and len(test_dataset) > 0:
-        vis_index = int(args.vis_test_index) % len(test_dataset)
+    if is_main_process() and len(vis_schedule) > 0:
+        vis_desc = ", ".join(
+            f"{name}:n={len(vis_datasets[name][0])}" for name in vis_schedule
+        )
         print(
-            f"[vis] validation visualization starts at sample index={vis_index} and advances by 1 each vis step",
+            f"[vis] validation visualization schedule={vis_schedule}; "
+            f"sample index is random per source/vis step (seed_offset={args.vis_test_index}); {vis_desc}",
             flush=True,
         )
 
@@ -2396,14 +2783,18 @@ def main() -> None:
                     log_metrics[f"source_{name}_microbatches"] = float(count)
                 log_wandb_scalars(wandb_run, log_metrics, global_step)
 
-            if use_mixed_teacher:
-                vis_source = mixed_schedule[(global_step // max(args.vis_every, 1)) % len(mixed_schedule)]
-                vis_dataset = test_datasets[vis_source]
-                vis_is_cache = vis_source.startswith("cache")
+            vis_count = global_step // max(args.vis_every, 1)
+            if use_cached_teacher and not use_mixed_teacher:
+                # Step 0 is skipped for cached training, so make the first
+                # emitted visualization use the first schedule entry.
+                vis_count = max(0, vis_count - 1)
+            if len(vis_schedule) > 0:
+                vis_source = vis_schedule[vis_count % len(vis_schedule)]
+                vis_dataset, vis_is_cache = vis_datasets[vis_source]
             else:
-                vis_source = "cache" if use_cached_teacher else "raw"
-                vis_dataset = test_dataset
-                vis_is_cache = use_cached_teacher
+                vis_source = "none"
+                vis_dataset = []
+                vis_is_cache = False
 
             should_run_vis = len(vis_dataset) > 0 and global_step % args.vis_every == 0
             if use_cached_teacher and not use_mixed_teacher and global_step == 0:
@@ -2411,7 +2802,13 @@ def main() -> None:
             if should_run_vis and is_distributed():
                 dist.barrier()
             if is_main_process() and should_run_vis:
-                vis_index = (int(args.vis_test_index) + (global_step // args.vis_every)) % len(vis_dataset)
+                vis_index = deterministic_vis_index(
+                    base_seed=args.seed,
+                    vis_test_index=args.vis_test_index,
+                    vis_count=vis_count,
+                    source_name=vis_source,
+                    dataset_len=len(vis_dataset),
+                )
                 if vis_is_cache:
                     vis_sample = tokenizer_cache_collate_fn([vis_dataset[vis_index]])
                 else:
@@ -2442,7 +2839,7 @@ def main() -> None:
                 if grid is not None:
                     grid.save(
                         dirs["vis"]
-                        / f"validation_{vis_source}_step_{global_step:06d}_sample_{vis_index:06d}.png"
+                        / f"validation_step_{global_step:06d}_{vis_source}_sample_{vis_index:06d}.png"
                     )
                     vis_num_frames = int(
                         vis_sample["sample"]["num_frames"][0].item()
