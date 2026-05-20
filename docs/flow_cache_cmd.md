@@ -23,7 +23,7 @@
 
 ## Cache 语义：full-source-Gaussian splat
 
-v6 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend 特征。它的 source Gaussian 集合是完整 clip 的所有帧；训练时随机选 4-8 帧时，dataset 只在 target frame 维度做 `index_select`。
+v6 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend 特征。它的 source Gaussian 集合是完整 clip 的所有帧；训练时随机选连续 4-8 帧窗口时，dataset 只在 target frame 维度做 `index_select`。
 
 因此 `cache.index_select(subset)` 不应该和“先把 `gs_map` 裁成 subset，再 live 重跑 `FeatureSplatter`”逐 token 相等。后者的 source Gaussian 少了其他帧，遮挡和补洞都会变。验证时应检查 full clip cache 与 full clip live recompute 一致；对子集只检查缓存切片结构正常，以及 mask、`z_clean`、asset tokens、scaffold 等非 pass2 字段一致。这个语义更接近实际推理：推理通常对完整 clip 做 live splat。
 
@@ -179,7 +179,7 @@ pytest tests/test_offline_cache.py tests/test_mode_b_planner.py \
        tests/test_scene_pointers.py tests/test_per_token_noise.py -q
 
 # WYSIWYG / pass2 校验说明：
-# - 校验对象是完整 29 帧 cache，不是训练时随机采样出的 4-8 帧子序列。
+# - 校验对象是完整 29 帧 cache，不是训练时随机采样出的连续 4-8 帧窗口。
 # - 默认会从 .pt 反读完整 29 帧，输出 cache-derived 可视化，并用完整 29 帧
 #   live assembler 重算 pass2_splatted_tok_low，和 .pt 中保存的 int8/scale 做逐值校验。
 # - 默认使用 zero tokenizer stub；这是因为 cache 实际保存的是 tokenizer 前的

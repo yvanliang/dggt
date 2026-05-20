@@ -6,7 +6,8 @@ Both edit modes (`mode_a` and `mode_b`) share the same payload schema; the
 
 1. Loads the clip cache (metadata + int8 LUTs + per-object asset renders OR
    Mode-B planner output).
-2. Randomly picks a 4–8 frame subset from the 29-frame clip.
+2. Randomly picks a contiguous 4–8 frame window from the 29-frame clip,
+   retrying a few times if the window contains no edit.
 3. Subsets every per-frame tensor to the chosen subset.
 4. Dequantizes the int8 LUTs to fp16.
 5. Returns a dict structured as `(sample, predictions, asset_pass_result, mode_b)`
@@ -37,6 +38,29 @@ from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
 from dggt.utils.flow_cache_io import load_flow_cache
 from dggt.utils.gaussian_edit import Sim3Transform
+
+
+GS_CONF_REPAIR_VALUE = 1_000_000.0
+
+
+def repair_cached_gs_conf(gs_conf: torch.Tensor) -> torch.Tensor:
+    """Repair legacy fp16-overflowed pass1.gs_conf while reading cache files.
+
+    Older cache generation stored ``gs_conf`` as float16.  The Gaussian head can
+    legitimately emit values up to 1e6, which overflow to inf in fp16.  In the
+    alpha schedule those values all mean "almost no temporal decay", so replacing
+    non-finite entries with 1e6 recovers the intended semantics closely enough
+    without regenerating the full cache.
+    """
+    repaired = gs_conf.to(torch.float32)
+    if bool(torch.isfinite(repaired).all().item()):
+        return repaired
+    return torch.nan_to_num(
+        repaired,
+        nan=GS_CONF_REPAIR_VALUE,
+        posinf=GS_CONF_REPAIR_VALUE,
+        neginf=GS_CONF_REPAIR_VALUE,
+    )
 
 
 def _parse_cache_root_spec(cache_root: str | Path) -> tuple[Path, str]:
@@ -198,10 +222,7 @@ class WaymoFlowCacheDataset(Dataset):
         mode_kind = str(payload["mode_kind"])
         meta = payload["meta"]
         num_frames_all = int(meta["num_frames"])
-        n_select = self._rng.randint(self.min_frames, self.max_frames)
-        n_select = min(n_select, num_frames_all)
-        subset = sorted(self._rng.sample(range(num_frames_all), n_select))
-        subset_t = torch.tensor(subset, dtype=torch.long)
+        subset_t = self._sample_contiguous_subset(payload, num_frames_all)
 
         sample = self._build_sample(payload, subset_t)
         sample["mode_kind"] = mode_kind
@@ -261,6 +282,71 @@ class WaymoFlowCacheDataset(Dataset):
             "splatted_tok_low_cached": splatted_tok_low_cached,
             "cache_schema_version": schema_version,
         }
+
+    # ------------------------------------------------------------------ #
+    def _sample_contiguous_subset(self, payload: dict[str, Any], num_frames_all: int) -> torch.Tensor:
+        n_select = self._rng.randint(self.min_frames, self.max_frames)
+        n_select = min(n_select, int(num_frames_all))
+        if n_select <= 0:
+            raise ValueError(f"Invalid selected frame count: {n_select}")
+
+        subset = self._random_contiguous_subset(int(num_frames_all), n_select)
+        if self._subset_has_edit(payload, subset):
+            return subset
+
+        # Initial sample plus up to three retries. If the cache itself has no
+        # editable frames, keep the last sampled window instead of failing the
+        # dataloader worker.
+        for _ in range(3):
+            candidate = self._random_contiguous_subset(int(num_frames_all), n_select)
+            subset = candidate
+            if self._subset_has_edit(payload, candidate):
+                break
+        return subset
+
+    def _random_contiguous_subset(self, num_frames_all: int, n_select: int) -> torch.Tensor:
+        if n_select >= num_frames_all:
+            start = 0
+        else:
+            start = self._rng.randint(0, num_frames_all - n_select)
+        return torch.arange(start, start + n_select, dtype=torch.long)
+
+    @staticmethod
+    def _subset_has_edit(payload: dict[str, Any], subset: torch.Tensor) -> bool:
+        mode_kind = str(payload.get("mode_kind", "mode_a"))
+        if mode_kind == "mode_b":
+            block = payload.get("mode_b") or {}
+            if int(block.get("num_imagined_objects", 0)) <= 0:
+                return False
+            delete_per_frame = block.get("delete_mask_per_frame")
+            if torch.is_tensor(delete_per_frame) and delete_per_frame.numel() > 0:
+                if delete_per_frame.dim() < 2:
+                    return bool(delete_per_frame.any().item())
+                max_idx = int(delete_per_frame.shape[0]) - 1
+                if max_idx < 0:
+                    return False
+                rows = subset.clamp(min=0, max=max_idx)
+                return bool(delete_per_frame.index_select(0, rows).any().item())
+            delete_mask = block.get("delete_mask")
+            return bool(torch.is_tensor(delete_mask) and delete_mask.numel() > 0 and delete_mask.any().item())
+
+        phase1 = payload.get("phase1_localized") or {}
+        frame_idx = phase1.get("frame_idx") if isinstance(phase1, dict) else None
+        if torch.is_tensor(frame_idx) and frame_idx.numel() > 0:
+            frame_idx = frame_idx.to(dtype=torch.long).view(-1)
+            subset_long = subset.to(dtype=torch.long).view(-1)
+            return bool((frame_idx[:, None] == subset_long[None, :]).any().item())
+
+        obj = payload.get("object_meta") or {}
+        for key in ("object_bbox_editable_mask_selected", "object_front_bbox_editable_mask_selected"):
+            mask = obj.get(key)
+            if torch.is_tensor(mask) and mask.numel() > 0 and mask.dim() >= 2:
+                max_idx = int(mask.shape[1]) - 1
+                if max_idx >= 0:
+                    cols = subset.clamp(min=0, max=max_idx)
+                    if bool(mask.index_select(1, cols).any().item()):
+                        return True
+        return False
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -408,7 +494,7 @@ class WaymoFlowCacheDataset(Dataset):
         gs_map = _sub(pass1["gs_map"]).unsqueeze(0)
         depth = _sub(pass1["depth"]).unsqueeze(0)
         dyn = _sub(pass1["dynamic_conf"]).unsqueeze(0)
-        gs_conf = _sub(pass1["gs_conf"]).unsqueeze(0)
+        gs_conf = repair_cached_gs_conf(_sub(pass1["gs_conf"])).unsqueeze(0)
         pose_enc = _sub(pass1["pose_enc"]).unsqueeze(0)
         sem = pass1.get("semantic_logits")
         if sem is not None:
@@ -666,7 +752,7 @@ class WaymoFlowCacheDataset(Dataset):
 
         This function does not re-run ``resolve_editable_subset``.  That
         helper is subset-dependent, while v6 caches are generated once for the
-        full 29-frame clip before the random 4-8 frame training subsequence is
+        full 29-frame clip before the random contiguous 4-8 frame training window is
         known.  The cache therefore preserves the full-clip edit decision and
         this reader only remaps/slices it to the sampled target frames.
         """

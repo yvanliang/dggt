@@ -1925,10 +1925,7 @@ def build_cached_dataset(
             mode_kind = str(payload["mode_kind"])
             meta = payload["meta"]
             num_frames_all = int(meta["num_frames"])
-            n_select = self._rng.randint(self.min_frames, self.max_frames)
-            n_select = min(n_select, num_frames_all)
-            subset = sorted(self._rng.sample(range(num_frames_all), n_select))
-            subset_t = torch.tensor(subset, dtype=torch.long)
+            subset_t = self._sample_contiguous_subset(payload, num_frames_all)
 
             sample = self._build_sample(payload, subset_t)
             sample["mode_kind"] = mode_kind
