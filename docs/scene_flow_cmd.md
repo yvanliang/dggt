@@ -245,6 +245,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 | warm-start | `$SCENE_FLOW_PRETRAIN_CKPT` + `--scene_flow_pretrain_ema` | 从正式 pretrain 的 EMA SceneFlow 权重继续训练 |
 | 帧数 | `--sequence_length 8` | 固定 8 帧，和 pretrain `--sequence_length 8` 一致 |
 | 有效 batch | `2 GPU × batch_size 2 × grad_accum 4 = 16` clip/optimizer update | 与 pretrain 完全一致；DataLoader 现在返回完整 micro-batch list，不再丢弃 `batch[1:]` |
+| micro-batch 执行 | 默认将 `batch_size>1` 的 bundle 合并后一次送入 `WanSceneFlow` | assembler 仍按 cache item 构建，但 WAN forward/backward 不再对 micro-batch 内样本完全串行；如需回退旧路径可加 `--no_batch_scene_flow` |
 | DataLoader | `--num_workers 4 --prefetch_factor 1`，默认不启用 `pin_memory` | 每个 cache 文件平均约 651MB，低 prefetch 避免 8 workers × 2 prefetch × batch_size 2 造成几十个大文件并发读；GB 级 batch 走 pin-memory 线程容易触发 `received 0 items of ancdata` |
 | worker tensor sharing | 默认 `--mp_sharing_strategy file_system` | 减少 multiprocessing 通过大量 fd 传递超大 tensor 时的稳定性问题；若系统 `/dev/shm`/临时目录策略特殊，可显式改回 `file_descriptor` |
 | cache 读取 | zstd / gzip / plain 均自动识别；plain torch cache 默认 `mmap=True` | 支持 schema v6/v7；v6 读取时会把 fp16 溢出的 `pass1.gs_conf` 修成 finite fp32，v7 直接读取 finite fp32。空间不足时优先把现有 gzip cache 原地转 zstd：同样保留 `.pt` 路径，实测更小且解压显著更快；plain+mmap 最快但空间约翻倍 |

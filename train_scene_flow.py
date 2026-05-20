@@ -16,6 +16,7 @@ import os
 import random
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -371,6 +372,8 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Torch multiprocessing tensor sharing strategy for DataLoader workers.")
     parser.add_argument("--no_mmap_plain_cache", action="store_true",
                         help="Disable mmap=True when reading uncompressed torch cache files.")
+    parser.add_argument("--no_batch_scene_flow", action="store_true",
+                        help="Process cache items in a micro-batch serially instead of batching WanSceneFlow.")
     parser.add_argument("--max_steps", type=int, default=40000)
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--vis_every", type=int, default=1000)
@@ -522,6 +525,47 @@ def _maybe_drop_asset_kv(bundle, drop_prob: float) -> None:
     bundle.F_asset_tokens = bundle.F_asset_tokens.new_zeros((B, 0, C))
 
 
+def _pad_asset_tokens_for_batch(bundles: list[Any]) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if len(bundles) == 0:
+        raise ValueError("Cannot pad an empty bundle list.")
+    token_lists = [bundle.F_asset_tokens for bundle in bundles]
+    device = token_lists[0].device
+    dtype = token_lists[0].dtype
+    dim = int(token_lists[0].shape[-1])
+    lengths = [int(tokens.shape[1]) for tokens in token_lists]
+    max_len = max(lengths)
+    batch = len(token_lists)
+    if max_len == 0:
+        return token_lists[0].new_zeros((batch, 0, dim)), None
+    out = torch.zeros((batch, max_len, dim), device=device, dtype=dtype)
+    mask = torch.zeros((batch, max_len), device=device, dtype=torch.bool)
+    for row, tokens in enumerate(token_lists):
+        n = int(tokens.shape[1])
+        if n == 0:
+            continue
+        out[row, :n] = tokens.squeeze(0)
+        mask[row, :n] = True
+    if all(n == max_len for n in lengths):
+        return out, None
+    return out, mask
+
+
+def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor | None, list[int]]:
+    asset_tokens, asset_mask = _pad_asset_tokens_for_batch(bundles)
+    lengths = [int(bundle.F_asset_tokens.shape[1]) for bundle in bundles]
+    merged = SimpleNamespace(
+        z_clean=torch.cat([bundle.z_clean for bundle in bundles], dim=0),
+        z_splat=torch.cat([bundle.z_splat for bundle in bundles], dim=0),
+        scaffold_tok=torch.cat([bundle.scaffold_tok for bundle in bundles], dim=0),
+        M_preserve=torch.cat([bundle.M_preserve for bundle in bundles], dim=0),
+        M_source=torch.cat([bundle.M_source for bundle in bundles], dim=0),
+        M_dest=torch.cat([bundle.M_dest for bundle in bundles], dim=0),
+        F_asset_tokens=asset_tokens,
+        phase4_slots=[],
+    )
+    return merged, asset_mask, lengths
+
+
 def train_step(
     item: dict[str, Any] | list[dict[str, Any]],
     assembler: FlowFeatureAssembler,
@@ -533,6 +577,66 @@ def train_step(
     if isinstance(item, list):
         if len(item) == 0:
             raise ValueError("Received an empty training micro-batch.")
+        if len(item) > 1 and not bool(getattr(args, "no_batch_scene_flow", False)):
+            bundles = [build_flow_bundle(single, assembler, device) for single in item]
+            if unwrap_ddp(scene_flow).training:
+                for bundle_i in bundles:
+                    _maybe_drop_asset_kv(bundle_i, args.uncond_drop_prob)
+            bundle, asset_mask, asset_lengths = _merge_bundles_for_scene_flow(bundles)
+            sf = unwrap_ddp(scene_flow)
+            z_clean_n = sf.normalize(bundle.z_clean)
+            z_splat_n = sf.normalize(bundle.z_splat)
+            bundle.z_clean_n = z_clean_n
+
+            target = build_rectified_flow_target(
+                scheduler,
+                z_clean_n,
+                weighting_scheme=args.weighting_scheme,
+                logit_mean=args.logit_mean,
+                logit_std=args.logit_std,
+                loss_weighting_scheme=args.loss_weighting_scheme,
+            )
+
+            use_repa = float(args.lambda_repa) != 0.0
+            out = scene_flow(
+                target.z_t,
+                target.sigmas,
+                z_splat_n,
+                bundle.scaffold_tok,
+                bundle.M_preserve,
+                bundle.M_source,
+                bundle.M_dest,
+                bundle.F_asset_tokens,
+                encoder_attention_mask=asset_mask,
+                return_mid=use_repa,
+            )
+            if use_repa:
+                v_pred, mid_repa = out
+            else:
+                v_pred, mid_repa = out, None
+            loss, metrics = compute_total_loss(
+                v_pred=v_pred,
+                v_gt=target.v_gt,
+                eps=target.eps,
+                bundle=bundle,
+                sd3_weights=target.weights,
+                mid_repa=mid_repa,
+                lambda_flow=args.lambda_flow,
+                lambda_preserve=args.lambda_preserve,
+                lambda_repa=args.lambda_repa,
+                lambda_identity=0.0,
+                identity_batch=False,
+                preserve_floor=args.preserve_floor,
+            )
+            metrics.update({
+                "edit_weight_mean": float((1.0 - bundle.M_preserve).mean().item()),
+                "num_objects": sum(float(len(b.phase4_slots)) for b in bundles) / float(len(bundles)),
+                "kv_tokens": sum(float(n) for n in asset_lengths) / float(len(asset_lengths)),
+                "sigma_mean": float(target.sigmas.float().mean().item()),
+                "micro_batch_size": float(len(item)),
+            })
+            return loss, metrics
+
         losses: list[torch.Tensor] = []
         metric_sums: dict[str, float] = {}
         for single in item:
