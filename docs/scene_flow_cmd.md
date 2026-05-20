@@ -63,6 +63,7 @@ CUDA_VISIBLE_DEVICES=2 python -u train_scene_flow_pretrain.py \
     --max_steps 100000 \
     --warmup_steps 5000 \
     --save_every 5000 \
+    --shift 5.0 \
     --val_scene_start 0 --val_scene_end 198 \
     --val_every 1000 \
     --wandb_log_every 50 \
@@ -83,7 +84,7 @@ CUDA_VISIBLE_DEVICES=2 python -u train_scene_flow_pretrain.py \
 CUDA_VISIBLE_DEVICES=0,1 conda run -n dggt --no-capture-output \
     torchrun --nproc_per_node=2 train_scene_flow_pretrain.py \
     --image_dir $WAYMO_DGGT_ROOT \
-    --val_image_dir $WAYMO_DGGT_VAL_ROOT \
+    --val_image_dir $WAYMO_DGGT_ROOT \
     --dggt_ckpt_path $DGGT_CKPT \
     --tokenizer_ckpt_path $TOKENIZER_CKPT \
     --feature_stats_path $FEATURE_STATS \
@@ -93,16 +94,16 @@ CUDA_VISIBLE_DEVICES=0,1 conda run -n dggt --no-capture-output \
     --pretrain_task full_scene \
     --patch_grid_h 25 --patch_grid_w 37 \
     --latent_dim 1024 \
-    --batch_size 2 \
-    --grad_accum_steps 4 \
-    --num_workers 8 \
+    --batch_size 8 \
+    --grad_accum_steps 1 \
+    --num_workers 16 \
     --lr 2e-4 \
     --weight_decay 0.0 \
     --ema_decay 0.9995 \
-    --warmup_steps 3000 \
+    --warmup_steps 5000 \
     --max_steps 150000 \
     --save_every 5000 \
-    --shift 3.0 \
+    --shift 5.0 \
     --weighting_scheme logit_normal \
     --logit_mean 0.0 --logit_std 1.0 \
     --loss_weighting_scheme none \
@@ -110,13 +111,14 @@ CUDA_VISIBLE_DEVICES=0,1 conda run -n dggt --no-capture-output \
     --uncond_drop_prob 0.1 \
     --guidance_scale 1.0 \
     --val_guidance_scales "1.0,2.0,4.0" \
-    --val_scene_start 0 --val_scene_end 50 \
+    --val_scene_start 0 --val_scene_end 100 \
     --val_every 1000 \
     --val_batches 8 \
     --val_log_images 4 \
-    --val_sample_steps 50 \
+    --val_sample_steps 35 \
     --seed 0 \
     --precision bf16 \
+    --ddp_timeout_minutes 60 \
     --wandb \
     --wandb_project dggt-flow \
     --wandb_name scene_flow_pretrain_waymo_2a100
@@ -246,18 +248,19 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 | 帧数 | `--sequence_length 8` | 固定 8 帧，和 pretrain `--sequence_length 8` 一致 |
 | 有效 batch | `2 GPU × batch_size 2 × grad_accum 4 = 16` clip/optimizer update | 与 pretrain 完全一致；DataLoader 现在返回完整 micro-batch list，不再丢弃 `batch[1:]` |
 | micro-batch 执行 | 默认将 `batch_size>1` 的 bundle 合并后一次送入 `WanSceneFlow` | assembler 仍按 cache item 构建，但 WAN forward/backward 不再对 micro-batch 内样本完全串行；如需回退旧路径可加 `--no_batch_scene_flow` |
+| asset LUT 读取 | 默认只读取 asset LUT 最后一层；如需完整诊断可加 `--full_asset_lut_cache` | T1 使用 cached `pass2_splatted_tok_low` 作为 `z_splat` 输入，不再 live splat/blend；cross-attn `F_asset_tokens` 只使用最后一层 asset LUT，因此训练语义和完整读取一致，但显著减少 Mode-A CPU/IPC 体量 |
 | DataLoader | `--num_workers 4 --prefetch_factor 1`，默认不启用 `pin_memory` | 每个 cache 文件平均约 651MB，低 prefetch 避免 8 workers × 2 prefetch × batch_size 2 造成几十个大文件并发读；GB 级 batch 走 pin-memory 线程容易触发 `received 0 items of ancdata` |
 | worker tensor sharing | 默认 `--mp_sharing_strategy file_system` | 减少 multiprocessing 通过大量 fd 传递超大 tensor 时的稳定性问题；若系统 `/dev/shm`/临时目录策略特殊，可显式改回 `file_descriptor` |
 | cache 读取 | zstd / gzip / plain 均自动识别；plain torch cache 默认 `mmap=True` | 支持 schema v6/v7；v6 读取时会把 fp16 溢出的 `pass1.gs_conf` 修成 finite fp32，v7 直接读取 finite fp32。空间不足时优先把现有 gzip cache 原地转 zstd：同样保留 `.pt` 路径，实测更小且解压显著更快；plain+mmap 最快但空间约翻倍 |
 | sigma / target | `--shift 3.0 --weighting_scheme logit_normal --logit_mean 0.0 --logit_std 1.0 --loss_weighting_scheme none` | 正式训练代码已改为和 pretrain 一样调用 `build_rectified_flow_target`，用 clean-progress sigma 训练 `v=z_clean-eps` |
 | REPA | `--lambda_repa 0.5` | 正式训练已启用 `return_mid` + `compute_total_loss(... lambda_repa=0.5)` |
 | EMA | `--ema_decay 0.9995`，validation 默认用 EMA | checkpoint 同时保存 raw / full / EMA-only 权重 |
-| validation | `--val_fraction 0.1 --val_every 1000 --val_batches 8 --val_log_images 4 --val_sample_steps 50 --guidance_scale 1.0 --val_guidance_scales "1.0,2.0,4.0"` | 从 training manifest 内部 9:1 holdout，cadence / CFG scales / sampling steps 与正式 pretrain 一致 |
+| validation | `--val_fraction 0.1 --val_every 1000 --val_batches 8 --val_log_images 4 --val_sample_steps 50 --guidance_scale 1.0 --val_guidance_scales "1.0,2.0,4.0"` | 从 training manifest 内部 9:1 holdout，cadence / CFG scales / sampling steps 与正式 2×A100 pretrain 推荐命令一致；采样噪声用 `seed + step`，和 pretrain validation 一样可复现 |
 | schedule | `--lr 2e-4 --weight_decay 0.0 --warmup_steps 3000 --max_steps 150000` | 与正式 pretrain 的 optimizer / warmup / cosine horizon 一致 |
 
 注意：`train_scene_flow.py` 的 `global_step` 现在和 pretrain 一样是 optimizer update 口径；`--max_steps/--save_every/--vis_every/--val_every` 都按 optimizer update 触发。
 
-注意：正式训练 validation 会保存 loss 标量、latent PCA / mask / CFG 采样诊断图到 `logs/scene_flow_t1_1024/validation/step_xxxxxx/` 并写入 wandb。T1 的完整 3DGS RGB validation 仍建议用 `inference_scene_flow_validation.py` 在 checkpoint 上离线跑；训练内 validation 保持轻量，避免每 1000 step 做 3DGS 渲染拖慢训练。
+注意：正式训练 validation 会保存 loss 标量、latent PCA / mask / CFG 采样诊断图到 `logs/scene_flow_t1_1024/validation/step_xxxxxx/` 并写入 wandb。`generated_raw_latent_pca__cfg*.jpg` 是模型从 pass2 splat 条件采样得到的原始 latent，GT 是未编辑 clean latent；`generated_preserve_blend_latent_pca__cfg*.jpg` 额外展示未编辑区域直接回填 GT 的诊断版本。T1 的完整 3DGS RGB validation 仍建议用 `inference_scene_flow_validation.py` 在 checkpoint 上离线跑；训练内 validation 保持轻量，避免每 1000 step 做 3DGS 渲染拖慢训练。
 
 空间不足时的 cache 提速建议：
 

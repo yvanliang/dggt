@@ -486,6 +486,15 @@ class FlowFeatureAssembler(nn.Module):
         # F_g_lut_scene from cached 4-level image tokens (already subsetted to S frames)
         F_g_lut_scene = self._select_lut_scene(predictions)
         F_g_lut_asset = asset_pass_result.F_g_lut_asset
+        if splatted_tok_low_cached is None:
+            for obj_key, asset_levels in F_g_lut_asset.items():
+                if len(asset_levels) != len(F_g_lut_scene):
+                    raise RuntimeError(
+                        "Live Mode-A splatting requires all asset LUT levels. "
+                        f"Object {int(obj_key)} has {len(asset_levels)} levels, "
+                        f"but scene has {len(F_g_lut_scene)}. Use cached "
+                        "pass2_splatted_tok_low or load the full asset LUT cache."
+                    )
 
         # ------------------- Phase 2: FeatureSplatter -------------------- #
         B = int(F_g_lut_scene[0].shape[0])

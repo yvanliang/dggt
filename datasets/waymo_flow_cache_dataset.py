@@ -145,6 +145,41 @@ def _dequantize_nplc_subset(
     return dequantize_tokens(q, dtype=dtype)
 
 
+def _normalize_level_indices(level_indices: list[int] | tuple[int, ...], num_levels: int) -> list[int]:
+    out: list[int] = []
+    for raw in level_indices:
+        idx = int(raw)
+        if idx < 0:
+            idx += int(num_levels)
+        if idx < 0 or idx >= int(num_levels):
+            raise IndexError(f"level index {raw} is out of range for {num_levels} levels")
+        if idx not in out:
+            out.append(idx)
+    if len(out) == 0:
+        raise ValueError("level_indices must contain at least one level")
+    return out
+
+
+def _dequantize_nplc_subset_levels(
+    *,
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    subset: torch.Tensor,
+    level_indices: list[int] | tuple[int, ...],
+    dtype: torch.dtype,
+) -> list[torch.Tensor]:
+    """Select target frames and selected levels from a `[N, P, L, C]` int8 LUT."""
+    num_levels = int(data.shape[2])
+    levels = _normalize_level_indices(level_indices, num_levels)
+    level_tensor = torch.tensor(levels, dtype=torch.long, device=data.device)
+    q = QuantizedTokens(
+        data=data.index_select(2, level_tensor).index_select(0, subset),
+        scale=scale.index_select(1, level_tensor).index_select(0, subset),
+        layout="NPLC",
+    )
+    return _split_nplc_levels(dequantize_tokens(q, dtype=dtype))
+
+
 def _split_nplc_levels(x: torch.Tensor) -> list[torch.Tensor]:
     """Convert `[S, P, L, C]` into level tensors `[1, S, P, C]`."""
     return [
@@ -168,6 +203,7 @@ class WaymoFlowCacheDataset(Dataset):
         mode_filter: list[str] | None = None,
         include_aux_tokens: bool = False,
         mmap_plain_cache: bool = True,
+        asset_lut_level_indices: list[int] | tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         if min_frames <= 0 or max_frames < min_frames:
@@ -179,6 +215,9 @@ class WaymoFlowCacheDataset(Dataset):
         self.split = str(split)
         self.include_aux_tokens = bool(include_aux_tokens)
         self.mmap_plain_cache = bool(mmap_plain_cache)
+        self.asset_lut_level_indices = (
+            None if asset_lut_level_indices is None else tuple(int(v) for v in asset_lut_level_indices)
+        )
 
         if manifest_path is not None:
             self.manifest_path = Path(manifest_path)
@@ -580,13 +619,22 @@ class WaymoFlowCacheDataset(Dataset):
 
         for k in object_keys:
             entry = asset[k]
-            F_sub = _dequantize_nplc_subset(
-                data=entry["F_g_lut_asset_int8"],
-                scale=entry["F_g_lut_asset_scale"],
-                subset=subset,
-                dtype=self.lut_dtype,
-            )
-            F_g_lut_asset[k] = _split_nplc_levels(F_sub)
+            if self.asset_lut_level_indices is None:
+                F_sub = _dequantize_nplc_subset(
+                    data=entry["F_g_lut_asset_int8"],
+                    scale=entry["F_g_lut_asset_scale"],
+                    subset=subset,
+                    dtype=self.lut_dtype,
+                )
+                F_g_lut_asset[k] = _split_nplc_levels(F_sub)
+            else:
+                F_g_lut_asset[k] = _dequantize_nplc_subset_levels(
+                    data=entry["F_g_lut_asset_int8"],
+                    scale=entry["F_g_lut_asset_scale"],
+                    subset=subset,
+                    level_indices=self.asset_lut_level_indices,
+                    dtype=self.lut_dtype,
+                )
 
             subset_list = subset.tolist()
             remap = {n: i for i, n in enumerate(subset_list)}

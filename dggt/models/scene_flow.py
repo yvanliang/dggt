@@ -668,18 +668,22 @@ class WanSceneFlow(WanTransformer3DModel):
         F_asset_tokens: torch.Tensor,
         z_clean_for_blend: torch.Tensor | None = None,
         scheduler: Any | None = None,
+        shift: float | None = None,
         num_steps: int = 15,
         generator: torch.Generator | None = None,
     ) -> torch.Tensor:
         from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
         if scheduler is None:
-            # shift=13 matches RAE's dimension-dependent prescription for our
-            # 25*37*768 per-frame latent (sqrt(710400/4096) ~= 13). Callers
-            # that need a different schedule should pass their own scheduler.
+            if shift is None:
+                raise ValueError(
+                    "WanSceneFlow.sample requires an explicit `shift` when no "
+                    "scheduler is provided. Pass the same shift used for "
+                    "training, or pass a preconfigured scheduler."
+                )
             scheduler = FlowMatchEulerDiscreteScheduler(
                 num_train_timesteps=1000,
-                shift=13.0,
+                shift=float(shift),
                 invert_sigmas=True,
             )
         scheduler.set_timesteps(num_inference_steps=num_steps, device=z_splat.device)

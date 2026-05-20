@@ -23,6 +23,7 @@ import math
 import os
 import random
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -76,10 +77,23 @@ def is_main_process() -> bool:
     return get_rank() == 0
 
 
-def setup_distributed() -> tuple[torch.device, int, int]:
+def setup_distributed(args: argparse.Namespace | None = None) -> tuple[torch.device, int, int]:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+            timeout_minutes = int(
+                getattr(
+                    args,
+                    "ddp_timeout_minutes",
+                    os.environ.get("DDP_TIMEOUT_MINUTES", 60),
+                )
+            )
+            init_kwargs = {}
+            if timeout_minutes > 0:
+                init_kwargs["timeout"] = timedelta(minutes=timeout_minutes)
+            dist.init_process_group(
+                backend="nccl" if torch.cuda.is_available() else "gloo",
+                **init_kwargs,
+            )
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         world_size = dist.get_world_size()
         if torch.cuda.is_available():
@@ -318,13 +332,19 @@ def load_resume_checkpoint(
     payload = torch.load(resume_path, map_location=device)
     if not isinstance(payload, dict) or "scene_flow" not in payload:
         raise ValueError(f"Unsupported resume checkpoint format: {resume_path}")
+    required_keys = {"step", "scene_flow", "ema_scene_flow", "optimizer", "lr_scheduler"}
+    missing_keys = sorted(required_keys.difference(payload.keys()))
+    if missing_keys:
+        raise ValueError(
+            f"`--resume_path` requires a full training checkpoint, but {resume_path} "
+            f"is missing keys: {missing_keys}. Do not pass *_weights_only.pt or "
+            f"*_ema_weights_only.pt to --resume_path; those files are for warm-start "
+            f"or inference, not exact training resume."
+        )
     unwrap_ddp(scene_flow).load_state_dict(payload["scene_flow"], strict=True)
-    if "ema_scene_flow" in payload:
-        ema.load_state_dict(payload["ema_scene_flow"])
-    if "optimizer" in payload:
-        optimizer.load_state_dict(payload["optimizer"])
-    if "lr_scheduler" in payload:
-        lr_scheduler.load_state_dict(payload["lr_scheduler"])
+    ema.load_state_dict(payload["ema_scene_flow"])
+    optimizer.load_state_dict(payload["optimizer"])
+    lr_scheduler.load_state_dict(payload["lr_scheduler"])
     step = int(payload.get("step", 0))
     if is_main_process():
         print(f"[resume] loaded {resume_path} at step={step}", flush=True)
@@ -344,6 +364,8 @@ def init_wandb(args: argparse.Namespace, log_dir: Path):
         name=args.wandb_name,
         dir=str(log_dir),
         config=vars(args),
+        id=args.wandb_run_id,
+        resume=args.wandb_resume,
     )
     return run
 
@@ -391,6 +413,30 @@ def _normalized_mask_grid(mask: torch.Tensor, patch_grid: tuple[int, int], max_f
 
 def _image_grid(images: torch.Tensor, max_frames: int) -> torch.Tensor:
     return images[:1, :max_frames].detach().float().cpu().reshape(-1, *images.shape[2:]).clamp(0.0, 1.0)
+
+
+def _slice_batch_for_visualization(batch: dict[str, Any], max_samples: int = 1) -> dict[str, Any]:
+    """Keep qualitative validation bounded even when the val loader batch is large."""
+    images = batch.get("images")
+    if not torch.is_tensor(images) or images.ndim == 0:
+        return batch
+    batch_size = int(images.shape[0])
+    keep = max(1, min(int(max_samples), batch_size))
+
+    def maybe_slice(value: Any) -> Any:
+        if torch.is_tensor(value):
+            if value.ndim > 0 and int(value.shape[0]) == batch_size:
+                return value[:keep]
+            return value
+        if isinstance(value, dict):
+            return {key: maybe_slice(item) for key, item in value.items()}
+        if isinstance(value, list) and len(value) == batch_size:
+            return value[:keep]
+        if isinstance(value, tuple) and len(value) == batch_size:
+            return value[:keep]
+        return value
+
+    return {key: maybe_slice(value) for key, value in batch.items()}
 
 
 def _semantic_logits_to_sky_mask(
@@ -694,7 +740,7 @@ def render_validation_rgb(
     # ------------------------------------------------------------------
     with autocast_context(args, device):
         # Heads MUST run with autocast disabled (matches VGGT.forward).
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type=device.type, enabled=False):
             pose_enc = vggt_model.camera_head(aggregated_tokens_list)[-1]
             depth, _ = vggt_model.depth_head(aggregated_tokens_list, images, patch_start_idx)
             dynamic_conf, _ = vggt_model.instance_head(dino_token_list, images, patch_start_idx)
@@ -716,7 +762,7 @@ def render_validation_rgb(
     # ------------------------------------------------------------------
     with autocast_context(args, device):
         gen_agg, gen_dino = split_image_tokens_for_heads(generated_image_tokens)
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type=device.type, enabled=False):
             raw_gs_map, raw_gs_conf = vggt_model.gs_head(generated_image_tokens, images, patch_start_idx)
             generated_pose_enc = vggt_model.camera_head(gen_agg)[-1]
             generated_depth, _ = vggt_model.depth_head(gen_agg, images, patch_start_idx)
@@ -753,7 +799,7 @@ def render_validation_rgb(
     # ------------------------------------------------------------------
     with autocast_context(args, device):
         recon_agg, recon_dino = split_image_tokens_for_heads(recon_image_tokens)
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(device_type=device.type, enabled=False):
             recon_pose_enc = vggt_model.camera_head(recon_agg)[-1]
             recon_depth, _ = vggt_model.depth_head(recon_agg, images, patch_start_idx)
             recon_dynamic_conf, _ = vggt_model.instance_head(recon_dino, images, patch_start_idx)
@@ -774,6 +820,73 @@ def render_validation_rgb(
     # GT images grid (always cheap)
     # ------------------------------------------------------------------
     result["input_rgb_gt"] = _image_grid(images, frames)
+    return result
+
+
+@torch.no_grad()
+def render_validation_generated_rgb(
+    batch: dict[str, Any],
+    vggt_model: VGGT,
+    scene_flow: nn.Module,
+    z_generated_raw_n: torch.Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Render only the generated branch for secondary CFG scales."""
+    images = batch["images"].to(device, non_blocking=True)
+    frames = min(int(args.val_log_images), int(images.shape[1]))
+    sf = unwrap_ddp(scene_flow)
+    timestamps = batch["timestamps"][0] if torch.is_tensor(batch["timestamps"]) else torch.as_tensor(batch["timestamps"][0])
+
+    with autocast_context(args, device):
+        outputs = vggt_model.get_aggregator_token_outputs(images)
+        image_tokens_list = outputs["image_tokens_list"]
+        patch_start_idx = int(outputs["patch_start_idx"])
+        del outputs
+
+        z_generated = sf.denormalize(z_generated_raw_n.float())
+        decoded_patch_tokens = vggt_model.scene_tokenizer.decode(z_generated, patch_grid=args.patch_grid)
+        del z_generated
+        decoded_full_tokens = reattach_special_tokens(
+            image_tokens_list, TOKENIZER_LEVELS, patch_start_idx, decoded_patch_tokens,
+        )
+        del decoded_patch_tokens
+        generated_image_tokens = replace_selected_levels(
+            image_tokens_list, TOKENIZER_LEVELS, decoded_full_tokens,
+        )
+        del decoded_full_tokens, image_tokens_list
+
+    with autocast_context(args, device):
+        gen_agg, gen_dino = split_image_tokens_for_heads(generated_image_tokens)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            raw_gs_map, raw_gs_conf = vggt_model.gs_head(generated_image_tokens, images, patch_start_idx)
+            generated_pose_enc = vggt_model.camera_head(gen_agg)[-1]
+            generated_depth, _ = vggt_model.depth_head(gen_agg, images, patch_start_idx)
+            generated_dynamic_conf, _ = vggt_model.instance_head(gen_dino, images, patch_start_idx)
+            generated_semantic_logits, _ = vggt_model.semantic_head(gen_dino, images, patch_start_idx)
+            generated_sky_mask = _semantic_logits_to_sky_mask(generated_semantic_logits)
+
+    del generated_image_tokens, gen_agg, gen_dino
+
+    result = {
+        "generated_pred_sky_mask": _sky_mask_image_grid(generated_sky_mask, frames),
+        "generated_raw_3dgs_rgb": _render_gs_map_rgb(
+            vggt_model, images, generated_sky_mask, timestamps,
+            generated_pose_enc, generated_depth, raw_gs_map, raw_gs_conf,
+            generated_dynamic_conf,
+            device, frames, background_mode="black", use_sky_mask=True,
+        ),
+    }
+    del (
+        generated_pose_enc,
+        generated_depth,
+        raw_gs_map,
+        raw_gs_conf,
+        generated_dynamic_conf,
+        generated_semantic_logits,
+        generated_sky_mask,
+    )
+    torch.cuda.empty_cache()
     return result
 
 
@@ -1110,7 +1223,7 @@ def run_validation(
         if count >= args.val_batches:
             break
         if first_batch is None and is_main_process():
-            first_batch = batch
+            first_batch = _slice_batch_for_visualization(batch, max_samples=1)
         loss, logs = train_step(batch, vggt_model, scene_flow, scheduler, device, args)
         logs = dict(logs)
         logs["loss"] = float(loss.detach().item())
@@ -1190,7 +1303,7 @@ def run_validation(
                 )
                 rgb_extra = None
                 if not args.no_val_render_rgb:
-                    rgb_extra = render_validation_rgb(
+                    rgb_extra = render_validation_generated_rgb(
                         first_batch,
                         vggt_model,
                         scene_flow,
@@ -1363,11 +1476,34 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--loss_weighting_scheme", type=str, default="none")
     parser.add_argument("--precision", type=str, default="bf16", choices=("bf16", "fp32"))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--ddp_timeout_minutes",
+        type=int,
+        default=60,
+        help=(
+            "Distributed process-group timeout. Validation image rendering is "
+            "rank-0-only, so keep this above the worst-case qualitative dump time. "
+            "Use <=0 to leave the PyTorch default."
+        ),
+    )
     parser.add_argument("--no_tqdm", action="store_true")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="dggt-flow")
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument(
+        "--wandb_run_id",
+        type=str,
+        default=None,
+        help="Optional existing wandb run id for resume. Use with --wandb_resume.",
+    )
+    parser.add_argument(
+        "--wandb_resume",
+        type=str,
+        default="allow",
+        choices=("allow", "must", "never", "auto"),
+        help="wandb resume mode passed to wandb.init(..., resume=...).",
+    )
     return parser
 
 
@@ -1385,7 +1521,7 @@ def main() -> None:
     if args.val_scene_end is None:
         args.val_scene_end = args.val_scene_start
 
-    device, local_rank, world_size = setup_distributed()
+    device, local_rank, world_size = setup_distributed(args)
     seed_everything(args.seed + get_rank())
 
     log_dir = Path(args.log_dir)

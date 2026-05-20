@@ -374,6 +374,15 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Disable mmap=True when reading uncompressed torch cache files.")
     parser.add_argument("--no_batch_scene_flow", action="store_true",
                         help="Process cache items in a micro-batch serially instead of batching WanSceneFlow.")
+    parser.add_argument(
+        "--full_asset_lut_cache",
+        action="store_true",
+        help=(
+            "Load all cached asset LUT levels. By default T1 loads only the last "
+            "asset level because cached pass2_splatted_tok_low supplies z_splat "
+            "and cross-attn uses only the last level."
+        ),
+    )
     parser.add_argument("--max_steps", type=int, default=40000)
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--vis_every", type=int, default=1000)
@@ -561,6 +570,7 @@ def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor
         M_source=torch.cat([bundle.M_source for bundle in bundles], dim=0),
         M_dest=torch.cat([bundle.M_dest for bundle in bundles], dim=0),
         F_asset_tokens=asset_tokens,
+        encoder_attention_mask=asset_mask,
         phase4_slots=[],
     )
     return merged, asset_mask, lengths
@@ -676,6 +686,7 @@ def train_step(
         bundle.M_source,
         bundle.M_dest,
         bundle.F_asset_tokens,
+        encoder_attention_mask=getattr(bundle, "encoder_attention_mask", None),
         return_mid=use_repa,
     )
     if use_repa:
@@ -761,6 +772,7 @@ def cfg_sample_edit_latents(
     scene_flow: nn.Module,
     bundle,
     args,
+    step: int,
     device: torch.device,
     guidance_scale: float,
 ) -> torch.Tensor:
@@ -773,10 +785,14 @@ def cfg_sample_edit_latents(
     scheduler.set_timesteps(num_inference_steps=int(args.val_sample_steps), device=device)
     z_clean_n = sf.normalize(bundle.z_clean.float())
     z_splat_n = sf.normalize(bundle.z_splat.float())
-    z = torch.randn_like(z_clean_n)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(args.seed) + int(step))
+    z = torch.empty_like(z_clean_n)
+    z.normal_(generator=generator)
     batch_size = int(z.shape[0])
     F_asset = bundle.F_asset_tokens
     F_uncond = F_asset.new_zeros((batch_size, 0, F_asset.shape[-1]))
+    encoder_attention_mask = getattr(bundle, "encoder_attention_mask", None)
     do_cfg = abs(float(guidance_scale) - 1.0) > 1e-6 and F_asset.shape[1] > 0
 
     for timestep in scheduler.timesteps:
@@ -791,6 +807,8 @@ def cfg_sample_edit_latents(
             bundle.M_source,
             bundle.M_dest,
             F_asset,
+            encoder_attention_mask=encoder_attention_mask,
+            return_mid=False,
         )
         if do_cfg:
             v_uncond = sf(
@@ -802,13 +820,15 @@ def cfg_sample_edit_latents(
                 bundle.M_source,
                 bundle.M_dest,
                 F_uncond,
+                encoder_attention_mask=None,
+                return_mid=False,
             )
             v = v_uncond + float(guidance_scale) * (v_cond - v_uncond)
         else:
             v = v_cond
         z = scheduler.step(model_output=v, timestep=timestep, sample=z, return_dict=False)[0]
 
-    return bundle.M_preserve * z_clean_n + (1.0 - bundle.M_preserve) * z
+    return z
 
 
 def _validation_scales(args) -> list[float]:
@@ -861,12 +881,23 @@ def save_validation_images(bundle, scene_flow: nn.Module, log_dir: Path, step: i
         paths[name] = path
 
     for scale in _validation_scales(args):
-        z_edited = cfg_sample_edit_latents(scene_flow, bundle, args, device, scale)
+        z_generated_raw = cfg_sample_edit_latents(scene_flow, bundle, args, step, device, scale)
+        z_generated_preserve_blend = bundle.M_preserve * z_clean_n + (1.0 - bundle.M_preserve) * z_generated_raw
         suffix = f"__cfg{scale:g}"
         images = {
-            f"generated_raw_latent_pca{suffix}": _latent_pca_grid(z_edited, bundle.patch_grid, frames),
-            f"abs_error{suffix}": _normalized_mask_grid(
-                (z_edited - z_clean_n).abs().mean(dim=-1, keepdim=True),
+            f"generated_raw_latent_pca{suffix}": _latent_pca_grid(z_generated_raw, bundle.patch_grid, frames),
+            f"generated_preserve_blend_latent_pca{suffix}": _latent_pca_grid(
+                z_generated_preserve_blend,
+                bundle.patch_grid,
+                frames,
+            ),
+            f"abs_error_raw{suffix}": _normalized_mask_grid(
+                (z_generated_raw - z_clean_n).abs().mean(dim=-1, keepdim=True),
+                bundle.patch_grid,
+                frames,
+            ),
+            f"abs_error_preserve_blend{suffix}": _normalized_mask_grid(
+                (z_generated_preserve_blend - z_clean_n).abs().mean(dim=-1, keepdim=True),
                 bundle.patch_grid,
                 frames,
             ),
@@ -1008,6 +1039,7 @@ def main() -> None:
         max_frames=args.sequence_length,
         seed=args.seed,
         mmap_plain_cache=not bool(args.no_mmap_plain_cache),
+        asset_lut_level_indices=None if bool(args.full_asset_lut_cache) else (-1,),
     )
     val_ds = split_train_val_entries(
         train_ds,
@@ -1018,7 +1050,8 @@ def main() -> None:
         print(
             f"[data] train_entries={len(train_ds.entries)} "
             f"val_entries={0 if val_ds is None else len(val_ds.entries)} "
-            f"val_fraction={float(args.val_fraction):.3f}",
+            f"val_fraction={float(args.val_fraction):.3f} "
+            f"asset_lut_levels={'all' if bool(args.full_asset_lut_cache) else 'last'}",
             flush=True,
         )
     val_loader = None

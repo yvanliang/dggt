@@ -157,7 +157,7 @@ torchrun --nproc_per_node=8 train_scene_flow.py \
     --val_manifest_path /data/flow_cache/validation_manifest.jsonl \
     --log_dir runs/flow_t1 \
     --batch_size 1 --grad_accum_steps 2 \
-    --min_frames 4 --max_frames 8 \
+    --sequence_length 8 \
     --max_steps 40000 --vis_every 1000
 ```
 
@@ -240,7 +240,7 @@ CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node=1 train_scene_flow.py \
     --ckpt_path .../model_latest_waymo.pt \
     --manifest_path /data/flow_cache/training_manifest_smoke.jsonl \
     --log_dir runs/flow_smoke --batch_size 1 --max_steps 5 \
-    --min_frames 4 --max_frames 4 --vis_every 2
+    --sequence_length 4 --vis_every 2
 ```
 
 通过标准：
