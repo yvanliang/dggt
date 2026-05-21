@@ -53,6 +53,7 @@ from dggt.utils.gaussian_edit import (
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
+DGGT_DYNAMIC_STATIC_PROB_THRESHOLD = 0.6224593312018546  # sigmoid(0.5)
 
 
 @dataclass
@@ -1239,7 +1240,7 @@ class FlowFeatureAssembler(nn.Module):
         gauss_chunks: list[dict[str, torch.Tensor]] = []
         ptr_chunks: list[GaussianPointers] = []
 
-        static_mask = base_mask & (dynamic_prob < 0.5)
+        static_mask = base_mask & (dynamic_prob < DGGT_DYNAMIC_STATIC_PROB_THRESHOLD)
         if bool(static_mask.any().item()):
             static_opacity = opacities[static_mask] * (1.0 - dynamic_prob[static_mask])
             static_opacity = self._mode_b_alpha_t(
@@ -1282,7 +1283,7 @@ class FlowFeatureAssembler(nn.Module):
         opacities = clean_dict["opacities"].to(device=device, dtype=torch.float32).view(-1)
 
         chunks: list[dict[str, torch.Tensor]] = []
-        static_mask = base_mask & (dynamic_prob < 0.5)
+        static_mask = base_mask & (dynamic_prob < DGGT_DYNAMIC_STATIC_PROB_THRESHOLD)
         if bool(static_mask.any().item()):
             static_opacity = opacities[static_mask] * (1.0 - dynamic_prob[static_mask])
             static_opacity = self._mode_b_alpha_t(

@@ -64,7 +64,7 @@ from dggt.utils.tokens import select_patch_pyramid
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
-CACHE_SCHEMA_VERSION = 7
+CACHE_SCHEMA_VERSION = 8
 GS_CONF_REPAIR_VALUE = 1_000_000.0
 CLIP_LENGTH = 29
 
@@ -91,7 +91,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--end_clip_idx", type=int, default=-1, help="-1 for all")
     p.add_argument("--force_overwrite", action="store_true")
     p.add_argument(
-        "--overwrite_v6",
+        "--overwrite_v7",
         action="store_true",
         help=(
             "If an output .pt already exists, keep it only when it is already the "
@@ -215,7 +215,7 @@ def _should_skip_existing_cache(path: Path, args: argparse.Namespace) -> tuple[b
         return False, "missing"
     if bool(args.force_overwrite):
         return False, "force_overwrite"
-    if bool(getattr(args, "overwrite_v6", False)):
+    if bool(getattr(args, "overwrite_v7", False)):
         version = _read_cache_schema_version(path)
         if version == CACHE_SCHEMA_VERSION:
             return True, f"schema_v{CACHE_SCHEMA_VERSION}"
@@ -1535,7 +1535,7 @@ def main() -> None:
                 del sample, record
                 progress.set_postfix(done=done_count, saved=saved_count, skip=skip_count, err=err_count)
                 continue
-            if out_path.is_file() and args.overwrite_v6 and not args.force_overwrite:
+            if out_path.is_file() and args.overwrite_v7 and not args.force_overwrite:
                 progress.write(
                     f"[regen] idx={idx:05d} manifest={manifest_index:06d} "
                     f"existing={skip_reason} -> schema_v{CACHE_SCHEMA_VERSION}"

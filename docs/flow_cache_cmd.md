@@ -23,7 +23,7 @@
 
 ## Cache 语义：full-source-Gaussian splat
 
-v7 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend 特征。它的 source Gaussian 集合是完整 clip 的所有帧；训练时随机选连续 4-8 帧窗口时，dataset 只在 target frame 维度做 `index_select`。v7 还把 `pass1.gs_conf` 从旧版 fp16 改为 finite fp32，避免大置信度值溢出为 `inf`。
+v8 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend 特征。它的 source Gaussian 集合是完整 clip 的所有帧；训练时随机选连续 4-8 帧窗口时，dataset 只在 target frame 维度做 `index_select`。v7 把 `pass1.gs_conf` 从旧版 fp16 改为 finite fp32，避免大置信度值溢出为 `inf`；v8 修正了动态 Gaussian 生命周期阈值。训练读取端兼容 v6 / v7 / v8。
 
 因此 `cache.index_select(subset)` 不应该和“先把 `gs_map` 裁成 subset，再 live 重跑 `FeatureSplatter`”逐 token 相等。后者的 source Gaussian 少了其他帧，遮挡和补洞都会变。验证时应检查 full clip cache 与 full clip live recompute 一致；对子集只检查缓存切片结构正常，以及 mask、`z_clean`、asset tokens、scaffold 等非 pass2 字段一致。这个语义更接近实际推理：推理通常对完整 clip 做 live splat。
 
@@ -66,7 +66,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/precompute_flow_features.py \
     --views 1
 ```
 
-如果已有 v6 cache，只想升级旧文件并保留已生成的 v7 文件，可在 Mode A / Mode B 预计算命令里加 `--overwrite_v6`。它会读取已存在 `.pt` 的 `schema_version`：v7 直接跳过，非 v7 或无法读取的文件会重新生成并覆盖。`--force_overwrite` 仍表示无条件重算覆盖。
+如果已有 v6/v7 cache，只想升级旧文件并保留已生成的 v8 文件，可在 Mode A / Mode B 预计算命令里加 `--overwrite_v7`。它会读取已存在 `.pt` 的 `schema_version`：v8 直接跳过，非 v8 或无法读取的文件会重新生成并覆盖。`--force_overwrite` 仍表示无条件重算覆盖。
 
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python inference_scene_editor.py \
     --output_dir runs/mode_a_all_vis \

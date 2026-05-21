@@ -7,7 +7,7 @@ decoupled localization ONCE, then derive 5 variant caches:
   insert {insertion, replacement, reposition} (all 4 edits in one scene).
 * ``delete`` / ``add`` / ``replace`` / ``move`` -- single-edit-type caches.
 
-Output (schema-identical to Mode A v7, ``mode_kind="mode_a"``; FLAT layout so
+Output (schema-identical to Mode A v8, ``mode_kind="mode_a"``; FLAT layout so
 the unmodified Mode-A toolchain works -- ``index = entry_index*5 + variant_ord``,
 ``variant_ord`` = combined0/delete1/add2/replace3/move4):
 
@@ -105,7 +105,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--end", type=int, default=None, help="entry index, exclusive")
     p.add_argument("--force_overwrite", action="store_true")
     p.add_argument(
-        "--overwrite_v6",
+        "--overwrite_v7",
         action="store_true",
         help=(
             "If an output .pt already exists, keep it only when it is already the "
@@ -453,7 +453,7 @@ def main() -> None:
                 skip_existing, skip_reason = _should_skip_existing_cache(out_path, args)
                 if skip_existing:
                     continue
-                if out_path.is_file() and args.overwrite_v6 and not args.force_overwrite:
+                if out_path.is_file() and args.overwrite_v7 and not args.force_overwrite:
                     progress.write(
                         f"[regen] entry={idx:03d} variant={variant} "
                         f"existing={skip_reason} -> schema_v{CACHE_SCHEMA_VERSION}"

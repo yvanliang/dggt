@@ -92,7 +92,7 @@ NCCL_P2P_DISABLE=1 torchrun \
     --wandb_project dggt-tokenizer \
     --wandb_name t0_stageA_dz1024_2x80g
 
-Stage-B (cached v6 flow-cache fine-tuning, 2 x 80GB):
+Stage-B (flow-cache fine-tuning, 2 x 80GB):
 
 NCCL_P2P_DISABLE=1 torchrun \
     --nproc_per_node=2 \
@@ -201,7 +201,7 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help=(
-            "Use v6 FlowDGGT .pt cache as tokenizer teacher data. Can be repeated. "
+            "Use FlowDGGT .pt cache as tokenizer teacher data. Can be repeated. "
             "Each value may be a cache root, a split directory, or path:mode_a/mode_b/auto."
         ),
     )
@@ -209,7 +209,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--cache_manifest_path",
         type=str,
         default=None,
-        help="Merged v6 flow-cache manifest JSONL for cached tokenizer training.",
+        help="Merged flow-cache manifest JSONL for cached tokenizer training.",
     )
     parser.add_argument("--cache_split", type=str, default="training")
     parser.add_argument(
@@ -2250,7 +2250,7 @@ def build_cached_dataset(
     from dggt.utils.flow_cache_io import load_flow_cache
 
     class TokenizerFlowCacheDataset(WaymoFlowCacheDataset):
-        """Lightweight v6 flow-cache reader for tokenizer Stage-B."""
+        """Lightweight flow-cache reader for tokenizer Stage-B."""
 
         def __getitem__(self, idx: int) -> dict[str, Any]:
             entry = self.entries[idx]

@@ -40,7 +40,7 @@ from dggt.utils.flow_cache_io import load_flow_cache
 from dggt.utils.gaussian_edit import Sim3Transform
 
 
-SUPPORTED_CACHE_SCHEMA_VERSIONS = (6, 7)
+SUPPORTED_CACHE_SCHEMA_VERSIONS = (6, 7, 8)
 GS_CONF_REPAIR_VALUE = 1_000_000.0
 
 
@@ -289,7 +289,7 @@ class WaymoFlowCacheDataset(Dataset):
         cameras_dggt = self._build_cameras_dggt(payload, subset_t)
         alignment = self._build_alignment(payload)
 
-        # Schema v6/v7 fast-path inputs.
+        # Schema v6+ fast-path inputs.
         # * phase1_localized          — Mode A only (Mode B doesn't run editor.localize).
         # * pass2_splatted_tok_low    — both modes (precomputed splat→blend output,
         #                               i.e. the *input* to tokenizer.encode).
@@ -304,7 +304,7 @@ class WaymoFlowCacheDataset(Dataset):
             phase1_payload = payload.get("phase1_localized")
             if phase1_payload is None:
                 raise RuntimeError(
-                    f"Mode-A cache {cache_path} missing phase1_localized payload (schema v6/v7)."
+                    f"Mode-A cache {cache_path} missing phase1_localized payload (schema v6+)."
                 )
             phase1_localized_subset = self._subset_phase1_localized(
                 phase1_payload, subset_t
@@ -313,7 +313,7 @@ class WaymoFlowCacheDataset(Dataset):
         if pass2_payload is None:
             raise RuntimeError(
                 f"Cache {cache_path} missing pass2_splatted_tok_low payload "
-                "(schema v6/v7). Re-run tools/precompute_flow_features.py."
+                "(schema v6+). Re-run tools/precompute_flow_features.py."
             )
         splatted_tok_low_cached = self._subset_pass2_splatted_tok_low(
             pass2_payload, subset_t, dtype=self.lut_dtype,
@@ -435,7 +435,7 @@ class WaymoFlowCacheDataset(Dataset):
         if payload.get("pass2_z_splat") is not None:
             raise RuntimeError(
                 f"Cache {cache_path} still carries legacy pass2_z_splat; "
-                "regenerate as schema v7 without tokenizer-output cache."
+                "regenerate as schema v7+ without tokenizer-output cache."
             )
         if mode_kind == "mode_a" and payload.get("phase1_localized") is None:
             raise RuntimeError(
