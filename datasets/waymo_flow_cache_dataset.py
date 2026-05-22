@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import json
 import random
+import warnings
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 from dggt.models.asset_pass import AssetPassResult
 from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
@@ -204,6 +205,7 @@ class WaymoFlowCacheDataset(Dataset):
         include_aux_tokens: bool = False,
         mmap_plain_cache: bool = True,
         asset_lut_level_indices: list[int] | tuple[int, ...] | None = None,
+        max_read_retries: int = 16,
     ) -> None:
         super().__init__()
         if min_frames <= 0 or max_frames < min_frames:
@@ -218,6 +220,7 @@ class WaymoFlowCacheDataset(Dataset):
         self.asset_lut_level_indices = (
             None if asset_lut_level_indices is None else tuple(int(v) for v in asset_lut_level_indices)
         )
+        self.max_read_retries = max(1, int(max_read_retries))
 
         if manifest_path is not None:
             self.manifest_path = Path(manifest_path)
@@ -261,6 +264,88 @@ class WaymoFlowCacheDataset(Dataset):
 
     # ------------------------------------------------------------------ #
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        return self._getitem_with_cache_read_retry(idx, self._load_item_at_index)
+
+    def _getitem_with_cache_read_retry(self, idx: int, load_fn) -> Any:
+        dataset_len = len(self.entries)
+        if dataset_len <= 0:
+            raise RuntimeError("Cannot read from an empty cache dataset.")
+        requested_idx = int(idx) % dataset_len
+        current_idx = requested_idx
+        last_exc: Exception | None = None
+        max_attempts = min(self.max_read_retries, dataset_len) if dataset_len > 1 else 1
+        tried: set[int] = set()
+
+        for attempt in range(max_attempts):
+            tried.add(current_idx)
+            try:
+                return load_fn(current_idx)
+            except Exception as exc:
+                last_exc = exc
+                will_retry = attempt + 1 < max_attempts
+                replacement_idx = self._sample_retry_index(current_idx, tried) if will_retry else current_idx
+                self._warn_cache_read_failure(
+                    requested_idx=requested_idx,
+                    failed_idx=current_idx,
+                    replacement_idx=replacement_idx,
+                    attempt=attempt + 1,
+                    max_attempts=max_attempts,
+                    exc=exc,
+                    will_retry=will_retry,
+                )
+                if attempt + 1 >= max_attempts:
+                    break
+                current_idx = replacement_idx
+
+        failed_paths = ", ".join(
+            str(self.entries[i].get("cache_path", "<unknown>")) for i in sorted(tried)
+        )
+        raise RuntimeError(
+            f"Failed to load cache item requested_idx={requested_idx} after "
+            f"{max_attempts} attempts. Tried cache paths: {failed_paths}"
+        ) from last_exc
+
+    def _sample_retry_index(self, failed_idx: int, tried: set[int]) -> int:
+        dataset_len = len(self.entries)
+        if dataset_len <= 1:
+            return int(failed_idx)
+        available = [i for i in range(dataset_len) if i not in tried]
+        if not available:
+            available = [i for i in range(dataset_len) if i != int(failed_idx)]
+        return int(available[self._rng.randrange(len(available))])
+
+    def _warn_cache_read_failure(
+        self,
+        *,
+        requested_idx: int,
+        failed_idx: int,
+        replacement_idx: int,
+        attempt: int,
+        max_attempts: int,
+        exc: Exception,
+        will_retry: bool,
+    ) -> None:
+        worker = get_worker_info()
+        worker_id = "main" if worker is None else str(worker.id)
+        failed_path = self.entries[failed_idx].get("cache_path", "<unknown>")
+        replacement_path = self.entries[replacement_idx].get("cache_path", "<unknown>")
+        action = (
+            f"resampling replacement_idx={replacement_idx} replacement_path={replacement_path}"
+            if will_retry
+            else "no retry attempts remain"
+        )
+        warnings.warn(
+            "[cache/dataloader] failed to read cache item. "
+            f"worker={worker_id} requested_idx={requested_idx} "
+            f"failed_idx={failed_idx} failed_path={failed_path} "
+            f"{action} "
+            f"attempt={attempt}/{max_attempts} "
+            f"error={type(exc).__name__}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    def _load_item_at_index(self, idx: int) -> dict[str, Any]:
         entry = self.entries[idx]
         cache_path = Path(entry["cache_path"])
         payload = load_flow_cache(

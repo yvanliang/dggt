@@ -2253,6 +2253,9 @@ def build_cached_dataset(
         """Lightweight flow-cache reader for tokenizer Stage-B."""
 
         def __getitem__(self, idx: int) -> dict[str, Any]:
+            return self._getitem_with_cache_read_retry(idx, self._load_tokenizer_item_at_index)
+
+        def _load_tokenizer_item_at_index(self, idx: int) -> dict[str, Any]:
             entry = self.entries[idx]
             cache_path = Path(entry["cache_path"])
             payload = load_flow_cache(

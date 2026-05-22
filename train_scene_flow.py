@@ -259,23 +259,27 @@ def load_scene_flow_warm_start(
 def _infer_cache_patch_grid(dataset: WaymoFlowCacheDataset) -> tuple[int, int]:
     if len(dataset.entries) == 0:
         raise RuntimeError("Cannot infer patch grid from an empty cache dataset.")
-    entry = dataset.entries[0]
-    cache_path = entry.get("cache_path")
-    if cache_path is None:
-        raise KeyError("Cache dataset entry is missing 'cache_path'.")
-    payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
-    WaymoFlowCacheDataset._validate_v6_payload(
-        payload,
-        cache_path=Path(cache_path),
-        entry=entry,
-    )
-    patch_grid = payload.get("meta", {}).get("patch_grid")
-    if patch_grid is None or len(patch_grid) != 2:
-        raise KeyError(f"Cache payload {cache_path} is missing meta.patch_grid=(H,W).")
-    out = (int(patch_grid[0]), int(patch_grid[1]))
-    if out[0] <= 0 or out[1] <= 0:
-        raise ValueError(f"Invalid cache patch_grid {out} in {cache_path}.")
-    return out
+
+    def _load_patch_grid(idx: int) -> tuple[int, int]:
+        entry = dataset.entries[idx]
+        cache_path = entry.get("cache_path")
+        if cache_path is None:
+            raise KeyError("Cache dataset entry is missing 'cache_path'.")
+        payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
+        WaymoFlowCacheDataset._validate_v6_payload(
+            payload,
+            cache_path=Path(cache_path),
+            entry=entry,
+        )
+        patch_grid = payload.get("meta", {}).get("patch_grid")
+        if patch_grid is None or len(patch_grid) != 2:
+            raise KeyError(f"Cache payload {cache_path} is missing meta.patch_grid=(H,W).")
+        out = (int(patch_grid[0]), int(patch_grid[1]))
+        if out[0] <= 0 or out[1] <= 0:
+            raise ValueError(f"Invalid cache patch_grid {out} in {cache_path}.")
+        return out
+
+    return dataset._getitem_with_cache_read_retry(0, _load_patch_grid)
 
 
 def split_train_val_entries(
