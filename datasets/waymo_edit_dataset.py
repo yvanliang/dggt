@@ -844,8 +844,8 @@ class WaymoEditDataset(Dataset):
 
         sample_index = int(idx)
         sample_num_frames = int(sample_num_frames)
-        if tuple_override and not 4 <= sample_num_frames <= 8:
-            raise ValueError(f"WaymoEditDataset tuple num_frames must be in [4, 8], got {sample_num_frames}")
+        if tuple_override and not 4 <= sample_num_frames <= 10:
+            raise ValueError(f"WaymoEditDataset tuple num_frames must be in [4, 10], got {sample_num_frames}")
         if sample_num_frames <= 0:
             raise ValueError(f"WaymoEditDataset num_frames must be positive, got {sample_num_frames}")
         return sample_index, sample_num_frames

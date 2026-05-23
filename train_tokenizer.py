@@ -424,12 +424,14 @@ def is_main_process() -> bool:
 def setup_distributed(args: argparse.Namespace) -> tuple[torch.device, int, int]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
     if torch.cuda.is_available():
-        if world_size == 1:
-            torch.cuda.set_device(local_rank)
+        torch.cuda.set_device(local_rank)
+    if world_size > 1 and not dist.is_initialized():
+        init_kwargs: dict[str, Any] = {}
+        if torch.cuda.is_available():
+            init_kwargs["device_id"] = torch.device("cuda", local_rank)
+        dist.init_process_group(backend="nccl", **init_kwargs)
+    if torch.cuda.is_available():
         device = torch.device("cuda", local_rank)
     else:
         device = torch.device("cpu")

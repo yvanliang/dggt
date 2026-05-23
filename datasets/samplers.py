@@ -25,7 +25,7 @@ class DeterministicVariableLengthDistributedSampler(DistributedSampler):
         drop_last=False,
         batch_size=1,
         min_num_frames=4,
-        max_num_frames=8,
+        max_num_frames=10,
         num_frames_choices=None,
     ):
         super().__init__(
@@ -48,8 +48,8 @@ class DeterministicVariableLengthDistributedSampler(DistributedSampler):
         seen = set()
         for value in num_frames_choices:
             value = int(value)
-            if not 4 <= value <= 8:
-                raise ValueError(f"num_frames choices must stay in [4, 8], got {value}")
+            if not 4 <= value <= 10:
+                raise ValueError(f"num_frames choices must stay in [4, 10], got {value}")
             if value not in seen:
                 normalized_choices.append(value)
                 seen.add(value)
