@@ -1,3 +1,13 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# CUDA 12.8 build. Required for NVIDIA Blackwell / sm_120 GPUs.
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchaudio==2.7.1+cu128
+
+# Keep NumPy 1.x for binary compatibility with OpenCV/Open3D/custom CUDA extensions.
+numpy==1.26.4
+
 av
 IPython
 open3d
@@ -18,8 +28,7 @@ kornia
 peft
 sophuspy
 opencv-python
-rerun-sdk~=0.21
-numpy<2
+rerun-sdk==0.23.1
 matplotlib
 imageio
 trimesh
@@ -27,3 +36,5 @@ huggingface_hub
 python-box[all]~=7.0
 timm
 wandb
+ninja>=1.11
+packaging>=23

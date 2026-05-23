@@ -56,16 +56,46 @@ This codebase provides support for Waymo Open Dataset, Nuscenes and Argoverse2. 
 conda create -n dggt python=3.10
 conda activate dggt
 
-pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
 pip install -r requirements.txt
 ```
+
+The default requirements target CUDA 12.8:
+
+```text
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchaudio==2.7.1+cu128
+```
+
+This is the recommended stack for NVIDIA Blackwell GPUs such as RTX PRO 6000 Blackwell (`sm_120`). Older PyTorch 2.4.x CUDA builds do not include Blackwell kernels and can fail with `no kernel image is available for execution on the device`.
 
 2. Compile pointops2
 
 ```bash
+export CUDA_HOME=${CUDA_HOME:-/home/dancer/software/cuda/cuda-12.8}
+export PATH=$CUDA_HOME/bin:$PATH
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export TORCH_CUDA_ARCH_LIST="8.9;12.0"
+
 cd third_party/pointops2
 python setup.py install
 cd ../..
+```
+
+Use `CUDA_DEVICE_ORDER=PCI_BUS_ID` when selecting GPUs so `CUDA_VISIBLE_DEVICES` follows the same order shown by `nvidia-smi`. On mixed Ada + Blackwell systems, this avoids CUDA's default runtime order selecting a different physical GPU than expected.
+
+Sanity check:
+
+```bash
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 python - <<'PY'
+import torch
+print(torch.__version__, torch.version.cuda)
+print(torch.cuda.get_device_name(0))
+print(torch.cuda.get_device_capability(0))
+print(torch.cuda.get_arch_list())
+x = torch.ones(1, device="cuda")
+print(x.item())
+PY
 ```
 
 
