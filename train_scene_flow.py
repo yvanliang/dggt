@@ -32,7 +32,7 @@ from dggt.losses.flow_losses import build_rectified_flow_target, compute_total_l
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_stats import load_into_buffers
-from dggt.utils.flow_cache_io import load_flow_cache
+from dggt.utils.flow_cache_io import is_chunked_flow_cache, load_chunked_flow_cache_summary, load_flow_cache
 from dggt.utils.flow_viz import save_image_grid
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import EMAModel
@@ -265,6 +265,12 @@ def _infer_cache_patch_grid(dataset: WaymoFlowCacheDataset) -> tuple[int, int]:
         cache_path = entry.get("cache_path")
         if cache_path is None:
             raise KeyError("Cache dataset entry is missing 'cache_path'.")
+        if is_chunked_flow_cache(cache_path):
+            summary = load_chunked_flow_cache_summary(cache_path)
+            patch_grid = summary.get("patch_grid")
+            if patch_grid is None or len(patch_grid) != 2:
+                raise KeyError(f"Chunked cache payload {cache_path} is missing patch_grid=(H,W).")
+            return (int(patch_grid[0]), int(patch_grid[1]))
         payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
         WaymoFlowCacheDataset._validate_v6_payload(
             payload,

@@ -58,7 +58,13 @@ from datasets.waymo_edit_dataset import (
 from dggt.models.asset_pass import AssetAggregatorPass
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens, quantize_tokens
-from dggt.utils.flow_cache_io import load_flow_cache, save_flow_cache
+from dggt.utils.flow_cache_io import (
+    is_chunked_flow_cache,
+    load_chunked_flow_cache_summary,
+    load_flow_cache,
+    save_flow_cache,
+    save_flow_cache_chunked,
+)
 from dggt.utils.gaussian_edit import parse_object_slots
 from dggt.utils.tokens import select_patch_pyramid
 
@@ -100,8 +106,8 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dataset_mode", type=int, default=2, help="2 = deterministic")
     p.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16")
-    p.add_argument("--save_compression", choices=["gzip", "zstd", "none"], default="zstd",
-                   help="Cache file compression. gzip/zstd keep .pt paths but wrap torch serialization.")
+    p.add_argument("--save_compression", choices=["chunked_zstd", "gzip", "zstd", "none"], default="chunked_zstd",
+                   help="Cache file format/compression. chunked_zstd keeps .pt paths and schema_version, but stores frame-level zstd chunks.")
     p.add_argument("--gzip_level", type=int, default=1,
                    help="Compression level: gzip level for gzip, zstd level for zstd. Default 1.")
     p.add_argument("--sync_save", action="store_true",
@@ -199,6 +205,8 @@ def _finite_gs_conf_for_cache(gs_conf: torch.Tensor) -> torch.Tensor:
 
 def _read_cache_schema_version(path: Path) -> int | None:
     try:
+        if is_chunked_flow_cache(path):
+            return int(load_chunked_flow_cache_summary(path).get("schema_version", 0))
         payload = load_flow_cache(path, map_location="cpu", weights_only=False, mmap=False)
     except Exception:
         return None
@@ -292,6 +300,10 @@ class AsyncFlowCacheWriter:
                 path,
                 compression=self.compression,
                 gzip_level=self.gzip_level,
+            ) if self.compression != "chunked_zstd" else save_flow_cache_chunked(
+                payload,
+                path,
+                zstd_level=self.gzip_level,
             )
             item = {
                 **meta,
@@ -1567,12 +1579,15 @@ def main() -> None:
             compute_dt = time.time() - t0
             scheduled_paths.add(out_path)
             if save_writer is None:
-                save_flow_cache(
-                    payload,
-                    out_path,
-                    compression=args.save_compression,
-                    gzip_level=int(args.gzip_level),
-                )
+                if args.save_compression == "chunked_zstd":
+                    save_flow_cache_chunked(payload, out_path, zstd_level=int(args.gzip_level))
+                else:
+                    save_flow_cache(
+                        payload,
+                        out_path,
+                        compression=args.save_compression,
+                        gzip_level=int(args.gzip_level),
+                    )
                 sz_mb = os.path.getsize(out_path) / 1e6
                 saved_count += 1
                 last = f"{compute_dt:.1f}s/{sz_mb:.0f}MB{extra}"

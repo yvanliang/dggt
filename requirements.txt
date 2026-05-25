@@ -22,6 +22,7 @@ hydra-core
 einops
 rich
 tqdm
+zstandard
 scipy
 h5py
 kornia

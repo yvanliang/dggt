@@ -248,10 +248,10 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 | 帧数 | `--sequence_length 8` | 固定 8 帧，和 pretrain `--sequence_length 8` 一致 |
 | 有效 batch | `2 GPU × batch_size 2 × grad_accum 4 = 16` clip/optimizer update | 与 pretrain 完全一致；DataLoader 现在返回完整 micro-batch list，不再丢弃 `batch[1:]` |
 | micro-batch 执行 | 默认将 `batch_size>1` 的 bundle 合并后一次送入 `WanSceneFlow` | assembler 仍按 cache item 构建，但 WAN forward/backward 不再对 micro-batch 内样本完全串行；如需回退旧路径可加 `--no_batch_scene_flow` |
-| asset LUT 读取 | 默认只读取 asset LUT 最后一层；如需完整诊断可加 `--full_asset_lut_cache` | T1 使用 cached `pass2_splatted_tok_low` 作为 `z_splat` 输入，不再 live splat/blend；cross-attn `F_asset_tokens` 只使用最后一层 asset LUT，因此训练语义和完整读取一致，但显著减少 Mode-A CPU/IPC 体量 |
+| asset LUT 读取 | 新版 cache 只保存/读取 asset LUT 最后一层 | T1 使用 cached `pass2_splatted_tok_low` 作为 `z_splat` 输入，不再 live splat/blend；cross-attn `F_asset_tokens` 只使用最后一层 asset LUT，因此无需保存完整 asset LUT |
 | DataLoader | `--num_workers 4 --prefetch_factor 1`，默认不启用 `pin_memory` | 每个 cache 文件平均约 651MB，低 prefetch 避免 8 workers × 2 prefetch × batch_size 2 造成几十个大文件并发读；GB 级 batch 走 pin-memory 线程容易触发 `received 0 items of ancdata` |
 | worker tensor sharing | 默认 `--mp_sharing_strategy file_system` | 减少 multiprocessing 通过大量 fd 传递超大 tensor 时的稳定性问题；若系统 `/dev/shm`/临时目录策略特殊，可显式改回 `file_descriptor` |
-| cache 读取 | zstd / gzip / plain 均自动识别；plain torch cache 默认 `mmap=True` | 支持 schema v6/v7；v6 读取时会把 fp16 溢出的 `pass1.gs_conf` 修成 finite fp32，v7 直接读取 finite fp32。空间不足时优先把现有 gzip cache 原地转 zstd：同样保留 `.pt` 路径，实测更小且解压显著更快；plain+mmap 最快但空间约翻倍 |
+| cache 读取 | 默认读取 chunked zstd `.pt`；每个样本只解压 8 帧窗口需要的 chunk | 逻辑 `schema_version` 仍为 v8。SceneFlow 读取 `raw/pass1/semantic_vehicle_prob+mask/scene_lut/pass2` 和 Mode-A/Mode-B 编辑字段；tokenizer Stage-B 读取同一 cache 中的 `raw/pass1/scene_lut/pass2`。旧 monolithic cache 可用 `tools/convert_flow_cache_to_chunked.py` 转换并逐 tensor 校验 |
 | sigma / target | `--shift 3.0 --weighting_scheme logit_normal --logit_mean 0.0 --logit_std 1.0 --loss_weighting_scheme none` | 正式训练代码已改为和 pretrain 一样调用 `build_rectified_flow_target`，用 clean-progress sigma 训练 `v=z_clean-eps` |
 | REPA | `--lambda_repa 0.5` | 正式训练已启用 `return_mid` + `compute_total_loss(... lambda_repa=0.5)` |
 | EMA | `--ema_decay 0.9995`，validation 默认用 EMA | checkpoint 同时保存 raw / full / EMA-only 权重 |
@@ -262,17 +262,19 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 
 注意：正式训练 validation 会保存 loss 标量、latent PCA / mask / CFG 采样诊断图到 `logs/scene_flow_t1_1024/validation/step_xxxxxx/` 并写入 wandb。`generated_raw_latent_pca__cfg*.jpg` 是模型从 pass2 splat 条件采样得到的原始 latent，GT 是未编辑 clean latent；`generated_preserve_blend_latent_pca__cfg*.jpg` 额外展示未编辑区域直接回填 GT 的诊断版本。T1 的完整 3DGS RGB validation 仍建议用 `inference_scene_flow_validation.py` 在 checkpoint 上离线跑；训练内 validation 保持轻量，避免每 1000 step 做 3DGS 渲染拖慢训练。
 
-空间不足时的 cache 提速建议：
+旧 monolithic cache 转换为当前 chunked cache：
 
 ```bash
-conda run -n dggt --no-capture-output python tools/recompress_flow_cache.py \
+python tools/convert_flow_cache_to_chunked.py \
     --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
-    --compression zstd \
-    --gzip_level 1 \
-    --workers 1
+    --mode_a_source_dir /data/disk3/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a/training \
+    --mode_a_output_dir /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a/training \
+    --workers 2 \
+    --zstd_level 1 \
+    --verify --verify_items 8
 ```
 
-该命令逐文件原地替换，manifest 不需要改；峰值额外空间约为当前正在转换的一个 zstd 临时文件。后续重新 precompute cache 时可直接使用 `--save_compression zstd --gzip_level 1`。
+转换脚本默认原地覆盖 `.pt`；这批 Mode-A 迁移使用上面两个参数从 disk3 读取旧 cache，并写到 disk2。manifest 不需要改变；`--verify` 会在覆盖/落盘前比较原始文件和临时 chunked 文件。后续重新 precompute cache 时直接使用默认 `--save_compression chunked_zstd --gzip_level 1`。
 
 注意：正式训练 wandb 会在 rank-0 按 `--wandb_log_every` 记录 averaged `train/loss`、`train/loss_flow`、`train/loss_repa`、`train/sigma_mean`、`train/lr` 等标量；如果机器未登录 wandb，可先执行 `wandb login`，或临时去掉 `--wandb` 相关参数。
 

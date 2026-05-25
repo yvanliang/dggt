@@ -40,7 +40,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dggt.utils.flow_cache_io import load_flow_cache
+from dggt.utils.flow_cache_io import (
+    is_chunked_flow_cache,
+    load_chunked_flow_cache_probe,
+    load_chunked_flow_cache_summary,
+    load_flow_cache,
+)
 
 
 def parse_cache_root(arg: str) -> tuple[Path, str]:
@@ -78,7 +83,50 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
+def _to_int(value: Any, default: int = -1) -> int:
+    if torch.is_tensor(value):
+        return int(value.item())
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _peek_clip(path: Path) -> dict[str, Any] | None:
+    if is_chunked_flow_cache(path):
+        try:
+            summary = load_chunked_flow_cache_summary(path)
+            probe = load_chunked_flow_cache_probe(path)
+        except Exception as e:
+            print(f"[warn] failed to read chunked header {path}: {e}", file=sys.stderr)
+            return None
+        mode_kind = str(summary.get("mode_kind", "mode_a"))
+        meta = probe.get("meta") or {}
+        # The cheap header is enough for mode and counts; detailed scene names
+        # still come from the filesystem unless --peek_full is used on legacy
+        # monolithic files.
+        num_objects = (
+            len(summary.get("asset_object_keys", []))
+            if mode_kind == "mode_a"
+            else int(
+                summary.get(
+                    "mode_b_num_imagined_objects",
+                    max(0, sum(1 for v in summary.get("mode_b_target_has_delete", []) if bool(v))),
+                )
+            )
+        )
+        return {
+            "mode_kind": mode_kind,
+            "index": _to_int(meta.get("manifest_index", -1)),
+            "dataset_index": _to_int(meta.get("dataset_index", -1)),
+            "scene_name": str(meta.get("scene_name", path.parent.name)),
+            "clip_name": str(meta.get("clip_name", path.stem)),
+            "clip_start": int(meta.get("frame_indices_scene", torch.tensor([0]))[0].item())
+                if torch.is_tensor(meta.get("frame_indices_scene"))
+                else (int(path.stem) if path.stem.isdigit() else 0),
+            "num_frames": int(meta.get("num_frames", summary.get("num_frames", 29))),
+            "num_objects": num_objects,
+        }
     try:
         payload = load_flow_cache(path, map_location="cpu", weights_only=False)
     except Exception as e:
@@ -91,14 +139,6 @@ def _peek_clip(path: Path) -> dict[str, Any] | None:
         num_objects = int(block.get("num_imagined_objects", 0))
     else:
         num_objects = len(payload.get("asset_pass", {}) or {})
-    def _to_int(value: Any, default: int = -1) -> int:
-        if torch.is_tensor(value):
-            return int(value.item())
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return int(default)
-
     return {
         "mode_kind": mode_kind,
         "index": _to_int(meta.get("manifest_index", -1)),

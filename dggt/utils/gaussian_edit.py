@@ -253,15 +253,21 @@ def build_clean_scene_state(sample: dict[str, Any], predictions: dict[str, torch
         dynamic_logits = dynamic_logits[..., 0]
     dynamic_prob = torch.sigmoid(dynamic_logits)
     gs_conf = predictions["gs_conf"][0].detach().cpu().float()
-    semantic_logits = predictions.get("semantic_logits")
     semantic_vehicle_prob = torch.zeros((seq_len, height, width), dtype=torch.float32)
     semantic_vehicle_mask = torch.zeros((seq_len, height, width), dtype=torch.bool)
-    if semantic_logits is not None:
-        semantic_logits = semantic_logits[0].detach().cpu().float()
-        semantic_probs = torch.softmax(semantic_logits, dim=-1)
-        if semantic_probs.shape[-1] > 4:
-            semantic_vehicle_prob = semantic_probs[..., 4]
-            semantic_vehicle_mask = semantic_probs.argmax(dim=-1) == 4
+    cached_semantic_vehicle_prob = predictions.get("semantic_vehicle_prob")
+    cached_semantic_vehicle_mask = predictions.get("semantic_vehicle_mask")
+    if cached_semantic_vehicle_prob is not None and cached_semantic_vehicle_mask is not None:
+        semantic_vehicle_prob = cached_semantic_vehicle_prob[0].detach().cpu().float().contiguous()
+        semantic_vehicle_mask = cached_semantic_vehicle_mask[0].detach().cpu().bool().contiguous()
+    else:
+        semantic_logits = predictions.get("semantic_logits")
+        if semantic_logits is not None:
+            semantic_logits = semantic_logits[0].detach().cpu().float()
+            semantic_probs = torch.softmax(semantic_logits, dim=-1)
+            if semantic_probs.shape[-1] > 4:
+                semantic_vehicle_prob = semantic_probs[..., 4]
+                semantic_vehicle_mask = semantic_probs.argmax(dim=-1) == 4
 
     sky_mask = sample.get("sky_mask", sample["masks"]).detach().cpu().float()
     sky_mask_hw = sky_mask.permute(0, 2, 3, 1)

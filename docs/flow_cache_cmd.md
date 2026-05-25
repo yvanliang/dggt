@@ -6,7 +6,7 @@
 * `/data/flow_cache_mode_b/{split}/{scene}/{clip:04d}.pt` — Mode B 片段（规划器想象的目标位置 + 场景 Gaussian 伪删除）。
 * `/data/flow_cache/{split}_manifest.jsonl` — 扩散数据加载器使用的合并训练 manifest（每个片段一行，两种模式混合在一起）。
 
-两种缓存共享相同的磁盘 schema。它们只在 payload 顶层的 `mode_kind` 字段以及下面两个 sibling 中哪一个被填充上有所不同：
+当前 `.pt` 文件仍保持 `schema_version=8` 和原有逻辑 schema，但物理存储已经改为 **chunked zstd SQLite container**：每个帧/字段独立压缩，训练时只读取随机 8 帧窗口需要的 chunk。两种缓存共享相同的逻辑 schema。它们只在 payload 顶层的 `mode_kind` 字段以及下面两个 sibling 中哪一个被填充上有所不同：
 
 | 字段 | Mode A | Mode B |
 |--------------|---------------------------------------|-------------------------------------|
@@ -23,7 +23,13 @@
 
 ## Cache 语义：full-source-Gaussian splat
 
-v8 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend 特征。它的 source Gaussian 集合是完整 clip 的所有帧；训练时随机选连续 4-8 帧窗口时，dataset 只在 target frame 维度做 `index_select`。v7 把 `pass1.gs_conf` 从旧版 fp16 改为 finite fp32，避免大置信度值溢出为 `inf`；v8 修正了动态 Gaussian 生命周期阈值。训练读取端兼容 v6 / v7 / v8。
+v8 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend 特征。它的 source Gaussian 集合是完整 clip 的所有帧；训练时随机选连续 4-8 帧窗口时，dataset 只在 target frame 维度做 `index_select`。v7 把 `pass1.gs_conf` 从旧版 fp16 改为 finite fp32，避免大置信度值溢出为 `inf`；v8 修正了动态 Gaussian 生命周期阈值。chunked v8 仍然写 `schema_version=8`，只是把正式训练和 tokenizer Stage-B 需要的内容分块保存。
+
+chunked v8 包含：
+
+* SceneFlow：`raw`、`pass1` heads、由 `semantic_logits` 派生出的 `semantic_vehicle_prob/mask`、scene LUT、`pass2_splatted_tok_low`、Mode-A `phase1_localized`/`asset_pass`、Mode-B planner/delete masks。
+* tokenizer Stage-B：`raw`、`pass1` heads、scene LUT、`pass2_splatted_tok_low`。
+* 不再保存训练读取路径未消费的 `aggregated_tokens_*`、`dino_tokens_*`、special tokens、全量 `semantic_logits`；Mode-A asset LUT 只保存正式 T1 默认使用的最后一层。
 
 因此 `cache.index_select(subset)` 不应该和“先把 `gs_map` 裁成 subset，再 live 重跑 `FeatureSplatter`”逐 token 相等。后者的 source Gaussian 少了其他帧，遮挡和补洞都会变。验证时应检查 full clip cache 与 full clip live recompute 一致；对子集只检查缓存切片结构正常，以及 mask、`z_clean`、asset tokens、scaffold 等非 pass2 字段一致。这个语义更接近实际推理：推理通常对完整 clip 做 live splat。
 
@@ -63,7 +69,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/precompute_flow_features.py \
     --out_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a \
     --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_mode_a_views1.jsonl \
     --candidate_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/metadata/training/mode_a_candidates.jsonl \
-    --views 1
+    --views 1 \
+    --save_compression chunked_zstd --gzip_level 1
 ```
 
 如果已有 v6/v7 cache，只想升级旧文件并保留已生成的 v8 文件，可在 Mode A / Mode B 预计算命令里加 `--overwrite_v7`。它会读取已存在 `.pt` 的 `schema_version`：v8 直接跳过，非 v8 或无法读取的文件会重新生成并覆盖。`--force_overwrite` 仍表示无条件重算覆盖。
@@ -93,7 +100,8 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python tools/precompute_flow_features.py \
     --out_root /data/intelssd/liangyiyuan/waymo_processed_dggt/flow_cache_mode_b \
     --views 1 \
     --planner_seed 0 \
-    --allow_empty_plan --start 500
+    --allow_empty_plan --start 500 \
+    --save_compression chunked_zstd --gzip_level 1
 ```
 
 `--allow_empty_plan` 会为规划器无法满足条件的片段保留缓存文件（这样 manifest 条目可以与 manifest split 保持 1:1）。如果不使用它，脚本会报错并跳过该片段。
@@ -115,6 +123,23 @@ Mode B 的 `--dump_features` 同样走训练用 `FlowFeatureAssembler(mode_kind=
 不会另写一套 mask 计算逻辑；导出的 mask 是 bundle 中的
 `M_preserve/M_source/M_dest` 的 JPG 可视化。注意：非空 imagined 区域会触发一次
 训练同路径的 feature splat，因此比只画框和 `D_map` 慢。
+
+
+## 2.5 旧 cache 转换为 chunked v8
+
+已有 monolithic gzip/zstd/plain `.pt` 可直接原地转换；转换后逻辑 `schema_version` 不变，路径仍是原来的 `.pt`：
+
+```bash
+python tools/convert_flow_cache_to_chunked.py \
+    --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
+    --mode_a_source_dir /data/disk3/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a/training \
+    --mode_a_output_dir /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a/training \
+    --workers 2 \
+    --zstd_level 1 \
+    --verify --verify_items 8
+```
+
+`--mode_a_source_dir/--mode_a_output_dir` 用于这批迁移：Mode-A 从 disk3 旧 cache 读取，转换后写到 disk2；Mode-B 仍按 manifest 原地转换。`--verify` 会在覆盖/落盘前，对临时 chunked 文件分别走 SceneFlow 默认读取路径和 tokenizer Stage-B 读取路径，并与原始 `.pt` 做逐 tensor 精确比较；通过后才执行原子替换。manifest 路径不需要改变。
 
 
 ## 3. 构建合并训练 manifest
@@ -180,6 +205,11 @@ torchrun --nproc_per_node=8 train_scene_flow.py \
 # Sanity：缓存 schema + 规划器集成
 pytest tests/test_offline_cache.py tests/test_mode_b_planner.py \
        tests/test_scene_pointers.py tests/test_per_token_noise.py -q
+
+# 转换正确性：SceneFlow + tokenizer Stage-B exact tensor compare
+python tools/convert_flow_cache_to_chunked.py \
+    --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
+    --workers 2 --verify --verify_items 8
 
 # WYSIWYG / pass2 校验说明：
 # - 校验对象是完整 29 帧 cache，不是训练时随机采样出的连续 4-8 帧窗口。

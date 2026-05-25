@@ -37,7 +37,12 @@ from torch.utils.data import Dataset, get_worker_info
 from dggt.models.asset_pass import AssetPassResult
 from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
-from dggt.utils.flow_cache_io import load_flow_cache
+from dggt.utils.flow_cache_io import (
+    is_chunked_flow_cache,
+    load_chunked_flow_cache_probe,
+    load_chunked_flow_cache_subset,
+    load_flow_cache,
+)
 from dggt.utils.gaussian_edit import Sim3Transform
 
 
@@ -348,6 +353,42 @@ class WaymoFlowCacheDataset(Dataset):
     def _load_item_at_index(self, idx: int) -> dict[str, Any]:
         entry = self.entries[idx]
         cache_path = Path(entry["cache_path"])
+        payload, subset_t, subset_payload = self._load_payload_for_sample(
+            cache_path,
+            entry,
+            consumer="scene_flow",
+        )
+        return self._build_item_from_payload(
+            payload=payload,
+            entry=entry,
+            cache_path=cache_path,
+            subset_t=subset_t,
+            subset_payload=subset_payload,
+        )
+
+    def _load_payload_for_sample(
+        self,
+        cache_path: Path,
+        entry: dict[str, Any],
+        *,
+        consumer: str,
+    ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
+        if is_chunked_flow_cache(cache_path):
+            probe = load_chunked_flow_cache_probe(cache_path)
+            self._validate_v6_payload(probe, cache_path=cache_path, entry=entry)
+            num_frames_all = int(probe["meta"]["num_frames"])
+            subset_t = self._sample_contiguous_subset(probe, num_frames_all)
+            payload = load_chunked_flow_cache_subset(
+                cache_path,
+                subset_t,
+                consumer=consumer,
+                asset_lut_level_indices=self.asset_lut_level_indices,
+            )
+            if consumer != "tokenizer_stage_b":
+                self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
+            subset_payload = torch.arange(int(subset_t.numel()), dtype=torch.long)
+            return payload, subset_t, subset_payload
+
         payload = load_flow_cache(
             cache_path,
             map_location="cpu",
@@ -355,23 +396,35 @@ class WaymoFlowCacheDataset(Dataset):
             mmap=self.mmap_plain_cache,
         )
         self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
-        mode_kind = str(payload["mode_kind"])
-        meta = payload["meta"]
-        num_frames_all = int(meta["num_frames"])
+        num_frames_all = int(payload["meta"]["num_frames"])
         subset_t = self._sample_contiguous_subset(payload, num_frames_all)
+        return payload, subset_t, subset_t
 
-        sample = self._build_sample(payload, subset_t)
+    def _build_item_from_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        entry: dict[str, Any],
+        cache_path: Path,
+        subset_t: torch.Tensor,
+        subset_payload: torch.Tensor,
+    ) -> dict[str, Any]:
+        mode_kind = str(payload["mode_kind"])
+
+        sample = self._build_sample(payload, subset_payload)
         sample["mode_kind"] = mode_kind
-        sample["cache_index"] = int(entry.get("index", payload.get("meta", {}).get("manifest_index", idx)))
-        predictions = self._build_predictions(payload, subset_t)
+        sample["cache_index"] = int(entry.get("index", payload.get("meta", {}).get("manifest_index", -1)))
+        predictions = self._build_predictions(payload, subset_payload)
         if mode_kind == "mode_a":
-            asset_pass_result = self._build_asset_pass(payload, subset_t)
+            asset_pass_result = self._build_asset_pass(payload, subset_payload)
             mode_b_block = None
         else:
+            meta = payload["meta"]
             patch_grid = tuple(int(v) for v in meta["patch_grid"])
             asset_pass_result = _empty_asset_pass(patch_grid, int(meta["patch_start_idx"]))
-            mode_b_block = self._build_mode_b(payload, subset_t)
-        cameras_dggt = self._build_cameras_dggt(payload, subset_t)
+            mode_b_block = self._build_mode_b(payload, subset_payload)
+            mode_b_block["subset_frames"] = subset_t.clone()
+        cameras_dggt = self._build_cameras_dggt(payload, subset_payload)
         alignment = self._build_alignment(payload)
 
         # Schema v6+ fast-path inputs.
@@ -392,7 +445,7 @@ class WaymoFlowCacheDataset(Dataset):
                     f"Mode-A cache {cache_path} missing phase1_localized payload (schema v6+)."
                 )
             phase1_localized_subset = self._subset_phase1_localized(
-                phase1_payload, subset_t
+                phase1_payload, subset_payload
             )
         pass2_payload = payload.get("pass2_splatted_tok_low")
         if pass2_payload is None:
@@ -401,7 +454,7 @@ class WaymoFlowCacheDataset(Dataset):
                 "(schema v6+). Re-run tools/precompute_flow_features.py."
             )
         splatted_tok_low_cached = self._subset_pass2_splatted_tok_low(
-            pass2_payload, subset_t, dtype=self.lut_dtype,
+            pass2_payload, subset_payload, dtype=self.lut_dtype,
         )
 
         return {
@@ -452,6 +505,10 @@ class WaymoFlowCacheDataset(Dataset):
         mode_kind = str(payload.get("mode_kind", "mode_a"))
         if mode_kind == "mode_b":
             block = payload.get("mode_b") or {}
+            target_has_delete = block.get("target_has_delete")
+            if torch.is_tensor(target_has_delete) and target_has_delete.numel() > 0:
+                rows = subset.clamp(min=0, max=int(target_has_delete.numel()) - 1)
+                return bool(target_has_delete.index_select(0, rows).any().item())
             if int(block.get("num_imagined_objects", 0)) <= 0:
                 return False
             delete_per_frame = block.get("delete_mask_per_frame")
@@ -636,6 +693,12 @@ class WaymoFlowCacheDataset(Dataset):
         sem = pass1.get("semantic_logits")
         if sem is not None:
             sem = _sub(sem).unsqueeze(0)
+        semantic_vehicle_prob = pass1.get("semantic_vehicle_prob")
+        if semantic_vehicle_prob is not None:
+            semantic_vehicle_prob = _sub(semantic_vehicle_prob).unsqueeze(0)
+        semantic_vehicle_mask = pass1.get("semantic_vehicle_mask")
+        if semantic_vehicle_mask is not None:
+            semantic_vehicle_mask = _sub(semantic_vehicle_mask).unsqueeze(0)
 
         lut_sub = _dequantize_nplc_subset(
             data=pass1["F_g_lut_scene_int8"],
@@ -671,6 +734,8 @@ class WaymoFlowCacheDataset(Dataset):
             "dynamic_conf": dyn,
             "gs_conf": gs_conf,
             "semantic_logits": sem,
+            "semantic_vehicle_prob": semantic_vehicle_prob,
+            "semantic_vehicle_mask": semantic_vehicle_mask,
             "image_tokens_levels": image_tokens_levels,
             "aggregated_tokens_levels": agg_levels,
             "dino_tokens_levels": dino_levels,

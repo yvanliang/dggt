@@ -2249,7 +2249,6 @@ def build_cached_dataset(
     mode_filter: list[str] | None = None,
 ) -> Any:
     from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
-    from dggt.utils.flow_cache_io import load_flow_cache
 
     class TokenizerFlowCacheDataset(WaymoFlowCacheDataset):
         """Lightweight flow-cache reader for tokenizer Stage-B."""
@@ -2260,22 +2259,17 @@ def build_cached_dataset(
         def _load_tokenizer_item_at_index(self, idx: int) -> dict[str, Any]:
             entry = self.entries[idx]
             cache_path = Path(entry["cache_path"])
-            payload = load_flow_cache(
+            payload, subset_t, subset_payload = self._load_payload_for_sample(
                 cache_path,
-                map_location="cpu",
-                weights_only=False,
-                mmap=self.mmap_plain_cache,
+                entry,
+                consumer="tokenizer_stage_b",
             )
-            self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
             mode_kind = str(payload["mode_kind"])
-            meta = payload["meta"]
-            num_frames_all = int(meta["num_frames"])
-            subset_t = self._sample_contiguous_subset(payload, num_frames_all)
 
-            sample = self._build_sample(payload, subset_t)
+            sample = self._build_sample(payload, subset_payload)
             sample["mode_kind"] = mode_kind
-            sample["cache_index"] = int(entry.get("index", payload.get("meta", {}).get("manifest_index", idx)))
-            predictions = self._build_predictions(payload, subset_t)
+            sample["cache_index"] = int(entry.get("index", payload.get("meta", {}).get("manifest_index", -1)))
+            predictions = self._build_predictions(payload, subset_payload)
             pass2_payload = payload.get("pass2_splatted_tok_low")
             if pass2_payload is None:
                 raise RuntimeError(
@@ -2284,7 +2278,7 @@ def build_cached_dataset(
                 )
             tokenizer_teacher_levels = self._subset_pass2_splatted_tok_low(
                 pass2_payload,
-                subset_t,
+                subset_payload,
                 dtype=self.lut_dtype,
             )
             return {
