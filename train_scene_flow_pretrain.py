@@ -1358,6 +1358,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--feature_stats_path", type=str, required=True)
     parser.add_argument("--log_dir", type=str, required=True)
     parser.add_argument("--resume_path", type=str, default=None)
+    parser.add_argument("--warm_start_path", type=str, default=None,
+                        help="加载模型权重以从头开始训练，不恢复优化器和step")
     parser.add_argument("--patch_grid_h", type=int, default=37)
     parser.add_argument("--patch_grid_w", type=int, default=37)
     parser.add_argument(
@@ -1618,6 +1620,22 @@ def main() -> None:
         args.resume_path,
         device,
     )
+    # 如果指定了 warm_start_path，则覆盖模型和 EMA 的权重，但保留 global_step = 0
+    if args.warm_start_path:
+        payload = torch.load(args.warm_start_path, map_location=device)
+
+        # 兼容完整 checkpoint 或 weights_only 的 checkpoint
+        state_dict = payload.get("scene_flow", payload)
+        unwrap_ddp(scene_flow).load_state_dict(state_dict, strict=True)
+
+        # 如果 checkpoint 中包含 EMA 权重，也一并加载，防止验证时表现不佳
+        if "ema_scene_flow" in payload:
+            ema.load_state_dict(payload["ema_scene_flow"])
+        elif "ema_scene_flow_state_dict" in payload:
+            ema.load_state_dict(payload["ema_scene_flow_state_dict"])
+
+        if is_main_process():
+            print(f"[warm start] 成功从 {args.warm_start_path} 加载权重，将从 step 0 开始全新训练", flush=True)
 
     if world_size > 1:
         scene_flow = DistributedDataParallel(
