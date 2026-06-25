@@ -10,24 +10,24 @@ external assets / shifted boxes:
   deletion via :func:`apply_mode_a`). 100% the battle-tested delete path,
   including Sim3 alignment + corner-projection pose refine + semantic-mask
   component extraction.
-* **Asset slots (3,4,5)** -> custom placement (no semantic gating): the
-  target box is the *refined* box of the corresponding delete slot
-  (replacement = slot-1 box, reposition = slot-2 box + local-axis shift) or
-  the Sim3-transformed insertion tar box (insertion = slot-3, no source).
+* **Asset slots (3,4,5)** -> load their authoritative external PLY through
+  ``sample["object_asset_paths"]`` and perform custom placement (no semantic
+  gating). For reposition, the PLY key is the source raw object id; it is not
+  reconstructed from the clean scene's deleted Gaussians. All three target
+  tracks come from their dedicated validation tars
+  (insertion/replacement/reposition), then use the same placement path:
+  Waymo->DGGT Sim3, fixed-rotation 2D bbox/depth center refinement, and the
+  same cross-frame median translation stabilization used by Mode A.
   The chosen asset's Gaussians are fitted with the same
   :func:`_transform_asset_gaussians_simple` used by Mode A, so the emitted
   ``LocalizedFrameObject`` is schema-identical and the downstream
   ``AssetAggregatorPass`` / cache packers run unchanged.
 
-The reposition shift replicates ``pointcloud_validation`` 's
-``EditProcessor.shift_object_tfm_by_action`` (REPOSITION_DISTANCE_M = 3.0):
-``up -> +localX``, ``down -> -localX``, ``left -> +localY``, ``right -> -localY``
-(local axes = columns of the DGGT box rotation; distance scaled by the Sim3
-scale so it stays a physical 3 m).
+The reposition tar already stores the shifted destination track, so this
+module must not apply the 3-m action a second time.
 """
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
@@ -50,38 +50,11 @@ from dggt.utils.gaussian_edit import (
     project_world_points,
 )
 
-REPOSITION_DISTANCE_M = 3.0
+VALIDATION_LOCALIZATION_POLICY = "target_tar_member_index_sim3_bbox_depth_shared_delta_v3"
 
 
 def _empty_long() -> torch.Tensor:
     return torch.zeros((0,), dtype=torch.long)
-
-
-def _apply_reposition_shift(
-    center: torch.Tensor,
-    rotation: torch.Tensor,
-    action: str,
-    distance: float,
-) -> torch.Tensor:
-    """Replicate ``shift_object_tfm_by_action`` in the DGGT box frame.
-
-    ``rotation`` columns are the box local axes (col0 = local X / forward,
-    col1 = local Y / left), matching the 4x4 ``tfm[:3,0]`` / ``tfm[:3,1]``
-    convention of the reference implementation.
-    """
-    action = str(action).lower()
-    if action == "up":
-        dir_vec = rotation[:, 0]
-    elif action == "down":
-        dir_vec = -rotation[:, 0]
-    elif action == "left":
-        dir_vec = rotation[:, 1]
-    elif action == "right":
-        dir_vec = -rotation[:, 1]
-    else:  # unknown -> forward (matches reference 'else' branch)
-        dir_vec = rotation[:, 0]
-    dir_unit = dir_vec / (dir_vec.norm() + 1e-8)
-    return center + dir_unit * float(distance)
 
 
 def _build_asset_lfo(
@@ -92,8 +65,10 @@ def _build_asset_lfo(
     asset_local: dict[str, torch.Tensor],
     asset_path: str,
     target_center: torch.Tensor,
+    gt_center: torch.Tensor,
     target_size: torch.Tensor,
     target_rotation: torch.Tensor,
+    target_bbox_model: torch.Tensor | None,
     clean_state: Any,
     image_hw: tuple[int, int],
     asset_yaw_correction_deg: float,
@@ -104,6 +79,7 @@ def _build_asset_lfo(
     ~4765-4886) but with empty delete indices and no semantic mask.
     """
     c = target_center.detach().cpu().float()
+    c_gt = gt_center.detach().cpu().float()
     s = target_size.detach().cpu().float()
     R = _orthonormalize_rotation(target_rotation.detach().cpu().float())
 
@@ -142,7 +118,10 @@ def _build_asset_lfo(
     K = clean_state.intrinsics[source_front_index]
     corner_uv, _, corner_valid = project_world_points(corners, c2w, K, image_hw)
     edge_uv, _, edge_valid = project_world_points(_edge_midpoints(corners), c2w, K, image_hw)
-    target_bbox_model = compute_bbox_from_projected_points(corner_uv, corner_valid)
+    if target_bbox_model is not None:
+        target_bbox_model = target_bbox_model.detach().cpu().float()
+    else:
+        target_bbox_model = compute_bbox_from_projected_points(corner_uv, corner_valid)
     if target_bbox_model is None:
         target_bbox_model = projected_asset_bbox
     if target_bbox_model is None:
@@ -178,7 +157,7 @@ def _build_asset_lfo(
         waymo_max_speed_mps=0.0,
         waymo_mean_speed_mps=0.0,
         render_dynamic_ratio=0.0,
-        gt_center=c.clone(),
+        gt_center=c_gt.clone(),
         gt_size=s.clone(),
         gt_rotation=R.clone(),
         proposal_center=c.clone(),
@@ -234,15 +213,12 @@ def localize_validation_objects(
     """Return ``{"delete_lfos", "asset_lfos", "refined_box"}``.
 
     ``delete_lfos`` are produced by stock ``editor.localize`` over the delete
-    slots with ``load_asset=False`` (empty assets). ``asset_lfos`` are the
-    custom placements for the present asset slots.
+    slots with ``load_asset=False`` (empty assets). ``asset_lfos`` use one
+    uniform target-track placement algorithm for insertion/replacement/move.
     """
     ve = sample["validation_edit"]
     delete_slots = [int(s) for s in ve["delete_slots"]]
     asset_slots = [int(s) for s in ve["asset_slots"]]
-    asset_source_box_slot = {int(k): int(v) for k, v in ve["asset_source_box_slot"].items()}
-    action = str(ve["action_for_reposition"])
-
     image_hw = tuple(int(v) for v in clean_state.images.shape[-2:])
 
     # ---- Phase A: stock delete localization (no asset) --------------------
@@ -254,8 +230,8 @@ def localize_validation_objects(
         load_asset=False,
     )
 
-    # refined_box[slot][frame] = (center, size, rotation) -- the final
-    # pose-refined box the asset side reuses (== Mode A's asset placement box).
+    # Retained for diagnostics of source deletion; asset placement does not
+    # reuse these boxes because slots 3/4/5 have authoritative target tracks.
     refined_box: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = {}
     for lfo in delete_lfos:
         refined_box.setdefault(int(lfo.slot_idx), {})[int(lfo.frame_idx)] = (
@@ -276,19 +252,24 @@ def localize_validation_objects(
     for slot in asset_slots:
         asset_path = str(sample["object_asset_paths"][slot])
         asset_local = _load_asset_gaussians(asset_path, asset_cache)
+        frame_targets: dict[
+            int,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
         for f in range(int(track_valid.shape[1])):
             if not bool(track_valid[slot, f].item()):
                 continue
-
-            if slot == 3:
-                # Insertion: no source object -> Sim3-transformed tar box,
-                # optional depth-snap against the projected box bbox.
-                c, s, R = _transform_track_box(
-                    obj_to_world[slot, f], box_size[slot, f], alignment
-                )
-                R = _orthonormalize_rotation(R)
-                if bool(bbox_present[slot, f, 0].item()):
-                    try:
+            c_gt, s, R = _transform_track_box(
+                obj_to_world[slot, f], box_size[slot, f], alignment
+            )
+            R = _orthonormalize_rotation(R)
+            c = c_gt.clone()
+            if bool(bbox_present[slot, f, 0].item()):
+                try:
+                    # Mode A runs this fixed-rotation center solve once while
+                    # building frame specs and once again while materializing
+                    # frame geometry. Preserve that behavior here.
+                    for _ in range(2):
                         c, _ = _solve_proposal_center_with_fixed_rotation(
                             object_center=c,
                             object_size=s,
@@ -301,24 +282,25 @@ def localize_validation_objects(
                             depth_map=clean_state.depth[f],
                             valid_mask=clean_state.valid_mask[f],
                         )
-                    except Exception:
-                        pass
-            else:
-                src = asset_source_box_slot[slot]
-                rb = refined_box.get(src, {}).get(f)
-                if rb is None:
-                    # delete localization missed this frame -> Sim3 fallback.
-                    c, s, R = _transform_track_box(
-                        obj_to_world[src, f], box_size[src, f], alignment
-                    )
-                    R = _orthonormalize_rotation(R)
-                else:
-                    c, s, R = rb[0].clone(), rb[1].clone(), rb[2].clone()
-                if slot == 5:
-                    c = _apply_reposition_shift(
-                        c, R, action, REPOSITION_DISTANCE_M * float(alignment.scale)
-                    )
+                except Exception:
+                    pass
+            frame_targets[f] = (c_gt, c, s, R)
 
+        # Match Mode A's track-level stabilization: use one robust translation
+        # correction for the whole target track instead of allowing per-frame
+        # depth noise to jitter the asset.
+        if len(frame_targets) > 1:
+            deltas = []
+            for _, (c_gt, c, _, _) in frame_targets.items():
+                deltas.append(c - c_gt)
+            delta_stack = torch.stack(deltas, dim=0)
+            finite = torch.isfinite(delta_stack).all(dim=-1)
+            if bool(finite.any().item()):
+                shared_delta = torch.median(delta_stack[finite], dim=0).values
+                for f, (c_gt, _, s, R) in list(frame_targets.items()):
+                    frame_targets[f] = (c_gt, c_gt + shared_delta, s, R)
+
+        for f, (c_gt, c, s, R) in frame_targets.items():
             asset_lfos.append(
                 _build_asset_lfo(
                     sample=sample,
@@ -327,8 +309,14 @@ def localize_validation_objects(
                     asset_local=asset_local,
                     asset_path=asset_path,
                     target_center=c,
+                    gt_center=c_gt,
                     target_size=s,
                     target_rotation=R,
+                    target_bbox_model=(
+                        bbox_model[slot, f, 0]
+                        if bool(bbox_present[slot, f, 0].item())
+                        else None
+                    ),
                     clean_state=clean_state,
                     image_hw=image_hw,
                     asset_yaw_correction_deg=asset_yaw_correction_deg,
@@ -345,10 +333,10 @@ def localize_validation_objects(
 # Per-variant slot membership (delete slots / asset slots).
 VARIANT_SLOTS: dict[str, dict[str, tuple[int, ...]]] = {
     "combined": {"delete": (0, 1, 2), "asset": (3, 4, 5)},
-    "delete": {"delete": (0, 1, 2), "asset": ()},
-    "add": {"delete": (), "asset": (3,)},
-    "replace": {"delete": (1,), "asset": (4,)},
-    "move": {"delete": (2,), "asset": (5,)},
+    "deletion": {"delete": (0, 1, 2), "asset": ()},
+    "insertion": {"delete": (), "asset": (3,)},
+    "replacement": {"delete": (1,), "asset": (4,)},
+    "repositioning": {"delete": (2,), "asset": (5,)},
 }
 
 

@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +60,7 @@ from dggt.models.asset_pass import AssetAggregatorPass
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens, quantize_tokens
 from dggt.utils.flow_cache_io import (
+    CURRENT_FLOW_CACHE_SCHEMA_VERSION,
     is_chunked_flow_cache,
     load_chunked_flow_cache_summary,
     load_flow_cache,
@@ -70,7 +72,7 @@ from dggt.utils.tokens import select_patch_pyramid
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
-CACHE_SCHEMA_VERSION = 8
+CACHE_SCHEMA_VERSION = CURRENT_FLOW_CACHE_SCHEMA_VERSION
 GS_CONF_REPAIR_VALUE = 1_000_000.0
 CLIP_LENGTH = 29
 
@@ -1020,6 +1022,29 @@ def _compute_and_pack_pass2_splatted_tok_low(
             F_g_lut_asset=F_g_lut_asset,
             I_map_per_obj=I_per_obj,
         )
+        A_edited_hires = assembler._compose_edited_alpha(K_map, I_map)
+        S_mask = int(F_g_lut_scene[0].shape[1])
+        dyn_prior = torch.sigmoid(
+            predictions["dynamic_conf"].reshape(1, S_mask, H_img, W_img, 1).to(device)
+        ).float()
+        time_index = torch.arange(S_mask, dtype=torch.float32, device=device).view(1, S_mask)
+        time_index = time_index / max(S_mask - 1, 1)
+        scaffold_hires = assembler.scaffold_packer.build_scaffold_hires(
+            D_edited=D_edited_hires,
+            A_edited=A_edited_hires,
+            K_map=K_map,
+            D_map=D_map,
+            I_map=I_map,
+            dynamic_prior=dyn_prior,
+            time_index=time_index,
+        )
+        scaffold_pooled = _pool_scaffold_to_tokens(scaffold_hires, patch_grid)
+        from dggt.utils.edit_coverage import build_phase1_asset_coverage
+
+        phase1_coverage, phase4_slots = build_phase1_asset_coverage(
+            sample["object_asset_image_valid_mask_selected"],
+            localized_objects,
+        )
 
     # splatted_tok_low: list[L × [1, S, P, C]]. Stack to [S, P, L, C] (NPLC) and
     # quantize per (frame, level) with the existing int8 utility.
@@ -1037,6 +1062,14 @@ def _compute_and_pack_pass2_splatted_tok_low(
         "patch_grid": (int(patch_grid[0]), int(patch_grid[1])),
         "channels": int(C_full),
         "num_levels": int(L_full),
+        "flow_inputs": {
+            "M_preserve": M_preserve.detach().squeeze(0).cpu().to(torch.float16),
+            "M_source": M_source.detach().squeeze(0).cpu().to(torch.float16),
+            "M_dest": M_dest.detach().squeeze(0).cpu().to(torch.float16),
+            "scaffold_pooled": scaffold_pooled.detach().squeeze(0).cpu().to(torch.float16),
+            "phase1_coverage": phase1_coverage.detach().cpu().to(torch.bool),
+            "phase4_slots": [int(v) for v in phase4_slots],
+        },
     }
 
 
@@ -1134,6 +1167,41 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
             # Store clean tokens directly; splatting would only introduce
             # coverage-mask artifacts in low-alpha/sky tokens.
             splatted_tok_low = [lvl.to(device) for lvl in F_g_lut_scene]
+            B = 1
+            S_full = int(F_g_lut_scene[0].shape[1])
+            P_full = int(F_g_lut_scene[0].shape[2])
+            M_preserve = torch.ones((B, S_full, P_full, 1), dtype=torch.float32, device=device)
+            M_source = torch.zeros_like(M_preserve)
+            M_dest = torch.zeros_like(M_preserve)
+            K_map = torch.ones((B, S_full, H_img, W_img, 1), dtype=torch.float32, device=device)
+            D_map = torch.zeros_like(K_map)
+            I_map = torch.zeros_like(K_map)
+            D_edited_hires = assembler._pass1_depth_hires(
+                predictions,
+                B=B,
+                S=S_full,
+                H=H_img,
+                W=W_img,
+                device=device,
+                dtype=torch.float32,
+            )
+            dyn_prior = torch.sigmoid(
+                predictions["dynamic_conf"].reshape(B, S_full, H_img, W_img, 1).to(device)
+            ).float()
+            denom = float(max(S_full - 1, 1))
+            time_index = (
+                torch.arange(S_full, dtype=torch.float32, device=device).view(1, S_full) / denom
+            )
+            scaffold_hires = assembler.scaffold_packer.build_scaffold_hires(
+                D_edited=D_edited_hires,
+                A_edited=K_map,
+                K_map=K_map,
+                D_map=D_map,
+                I_map=I_map,
+                dynamic_prior=dyn_prior,
+                time_index=time_index,
+            )
+            scaffold_pooled = _pool_scaffold_to_tokens(scaffold_hires, patch_grid)
         else:
             # Soft mask coverage with each target frame's own delete mask.
             K_map, D_map, I_map, _, D_edited_hires = assembler._render_mode_b_per_target_coverage(
@@ -1182,6 +1250,25 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
                 splatted_levels=splatted_tok_low,
                 M_preserve=M_preserve,
             )
+            A_edited_hires = assembler.soft_mask.compose_deleted_hole_alpha(
+                K_alpha=K_map,
+                hole_alpha=I_map,
+            )
+            dyn_prior = torch.sigmoid(
+                predictions["dynamic_conf"].reshape(1, S_total, H_img, W_img, 1).to(device)
+            ).float()
+            time_index = torch.arange(S_total, dtype=torch.float32, device=device).view(1, S_total)
+            time_index = time_index / max(S_total - 1, 1)
+            scaffold_hires = assembler.scaffold_packer.build_scaffold_hires(
+                D_edited=D_edited_hires,
+                A_edited=A_edited_hires,
+                K_map=K_map,
+                D_map=D_map,
+                I_map=I_map,
+                dynamic_prior=dyn_prior,
+                time_index=time_index,
+            )
+            scaffold_pooled = _pool_scaffold_to_tokens(scaffold_hires, patch_grid)
 
     if len(splatted_tok_low) == 0:
         raise RuntimeError("splatted_tok_low is empty after blending (mode_b)")
@@ -1197,7 +1284,25 @@ def _compute_and_pack_pass2_splatted_tok_low_mode_b(
         "patch_grid": (int(patch_grid[0]), int(patch_grid[1])),
         "channels": int(C_full),
         "num_levels": int(L_full),
+        "flow_inputs": {
+            "M_preserve": M_preserve.detach().squeeze(0).cpu().to(torch.float16),
+            "M_source": M_source.detach().squeeze(0).cpu().to(torch.float16),
+            "M_dest": M_dest.detach().squeeze(0).cpu().to(torch.float16),
+            "scaffold_pooled": scaffold_pooled.detach().squeeze(0).cpu().to(torch.float16),
+            "phase1_coverage": torch.zeros((0, S_full), dtype=torch.bool),
+            "phase4_slots": [],
+        },
     }
+
+
+def _pool_scaffold_to_tokens(scaffold_hires: torch.Tensor, patch_grid: tuple[int, int]) -> torch.Tensor:
+    B, S, H, W, C = scaffold_hires.shape
+    grid_h, grid_w = int(patch_grid[0]), int(patch_grid[1])
+    if H % grid_h != 0 or W % grid_w != 0:
+        raise ValueError(f"Cannot pool scaffold shape {(H, W)} to patch_grid={patch_grid}")
+    x = scaffold_hires.reshape(B * S, H, W, C).permute(0, 3, 1, 2)
+    x = F.avg_pool2d(x, kernel_size=(H // grid_h, W // grid_w), stride=(H // grid_h, W // grid_w))
+    return x.permute(0, 2, 3, 1).reshape(B, S, grid_h * grid_w, C).contiguous()
 
 
 def _ensure_batched_cameras(d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:

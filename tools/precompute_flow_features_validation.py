@@ -5,18 +5,20 @@ decoupled localization ONCE, then derive 5 variant caches:
 
 * ``combined`` -- delete {deletion, replacement-src, reposition-src} +
   insert {insertion, replacement, reposition} (all 4 edits in one scene).
-* ``delete`` / ``add`` / ``replace`` / ``move`` -- single-edit-type caches.
+* ``deletion`` / ``insertion`` / ``replacement`` / ``repositioning`` --
+  single-edit-type caches.
 
-Output (schema-identical to Mode A v8, ``mode_kind="mode_a"``; FLAT layout so
-the unmodified Mode-A toolchain works -- ``index = entry_index*5 + variant_ord``,
-``variant_ord`` = combined0/delete1/add2/replace3/move4):
+Output (schema-identical to Mode A v8, ``mode_kind="mode_a"``) uses the same
+six-digit padding as training plus a readable edit suffix:
 
-    {out_root}/validation/{index:06d}.pt
+    {out_root}/validation/{entry_index:06d}_{edit_name}.pt
     {out_root}/validation/_errors.jsonl   # skipped entries (e.g. missing asset)
 
 The heavy work (VGGT forward, clean_state, Sim3 alignment, pose-refine inside
 ``localize_validation_objects``) runs once per entry; only the genuinely
 variant-dependent steps (asset pass, phase1 pack, splat+blend) run per variant.
+The default physical format is the same chunked-zstd SQLite container used by
+current training. Existing v6/v7 or monolithic files are regenerated.
 
 Usage:
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/precompute_flow_features_validation.py \
@@ -29,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -36,8 +39,14 @@ from typing import Any
 import torch
 from tqdm import tqdm
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from datasets.waymo_validation_edit_dataset import (
     DEFAULT_ALL_OBJECT_INFO_INSERTION_ROOT,
+    DEFAULT_ALL_OBJECT_INFO_REPLACEMENT_ROOT,
+    DEFAULT_ALL_OBJECT_INFO_REPOSITION_ROOT,
     DEFAULT_ALL_OBJECT_INFO_ROOT,
     DEFAULT_ASSET_ROOT,
     NUM_SLOTS,
@@ -46,11 +55,28 @@ from datasets.waymo_validation_edit_dataset import (
 )
 from dggt.models.asset_pass import AssetAggregatorPass
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
-from dggt.utils.flow_cache_io import save_flow_cache
+from dggt.utils.flow_cache_io import (
+    CURRENT_FLOW_CACHE_SCHEMA_VERSION,
+    is_chunked_flow_cache,
+    is_current_flow_cache_summary,
+    load_chunked_flow_cache_summary,
+    load_chunked_flow_cache_probe,
+    save_flow_cache,
+    save_flow_cache_chunked,
+)
 from dggt.utils.validation_edit_localize import (
+    VALIDATION_LOCALIZATION_POLICY,
     VARIANT_SLOTS,
     localize_validation_objects,
     subset_localized_for_variant,
+)
+from dggt.utils.validation_cache_naming import (
+    VALIDATION_VARIANTS,
+    legacy_validation_cache_path,
+    normalize_validation_variant,
+    old_readable_validation_cache_path,
+    validation_cache_index,
+    validation_cache_path,
 )
 from tools.precompute_flow_features import (
     DEFAULT_PROCESSED_ROOT,
@@ -68,22 +94,53 @@ from tools.precompute_flow_features import (
     _pack_pass1_tokens,
     _pack_phase1_localized,
     _replace_asset_luts_with_cached_dtype,
-    _should_skip_existing_cache,
 )
 
-ALL_VARIANTS = ["combined", "delete", "add", "replace", "move"]
-VARIANT_ORD = {v: i for i, v in enumerate(ALL_VARIANTS)}
+ALL_VARIANTS = list(VALIDATION_VARIANTS)
 
 
 def variant_cache_index(entry_index: int, variant: str) -> int:
-    """Flat, unique cache index: entry_index*5 + variant_ord.
+    """Backward-compatible logical index used in manifests and metadata."""
+    return validation_cache_index(entry_index, variant)
 
-    Matches ``build_flow_validation_manifest`` and keeps the on-disk layout
-    flat (``{out_root}/{split}/{index:06d}.pt``) so the unmodified Mode-A
-    toolchain (verify_flow_cache_wysiwyg, WaymoFlowCacheDataset cache_root
-    mode) works on validation caches without special-casing.
-    """
-    return int(entry_index) * len(ALL_VARIANTS) + VARIANT_ORD[variant]
+
+def _migrate_legacy_validation_cache(
+    split_root: Path,
+    entry_index: int,
+    variant: str,
+) -> Path:
+    """Rename a valid legacy cache to the canonical filename."""
+    readable = validation_cache_path(split_root, entry_index, variant)
+    legacy_candidates = (
+        old_readable_validation_cache_path(split_root, entry_index, variant),
+        legacy_validation_cache_path(split_root, entry_index, variant),
+    )
+    if readable.is_file():
+        for legacy in legacy_candidates:
+            legacy.unlink(missing_ok=True)
+        return readable
+    migrated = False
+    for legacy in legacy_candidates:
+        if not legacy.is_file():
+            continue
+        if migrated:
+            legacy.unlink()
+            continue
+        skip, _ = _should_skip_existing_validation_cache(
+            legacy,
+            force_overwrite=False,
+        )
+        if skip:
+            legacy.replace(readable)
+            migrated = True
+            continue
+        # Regenerate stale/corrupt legacy output under the canonical name and
+        # do not leave an ambiguous old file beside it.
+        legacy.unlink()
+    if migrated:
+        for legacy in legacy_candidates:
+            legacy.unlink(missing_ok=True)
+    return readable
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -98,6 +155,14 @@ def build_argparser() -> argparse.ArgumentParser:
         "--all_object_info_insertion_root",
         default=DEFAULT_ALL_OBJECT_INFO_INSERTION_ROOT,
     )
+    p.add_argument(
+        "--all_object_info_replacement_root",
+        default=DEFAULT_ALL_OBJECT_INFO_REPLACEMENT_ROOT,
+    )
+    p.add_argument(
+        "--all_object_info_reposition_root",
+        default=DEFAULT_ALL_OBJECT_INFO_REPOSITION_ROOT,
+    )
     p.add_argument("--split", default="validation")
     p.add_argument("--variants", default=",".join(ALL_VARIANTS),
                    help="comma list subset of: " + ",".join(ALL_VARIANTS))
@@ -108,21 +173,79 @@ def build_argparser() -> argparse.ArgumentParser:
         "--overwrite_v7",
         action="store_true",
         help=(
-            "If an output .pt already exists, keep it only when it is already the "
-            f"latest schema v{CACHE_SCHEMA_VERSION}; otherwise regenerate and overwrite it."
+            "Deprecated compatibility flag. Validation now always regenerates existing "
+            "v6/v7 or non-chunked files and only skips current v8 chunked-zstd caches."
         ),
     )
     p.add_argument("--asset_batch_size", type=int, default=1)
     p.add_argument("--save_fit_metrics", action="store_true")
     p.add_argument("--max_pose_refine_yaw_deg", type=float, default=15.0)
     p.add_argument("--asset_yaw_correction_deg", type=float, default=180.0)
-    p.add_argument("--save_compression", choices=["gzip", "zstd", "none"], default="zstd")
+    p.add_argument(
+        "--save_compression",
+        choices=["chunked_zstd", "gzip", "zstd", "none"],
+        default="chunked_zstd",
+        help=(
+            "Cache physical format. Default matches current training: schema-v8 "
+            "chunked-zstd SQLite. Legacy monolithic formats are retained only for debugging."
+        ),
+    )
     p.add_argument("--gzip_level", type=int, default=1,
                    help="Compression level: gzip level for gzip, zstd level for zstd. Default 1.")
     p.add_argument("--sync_save", action="store_true")
     p.add_argument("--max_save_threads", type=int, default=0)
     p.add_argument("--chunk_channels", type=int, default=64)
     return p
+
+
+def _should_skip_existing_validation_cache(
+    path: Path,
+    *,
+    force_overwrite: bool,
+) -> tuple[bool, str]:
+    """Only reuse a current v8 cache in the current chunked physical format.
+
+    Validation must not silently retain v6/v7 payloads (which predate the
+    finite-fp32 gs_conf and corrected dynamic lifecycle threshold) or an older
+    monolithic v8 file. Both are regenerated into the same format as training.
+    """
+    if not path.is_file():
+        return False, "missing"
+    if force_overwrite:
+        return False, "force_overwrite"
+    if not is_chunked_flow_cache(path):
+        return False, "non_chunked"
+    try:
+        summary = load_chunked_flow_cache_summary(path)
+        schema_version = int(summary.get("schema_version", 0))
+    except Exception:
+        return False, "unreadable_chunked"
+    if not is_current_flow_cache_summary(summary):
+        return False, f"schema_v{schema_version}"
+    try:
+        probe = load_chunked_flow_cache_probe(path)
+        policy = str(
+            probe.get("meta", {})
+            .get("editor_config", {})
+            .get("validation_localization_policy", "")
+        )
+    except Exception:
+        return False, "unreadable_meta"
+    if policy != VALIDATION_LOCALIZATION_POLICY:
+        return False, f"localization_policy_{policy or 'missing'}"
+    return True, f"schema_v{schema_version}_chunked_zstd"
+
+
+def _save_validation_payload(payload: dict[str, Any], path: Path, args) -> None:
+    if args.save_compression == "chunked_zstd":
+        save_flow_cache_chunked(payload, path, zstd_level=int(args.gzip_level))
+    else:
+        save_flow_cache(
+            payload,
+            path,
+            compression=args.save_compression,
+            gzip_level=int(args.gzip_level),
+        )
 
 
 def _variant_sample(sample_cached: dict[str, Any], loc_v: list) -> dict[str, Any]:
@@ -192,6 +315,7 @@ def _assemble_payload(
                 "max_pose_refine_yaw_deg": float(args.max_pose_refine_yaw_deg),
                 "asset_yaw_correction_deg": float(args.asset_yaw_correction_deg),
                 "pose_policy": "waymo_dggt_corner_projection_refine_v1",
+                "validation_localization_policy": VALIDATION_LOCALIZATION_POLICY,
             },
             "validation_edit": {
                 "clip_name": ve["clip_name"],
@@ -389,7 +513,11 @@ def precompute_one_entry(
 
 def main() -> None:
     args = build_argparser().parse_args()
-    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    variants = [
+        normalize_validation_variant(v.strip())
+        for v in args.variants.split(",")
+        if v.strip()
+    ]
     for v in variants:
         if v not in ALL_VARIANTS:
             raise ValueError(f"unknown variant {v!r}; choose from {ALL_VARIANTS}")
@@ -414,6 +542,8 @@ def main() -> None:
         processed_root=args.processed_root,
         all_object_info_root=args.all_object_info_root,
         all_object_info_insertion_root=args.all_object_info_insertion_root,
+        all_object_info_replacement_root=args.all_object_info_replacement_root,
+        all_object_info_reposition_root=args.all_object_info_reposition_root,
         asset_root=args.asset_root,
         split=args.split,
     )
@@ -449,14 +579,21 @@ def main() -> None:
             entry_index = int(entry.get("index", idx))
             todo = []
             for variant in variants:
-                out_path = split_root / f"{variant_cache_index(entry_index, variant):06d}.pt"
-                skip_existing, skip_reason = _should_skip_existing_cache(out_path, args)
+                out_path = _migrate_legacy_validation_cache(
+                    split_root,
+                    entry_index,
+                    variant,
+                )
+                skip_existing, skip_reason = _should_skip_existing_validation_cache(
+                    out_path,
+                    force_overwrite=bool(args.force_overwrite),
+                )
                 if skip_existing:
                     continue
-                if out_path.is_file() and args.overwrite_v7 and not args.force_overwrite:
+                if out_path.is_file() and not args.force_overwrite:
                     progress.write(
                         f"[regen] entry={idx:03d} variant={variant} "
-                        f"existing={skip_reason} -> schema_v{CACHE_SCHEMA_VERSION}"
+                        f"existing={skip_reason} -> schema_v{CACHE_SCHEMA_VERSION}_chunked_zstd"
                     )
                 todo.append(variant)
             if not todo:
@@ -489,13 +626,9 @@ def main() -> None:
                 continue
 
             for variant, payload in payloads.items():
-                out_path = split_root / f"{variant_cache_index(entry_index, variant):06d}.pt"
+                out_path = validation_cache_path(split_root, entry_index, variant)
                 if save_writer is None:
-                    save_flow_cache(
-                        payload, out_path,
-                        compression=args.save_compression,
-                        gzip_level=int(args.gzip_level),
-                    )
+                    _save_validation_payload(payload, out_path, args)
                     saved += 1
                 else:
                     save_writer.submit(payload, out_path, {

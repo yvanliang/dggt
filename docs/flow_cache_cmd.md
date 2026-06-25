@@ -6,7 +6,9 @@
 * `/data/flow_cache_mode_b/{split}/{scene}/{clip:04d}.pt` — Mode B 片段（规划器想象的目标位置 + 场景 Gaussian 伪删除）。
 * `/data/flow_cache/{split}_manifest.jsonl` — 扩散数据加载器使用的合并训练 manifest（每个片段一行，两种模式混合在一起）。
 
-当前 `.pt` 文件仍保持 `schema_version=8` 和原有逻辑 schema，但物理存储已经改为 **chunked zstd SQLite container**：每个帧/字段独立压缩，训练时只读取随机 8 帧窗口需要的 chunk。两种缓存共享相同的逻辑 schema。它们只在 payload 顶层的 `mode_kind` 字段以及下面两个 sibling 中哪一个被填充上有所不同：
+当前 `.pt` 文件仍保持 `schema_version=8` 和原有逻辑 schema，但物理存储已经改为 **chunked zstd SQLite container**：每个帧/字段独立压缩，训练时只读取随机 8 帧窗口需要的 chunk。新生成的 cache 还会写入 `pass2_splatted_tok_low.flow_inputs`，其中包含正式训练直接消费的 `M_preserve/M_source/M_dest`、pooled scaffold 输入和 Mode-A asset coverage。`WaymoFlowCacheDataset` 会优先走 `scene_flow_fast` 读取路径：只读取 scene/pass2 token、flow inputs 和 asset LUT，不读取 raw image、dense pass1 heads、asset Gaussian 或 asset render；如果旧 cache 没有 `flow_inputs`，会自动回退到原完整读取路径。
+
+两种缓存共享相同的逻辑 schema。它们只在 payload 顶层的 `mode_kind` 字段以及下面两个 sibling 中哪一个被填充上有所不同：
 
 | 字段 | Mode A | Mode B |
 |--------------|---------------------------------------|-------------------------------------|
@@ -15,6 +17,7 @@
 | `mode_b` | `None` | `{imagined_objects, delete_mask, delete_mask_per_frame, …}` |
 | `phase1_localized` | `{slot_idx, frame_idx, source_front_index, delete_mask, shell_mask, …}` | `None` |
 | `pass2_splatted_tok_low` | tokenizer 前的 splat→blend 特征（int8） | tokenizer 前的 splat→blend 特征（int8） |
+| `pass2_splatted_tok_low.flow_inputs` | 训练 fast path 的 masks + pooled scaffold + asset coverage | 训练 fast path 的 masks + pooled scaffold |
 | `pass1` | 相同（gs_map / depth / dyn / int8 LUTs / cameras_dggt） | 相同 |
 | `raw` | 相同（images_u8, sky_mask, dynamic_mask） | 相同 |
 | `meta`, `object_meta` | 相同 | 相同 |
@@ -27,7 +30,8 @@ v8 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend �
 
 chunked v8 包含：
 
-* SceneFlow：`raw`、`pass1` heads、由 `semantic_logits` 派生出的 `semantic_vehicle_prob/mask`、scene LUT、`pass2_splatted_tok_low`、Mode-A `phase1_localized`/`asset_pass`、Mode-B planner/delete masks。
+* SceneFlow fallback / debug：`raw`、`pass1` heads、由 `semantic_logits` 派生出的 `semantic_vehicle_prob/mask`、scene LUT、`pass2_splatted_tok_low`、Mode-A `phase1_localized`/`asset_pass`、Mode-B planner/delete masks。
+* SceneFlow fast training：scene LUT、`pass2_splatted_tok_low`、`flow_inputs`、Mode-A 最后一层 asset LUT。训练时 tokenizer.encode 和可训练的 `ScaffoldPacker.mlp` 仍在线运行；FeatureSplatter、SoftMask render、CleanSceneState 构建和 asset Gaussian 读取都会跳过。
 * tokenizer Stage-B：`raw`、`pass1` heads、scene LUT、`pass2_splatted_tok_low`。
 * 不再保存训练读取路径未消费的 `aggregated_tokens_*`、`dino_tokens_*`、special tokens、全量 `semantic_logits`；Mode-A asset LUT 只保存正式 T1 默认使用的最后一层。
 
@@ -140,6 +144,55 @@ python tools/convert_flow_cache_to_chunked.py \
 ```
 
 `--mode_a_source_dir/--mode_a_output_dir` 用于这批迁移：Mode-A 从 disk3 旧 cache 读取，转换后写到 disk2；Mode-B 仍按 manifest 原地转换。`--verify` 会在覆盖/落盘前，对临时 chunked 文件分别走 SceneFlow 默认读取路径和 tokenizer Stage-B 读取路径，并与原始 `.pt` 做逐 tensor 精确比较；通过后才执行原子替换。manifest 路径不需要改变。
+
+
+## 2.6 旧 chunked v8 原地补写 flow_inputs
+
+已有 chunked v8 cache 若缺少 `pass2_splatted_tok_low.flow_inputs`，可以原地追加训练 fast path 所需的小 chunk。该工具不会重写整个 `.pt`，也不会重算 `pass2_splatted_tok_low` 或运行 FeatureSplatter；它只用 dense heads、Phase-1 / Mode-B masks 和 asset Gaussian 渲染 masks 与 pooled scaffold 输入。
+
+先 dry-run 估算新增体积：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run -n dggt --no-capture-output \
+    python -u tools/backfill_flow_cache_flow_inputs.py \
+    --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
+    --mode_filter mode_a,mode_b \
+    --limit 8 \
+    --device cuda \
+    --out_jsonl /tmp/flow_inputs_dryrun.jsonl
+```
+
+确认后原地写入：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run -n dggt --no-capture-output \
+    python -u tools/backfill_flow_cache_flow_inputs.py \
+    --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
+    --mode_filter mode_a,mode_b \
+    --device cuda \
+    --write \
+    --out_jsonl /tmp/flow_inputs_backfill.jsonl
+```
+
+默认会设置 SQLite `journal_mode=OFF`，避免在磁盘紧张时生成大 rollback journal；若更重视异常中断安全性，可加 `--safe_journal`。
+
+4-worker cold-read dataloader benchmark：
+
+```bash
+conda run -n dggt --no-capture-output \
+    python -u tools/benchmark_flow_cache_fastpath.py \
+    --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
+    --mode_filter mode_a \
+    --limit 64 \
+    --sequence_length 8 \
+    --batch_size 1 \
+    --num_workers 4 \
+    --prefetch_factor 1 \
+    --max_batches 64 \
+    --sync_before
+```
+
+将 `--mode_filter mode_a` 改成 `mode_b` 可分别测两种模式；backfill 前后各跑一次即可对比旧路径和 fast path。
 
 
 ## 3. 构建合并训练 manifest

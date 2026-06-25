@@ -32,6 +32,7 @@ from datasets.waymo_flow_cache_dataset import SUPPORTED_CACHE_SCHEMA_VERSIONS, W
 from dggt.losses.flow_losses import build_rectified_flow_target, compute_total_loss
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
+from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
 from dggt.utils.feature_stats import load_into_buffers
 from dggt.utils.flow_cache_io import (
     is_chunked_flow_cache,
@@ -89,6 +90,11 @@ def setup_distributed(args) -> tuple[torch.device, int, int]:
         local_rank = 0
         world_size = 1
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
     return device, local_rank, world_size
 
 
@@ -124,6 +130,47 @@ def log_wandb(run, metrics: dict[str, float], step: int, prefix: str) -> None:
     if run is None:
         return
     run.log({f"{prefix}/{key}": value for key, value in metrics.items()}, step=step)
+
+
+TRAIN_PROGRESS_KEYS = (
+    "lr",
+    ("l", "loss"),
+    ("l_flow", "loss_flow"),
+    ("l_preserve", "loss_preserve"),
+    ("l_repa", "loss_repa"),
+    ("l_identity", "loss_identity"),
+    ("data_s", "data_wait_s"),
+    ("train_s", "train_wall_s"),
+    "optim_s",
+    ("step_s", "step_wall_s"),
+    ("data_frac", "data_wait_frac"),
+    ("ips", "items_per_s_per_rank"),
+)
+
+
+def _format_train_progress_metrics(metrics: dict[str, float]) -> dict[str, str]:
+    """Compact terminal progress; keep verbose metrics available for wandb."""
+    out: dict[str, str] = {}
+    for spec in TRAIN_PROGRESS_KEYS:
+        display_key, metric_key = spec if isinstance(spec, tuple) else (spec, spec)
+        if metric_key not in metrics:
+            continue
+        value = float(metrics[metric_key])
+        if display_key == "lr":
+            out[display_key] = f"{value:.2e}"
+        elif display_key.endswith("_s") or display_key == "data_frac":
+            out[display_key] = f"{value:.3f}"
+        elif display_key == "ips":
+            out[display_key] = f"{value:.2f}"
+        else:
+            out[display_key] = f"{value:.4f}"
+    return out
+
+
+def _format_train_progress_line(metrics: dict[str, float]) -> str:
+    return " | ".join(
+        f"{key}={value}" for key, value in _format_train_progress_metrics(metrics).items()
+    )
 
 
 def autocast_context(args, device: torch.device):
@@ -538,6 +585,42 @@ def _flatten_fast_asset_kv(asset_pass_result, flow_inputs: dict[str, Any], devic
     return torch.cat(chunks, dim=1)
 
 
+def _split_nplc_levels_for_train(x: torch.Tensor) -> list[torch.Tensor]:
+    return [x[:, :, level, :].unsqueeze(0).contiguous() for level in range(int(x.shape[2]))]
+
+
+def _dequantize_nplc_levels_on_device(
+    payload: dict[str, Any],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[torch.Tensor]:
+    q = QuantizedTokens(
+        data=payload["data"].to(device, non_blocking=True),
+        scale=payload["scale"].to(device, non_blocking=True),
+        layout=str(payload.get("layout", "NPLC")),
+    )
+    return _split_nplc_levels_for_train(dequantize_tokens(q, dtype=dtype))
+
+
+def _dequantize_stacked_nplc_levels_on_device(
+    payloads: list[dict[str, Any]],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[torch.Tensor]:
+    data = torch.stack([p["data"] for p in payloads], dim=0)
+    scale = torch.stack([p["scale"] for p in payloads], dim=0)
+    b, s, p_count, levels, channels = data.shape
+    q = QuantizedTokens(
+        data=data.reshape(b * s, p_count, levels, channels).to(device, non_blocking=True),
+        scale=scale.reshape(b * s, levels).to(device, non_blocking=True),
+        layout=str(payloads[0].get("layout", "NPLC")),
+    )
+    x = dequantize_tokens(q, dtype=dtype).reshape(b, s, p_count, levels, channels)
+    return [x[:, :, :, level, :].contiguous() for level in range(int(levels))]
+
+
 def build_cached_flow_bundle(
     item: dict[str, Any],
     assembler: FlowFeatureAssembler,
@@ -547,12 +630,32 @@ def build_cached_flow_bundle(
         k: (v.to(device) if torch.is_tensor(v) else v)
         for k, v in item["flow_inputs_cached"].items()
     }
-    predictions = _move_predictions(item["predictions"], device)
-    F_g_lut_scene = assembler._select_lut_scene(predictions)
-    splatted_tok_low_cached = item.get("splatted_tok_low_cached")
-    if splatted_tok_low_cached is None:
-        raise RuntimeError(f"Fast cache item {item.get('cache_path', '<unknown>')} missing splatted_tok_low_cached.")
-    splatted_tok_low = [t.to(device=device, dtype=F_g_lut_scene[0].dtype) for t in splatted_tok_low_cached]
+    predictions_raw = item["predictions"]
+    cache_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    if isinstance(predictions_raw.get("image_tokens_quantized"), dict):
+        F_g_lut_scene = _dequantize_nplc_levels_on_device(
+            predictions_raw["image_tokens_quantized"],
+            device=device,
+            dtype=cache_dtype,
+        )
+    else:
+        predictions = _move_predictions(predictions_raw, device)
+        F_g_lut_scene = assembler._select_lut_scene(predictions)
+
+    splatted_tok_low_quantized = item.get("splatted_tok_low_quantized")
+    if isinstance(splatted_tok_low_quantized, dict):
+        splatted_tok_low = _dequantize_nplc_levels_on_device(
+            splatted_tok_low_quantized,
+            device=device,
+            dtype=F_g_lut_scene[0].dtype,
+        )
+    else:
+        splatted_tok_low_cached = item.get("splatted_tok_low_cached")
+        if splatted_tok_low_cached is None:
+            raise RuntimeError(
+                f"Fast cache item {item.get('cache_path', '<unknown>')} missing splatted_tok_low_cached."
+            )
+        splatted_tok_low = [t.to(device=device, dtype=F_g_lut_scene[0].dtype) for t in splatted_tok_low_cached]
 
     if assembler.scene_tokenizer is None:
         raise RuntimeError("FlowFeatureAssembler needs scene_tokenizer for cached SceneFlow inputs.")
@@ -593,6 +696,90 @@ def build_cached_flow_bundle(
         splatted_tok_low=splatted_tok_low,
         F_g_lut_scene=F_g_lut_scene,
     )
+
+
+def build_cached_flow_batch_bundle(
+    items: list[dict[str, Any]],
+    assembler: FlowFeatureAssembler,
+    device: torch.device,
+) -> tuple[Any, list[int], float]:
+    if len(items) == 0:
+        raise ValueError("Cannot build an empty cached flow batch.")
+    if not all(item.get("flow_inputs_cached") is not None for item in items):
+        raise ValueError("build_cached_flow_batch_bundle requires fast cache items.")
+
+    cache_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    prediction_payloads = [item["predictions"]["image_tokens_quantized"] for item in items]
+    splat_payloads = [item["splatted_tok_low_quantized"] for item in items]
+    F_g_lut_scene = _dequantize_stacked_nplc_levels_on_device(
+        prediction_payloads,
+        device=device,
+        dtype=cache_dtype,
+    )
+    splatted_tok_low = _dequantize_stacked_nplc_levels_on_device(
+        splat_payloads,
+        device=device,
+        dtype=cache_dtype,
+    )
+
+    if assembler.scene_tokenizer is None:
+        raise RuntimeError("FlowFeatureAssembler needs scene_tokenizer for cached SceneFlow inputs.")
+    z_clean = assembler.scene_tokenizer.encode(F_g_lut_scene, patch_grid=assembler.patch_grid)
+    z_splat = assembler.scene_tokenizer.encode(splatted_tok_low, patch_grid=assembler.patch_grid)
+
+    flow_inputs = {
+        key: torch.cat(
+            [item["flow_inputs_cached"][key].to(device, non_blocking=True) for item in items],
+            dim=0,
+        )
+        for key in ("M_preserve", "M_source", "M_dest", "scaffold_pooled")
+    }
+    M_preserve = flow_inputs["M_preserve"].to(device=device, dtype=torch.float32)
+    M_source = flow_inputs["M_source"].to(device=device, dtype=torch.float32)
+    M_dest = flow_inputs["M_dest"].to(device=device, dtype=torch.float32)
+    scaffold_tok = unwrap_ddp(assembler.scaffold_packer).mlp(
+        flow_inputs["scaffold_pooled"].to(device=device, dtype=torch.float32)
+    )
+
+    base_t = assembler.noise_scheduler.sample_base_t(int(z_clean.shape[0]), device=device)
+    t_tok = assembler.noise_scheduler.build_t_tok(base_t, M_preserve, M_source, M_dest)
+    z_init, eps_noise = assembler.noise_scheduler.compose_z_init(
+        z_clean, z_splat, M_preserve, M_source, M_dest
+    )
+
+    asset_bundles: list[Any] = []
+    num_objects = 0.0
+    for item in items:
+        item_flow_inputs = {
+            k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+            for k, v in item["flow_inputs_cached"].items()
+        }
+        asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
+        F_asset_tokens = _flatten_fast_asset_kv(asset_pass_result, item_flow_inputs, device).to(dtype=z_clean.dtype)
+        asset_bundles.append(SimpleNamespace(F_asset_tokens=F_asset_tokens))
+        num_objects += float(len(item_flow_inputs.get("phase4_slots", [])))
+    F_asset_tokens, asset_mask = _pad_asset_tokens_for_batch(asset_bundles)
+    asset_lengths = [int(bundle.F_asset_tokens.shape[1]) for bundle in asset_bundles]
+
+    return SimpleNamespace(
+        z_clean=z_clean,
+        z_splat=z_splat,
+        z_init=z_init,
+        eps_noise=eps_noise,
+        t_tok=t_tok,
+        base_t=base_t,
+        scaffold_tok=scaffold_tok,
+        M_preserve=M_preserve,
+        M_source=M_source,
+        M_dest=M_dest,
+        F_asset_tokens=F_asset_tokens,
+        encoder_attention_mask=asset_mask,
+        phase4_slots=[],
+        patch_grid=assembler.patch_grid,
+        patch_start_idx=assembler.patch_start_idx,
+        splatted_tok_low=splatted_tok_low,
+        F_g_lut_scene=F_g_lut_scene,
+    ), asset_lengths, num_objects / float(len(items))
 
 
 # ---------------------------------------------------------------------- #
@@ -700,11 +887,18 @@ def train_step(
         if len(item) == 0:
             raise ValueError("Received an empty training micro-batch.")
         if len(item) > 1 and not bool(getattr(args, "no_batch_scene_flow", False)):
-            bundles = [build_flow_bundle(single, assembler, device) for single in item]
-            if unwrap_ddp(scene_flow).training:
-                for bundle_i in bundles:
-                    _maybe_drop_asset_kv(bundle_i, args.uncond_drop_prob)
-            bundle, asset_mask, asset_lengths = _merge_bundles_for_scene_flow(bundles)
+            if all(single.get("flow_inputs_cached") is not None for single in item):
+                bundle, asset_lengths, mean_num_objects = build_cached_flow_batch_bundle(item, assembler, device)
+                asset_mask = getattr(bundle, "encoder_attention_mask", None)
+                if unwrap_ddp(scene_flow).training:
+                    _maybe_drop_asset_kv(bundle, args.uncond_drop_prob)
+            else:
+                bundles = [build_flow_bundle(single, assembler, device) for single in item]
+                if unwrap_ddp(scene_flow).training:
+                    for bundle_i in bundles:
+                        _maybe_drop_asset_kv(bundle_i, args.uncond_drop_prob)
+                bundle, asset_mask, asset_lengths = _merge_bundles_for_scene_flow(bundles)
+                mean_num_objects = sum(float(len(b.phase4_slots)) for b in bundles) / float(len(bundles))
             sf = unwrap_ddp(scene_flow)
             z_clean_n = sf.normalize(bundle.z_clean)
             z_splat_n = sf.normalize(bundle.z_splat)
@@ -752,7 +946,7 @@ def train_step(
             )
             metrics.update({
                 "edit_weight_mean": float((1.0 - bundle.M_preserve).mean().item()),
-                "num_objects": sum(float(len(b.phase4_slots)) for b in bundles) / float(len(bundles)),
+                "num_objects": float(mean_num_objects),
                 "kv_tokens": sum(float(n) for n in asset_lengths) / float(len(asset_lengths)),
                 "sigma_mean": float(target.sigmas.float().mean().item()),
                 "micro_batch_size": float(len(item)),
@@ -1789,13 +1983,11 @@ def main() -> None:
                         else 0.0
                     )
                     if progress is not None:
-                        postfix = {"lr": f"{lr_now:.2e}"}
-                        for key, value in train_metrics.items():
-                            postfix[key] = f"{float(value):.4f}"
+                        postfix = _format_train_progress_metrics(train_metrics)
                         progress.set_postfix(postfix, refresh=False)
                     elif global_step % max(1, int(args.log_every)) == 0:
-                        metrics_str = " | ".join(f"{key}={value:.4f}" for key, value in train_metrics.items())
-                        print(f"[step {global_step:06d}] lr={lr_now:.2e} | {metrics_str}", flush=True)
+                        metrics_str = _format_train_progress_line(train_metrics)
+                        print(f"[step {global_step:06d}] {metrics_str}", flush=True)
                     for key, value in train_metrics.items():
                         wandb_sums[key] = wandb_sums.get(key, 0.0) + float(value)
                     wandb_count += 1

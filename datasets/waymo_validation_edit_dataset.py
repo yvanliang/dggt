@@ -6,21 +6,21 @@ This dataset turns one entry into a ``sample`` dict consumable by the shared
 ``gaussian_edit`` / ``asset_pass`` primitives, using a fixed **6-slot** layout:
 
 ====  ============================  ===========================  ====================
-slot  role                          3D box source                asset
+slot  role                          3D box source                     asset
 ====  ============================  ===========================  ====================
 0     delete: deletion source       all_object_info tar          none (deleted)
 1     delete: replacement source    all_object_info tar          none (deleted)
 2     delete: repositioning source  all_object_info tar          none (deleted)
 3     asset: insertion              all_object_info_insertion    insertion_candidates
-4     asset: replacement            slot-1 refined box (later)    replacement_candidates
-5     asset: repositioning          slot-2 refined box + shift    repositioning own asset
+4     asset: replacement            all_object_info_replacement  replacement_candidates
+5     asset: repositioning          all_object_info_reposition   {repositioning_id}.ply
 ====  ============================  ===========================  ====================
 
 Delete slots (0..2) are localized by the stock :func:`localize_objects` with
 ``load_asset=False`` (asset stays empty -> contributes only deletion). Asset
 slots (3..5) are *not* in the localize loop and carry ``object_valid_mask=False``
-so :func:`_collect_protected_boxes` skips them (slot-4 shares slot-1's box; if it
-were "protected" it would block deleting the replacement source). Asset
+so :func:`_collect_protected_boxes` skips destination boxes; otherwise a
+destination overlapping its source could block source deletion. Asset
 placement happens in :mod:`dggt.utils.validation_edit_localize`.
 
 3D boxes come from ``data/validation_info/*`` tars (NOT tfrecord / instances).
@@ -57,6 +57,8 @@ NUM_SLOTS = 6
 DEFAULT_ASSET_ROOT = "/data/disk2/lyy_dataset/test_transfer/objects_ply_transformed"
 DEFAULT_ALL_OBJECT_INFO_ROOT = "data/validation_info/all_object_info"
 DEFAULT_ALL_OBJECT_INFO_INSERTION_ROOT = "data/validation_info/all_object_info_insertion"
+DEFAULT_ALL_OBJECT_INFO_REPLACEMENT_ROOT = "data/validation_info/all_object_info_replacement"
+DEFAULT_ALL_OBJECT_INFO_REPOSITION_ROOT = "data/validation_info/all_object_info_reposition"
 
 # slot index -> (role, edit-variant it participates in)
 DELETE_SLOTS = (0, 1, 2)
@@ -69,10 +71,6 @@ SLOT_ROLE = {
     4: "asset_replacement",
     5: "asset_repositioning",
 }
-# asset slot -> delete slot whose refined box it reuses (3 = insertion, no source)
-ASSET_SOURCE_BOX_SLOT = {4: 1, 5: 2}
-
-
 class MissingAssetError(RuntimeError):
     """Raised when a required asset ``.ply`` cannot be resolved."""
 
@@ -108,26 +106,48 @@ def _list_cam0_frame_indices(scene_root: Path) -> list[int]:
 class _TarFrames:
     """Lazy reader over a ``<segment>.tar`` of per-frame all_object_info JSONs.
 
-    Sorted member index ``i`` corresponds 1:1 to scene frame index ``i``
-    (both equal the number of scene frames / ego poses).
+    Member names contain the source timestamp index, e.g.
+    ``<segment>.000174.all_object_info.json`` for scene frame ``174 / 3 = 58``.
+    Some validation target tars start in the middle of a scene, so indexing by
+    sorted-member position would silently shift every target frame.
     """
 
     def __init__(self, tar_path: Path):
         self.tar_path = tar_path
         with tarfile.open(tar_path) as tf:
-            self._names = sorted(n for n in tf.getnames() if n.endswith(".json"))
+            names = sorted(n for n in tf.getnames() if n.endswith(".json"))
+        self._name_by_scene_frame: dict[int, str] = {}
+        for name in names:
+            parts = Path(name).name.split(".")
+            if len(parts) < 4:
+                continue
+            try:
+                source_frame_number = int(parts[-3])
+            except ValueError:
+                continue
+            if source_frame_number % 3 != 0:
+                raise ValueError(
+                    f"unexpected all_object_info member frame number: {name}"
+                )
+            scene_frame_idx = source_frame_number // 3
+            if scene_frame_idx in self._name_by_scene_frame:
+                raise ValueError(
+                    f"duplicate scene frame {scene_frame_idx} in {tar_path}"
+                )
+            self._name_by_scene_frame[scene_frame_idx] = name
         self._cache: dict[int, dict[str, Any]] = {}
 
     def __len__(self) -> int:
-        return len(self._names)
+        return len(self._name_by_scene_frame)
 
     def frame(self, scene_frame_idx: int) -> dict[str, Any]:
-        if scene_frame_idx < 0 or scene_frame_idx >= len(self._names):
+        member_name = self._name_by_scene_frame.get(int(scene_frame_idx))
+        if member_name is None:
             return {}
         if scene_frame_idx in self._cache:
             return self._cache[scene_frame_idx]
         with tarfile.open(self.tar_path) as tf:
-            member = tf.extractfile(self._names[scene_frame_idx])
+            member = tf.extractfile(member_name)
             data = json.load(member) if member is not None else {}
         self._cache[scene_frame_idx] = data
         return data
@@ -142,6 +162,8 @@ class WaymoValidationEditDataset:
         processed_root: str = DEFAULT_PROCESSED_ROOT,
         all_object_info_root: str = DEFAULT_ALL_OBJECT_INFO_ROOT,
         all_object_info_insertion_root: str = DEFAULT_ALL_OBJECT_INFO_INSERTION_ROOT,
+        all_object_info_replacement_root: str = DEFAULT_ALL_OBJECT_INFO_REPLACEMENT_ROOT,
+        all_object_info_reposition_root: str = DEFAULT_ALL_OBJECT_INFO_REPOSITION_ROOT,
         asset_root: str = DEFAULT_ASSET_ROOT,
         split: str = "validation",
         clip_length: int = CLIP_LENGTH,
@@ -155,6 +177,8 @@ class WaymoValidationEditDataset:
         )
         self.all_object_info_root = Path(all_object_info_root)
         self.all_object_info_insertion_root = Path(all_object_info_insertion_root)
+        self.all_object_info_replacement_root = Path(all_object_info_replacement_root)
+        self.all_object_info_reposition_root = Path(all_object_info_reposition_root)
         self.asset_root = Path(asset_root)
         self.clip_length = int(clip_length)
         self.camera_ids = [0]  # views=1 only (editor constraint)
@@ -165,6 +189,8 @@ class WaymoValidationEditDataset:
         self._ann_cache: dict[str, dict[str, Any]] = {}
         self._tar_cache: dict[str, _TarFrames] = {}
         self._ins_tar_cache: dict[str, _TarFrames] = {}
+        self._replacement_tar_cache: dict[str, _TarFrames] = {}
+        self._reposition_tar_cache: dict[str, _TarFrames] = {}
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -201,6 +227,26 @@ class WaymoValidationEditDataset:
             self._ins_tar_cache[segment] = _TarFrames(tar_path)
         return self._ins_tar_cache[segment]
 
+    def _replacement_info(self, segment: str) -> _TarFrames:
+        if segment not in self._replacement_tar_cache:
+            tar_path = self.all_object_info_replacement_root / f"{segment}.tar"
+            if not tar_path.is_file():
+                raise FileNotFoundError(
+                    f"all_object_info_replacement tar not found: {tar_path}"
+                )
+            self._replacement_tar_cache[segment] = _TarFrames(tar_path)
+        return self._replacement_tar_cache[segment]
+
+    def _reposition_info(self, segment: str) -> _TarFrames:
+        if segment not in self._reposition_tar_cache:
+            tar_path = self.all_object_info_reposition_root / f"{segment}.tar"
+            if not tar_path.is_file():
+                raise FileNotFoundError(
+                    f"all_object_info_reposition tar not found: {tar_path}"
+                )
+            self._reposition_tar_cache[segment] = _TarFrames(tar_path)
+        return self._reposition_tar_cache[segment]
+
     def _resolve_asset_path(self, asset_id: str) -> str:
         return str(self.asset_root / f"{asset_id}.ply")
 
@@ -232,6 +278,8 @@ class WaymoValidationEditDataset:
         annotation = self._annotation(segment)
         all_obj = self._all_object_info(segment)
         ins_obj = self._insertion_info(segment)
+        replacement_obj = self._replacement_info(segment)
+        reposition_obj = self._reposition_info(segment)
 
         # ---- images / sky / dynamic ---------------------------------------
         dynamic_root = _resolve_mask_root(scene_root)
@@ -297,7 +345,8 @@ class WaymoValidationEditDataset:
             2: str(od.get("repositioning", "")),
             3: str(entry.get("insertion_candidates", "")),
             4: str(entry.get("replacement_candidates", "")),
-            5: str(od.get("repositioning", "")),  # reposition reuses own asset
+            # Move uses the authoritative external PLY keyed by the source raw id.
+            5: str(od.get("repositioning", "")),
         }
 
         S = self.clip_length
@@ -337,7 +386,7 @@ class WaymoValidationEditDataset:
 
         for j, sf in enumerate(scene_frame_indices):
             frame_objs = all_obj.frame(sf)
-            # delete slots 0..2 + asset slots 4,5 share scene-object boxes
+            # Delete slots always use the original scene-object tracks.
             for slot in (0, 1, 2):
                 rid = slot_raw_id[slot]
                 info = frame_objs.get(rid)
@@ -350,24 +399,6 @@ class WaymoValidationEditDataset:
                     np.asarray(info["object_lwh"], dtype=np.float32),
                     bool(info.get("object_is_moving", False)),
                 )
-            # slot 4 (replacement asset) shares slot-1 (replacement origin) box
-            if track_valid[1, j]:
-                box_size[4, j] = box_size[1, j]
-                obj_to_world[4, j] = obj_to_world[1, j]
-                box_corners[4, j] = box_corners[1, j]
-                track_valid[4, j] = True
-                is_moving_frame[4, j] = is_moving_frame[1, j]
-                bbox_model[4, j] = bbox_model[1, j]
-                bbox_present[4, j] = bbox_present[1, j]
-            # slot 5 (reposition asset) shares slot-2 (reposition origin) box
-            if track_valid[2, j]:
-                box_size[5, j] = box_size[2, j]
-                obj_to_world[5, j] = obj_to_world[2, j]
-                box_corners[5, j] = box_corners[2, j]
-                track_valid[5, j] = True
-                is_moving_frame[5, j] = is_moving_frame[2, j]
-                bbox_model[5, j] = bbox_model[2, j]
-                bbox_present[5, j] = bbox_present[2, j]
             # slot 3 (insertion) box from insertion tar
             ins_frame = ins_obj.frame(sf)
             ins = ins_frame.get("insertion_0")
@@ -378,6 +409,37 @@ class WaymoValidationEditDataset:
                     np.asarray(ins["object_to_world"], dtype=np.float32),
                     np.asarray(ins["object_lwh"], dtype=np.float32),
                     bool(ins.get("object_is_moving", False)),
+                )
+            # Slots 4 and 5 use their authoritative per-frame destination
+            # tracks. The reposition tar already contains the requested
+            # 3-m local-axis displacement; do not shift it again here.
+            replacement_target = replacement_obj.frame(sf).get(str(od.get("replacement", "")))
+            if replacement_target is not None:
+                _fill_box(
+                    4,
+                    j,
+                    np.asarray(replacement_target["object_to_world"], dtype=np.float32),
+                    np.asarray(replacement_target["object_lwh"], dtype=np.float32),
+                    bool(
+                        replacement_target.get(
+                            "object_is_moving",
+                            is_moving_frame[1, j].item() if track_valid[1, j] else False,
+                        )
+                    ),
+                )
+            reposition_target = reposition_obj.frame(sf).get(str(od.get("repositioning", "")))
+            if reposition_target is not None:
+                _fill_box(
+                    5,
+                    j,
+                    np.asarray(reposition_target["object_to_world"], dtype=np.float32),
+                    np.asarray(reposition_target["object_lwh"], dtype=np.float32),
+                    bool(
+                        reposition_target.get(
+                            "object_is_moving",
+                            is_moving_frame[2, j].item() if track_valid[2, j] else False,
+                        )
+                    ),
                 )
 
         # ---- asset path resolution + missing report -----------------------
@@ -404,8 +466,8 @@ class WaymoValidationEditDataset:
             object_valid_mask[slot] = bool(track_valid[slot].any().item())
             object_asset_valid_mask[slot] = True  # not skipped by localize_objects
         for slot in ASSET_SLOTS:
-            # valid_mask False -> _collect_protected_boxes skips asset slots so
-            # slot-4 (== slot-1 box) does not block deleting the replace source.
+            # valid_mask False -> _collect_protected_boxes skips destination
+            # slots so they cannot block deletion of their source objects.
             object_valid_mask[slot] = False
             object_asset_valid_mask[slot] = bool(track_valid[slot].any().item())
             asset_image_valid[slot, :, 0] = track_valid[slot]
@@ -485,7 +547,6 @@ class WaymoValidationEditDataset:
                 "slot_raw_id": dict(slot_raw_id),
                 "delete_slots": list(DELETE_SLOTS),
                 "asset_slots": list(present_asset_slots),
-                "asset_source_box_slot": dict(ASSET_SOURCE_BOX_SLOT),
                 "action_for_reposition": str(entry.get("action_for_reposition", "up")),
                 "trajectory": entry.get("trajectory", {}),
             },

@@ -25,7 +25,17 @@ import torch
 GZIP_MAGIC = b"\x1f\x8b"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SQLITE_MAGIC = b"SQLite format 3\x00"
+CHUNKED_FLOW_CACHE_FORMAT = "flow_cache_chunked_zstd_sqlite"
 CHUNKED_FLOW_CACHE_FORMAT_VERSION = 1
+CURRENT_FLOW_CACHE_SCHEMA_VERSION = 8
+
+
+def is_current_flow_cache_summary(summary: dict[str, Any]) -> bool:
+    return (
+        str(summary.get("format", "")) == CHUNKED_FLOW_CACHE_FORMAT
+        and int(summary.get("format_version", 0)) == CHUNKED_FLOW_CACHE_FORMAT_VERSION
+        and int(summary.get("schema_version", 0)) == CURRENT_FLOW_CACHE_SCHEMA_VERSION
+    )
 
 
 def is_gzip_file(path: str | os.PathLike[str]) -> bool:
@@ -280,6 +290,11 @@ def _stack_optional(values: list[Any]) -> Any:
     return torch.stack(values, dim=0).contiguous()
 
 
+def _has_chunk(conn: sqlite3.Connection, key: str) -> bool:
+    row = conn.execute("SELECT 1 FROM chunks WHERE key=? LIMIT 1", (str(key),)).fetchone()
+    return row is not None
+
+
 def _pack_bool_tensor(mask: torch.Tensor) -> dict[str, Any]:
     flat = mask.to(torch.uint8).flatten().cpu()
     n = int(flat.numel())
@@ -377,7 +392,7 @@ def save_flow_cache_chunked(
             for k in asset_keys
         }
         summary = {
-            "format": "flow_cache_chunked_zstd_sqlite",
+            "format": CHUNKED_FLOW_CACHE_FORMAT,
             "format_version": CHUNKED_FLOW_CACHE_FORMAT_VERSION,
             "schema_version": int(payload.get("schema_version", 0)),
             "mode_kind": mode_kind,
@@ -394,6 +409,11 @@ def save_flow_cache_chunked(
                 "pass1.dino_tokens_*",
             ],
         }
+        flow_inputs = pass2.get("flow_inputs") if isinstance(pass2, dict) else None
+        if isinstance(flow_inputs, dict):
+            summary["has_flow_inputs"] = True
+            if torch.is_tensor(flow_inputs.get("phase1_coverage")):
+                summary["flow_inputs_phase1_coverage_shape"] = list(flow_inputs["phase1_coverage"].shape)
         if mode_kind == "mode_a" and payload.get("phase1_localized") is not None:
             phase1 = payload["phase1_localized"]
             summary["mode_a_edit_frames"] = (
@@ -454,6 +474,13 @@ def save_flow_cache_chunked(
                     "splatted_tok_low_scale": _tensor_frame(pass2["splatted_tok_low_scale"], frame),
                 },
             }
+            if isinstance(flow_inputs, dict):
+                chunks[f"frame/{frame:02d}/flow_inputs"] = {
+                    "M_preserve": _tensor_frame(flow_inputs["M_preserve"], frame),
+                    "M_source": _tensor_frame(flow_inputs["M_source"], frame),
+                    "M_dest": _tensor_frame(flow_inputs["M_dest"], frame),
+                    "scaffold_pooled": _tensor_frame(flow_inputs["scaffold_pooled"], frame),
+                }
             for key, obj in chunks.items():
                 zbytes, raw_bytes = _put_chunk(conn, cctx, key, obj)
                 total_zbytes += zbytes
@@ -476,6 +503,19 @@ def save_flow_cache_chunked(
             total_zbytes += zbytes
             total_raw_bytes += raw_bytes
             chunk_count += 1
+            if isinstance(flow_inputs, dict):
+                zbytes, raw_bytes = _put_chunk(
+                    conn,
+                    cctx,
+                    "mode_a/flow_inputs_meta",
+                    {
+                        "phase1_coverage": flow_inputs.get("phase1_coverage"),
+                        "phase4_slots": flow_inputs.get("phase4_slots", []),
+                    },
+                )
+                total_zbytes += zbytes
+                total_raw_bytes += raw_bytes
+                chunk_count += 1
             for frame in range(num_frames):
                 s = int(offsets[frame].item())
                 e = int(offsets[frame + 1].item())
@@ -604,6 +644,115 @@ def load_chunked_flow_cache_summary(path: str | os.PathLike[str]) -> dict[str, A
         return _get_info(conn, "summary")
 
 
+def append_flow_inputs_to_chunked_flow_cache(
+    path: str | os.PathLike[str],
+    flow_inputs: dict[str, Any],
+    *,
+    force: bool = False,
+    zstd_level: int = 1,
+    unsafe_no_journal: bool = True,
+) -> dict[str, Any]:
+    """Append SceneFlow fast-path inputs to an existing chunked cache in place.
+
+    This intentionally does not rewrite the SQLite container.  It only inserts
+    ``frame/XX/flow_inputs`` chunks, optionally ``mode_a/flow_inputs_meta``,
+    and refreshes the summary/stats rows.  It is meant for low-free-space
+    backfills where making a full replacement ``.pt`` is not practical.
+    """
+    if not is_chunked_flow_cache(path):
+        raise RuntimeError(f"Flow inputs can only be appended to chunked cache files: {path}")
+    zstd = _require_zstd_module()
+    path = Path(path)
+    before_bytes = int(path.stat().st_size)
+    cctx = zstd.ZstdCompressor(level=max(1, min(19, int(zstd_level))))
+    conn = sqlite3.connect(str(path))
+    written_keys: list[str] = []
+    try:
+        if bool(unsafe_no_journal):
+            conn.execute("PRAGMA journal_mode=OFF")
+            conn.execute("PRAGMA synchronous=OFF")
+        summary = _get_info(conn, "summary")
+        if bool(summary.get("has_flow_inputs", False)) and not bool(force):
+            return {
+                "path": str(path),
+                "skipped": True,
+                "reason": "has_flow_inputs",
+                "before_bytes": before_bytes,
+                "after_bytes": before_bytes,
+                "delta_bytes": 0,
+                "written_chunks": 0,
+            }
+        num_frames = int(summary["num_frames"])
+        for key in ("M_preserve", "M_source", "M_dest", "scaffold_pooled"):
+            value = flow_inputs.get(key)
+            if not torch.is_tensor(value) or int(value.shape[0]) != num_frames:
+                raise ValueError(
+                    f"flow_inputs[{key!r}] must be a tensor with first dim={num_frames}, "
+                    f"got {None if value is None else tuple(value.shape)}"
+                )
+        for frame in range(num_frames):
+            key = f"frame/{frame:02d}/flow_inputs"
+            if _has_chunk(conn, key) and not bool(force):
+                continue
+            _put_chunk(
+                conn,
+                cctx,
+                key,
+                {
+                    "M_preserve": _tensor_frame(flow_inputs["M_preserve"], frame),
+                    "M_source": _tensor_frame(flow_inputs["M_source"], frame),
+                    "M_dest": _tensor_frame(flow_inputs["M_dest"], frame),
+                    "scaffold_pooled": _tensor_frame(flow_inputs["scaffold_pooled"], frame),
+                },
+            )
+            written_keys.append(key)
+
+        if str(summary.get("mode_kind")) == "mode_a":
+            key = "mode_a/flow_inputs_meta"
+            if bool(force) or not _has_chunk(conn, key):
+                _put_chunk(
+                    conn,
+                    cctx,
+                    key,
+                    {
+                        "phase1_coverage": flow_inputs.get("phase1_coverage"),
+                        "phase4_slots": flow_inputs.get("phase4_slots", []),
+                    },
+                )
+                written_keys.append(key)
+
+        summary["has_flow_inputs"] = True
+        if torch.is_tensor(flow_inputs.get("phase1_coverage")):
+            summary["flow_inputs_phase1_coverage_shape"] = list(flow_inputs["phase1_coverage"].shape)
+        _put_info(conn, "summary", summary)
+        row = conn.execute("SELECT COUNT(*), SUM(zbytes), SUM(raw_bytes) FROM chunks").fetchone()
+        _put_info(
+            conn,
+            "stats",
+            {
+                "chunk_count": int(row[0] or 0),
+                "chunk_zbytes": int(row[1] or 0),
+                "chunk_raw_torch_bytes": int(row[2] or 0),
+            },
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    after_bytes = int(path.stat().st_size)
+    return {
+        "path": str(path),
+        "skipped": False,
+        "before_bytes": before_bytes,
+        "after_bytes": after_bytes,
+        "delta_bytes": after_bytes - before_bytes,
+        "written_chunks": len(written_keys),
+        "written_keys": written_keys[:8],
+    }
+
+
 def load_chunked_flow_cache_probe(path: str | os.PathLike[str]) -> dict[str, Any]:
     """Load just enough metadata for validation and subset sampling."""
     zstd = _require_zstd_module()
@@ -675,39 +824,44 @@ def load_chunked_flow_cache_subset(
     with _open_chunked_ro(path) as conn:
         summary = _get_info(conn, "summary")
         meta_full = _get_chunk(conn, dctx, "global/meta")
-        object_meta_full = _get_chunk(conn, dctx, "global/object_meta")
-        phase1_alignment = _get_chunk(conn, dctx, "global/phase1_alignment")
+        fast_scene_flow = consumer == "scene_flow_fast" and bool(summary.get("has_flow_inputs", False))
+        object_meta_full = None if fast_scene_flow else _get_chunk(conn, dctx, "global/object_meta")
+        phase1_alignment = {} if fast_scene_flow else _get_chunk(conn, dctx, "global/phase1_alignment")
 
-        raw_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/raw") for f in subset_list]
-        pass1_head_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/pass1_heads") for f in subset_list]
+        raw_chunks = [] if fast_scene_flow else [_get_chunk(conn, dctx, f"frame/{f:02d}/raw") for f in subset_list]
+        pass1_head_chunks = [] if fast_scene_flow else [_get_chunk(conn, dctx, f"frame/{f:02d}/pass1_heads") for f in subset_list]
         scene_lut_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/scene_lut") for f in subset_list]
         pass2_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/pass2") for f in subset_list]
 
-        cams = {
-            key: torch.stack([chunk["cameras_dggt"][key] for chunk in pass1_head_chunks], dim=0).contiguous()
-            for key in ("viewmats", "Ks", "camera_to_world")
-        }
-        semantic_vehicle_prob = _stack_optional(
-            [chunk.get("semantic_vehicle_prob") for chunk in pass1_head_chunks]
-        )
-        semantic_vehicle_mask = _stack_optional(
-            [chunk.get("semantic_vehicle_mask") for chunk in pass1_head_chunks]
-        )
-        if semantic_vehicle_prob is None or semantic_vehicle_mask is None:
-            semantic_logits_legacy = _stack_optional(
-                [chunk.get("semantic_logits") for chunk in pass1_head_chunks]
+        cams = {}
+        semantic_vehicle_prob = None
+        semantic_vehicle_mask = None
+        if not fast_scene_flow:
+            cams = {
+                key: torch.stack([chunk["cameras_dggt"][key] for chunk in pass1_head_chunks], dim=0).contiguous()
+                for key in ("viewmats", "Ks", "camera_to_world")
+            }
+            semantic_vehicle_prob = _stack_optional(
+                [chunk.get("semantic_vehicle_prob") for chunk in pass1_head_chunks]
             )
-            if semantic_logits_legacy is not None:
-                semantic_vehicle_prob, semantic_vehicle_mask = _semantic_vehicle_from_logits(
-                    semantic_logits_legacy
+            semantic_vehicle_mask = _stack_optional(
+                [chunk.get("semantic_vehicle_mask") for chunk in pass1_head_chunks]
+            )
+            if semantic_vehicle_prob is None or semantic_vehicle_mask is None:
+                semantic_logits_legacy = _stack_optional(
+                    [chunk.get("semantic_logits") for chunk in pass1_head_chunks]
                 )
+                if semantic_logits_legacy is not None:
+                    semantic_vehicle_prob, semantic_vehicle_mask = _semantic_vehicle_from_logits(
+                        semantic_logits_legacy
+                    )
         pass1 = {
             "cameras_dggt": cams,
-            "pose_enc": torch.stack([chunk["pose_enc"] for chunk in pass1_head_chunks], dim=0).contiguous(),
-            "gs_map": torch.stack([chunk["gs_map"] for chunk in pass1_head_chunks], dim=0).contiguous(),
-            "depth": torch.stack([chunk["depth"] for chunk in pass1_head_chunks], dim=0).contiguous(),
-            "dynamic_conf": torch.stack([chunk["dynamic_conf"] for chunk in pass1_head_chunks], dim=0).contiguous(),
-            "gs_conf": torch.stack([chunk["gs_conf"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "pose_enc": None if fast_scene_flow else torch.stack([chunk["pose_enc"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "gs_map": None if fast_scene_flow else torch.stack([chunk["gs_map"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "depth": None if fast_scene_flow else torch.stack([chunk["depth"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "dynamic_conf": None if fast_scene_flow else torch.stack([chunk["dynamic_conf"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "gs_conf": None if fast_scene_flow else torch.stack([chunk["gs_conf"] for chunk in pass1_head_chunks], dim=0).contiguous(),
             "semantic_logits": None,
             "semantic_vehicle_prob": semantic_vehicle_prob,
             "semantic_vehicle_mask": semantic_vehicle_mask,
@@ -725,7 +879,7 @@ def load_chunked_flow_cache_subset(
             "dino_tokens_patch_scale": None,
             "dino_tokens_special": None,
         }
-        raw = {
+        raw = {} if fast_scene_flow else {
             "images_u8": torch.stack([chunk["images_u8"] for chunk in raw_chunks], dim=0).contiguous(),
             "sky_mask": torch.stack([chunk["sky_mask"] for chunk in raw_chunks], dim=0).contiguous(),
             "dynamic_mask": _stack_optional([chunk.get("dynamic_mask") for chunk in raw_chunks]),
@@ -749,7 +903,7 @@ def load_chunked_flow_cache_subset(
             "mode_kind": str(summary["mode_kind"]),
             "meta": _slice_meta_for_frames(meta_full, subset),
             "raw": raw,
-            "object_meta": _slice_object_meta_for_frames(object_meta_full, subset),
+            "object_meta": {} if object_meta_full is None else _slice_object_meta_for_frames(object_meta_full, subset),
             "pass1": pass1,
             "phase1_alignment": phase1_alignment,
             "asset_pass": {},
@@ -757,6 +911,17 @@ def load_chunked_flow_cache_subset(
             "phase1_localized": None,
             "pass2_splatted_tok_low": pass2,
         }
+        if fast_scene_flow:
+            flow_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/flow_inputs") for f in subset_list]
+            payload["flow_inputs"] = {
+                "M_preserve": torch.stack([chunk["M_preserve"] for chunk in flow_chunks], dim=0).contiguous(),
+                "M_source": torch.stack([chunk["M_source"] for chunk in flow_chunks], dim=0).contiguous(),
+                "M_dest": torch.stack([chunk["M_dest"] for chunk in flow_chunks], dim=0).contiguous(),
+                "scaffold_pooled": torch.stack([chunk["scaffold_pooled"] for chunk in flow_chunks], dim=0).contiguous(),
+            }
+            if payload["mode_kind"] == "mode_a" and _has_chunk(conn, "mode_a/flow_inputs_meta"):
+                payload["flow_inputs"].update(_get_chunk(conn, dctx, "mode_a/flow_inputs_meta"))
+            payload["_fast_scene_flow"] = True
 
         if consumer == "tokenizer_stage_b":
             return payload
@@ -804,17 +969,19 @@ def load_chunked_flow_cache_subset(
                 asset_meta = _get_chunk(conn, dctx, f"mode_a/asset/{obj_key}/meta")
                 num_levels = int(asset_meta["num_levels"])
                 levels = _normalize_level_indices(asset_lut_level_indices, num_levels)
-                frame_entries = [
-                    _get_chunk(conn, dctx, f"mode_a/asset/{obj_key}/frame/{f:02d}")
-                    for f in subset_list
-                ]
-                remap_view = {int(f): i for i, f in enumerate(subset_list)}
-                for local_i, frame_entry in enumerate(frame_entries):
-                    view_n = frame_entry["ptr_view_n"].to(torch.int32)
-                    frame_entry["ptr_view_n"] = torch.tensor(
-                        [remap_view.get(int(v), local_i) for v in view_n.tolist()],
-                        dtype=torch.int32,
-                    )
+                frame_entries = []
+                if not fast_scene_flow:
+                    frame_entries = [
+                        _get_chunk(conn, dctx, f"mode_a/asset/{obj_key}/frame/{f:02d}")
+                        for f in subset_list
+                    ]
+                    remap_view = {int(f): i for i, f in enumerate(subset_list)}
+                    for local_i, frame_entry in enumerate(frame_entries):
+                        view_n = frame_entry["ptr_view_n"].to(torch.int32)
+                        frame_entry["ptr_view_n"] = torch.tensor(
+                            [remap_view.get(int(v), local_i) for v in view_n.tolist()],
+                            dtype=torch.int32,
+                        )
                 lut_frames = []
                 scale_frames = []
                 for f in subset_list:
@@ -831,20 +998,23 @@ def load_chunked_flow_cache_subset(
                     lut_frames.append(torch.cat(lut_levels, dim=1))
                     scale_frames.append(torch.cat(scale_levels, dim=0))
                 entry = {
-                    "I_asset": torch.stack([v["I_asset"] for v in frame_entries], dim=0).contiguous(),
-                    "A_asset": torch.stack([v["A_asset"] for v in frame_entries], dim=0).contiguous(),
                     "F_g_lut_asset_int8": torch.stack(lut_frames, dim=0).contiguous(),
                     "F_g_lut_asset_scale": torch.stack(scale_frames, dim=0).contiguous(),
-                    "G_asset_dggt_per_frame": [v["G_asset_dggt_per_frame"] for v in frame_entries],
-                    "ptr_patch_idx": [v["ptr_patch_idx"] for v in frame_entries],
-                    "ptr_visible_mask": [v["ptr_visible_mask"] for v in frame_entries],
-                    "ptr_view_n": [v["ptr_view_n"] for v in frame_entries],
                 }
-                if bool(asset_meta.get("has_fit_metrics", False)):
-                    entry["fit_metrics"] = [v.get("fit_metrics") for v in frame_entries]
+                if not fast_scene_flow:
+                    entry.update({
+                        "I_asset": torch.stack([v["I_asset"] for v in frame_entries], dim=0).contiguous(),
+                        "A_asset": torch.stack([v["A_asset"] for v in frame_entries], dim=0).contiguous(),
+                        "G_asset_dggt_per_frame": [v["G_asset_dggt_per_frame"] for v in frame_entries],
+                        "ptr_patch_idx": [v["ptr_patch_idx"] for v in frame_entries],
+                        "ptr_visible_mask": [v["ptr_visible_mask"] for v in frame_entries],
+                        "ptr_view_n": [v["ptr_view_n"] for v in frame_entries],
+                    })
+                    if bool(asset_meta.get("has_fit_metrics", False)):
+                        entry["fit_metrics"] = [v.get("fit_metrics") for v in frame_entries]
                 asset_pass[obj_key] = entry
             payload["asset_pass"] = asset_pass
-        elif payload["mode_kind"] == "mode_b":
+        elif payload["mode_kind"] == "mode_b" and not fast_scene_flow:
             mode_b_meta = _get_chunk(conn, dctx, "mode_b/meta")
             rows = []
             for target in subset_list:

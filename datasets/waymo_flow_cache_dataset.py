@@ -9,7 +9,9 @@ Both edit modes (`mode_a` and `mode_b`) share the same payload schema; the
 2. Randomly picks a contiguous 4–8 frame window from the 29-frame clip,
    retrying a few times if the window contains no edit.
 3. Subsets every per-frame tensor to the chosen subset.
-4. Dequantizes the int8 LUTs to fp16.
+4. Dequantizes the int8 LUTs to fp16 for the legacy path.  The SceneFlow fast
+   path keeps scene/pass2 LUTs quantized through DataLoader IPC and lets the
+   training process dequantize them on device.
 5. Returns a dict structured as `(sample, predictions, asset_pass_result, mode_b)`
    — exactly the inputs `FlowFeatureAssembler.forward` consumes for either
    mode.
@@ -44,6 +46,12 @@ from dggt.utils.flow_cache_io import (
     load_flow_cache,
 )
 from dggt.utils.gaussian_edit import Sim3Transform
+from dggt.utils.validation_cache_naming import (
+    is_canonical_validation_cache_filename,
+    parse_validation_cache_filename,
+    validation_cache_filename,
+    validation_cache_index,
+)
 
 
 SUPPORTED_CACHE_SCHEMA_VERSIONS = (6, 7, 8)
@@ -105,7 +113,33 @@ def _list_cache_files(cache_root: Path, split: str) -> list[Path]:
         root = cache_root
     else:
         raise FileNotFoundError(f"Cache root not found: {split_root} or {cache_root}")
-    return sorted(root.rglob("*.pt"))
+    files = sorted(root.rglob("*.pt"))
+    if not any(is_canonical_validation_cache_filename(path) for path in files):
+        return files
+
+    # Validation suffixed names sort alphabetically by edit label, which would
+    # change the historical combined/delete/add/replace/move item order.
+    # Preserve the logical order and collapse legacy/canonical duplicates.
+    by_key: dict[tuple[int, str], Path] = {}
+    unparsed: list[Path] = []
+    for path in files:
+        parsed = parse_validation_cache_filename(path)
+        if parsed is None:
+            unparsed.append(path)
+            continue
+        entry_index, variant = parsed
+        key = (entry_index, variant)
+        previous = by_key.get(key)
+        if previous is None or path.name == validation_cache_filename(entry_index, variant):
+            by_key[key] = path
+    ordered = sorted(
+        by_key.items(),
+        key=lambda item: (
+            validation_cache_index(item[0][0], item[0][1]),
+            str(item[1]),
+        ),
+    )
+    return [path for _, path in ordered] + unparsed
 
 
 def _read_manifest(path: Path) -> list[dict[str, Any]]:
@@ -356,7 +390,7 @@ class WaymoFlowCacheDataset(Dataset):
         payload, subset_t, subset_payload = self._load_payload_for_sample(
             cache_path,
             entry,
-            consumer="scene_flow",
+            consumer="scene_flow_fast",
         )
         return self._build_item_from_payload(
             payload=payload,
@@ -378,12 +412,22 @@ class WaymoFlowCacheDataset(Dataset):
             self._validate_v6_payload(probe, cache_path=cache_path, entry=entry)
             num_frames_all = int(probe["meta"]["num_frames"])
             subset_t = self._sample_contiguous_subset(probe, num_frames_all)
-            payload = load_chunked_flow_cache_subset(
-                cache_path,
-                subset_t,
-                consumer=consumer,
-                asset_lut_level_indices=self.asset_lut_level_indices,
-            )
+            try:
+                payload = load_chunked_flow_cache_subset(
+                    cache_path,
+                    subset_t,
+                    consumer=consumer,
+                    asset_lut_level_indices=self.asset_lut_level_indices,
+                )
+            except Exception:
+                if consumer != "scene_flow_fast":
+                    raise
+                payload = load_chunked_flow_cache_subset(
+                    cache_path,
+                    subset_t,
+                    consumer="scene_flow",
+                    asset_lut_level_indices=self.asset_lut_level_indices,
+                )
             if consumer != "tokenizer_stage_b":
                 self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
             subset_payload = torch.arange(int(subset_t.numel()), dtype=torch.long)
@@ -410,6 +454,14 @@ class WaymoFlowCacheDataset(Dataset):
         subset_payload: torch.Tensor,
     ) -> dict[str, Any]:
         mode_kind = str(payload["mode_kind"])
+        if bool(payload.get("_fast_scene_flow", False)) and payload.get("flow_inputs") is not None:
+            return self._build_fast_item_from_payload(
+                payload=payload,
+                entry=entry,
+                cache_path=cache_path,
+                subset_t=subset_t,
+                subset_payload=subset_payload,
+            )
 
         sample = self._build_sample(payload, subset_payload)
         sample["mode_kind"] = mode_kind
@@ -470,6 +522,44 @@ class WaymoFlowCacheDataset(Dataset):
             "phase1_localized": phase1_localized_subset,
             "splatted_tok_low_cached": splatted_tok_low_cached,
             "cache_schema_version": schema_version,
+        }
+
+    def _build_fast_item_from_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        entry: dict[str, Any],
+        cache_path: Path,
+        subset_t: torch.Tensor,
+        subset_payload: torch.Tensor,
+    ) -> dict[str, Any]:
+        mode_kind = str(payload["mode_kind"])
+        meta = payload["meta"]
+        patch_grid = tuple(int(v) for v in meta["patch_grid"])
+        predictions = self._build_fast_predictions(payload, subset_payload)
+        pass2_payload = payload.get("pass2_splatted_tok_low")
+        if pass2_payload is None:
+            raise RuntimeError(f"Cache {cache_path} missing pass2_splatted_tok_low payload.")
+        splatted_tok_low_quantized = self._subset_pass2_splatted_tok_low_quantized(
+            pass2_payload, subset_payload
+        )
+        asset_pass_result = (
+            self._build_fast_asset_pass(payload, subset_payload)
+            if mode_kind == "mode_a"
+            else _empty_asset_pass(patch_grid, int(meta["patch_start_idx"]))
+        )
+        flow_inputs = self._subset_flow_inputs(payload["flow_inputs"], subset_payload)
+        flow_inputs["subset_frames"] = subset_t.clone()
+        return {
+            "predictions": predictions,
+            "asset_pass_result": asset_pass_result,
+            "mode_kind": mode_kind,
+            "mode_b": None,
+            "subset_frames": subset_t,
+            "cache_path": str(cache_path),
+            "splatted_tok_low_quantized": splatted_tok_low_quantized,
+            "flow_inputs_cached": flow_inputs,
+            "cache_schema_version": int(payload["schema_version"]),
         }
 
     # ------------------------------------------------------------------ #
@@ -741,6 +831,59 @@ class WaymoFlowCacheDataset(Dataset):
             "dino_tokens_levels": dino_levels,
             "patch_start_idx": int(payload["meta"]["patch_start_idx"]),
         }
+
+    def _build_fast_predictions(self, payload: dict[str, Any], subset: torch.Tensor) -> dict[str, torch.Tensor]:
+        pass1 = payload["pass1"]
+        return {
+            "image_tokens_quantized": {
+                "data": pass1["F_g_lut_scene_int8"].index_select(0, subset).contiguous(),
+                "scale": pass1["F_g_lut_scene_scale"].index_select(0, subset).contiguous(),
+                "layout": "NPLC",
+            },
+            "patch_start_idx": int(payload["meta"]["patch_start_idx"]),
+        }
+
+    def _build_fast_asset_pass(self, payload: dict[str, Any], subset: torch.Tensor) -> AssetPassResult:
+        meta = payload["meta"]
+        asset = payload.get("asset_pass") or {}
+        patch_grid = tuple(int(v) for v in meta["patch_grid"])
+        patch_start_idx = int(meta["patch_start_idx"])
+        object_keys = sorted(int(k) for k in asset.keys())
+        if len(object_keys) == 0:
+            return _empty_asset_pass(patch_grid, patch_start_idx)
+        F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
+        for k in object_keys:
+            entry = asset[k]
+            if self.asset_lut_level_indices is None:
+                F_sub = _dequantize_nplc_subset(
+                    data=entry["F_g_lut_asset_int8"],
+                    scale=entry["F_g_lut_asset_scale"],
+                    subset=subset,
+                    dtype=self.lut_dtype,
+                )
+                F_g_lut_asset[k] = _split_nplc_levels(F_sub)
+            else:
+                F_g_lut_asset[k] = _dequantize_nplc_subset_levels(
+                    data=entry["F_g_lut_asset_int8"],
+                    scale=entry["F_g_lut_asset_scale"],
+                    subset=subset,
+                    level_indices=self.asset_lut_level_indices,
+                    dtype=self.lut_dtype,
+                )
+        return AssetPassResult(
+            patch_grid=patch_grid,
+            patch_start_idx=patch_start_idx,
+            object_keys=object_keys,
+            cameras_waymo={},
+            F_g_lut_asset=F_g_lut_asset,
+            ptr_asset={},
+            G_asset_waymo={},
+            G_asset_dggt={},
+            I_asset={},
+            A_asset={},
+            asset_pass_space="fast_lut_only",
+            fit_metrics={},
+        )
 
     # ------------------------------------------------------------------ #
     def _build_asset_pass(self, payload: dict[str, Any], subset: torch.Tensor) -> AssetPassResult:
@@ -1040,6 +1183,34 @@ class WaymoFlowCacheDataset(Dataset):
             dtype=dtype,
         )
         return _split_nplc_levels(sub)
+
+    @staticmethod
+    def _subset_pass2_splatted_tok_low_quantized(
+        payload: dict[str, Any],
+        subset: torch.Tensor,
+    ) -> dict[str, torch.Tensor | str]:
+        return {
+            "data": payload["splatted_tok_low_int8"].index_select(0, subset).contiguous(),
+            "scale": payload["splatted_tok_low_scale"].index_select(0, subset).contiguous(),
+            "layout": "NPLC",
+        }
+
+    @staticmethod
+    def _subset_flow_inputs(
+        payload: dict[str, Any],
+        subset: torch.Tensor,
+    ) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for key in ("M_preserve", "M_source", "M_dest", "scaffold_pooled"):
+            value = payload[key]
+            out[key] = value.index_select(0, subset).unsqueeze(0).contiguous()
+        coverage = payload.get("phase1_coverage")
+        if torch.is_tensor(coverage):
+            out["phase1_coverage"] = coverage.to(torch.bool)
+        else:
+            out["phase1_coverage"] = torch.zeros((0, int(subset.numel())), dtype=torch.bool)
+        out["phase4_slots"] = [int(v) for v in payload.get("phase4_slots", [])]
+        return out
 
     # ------------------------------------------------------------------ #
     @staticmethod

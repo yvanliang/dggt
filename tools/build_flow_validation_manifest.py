@@ -1,18 +1,25 @@
 """Build the validation flow-cache manifest.
 
-Walks the FLAT ``{cache_root}/{split}/{index:06d}.pt`` layout produced by
-``tools/precompute_flow_features_validation.py`` (``index = entry_index*5 +
-variant_ord``), peeks each ``.pt``, and emits a JSONL manifest consumed by
-``WaymoFlowCacheDataset(manifest_path=...)``.
+Walks the canonical
+``{cache_root}/{split}/{entry_index:06d}_{edit_name}.pt`` layout produced
+by ``tools/precompute_flow_features_validation.py``, peeks each ``.pt``, and
+emits a JSONL manifest consumed by
+``WaymoFlowCacheDataset(manifest_path=...)``. Legacy numeric filenames remain
+readable; if both names exist for one pair, the canonical filename wins.
+
+Only current schema-v8 chunked-zstd SQLite caches are accepted. Legacy v6/v7
+or monolithic files are skipped so a manifest cannot silently mix cache
+semantics or physical formats.
 
 Each output line (same shape as ``build_flow_train_manifest.py``):
 
     {"index": <unique>, "mode_kind": "mode_a", "split": "validation",
      "scene_name": "...", "clip_name": "...", "variant": "...",
      "clip_start": 0, "num_frames": 29, "num_objects": <int>,
-     "cache_path": "/abs/path/{index:06d}.pt"}
+     "cache_path": "/abs/path/000012_combined.pt"}
 
-``index = entry_index * 5 + variant_ord`` keeps every (entry, variant) unique.
+The numeric ``index = entry_index * 5 + variant_ord`` is retained only as a
+backward-compatible logical manifest index.
 
 Usage:
     python tools/build_flow_validation_manifest.py \
@@ -24,12 +31,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
-from dggt.utils.flow_cache_io import load_flow_cache
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-VARIANT_ORDER = ["combined", "delete", "add", "replace", "move"]
-VARIANT_ORD = {v: i for i, v in enumerate(VARIANT_ORDER)}
+from dggt.utils.flow_cache_io import (
+    CURRENT_FLOW_CACHE_SCHEMA_VERSION,
+    is_chunked_flow_cache,
+    is_current_flow_cache_summary,
+    load_chunked_flow_cache_probe,
+)
+from dggt.utils.validation_cache_naming import (
+    VALIDATION_VARIANTS,
+    normalize_validation_variant,
+    parse_validation_cache_filename,
+    validation_cache_filename,
+    validation_cache_index,
+)
+
+VARIANT_ORDER = list(VALIDATION_VARIANTS)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -42,50 +65,96 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def main() -> None:
-    args = build_argparser().parse_args()
-    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
-    split_root = Path(args.cache_root) / args.split
+def build_manifest_rows(
+    cache_root: str | Path,
+    *,
+    split: str = "validation",
+    variants: list[str] | None = None,
+) -> tuple[list[dict], int]:
+    variants = [
+        normalize_validation_variant(v)
+        for v in (VARIANT_ORDER if variants is None else variants)
+    ]
+    split_root = Path(cache_root) / split
     if not split_root.is_dir():
         raise FileNotFoundError(f"cache split root not found: {split_root}")
 
-    rows: list[dict] = []
+    rows_by_key: dict[tuple[int, str], dict] = {}
     n_bad = 0
     for cache_path in sorted(split_root.glob("*.pt")):
-        try:
-            file_index = int(cache_path.stem)
-        except ValueError:
+        parsed_name = parse_validation_cache_filename(cache_path)
+        if parsed_name is None:
             continue
-        try:
-            payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
-        except Exception as e:  # noqa: BLE001
-            print(f"[warn] failed to peek {cache_path}: {e}")
+        filename_entry_index, filename_variant = parsed_name
+        if not is_chunked_flow_cache(cache_path):
+            print(f"[warn] {cache_path} is not a chunked-zstd cache; skipping")
             n_bad += 1
             continue
-        if int(payload.get("schema_version", 0)) != 6:
-            print(f"[warn] {cache_path} schema_version != 6; skipping")
+        try:
+            payload = load_chunked_flow_cache_probe(cache_path)
+        except Exception as e:  # noqa: BLE001
+            print(f"[warn] failed to probe {cache_path}: {e}")
+            n_bad += 1
+            continue
+        if int(payload.get("schema_version", 0)) != CURRENT_FLOW_CACHE_SCHEMA_VERSION:
+            print(
+                f"[warn] {cache_path} schema_version != "
+                f"{CURRENT_FLOW_CACHE_SCHEMA_VERSION}; skipping"
+            )
             n_bad += 1
             continue
         meta = payload.get("meta", {})
+        summary = payload.get("_chunked_summary", {})
+        if not is_current_flow_cache_summary(summary):
+            print(f"[warn] {cache_path} is not the current chunked cache format; skipping")
+            n_bad += 1
+            continue
         mode_kind = str(payload.get("mode_kind", "mode_a"))
-        variant = str(meta.get("variant", VARIANT_ORDER[file_index % len(VARIANT_ORDER)]))
+        try:
+            variant = normalize_validation_variant(
+                str(meta.get("variant", filename_variant))
+            )
+        except ValueError:
+            print(f"[warn] {cache_path} has unknown variant; skipping")
+            n_bad += 1
+            continue
         if variant not in variants:
             continue
-        rows.append({
-            "index": file_index,
+        entry_index = int(meta.get("validation_entry_index", filename_entry_index))
+        logical_index = validation_cache_index(entry_index, variant)
+        row = {
+            "index": logical_index,
             "mode_kind": mode_kind,
-            "split": args.split,
+            "split": split,
             "scene_name": str(meta.get("scene_name", "")),
             "clip_name": str(meta.get("clip_name", "")),
             "variant": variant,
-            "validation_entry_index": int(
-                meta.get("validation_entry_index", file_index // len(VARIANT_ORDER))
-            ),
+            "validation_entry_index": entry_index,
             "clip_start": 0,
             "num_frames": int(meta.get("num_frames", 29)),
-            "num_objects": int(len(payload.get("asset_pass", {}) or {})),
+            "num_objects": int(len(summary.get("asset_object_keys", []))),
             "cache_path": str(cache_path.resolve()),
-        })
+        }
+        key = (entry_index, variant)
+        previous = rows_by_key.get(key)
+        if previous is None:
+            rows_by_key[key] = row
+        else:
+            canonical_name = validation_cache_filename(entry_index, variant)
+            if cache_path.name == canonical_name:
+                rows_by_key[key] = row
+    rows = sorted(rows_by_key.values(), key=lambda row: int(row["index"]))
+    return rows, n_bad
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    rows, n_bad = build_manifest_rows(
+        args.cache_root,
+        split=args.split,
+        variants=variants,
+    )
 
     out_path = Path(args.out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

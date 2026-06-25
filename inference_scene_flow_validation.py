@@ -12,9 +12,10 @@ This script combines two documented pipelines:
   ``dggt.utils.flow_viz.dump_flow_features``) is reproduced verbatim.
 
 * The **validation flow cache** of ``tools/precompute_flow_features_validation.py``
-  (see ``docs/flow_cache_validation_cmd.md``): Mode-A-schema v6 ``.pt`` files,
-  flat layout ``{cache_root}/validation/{index:06d}.pt`` with
-  ``index = entry_index*5 + variant_ord`` (combined/delete/add/replace/move),
+  (see ``docs/flow_cache_validation_cmd.md``): Mode-A-schema v8 chunked-zstd
+  SQLite ``.pt`` files,
+  canonical layout
+  ``{cache_root}/validation/{entry_index:06d}_{edit_name}.pt``,
   consumed unchanged via the validation manifest.
 
 On top of the bundle it runs the trained ``WanSceneFlow`` with classifier-free
@@ -70,11 +71,11 @@ B) Pretrain checkpoint, cache_root scan (no manifest), EMA weights (default):
         --cache_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_validation \
         --split validation \
         --output_dir runs/scene_flow_val_pretrain \
-        --start 60 --end 65 \
+        --start 0 --end 5 \
         --sample_steps 30 --shift 3.0 --guidance_scales 2.0 \
         --window 8 --render_per_window
 
-C) Single entry smoke (entry 12 -> manifest index 60, combined variant):
+C) Single entry smoke (entry 0 -> manifest index 0, combined variant):
 
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow_validation.py \
         --ckpt_path $DGGT_CKPT --tokenizer_ckpt_path $TOKENIZER_CKPT \
@@ -82,7 +83,7 @@ C) Single entry smoke (entry 12 -> manifest index 60, combined variant):
         --feature_stats_path $FEATURE_STATS \
         --manifest_path $VAL_MANIFEST --split validation \
         --output_dir /tmp/scene_flow_val_smoke \
-        --index 60 --sample_steps 15 --guidance_scales 2.0 \
+        --index 0 --sample_steps 15 --guidance_scales 2.0 \
         --window 8 --no_render_rgb --splat_pca
 
 Notes:
@@ -211,6 +212,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mode_filter", type=str, default=None,
                    help="Restrict manifest to comma-sep modes (validation is mode_a).")
     p.add_argument("--split", type=str, default="validation")
+    p.add_argument("--output_dir", type=str, required=True,
+                   help="Root directory for per-entry validation inference outputs.")
 
     # Sliding window over the (29-frame) clip; WanSceneFlow is trained on
     # short windows so each window is sampled independently then stitched.
@@ -642,7 +645,6 @@ def _save_rgb_grids(
                 save_image_grid(tensor, out_dir / f"{name}.jpg", nrow=frames)
         else:
             save_image_grid(tensor, out_dir / f"{name}{suffix}.jpg", nrow=frames)
-
 
 # ---------------------------------------------------------------------- #
 # Main                                                                    #
