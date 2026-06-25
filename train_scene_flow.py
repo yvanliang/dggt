@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import time
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,11 +33,28 @@ from dggt.losses.flow_losses import build_rectified_flow_target, compute_total_l
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_stats import load_into_buffers
-from dggt.utils.flow_cache_io import is_chunked_flow_cache, load_chunked_flow_cache_summary, load_flow_cache
+from dggt.utils.flow_cache_io import (
+    is_chunked_flow_cache,
+    load_chunked_flow_cache_subset,
+    load_chunked_flow_cache_summary,
+    load_flow_cache,
+)
 from dggt.utils.flow_viz import save_image_grid
+from dggt.utils.tokens import reattach_special_tokens, replace_selected_levels, select_patch_pyramid
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import EMAModel
-from train_scene_flow_pretrain import _latent_pca_grid, _mask_grid, _normalized_mask_grid
+from train_scene_flow_pretrain import (
+    TOKENIZER_LEVELS,
+    _image_grid,
+    _latent_pca_grid,
+    _mask_grid,
+    _normalized_mask_grid,
+    _render_gs_map_rgb,
+    _semantic_logits_to_sky_mask,
+    _sky_mask_image_grid,
+    load_dggt_aggregator_and_tokenizer,
+    split_image_tokens_for_heads,
+)
 
 
 # ---------------------------------------------------------------------- #
@@ -402,7 +420,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--val_log_images", type=int, default=4)
     parser.add_argument("--val_sample_steps", type=int, default=50)
     parser.add_argument("--no_val_render_rgb", action="store_true",
-                        help="Formal training validation currently writes latent/mask diagnostics; kept for CLI parity.")
+                        help="Skip validation 3DGS RGB renders and log latent/mask diagnostics only.")
     parser.add_argument("--no_val_ema", action="store_true",
                         help="Disable EMA weights for validation. Default matches pretrain: validate with EMA.")
 
@@ -443,7 +461,7 @@ def _load_tokenizer(ckpt_path: str, device: torch.device) -> nn.Module:
     model.load_state_dict(cleaned, strict=False)
     # We only need scene_tokenizer; aggregator/heads stay offline.
     model.eval()
-    tokenizer = model.scene_tokenizer
+    tokenizer = model.scene_tokenizer.float()
     return tokenizer
 
 
@@ -496,6 +514,87 @@ def _move_v6_fast_path_inputs(
     return phase1_localized_lite, [t.to(device) for t in splatted_tok_low_cached]
 
 
+def _flatten_fast_asset_kv(asset_pass_result, flow_inputs: dict[str, Any], device: torch.device) -> torch.Tensor:
+    chunks: list[torch.Tensor] = []
+    coverage = flow_inputs.get("phase1_coverage")
+    if torch.is_tensor(coverage):
+        coverage = coverage.to(device=device, dtype=torch.bool)
+    phase4_slots = {int(v) for v in flow_inputs.get("phase4_slots", [])}
+    for obj_key in sorted(int(k) for k in asset_pass_result.F_g_lut_asset.keys()):
+        levels = asset_pass_result.F_g_lut_asset[obj_key]
+        if not levels:
+            continue
+        lvl = levels[-1].to(device)
+        if torch.is_tensor(coverage) and obj_key < int(coverage.shape[0]):
+            cov = coverage[obj_key].to(device=device, dtype=lvl.dtype).view(1, -1, 1, 1)
+            if cov.shape[1] == lvl.shape[1]:
+                lvl = lvl * cov
+        elif phase4_slots and obj_key not in phase4_slots:
+            lvl = torch.zeros_like(lvl)
+        B, S, P, C = lvl.shape
+        chunks.append(lvl.reshape(B, S * P, C))
+    if not chunks:
+        return torch.zeros((1, 0, 3072), dtype=torch.float32, device=device)
+    return torch.cat(chunks, dim=1)
+
+
+def build_cached_flow_bundle(
+    item: dict[str, Any],
+    assembler: FlowFeatureAssembler,
+    device: torch.device,
+) -> Any:
+    flow_inputs = {
+        k: (v.to(device) if torch.is_tensor(v) else v)
+        for k, v in item["flow_inputs_cached"].items()
+    }
+    predictions = _move_predictions(item["predictions"], device)
+    F_g_lut_scene = assembler._select_lut_scene(predictions)
+    splatted_tok_low_cached = item.get("splatted_tok_low_cached")
+    if splatted_tok_low_cached is None:
+        raise RuntimeError(f"Fast cache item {item.get('cache_path', '<unknown>')} missing splatted_tok_low_cached.")
+    splatted_tok_low = [t.to(device=device, dtype=F_g_lut_scene[0].dtype) for t in splatted_tok_low_cached]
+
+    if assembler.scene_tokenizer is None:
+        raise RuntimeError("FlowFeatureAssembler needs scene_tokenizer for cached SceneFlow inputs.")
+    z_clean = assembler.scene_tokenizer.encode(F_g_lut_scene, patch_grid=assembler.patch_grid)
+    z_splat = assembler.scene_tokenizer.encode(splatted_tok_low, patch_grid=assembler.patch_grid)
+
+    M_preserve = flow_inputs["M_preserve"].to(device=device, dtype=torch.float32)
+    M_source = flow_inputs["M_source"].to(device=device, dtype=torch.float32)
+    M_dest = flow_inputs["M_dest"].to(device=device, dtype=torch.float32)
+    scaffold_pooled = flow_inputs["scaffold_pooled"].to(device=device, dtype=torch.float32)
+    scaffold_tok = unwrap_ddp(assembler.scaffold_packer).mlp(scaffold_pooled)
+
+    B = int(z_clean.shape[0])
+    base_t = assembler.noise_scheduler.sample_base_t(B, device=device)
+    t_tok = assembler.noise_scheduler.build_t_tok(base_t, M_preserve, M_source, M_dest)
+    z_init, eps_noise = assembler.noise_scheduler.compose_z_init(
+        z_clean, z_splat, M_preserve, M_source, M_dest
+    )
+
+    asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
+    F_asset_tokens = _flatten_fast_asset_kv(asset_pass_result, flow_inputs, device).to(dtype=z_clean.dtype)
+    return SimpleNamespace(
+        z_clean=z_clean,
+        z_splat=z_splat,
+        z_init=z_init,
+        eps_noise=eps_noise,
+        t_tok=t_tok,
+        base_t=base_t,
+        scaffold_tok=scaffold_tok,
+        M_preserve=M_preserve,
+        M_source=M_source,
+        M_dest=M_dest,
+        F_asset_tokens=F_asset_tokens,
+        encoder_attention_mask=None,
+        phase4_slots=list(flow_inputs.get("phase4_slots", [])),
+        patch_grid=assembler.patch_grid,
+        patch_start_idx=assembler.patch_start_idx,
+        splatted_tok_low=splatted_tok_low,
+        F_g_lut_scene=F_g_lut_scene,
+    )
+
+
 # ---------------------------------------------------------------------- #
 # Train step                                                              #
 # ---------------------------------------------------------------------- #
@@ -504,6 +603,9 @@ def build_flow_bundle(
     assembler: FlowFeatureAssembler,
     device: torch.device,
 ) -> Any:
+    if item.get("flow_inputs_cached") is not None:
+        return build_cached_flow_bundle(item, assembler, device)
+
     sample = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item["sample"].items()}
     predictions = _move_predictions(item["predictions"], device)
     asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
@@ -870,8 +972,360 @@ def dataloader_runtime_kwargs(args) -> dict[str, Any]:
     }
 
 
+def _prepare_visualization_batch(sample: dict[str, Any]) -> dict[str, torch.Tensor]:
+    images = sample.get("images", sample.get("images_clean"))
+    masks = sample.get("masks", sample.get("sky_mask"))
+    timestamps = sample.get("timestamps")
+    if not torch.is_tensor(images):
+        raise RuntimeError("Validation visualization sample is missing tensor images/images_clean.")
+    if not torch.is_tensor(masks):
+        raise RuntimeError("Validation visualization sample is missing tensor masks/sky_mask.")
+    if not torch.is_tensor(timestamps):
+        raise RuntimeError("Validation visualization sample is missing tensor timestamps.")
+
+    if images.ndim == 4:
+        images = images.unsqueeze(0)
+    if masks.ndim == 4:
+        masks = masks.unsqueeze(0)
+    if timestamps.ndim == 1:
+        timestamps = timestamps.unsqueeze(0)
+    if images.ndim != 5:
+        raise ValueError(f"Expected visualization images [B,S,3,H,W], got {tuple(images.shape)}")
+    if masks.ndim != 5:
+        raise ValueError(f"Expected visualization masks [B,S,3,H,W], got {tuple(masks.shape)}")
+    if timestamps.ndim != 2:
+        raise ValueError(f"Expected visualization timestamps [B,S], got {tuple(timestamps.shape)}")
+    return {
+        "images": images.contiguous(),
+        "masks": masks.contiguous(),
+        "timestamps": timestamps.contiguous(),
+    }
+
+
+def load_validation_visualization_batch(
+    item: dict[str, Any],
+    dataset: WaymoFlowCacheDataset,
+) -> dict[str, torch.Tensor]:
+    """Return the raw batch fields needed by the 3DGS validation renderer."""
+    if item.get("sample") is not None:
+        return _prepare_visualization_batch(item["sample"])
+
+    cache_path_raw = item.get("cache_path")
+    if cache_path_raw is None:
+        raise RuntimeError("Fast validation item is missing cache_path; cannot load RGB render inputs.")
+    subset = item.get("subset_frames")
+    if not torch.is_tensor(subset):
+        subset = torch.as_tensor(subset, dtype=torch.long)
+    subset = subset.detach().cpu().to(torch.long).contiguous()
+    cache_path = Path(cache_path_raw)
+    entry = {
+        "cache_path": str(cache_path),
+        "mode_kind": item.get("mode_kind", "unknown"),
+    }
+
+    if is_chunked_flow_cache(cache_path):
+        payload = load_chunked_flow_cache_subset(
+            cache_path,
+            subset,
+            consumer="tokenizer_stage_b",
+        )
+        subset_payload = torch.arange(int(subset.numel()), dtype=torch.long)
+    else:
+        payload = load_flow_cache(
+            cache_path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=bool(getattr(dataset, "mmap_plain_cache", True)),
+        )
+        subset_payload = subset
+
+    if not is_chunked_flow_cache(cache_path):
+        WaymoFlowCacheDataset._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
+    sample = dataset._build_sample(payload, subset_payload)
+    return _prepare_visualization_batch(sample)
+
+
+def _save_rgb_validation_images(
+    rgb_images: dict[str, torch.Tensor],
+    out_dir: Path,
+    paths: dict[str, Path],
+    frames: int,
+    suffix: str,
+    *,
+    only_generated: bool,
+) -> None:
+    skip_for_extra = {"input_rgb_gt", "tokenizer_recon_3dgs_rgb", "dggt_clean_3dgs_rgb"}
+    for name, tensor in rgb_images.items():
+        if only_generated and name in skip_for_extra:
+            continue
+        key = f"{name}{suffix}" if name.startswith("generated_") else name
+        filename = f"{key}.jpg"
+        path = out_dir / filename
+        save_image_grid(tensor, path, nrow=frames)
+        paths[key] = path
+
+
+def _cuda_empty_cache_if_available() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 @torch.no_grad()
-def save_validation_images(bundle, scene_flow: nn.Module, log_dir: Path, step: int, args, device: torch.device) -> dict[str, Path]:
+def render_validation_rgb_gt_sky(
+    batch: dict[str, torch.Tensor],
+    vggt_model: nn.Module,
+    scene_flow: nn.Module,
+    z_generated_raw_n: torch.Tensor,
+    args,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Render formal-training validation RGB with generated outputs composited over GT sky."""
+    images = batch["images"].to(device, non_blocking=True)
+    masks = batch["masks"].to(device, non_blocking=True)
+    frames = min(int(args.val_log_images), int(images.shape[1]))
+    sf = unwrap_ddp(scene_flow)
+    timestamps_raw = batch["timestamps"]
+    timestamps = timestamps_raw[0] if torch.is_tensor(timestamps_raw) else torch.as_tensor(timestamps_raw[0])
+
+    result: dict[str, torch.Tensor] = {}
+
+    with autocast_context(args, device):
+        outputs = vggt_model.get_aggregator_token_outputs(images)
+        aggregated_tokens_list = outputs["aggregated_tokens_list"]
+        image_tokens_list = outputs["image_tokens_list"]
+        dino_token_list = outputs["dino_token_list"]
+        patch_start_idx = int(outputs["patch_start_idx"])
+        del outputs
+
+        z_generated = sf.denormalize(z_generated_raw_n.float())
+        decoded_patch_tokens = vggt_model.scene_tokenizer.decode(z_generated, patch_grid=args.patch_grid)
+        del z_generated
+        decoded_full_tokens = reattach_special_tokens(
+            image_tokens_list,
+            TOKENIZER_LEVELS,
+            patch_start_idx,
+            decoded_patch_tokens,
+        )
+        del decoded_patch_tokens
+        generated_image_tokens = replace_selected_levels(
+            image_tokens_list,
+            TOKENIZER_LEVELS,
+            decoded_full_tokens,
+        )
+        del decoded_full_tokens
+
+        tokens_4 = select_patch_pyramid(image_tokens_list, TOKENIZER_LEVELS, patch_start_idx)
+        z_recon = vggt_model.scene_tokenizer.encode(tokens_4, patch_grid=args.patch_grid)
+        del tokens_4
+        recon_patch_tokens = vggt_model.scene_tokenizer.decode(z_recon, patch_grid=args.patch_grid)
+        del z_recon
+        recon_full_tokens = reattach_special_tokens(
+            image_tokens_list,
+            TOKENIZER_LEVELS,
+            patch_start_idx,
+            recon_patch_tokens,
+        )
+        del recon_patch_tokens
+        recon_image_tokens = replace_selected_levels(
+            image_tokens_list,
+            TOKENIZER_LEVELS,
+            recon_full_tokens,
+        )
+        del recon_full_tokens
+
+    with autocast_context(args, device):
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            pose_enc = vggt_model.camera_head(aggregated_tokens_list)[-1]
+            depth, _ = vggt_model.depth_head(aggregated_tokens_list, images, patch_start_idx)
+            dynamic_conf, _ = vggt_model.instance_head(dino_token_list, images, patch_start_idx)
+            clean_gs_map, clean_gs_conf = vggt_model.gs_head(image_tokens_list, images, patch_start_idx)
+
+    del aggregated_tokens_list, dino_token_list, image_tokens_list
+
+    result["dggt_clean_3dgs_rgb"] = _render_gs_map_rgb(
+        vggt_model,
+        images,
+        masks,
+        timestamps,
+        pose_enc,
+        depth,
+        clean_gs_map,
+        clean_gs_conf,
+        dynamic_conf,
+        device,
+        frames,
+        background_mode="sky",
+        use_sky_mask=True,
+    )
+    del pose_enc, depth, dynamic_conf, clean_gs_map, clean_gs_conf
+    _cuda_empty_cache_if_available()
+
+    with autocast_context(args, device):
+        gen_agg, gen_dino = split_image_tokens_for_heads(generated_image_tokens)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            raw_gs_map, raw_gs_conf = vggt_model.gs_head(generated_image_tokens, images, patch_start_idx)
+            generated_pose_enc = vggt_model.camera_head(gen_agg)[-1]
+            generated_depth, _ = vggt_model.depth_head(gen_agg, images, patch_start_idx)
+            generated_dynamic_conf, _ = vggt_model.instance_head(gen_dino, images, patch_start_idx)
+            generated_semantic_logits, _ = vggt_model.semantic_head(gen_dino, images, patch_start_idx)
+            generated_sky_mask = _semantic_logits_to_sky_mask(generated_semantic_logits)
+
+    del generated_image_tokens, gen_agg, gen_dino
+
+    result["generated_pred_sky_mask"] = _sky_mask_image_grid(generated_sky_mask, frames)
+    result["generated_raw_3dgs_rgb"] = _render_gs_map_rgb(
+        vggt_model,
+        images,
+        masks,
+        timestamps,
+        generated_pose_enc,
+        generated_depth,
+        raw_gs_map,
+        raw_gs_conf,
+        generated_dynamic_conf,
+        device,
+        frames,
+        background_mode="sky",
+        use_sky_mask=True,
+    )
+    del (
+        generated_pose_enc,
+        generated_depth,
+        raw_gs_map,
+        raw_gs_conf,
+        generated_dynamic_conf,
+        generated_semantic_logits,
+        generated_sky_mask,
+    )
+    _cuda_empty_cache_if_available()
+
+    with autocast_context(args, device):
+        recon_agg, recon_dino = split_image_tokens_for_heads(recon_image_tokens)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            recon_pose_enc = vggt_model.camera_head(recon_agg)[-1]
+            recon_depth, _ = vggt_model.depth_head(recon_agg, images, patch_start_idx)
+            recon_dynamic_conf, _ = vggt_model.instance_head(recon_dino, images, patch_start_idx)
+            recon_gs_map, recon_gs_conf = vggt_model.gs_head(recon_image_tokens, images, patch_start_idx)
+
+    del recon_image_tokens, recon_agg, recon_dino
+
+    result["tokenizer_recon_3dgs_rgb"] = _render_gs_map_rgb(
+        vggt_model,
+        images,
+        masks,
+        timestamps,
+        recon_pose_enc,
+        recon_depth,
+        recon_gs_map,
+        recon_gs_conf,
+        recon_dynamic_conf,
+        device,
+        frames,
+        background_mode="sky",
+        use_sky_mask=True,
+    )
+    del recon_pose_enc, recon_depth, recon_dynamic_conf, recon_gs_map, recon_gs_conf
+    _cuda_empty_cache_if_available()
+
+    result["input_rgb_gt"] = _image_grid(images, frames)
+    return result
+
+
+@torch.no_grad()
+def render_validation_generated_rgb_gt_sky(
+    batch: dict[str, torch.Tensor],
+    vggt_model: nn.Module,
+    scene_flow: nn.Module,
+    z_generated_raw_n: torch.Tensor,
+    args,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Render the generated branch for secondary CFG scales over GT sky."""
+    images = batch["images"].to(device, non_blocking=True)
+    masks = batch["masks"].to(device, non_blocking=True)
+    frames = min(int(args.val_log_images), int(images.shape[1]))
+    sf = unwrap_ddp(scene_flow)
+    timestamps_raw = batch["timestamps"]
+    timestamps = timestamps_raw[0] if torch.is_tensor(timestamps_raw) else torch.as_tensor(timestamps_raw[0])
+
+    with autocast_context(args, device):
+        outputs = vggt_model.get_aggregator_token_outputs(images)
+        image_tokens_list = outputs["image_tokens_list"]
+        patch_start_idx = int(outputs["patch_start_idx"])
+        del outputs
+
+        z_generated = sf.denormalize(z_generated_raw_n.float())
+        decoded_patch_tokens = vggt_model.scene_tokenizer.decode(z_generated, patch_grid=args.patch_grid)
+        del z_generated
+        decoded_full_tokens = reattach_special_tokens(
+            image_tokens_list,
+            TOKENIZER_LEVELS,
+            patch_start_idx,
+            decoded_patch_tokens,
+        )
+        del decoded_patch_tokens
+        generated_image_tokens = replace_selected_levels(
+            image_tokens_list,
+            TOKENIZER_LEVELS,
+            decoded_full_tokens,
+        )
+        del decoded_full_tokens, image_tokens_list
+
+    with autocast_context(args, device):
+        gen_agg, gen_dino = split_image_tokens_for_heads(generated_image_tokens)
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            raw_gs_map, raw_gs_conf = vggt_model.gs_head(generated_image_tokens, images, patch_start_idx)
+            generated_pose_enc = vggt_model.camera_head(gen_agg)[-1]
+            generated_depth, _ = vggt_model.depth_head(gen_agg, images, patch_start_idx)
+            generated_dynamic_conf, _ = vggt_model.instance_head(gen_dino, images, patch_start_idx)
+            generated_semantic_logits, _ = vggt_model.semantic_head(gen_dino, images, patch_start_idx)
+            generated_sky_mask = _semantic_logits_to_sky_mask(generated_semantic_logits)
+
+    del generated_image_tokens, gen_agg, gen_dino
+
+    result = {
+        "generated_pred_sky_mask": _sky_mask_image_grid(generated_sky_mask, frames),
+        "generated_raw_3dgs_rgb": _render_gs_map_rgb(
+            vggt_model,
+            images,
+            masks,
+            timestamps,
+            generated_pose_enc,
+            generated_depth,
+            raw_gs_map,
+            raw_gs_conf,
+            generated_dynamic_conf,
+            device,
+            frames,
+            background_mode="sky",
+            use_sky_mask=True,
+        ),
+    }
+    del (
+        generated_pose_enc,
+        generated_depth,
+        raw_gs_map,
+        raw_gs_conf,
+        generated_dynamic_conf,
+        generated_semantic_logits,
+        generated_sky_mask,
+    )
+    _cuda_empty_cache_if_available()
+    return result
+
+
+@torch.no_grad()
+def save_validation_images(
+    bundle,
+    scene_flow: nn.Module,
+    log_dir: Path,
+    step: int,
+    args,
+    device: torch.device,
+    *,
+    visualization_batch: dict[str, torch.Tensor] | None = None,
+    vggt_model: nn.Module | None = None,
+) -> dict[str, Path]:
     out_dir = log_dir / "validation" / f"step_{step:06d}"
     out_dir.mkdir(parents=True, exist_ok=True)
     sf = unwrap_ddp(scene_flow)
@@ -890,7 +1344,12 @@ def save_validation_images(bundle, scene_flow: nn.Module, log_dir: Path, step: i
         save_image_grid(image, path, nrow=frames)
         paths[name] = path
 
-    for scale in _validation_scales(args):
+    render_rgb = (
+        vggt_model is not None
+        and visualization_batch is not None
+        and not bool(getattr(args, "no_val_render_rgb", False))
+    )
+    for scale_idx, scale in enumerate(_validation_scales(args)):
         z_generated_raw = cfg_sample_edit_latents(scene_flow, bundle, args, step, device, scale)
         z_generated_preserve_blend = bundle.M_preserve * z_clean_n + (1.0 - bundle.M_preserve) * z_generated_raw
         suffix = f"__cfg{scale:g}"
@@ -916,6 +1375,44 @@ def save_validation_images(bundle, scene_flow: nn.Module, log_dir: Path, step: i
             path = out_dir / f"{name}.jpg"
             save_image_grid(image, path, nrow=frames)
             paths[name] = path
+        if render_rgb:
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                rgb_images = (
+                    render_validation_rgb_gt_sky(
+                        visualization_batch,
+                        vggt_model,
+                        scene_flow,
+                        z_generated_raw,
+                        args,
+                        device,
+                    )
+                    if scale_idx == 0
+                    else render_validation_generated_rgb_gt_sky(
+                        visualization_batch,
+                        vggt_model,
+                        scene_flow,
+                        z_generated_raw,
+                        args,
+                        device,
+                    )
+                )
+                _save_rgb_validation_images(
+                    rgb_images,
+                    out_dir,
+                    paths,
+                    frames,
+                    suffix,
+                    only_generated=scale_idx != 0,
+                )
+            except Exception as exc:
+                print(
+                    f"[validation {step:06d}] warning: failed to render 3DGS RGB "
+                    f"for cfg={scale:g}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                render_rgb = False
     return paths
 
 
@@ -931,6 +1428,7 @@ def run_validation(
     log_dir: Path,
     wandb_run,
     ema: EMAModel | None = None,
+    vggt_model: nn.Module | None = None,
 ) -> dict[str, float]:
     was_training = scene_flow.training
     scene_flow.eval()
@@ -969,8 +1467,27 @@ def run_validation(
         if first_item is not None and args.val_log_images > 0:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            visualization_batch = None
+            if vggt_model is not None and not bool(getattr(args, "no_val_render_rgb", False)):
+                try:
+                    visualization_batch = load_validation_visualization_batch(first_item, loader.dataset)
+                except Exception as exc:
+                    print(
+                        f"[validation {step:06d}] warning: failed to load RGB render inputs: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
             first_bundle = build_flow_bundle(first_item, assembler, device)
-            image_paths = save_validation_images(first_bundle, scene_flow, log_dir, step, args, device)
+            image_paths = save_validation_images(
+                first_bundle,
+                scene_flow,
+                log_dir,
+                step,
+                args,
+                device,
+                visualization_batch=visualization_batch,
+                vggt_model=vggt_model,
+            )
         metrics_text = " | ".join(f"{key}={value:.4f}" for key, value in metrics.items())
         print(f"[validation {step:06d}] {metrics_text}", flush=True)
         log_wandb(wandb_run, metrics, step, "validation")
@@ -1089,7 +1606,27 @@ def main() -> None:
         )
     wandb_run = init_wandb(args, log_dir)
 
-    tokenizer = _load_tokenizer(args.tokenizer_ckpt_path or args.ckpt_path, device)
+    render_vggt = None
+    enable_val_rgb_render = (
+        not bool(args.no_val_render_rgb)
+        and val_loader is not None
+        and int(args.val_log_images) > 0
+    )
+    if is_main_process() and enable_val_rgb_render:
+        render_vggt = load_dggt_aggregator_and_tokenizer(
+            args.ckpt_path,
+            args.tokenizer_ckpt_path,
+            device,
+        )
+        render_vggt.scene_tokenizer.float()
+        if is_main_process():
+            print("[validation] 3DGS RGB rendering enabled on rank 0.", flush=True)
+
+    tokenizer = (
+        render_vggt.scene_tokenizer
+        if render_vggt is not None
+        else _load_tokenizer(args.tokenizer_ckpt_path or args.ckpt_path, device)
+    )
     freeze_module(tokenizer)  # T1: encoder frozen; decoder layer_heads/local_refine can be unfrozen later.
 
     # Assembler: scaffold_packer + feature_splatter + soft_mask + noise_scheduler trainable.
@@ -1185,6 +1722,8 @@ def main() -> None:
     optimizer.zero_grad(set_to_none=True)
     wandb_sums: dict[str, float] = {}
     wandb_count = 0
+    accum_data_wait_s = 0.0
+    accum_train_wall_s = 0.0
     progress = None
     if is_main_process() and not args.no_tqdm:
         progress = tqdm(total=args.max_steps, initial=global_step, desc="train", dynamic_ncols=True)
@@ -1192,9 +1731,12 @@ def main() -> None:
         while global_step < args.max_steps:
             if sampler is not None:
                 sampler.set_epoch(global_step)
+            data_wait_t0 = time.perf_counter()
             for item in loader:
+                data_wait_s = time.perf_counter() - data_wait_t0
                 if global_step >= args.max_steps:
                     break
+                micro_t0 = time.perf_counter()
                 sync_grad = (accum_count + 1) % max(1, args.grad_accum_steps) == 0
                 with ExitStack() as stack:
                     if isinstance(scene_flow, DistributedDataParallel) and not sync_grad:
@@ -1205,30 +1747,54 @@ def main() -> None:
                         loss, metrics = train_step(item, assembler, scene_flow, flow_scheduler, device, args)
                         loss = loss / max(1, args.grad_accum_steps)
                     loss.backward()
+                micro_wall_s = time.perf_counter() - micro_t0
+                accum_data_wait_s += float(data_wait_s)
+                accum_train_wall_s += float(micro_wall_s)
                 accum_count += 1
+                data_wait_t0 = time.perf_counter()
                 if not sync_grad:
                     continue
 
+                optim_t0 = time.perf_counter()
                 if args.grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(params, args.grad_clip_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 ema.step(unwrap_ddp(scene_flow).parameters())
+                optim_s = time.perf_counter() - optim_t0
+                data_wait_step_s = accum_data_wait_s
+                train_wall_step_s = accum_train_wall_s
+                step_wall_s = data_wait_step_s + train_wall_step_s + float(optim_s)
                 accum_count = 0
+                accum_data_wait_s = 0.0
+                accum_train_wall_s = 0.0
                 global_step += 1
 
                 if is_main_process():
                     lr_now = float(optimizer.param_groups[0]["lr"])
                     train_metrics = dict(metrics)
                     train_metrics["lr"] = lr_now
+                    train_metrics["data_wait_s"] = float(data_wait_step_s)
+                    train_metrics["train_wall_s"] = float(train_wall_step_s)
+                    train_metrics["optim_s"] = float(optim_s)
+                    train_metrics["step_wall_s"] = float(step_wall_s)
+                    train_metrics["data_wait_frac"] = (
+                        float(data_wait_step_s / step_wall_s) if step_wall_s > 0.0 else 0.0
+                    )
+                    micro_bs = float(metrics.get("micro_batch_size", args.batch_size))
+                    train_metrics["items_per_s_per_rank"] = (
+                        micro_bs * max(1, int(args.grad_accum_steps)) / step_wall_s
+                        if step_wall_s > 0.0
+                        else 0.0
+                    )
                     if progress is not None:
                         postfix = {"lr": f"{lr_now:.2e}"}
-                        for key, value in metrics.items():
+                        for key, value in train_metrics.items():
                             postfix[key] = f"{float(value):.4f}"
                         progress.set_postfix(postfix, refresh=False)
                     elif global_step % max(1, int(args.log_every)) == 0:
-                        metrics_str = " | ".join(f"{key}={value:.4f}" for key, value in metrics.items())
+                        metrics_str = " | ".join(f"{key}={value:.4f}" for key, value in train_metrics.items())
                         print(f"[step {global_step:06d}] lr={lr_now:.2e} | {metrics_str}", flush=True)
                     for key, value in train_metrics.items():
                         wandb_sums[key] = wandb_sums.get(key, 0.0) + float(value)
@@ -1259,6 +1825,7 @@ def main() -> None:
                         log_dir,
                         wandb_run,
                         ema,
+                        render_vggt,
                     )
 
                 if global_step > 0 and global_step % args.save_every == 0:
@@ -1295,6 +1862,15 @@ def _dump_vis(
     args,
 ) -> None:
     from dggt.utils.flow_viz import dump_flow_features
+
+    if item.get("flow_inputs_cached") is not None:
+        if is_main_process():
+            print(
+                f"[vis] skipping full flow feature dump for fast cache item at step={step}; "
+                "fast items do not load raw heads or asset Gaussians.",
+                flush=True,
+            )
+        return
 
     vis_dir = log_dir / "vis" / f"step_{step:06d}"
     vis_dir.mkdir(parents=True, exist_ok=True)

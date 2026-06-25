@@ -701,12 +701,20 @@ class JointSceneTokenizer(nn.Module):
         self.encoder = JointSceneTokenizerEncoder(**kwargs)
         self.decoder = JointSceneTokenizerDecoder(**kwargs)
 
+    def _compute_dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
     def encode(
         self,
         image_tokens_4: Sequence[torch.Tensor],
         patch_grid: tuple[int, int] | None = None,
         frame_positions_1d: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        compute_dtype = self._compute_dtype()
+        image_tokens_4 = [
+            t.to(dtype=compute_dtype) if torch.is_floating_point(t) and t.dtype != compute_dtype else t
+            for t in image_tokens_4
+        ]
         return self.encoder(image_tokens_4, patch_grid=patch_grid, frame_positions_1d=frame_positions_1d)
 
     def decode(
@@ -715,6 +723,9 @@ class JointSceneTokenizer(nn.Module):
         patch_grid: tuple[int, int] | None = None,
         frame_positions_1d: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
+        compute_dtype = self._compute_dtype()
+        if torch.is_floating_point(z) and z.dtype != compute_dtype:
+            z = z.to(dtype=compute_dtype)
         return self.decoder(z, patch_grid=patch_grid, frame_positions_1d=frame_positions_1d)
 
     def forward(
