@@ -39,3 +39,4 @@ timm
 wandb
 ninja>=1.11
 packaging>=23
+gram-newton-schulz @ git+https://github.com/nanovisionx/gmuon.git@main

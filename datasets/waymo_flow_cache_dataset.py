@@ -39,6 +39,7 @@ from torch.utils.data import Dataset, get_worker_info
 from dggt.models.asset_pass import AssetPassResult
 from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
+from dggt.utils.camera_condition import normalize_front_image_hw
 from dggt.utils.flow_cache_io import (
     is_chunked_flow_cache,
     load_chunked_flow_cache_probe,
@@ -56,6 +57,15 @@ from dggt.utils.validation_cache_naming import (
 
 SUPPORTED_CACHE_SCHEMA_VERSIONS = (6, 7, 8)
 GS_CONF_REPAIR_VALUE = 1_000_000.0
+EXPECTED_ASSET_LUT_LEVELS = 4
+
+
+class CaptionLookupError(RuntimeError):
+    pass
+
+
+class AssetLutIncompleteError(RuntimeError):
+    pass
 
 
 def repair_cached_gs_conf(gs_conf: torch.Tensor) -> torch.Tensor:
@@ -228,6 +238,70 @@ def _split_nplc_levels(x: torch.Tensor) -> list[torch.Tensor]:
     ]
 
 
+def _normalize_waymo_caption_base(name: Any) -> str:
+    base = Path(str(name).rstrip("/")).stem
+    if base.startswith("segment-"):
+        base = base[len("segment-"):]
+    suffix = "_with_camera_labels"
+    if base.endswith(suffix):
+        base = base[:-len(suffix)]
+    return base
+
+
+def _split_caption_trunk_suffix(stem: str) -> tuple[str, int | None]:
+    for trunk_id in range(6):
+        suffix = f"_{trunk_id}"
+        if stem.endswith(suffix):
+            return stem[:-len(suffix)], trunk_id
+    return stem, None
+
+
+def _normalize_caption_stem(name: Any, clip_index: int | None = None) -> str:
+    stem = Path(str(name).rstrip("/")).stem
+    base, trunk_id = _split_caption_trunk_suffix(stem)
+    if trunk_id is None:
+        trunk_id = None if clip_index is None else int(clip_index)
+    base = _normalize_waymo_caption_base(base)
+    return f"{base}_{trunk_id}" if trunk_id is not None else base
+
+
+def _validate_asset_lut_levels(
+    levels: list[torch.Tensor],
+    *,
+    obj_key: int,
+    cache_path: Path,
+) -> None:
+    if len(levels) != EXPECTED_ASSET_LUT_LEVELS:
+        raise AssetLutIncompleteError(
+            f"Asset LUT for object {obj_key} in {cache_path} must contain "
+            f"{EXPECTED_ASSET_LUT_LEVELS} levels, got {len(levels)}."
+        )
+    reference_shape = None
+    for level_idx, level in enumerate(levels):
+        if not torch.is_tensor(level):
+            raise AssetLutIncompleteError(
+                f"Asset LUT object {obj_key} level {level_idx} in {cache_path} is not a tensor."
+            )
+        if level.ndim != 4:
+            raise AssetLutIncompleteError(
+                f"Asset LUT object {obj_key} level {level_idx} in {cache_path} "
+                f"must be [1,S,P,C], got {tuple(level.shape)}."
+            )
+        if int(level.shape[0]) != 1 or min(int(v) for v in level.shape[1:]) <= 0:
+            raise AssetLutIncompleteError(
+                f"Asset LUT object {obj_key} level {level_idx} in {cache_path} "
+                f"has incomplete shape {tuple(level.shape)}."
+            )
+        shape = tuple(int(v) for v in level.shape)
+        if reference_shape is None:
+            reference_shape = shape
+        elif shape != reference_shape:
+            raise AssetLutIncompleteError(
+                f"Asset LUT object {obj_key} in {cache_path} has inconsistent "
+                f"level shapes: {reference_shape} vs {shape} at level {level_idx}."
+            )
+
+
 class WaymoFlowCacheDataset(Dataset):
     """Index-based dataset reading pre-computed FlowDGGT clip caches."""
 
@@ -244,7 +318,9 @@ class WaymoFlowCacheDataset(Dataset):
         include_aux_tokens: bool = False,
         mmap_plain_cache: bool = True,
         asset_lut_level_indices: list[int] | tuple[int, ...] | None = None,
+        caption_root: str | Path | None = None,
         max_read_retries: int = 16,
+        include_sky_training_data: bool = False,
     ) -> None:
         super().__init__()
         if min_frames <= 0 or max_frames < min_frames:
@@ -259,7 +335,9 @@ class WaymoFlowCacheDataset(Dataset):
         self.asset_lut_level_indices = (
             None if asset_lut_level_indices is None else tuple(int(v) for v in asset_lut_level_indices)
         )
+        self.caption_root = None if caption_root is None else Path(caption_root)
         self.max_read_retries = max(1, int(max_read_retries))
+        self.include_sky_training_data = bool(include_sky_training_data)
 
         if manifest_path is not None:
             self.manifest_path = Path(manifest_path)
@@ -319,6 +397,8 @@ class WaymoFlowCacheDataset(Dataset):
             tried.add(current_idx)
             try:
                 return load_fn(current_idx)
+            except (CaptionLookupError, AssetLutIncompleteError):
+                raise
             except Exception as exc:
                 last_exc = exc
                 will_retry = attempt + 1 < max_attempts
@@ -384,13 +464,66 @@ class WaymoFlowCacheDataset(Dataset):
             stacklevel=2,
         )
 
+    def _cache_names_and_caption(self, meta: dict[str, Any], cache_path: Path) -> dict[str, Any]:
+        scene_name = (
+            meta.get("scene_name")
+            or meta.get("scene_dir")
+            or meta.get("scene")
+            or cache_path.parent.name
+        )
+        scene_name = Path(str(scene_name)).name
+        clip_name = meta.get("clip_name")
+        clip_index = meta.get("clip_index")
+        if clip_name is None:
+            if clip_index is not None:
+                clip_name = f"{scene_name}_{int(clip_index)}"
+            else:
+                clip_name = cache_path.stem
+        clip_name = str(clip_name)
+        out = {"scene_name": str(scene_name), "clip_name": clip_name}
+        if self.caption_root is not None:
+            caption_dir = self.caption_root / "pinhole_front"
+            if not caption_dir.is_dir():
+                raise CaptionLookupError(f"Caption directory not found: {caption_dir}")
+            stems = [
+                _normalize_caption_stem(clip_name, None if clip_index is None else int(clip_index)),
+                _normalize_caption_stem(cache_path.stem, None),
+            ]
+            if clip_index is not None:
+                stems.append(_normalize_caption_stem(scene_name, int(clip_index)))
+            candidates: list[Path] = []
+            seen: set[str] = set()
+            for stem in stems:
+                if stem in seen:
+                    continue
+                seen.add(stem)
+                candidates.append(caption_dir / f"{stem}.json")
+            caption_path = next((path for path in candidates if path.exists()), None)
+            if caption_path is None:
+                raise CaptionLookupError(
+                    f"Caption file not found for cache={cache_path}, scene={scene_name!r}, "
+                    f"clip_name={clip_name!r}, clip_index={clip_index!r}. "
+                    f"Tried: {[str(path) for path in candidates]}"
+                )
+            try:
+                payload = json.loads(caption_path.read_text())
+            except Exception as exc:
+                raise CaptionLookupError(f"Failed to read caption JSON: {caption_path}") from exc
+            if not isinstance(payload, dict) or payload.get("caption") is None:
+                raise CaptionLookupError(
+                    f"Caption JSON must be an object with key 'caption': {caption_path}"
+                )
+            out["caption"] = str(payload["caption"])
+            out["caption_path"] = str(caption_path)
+        return out
+
     def _load_item_at_index(self, idx: int) -> dict[str, Any]:
         entry = self.entries[idx]
         cache_path = Path(entry["cache_path"])
         payload, subset_t, subset_payload = self._load_payload_for_sample(
             cache_path,
             entry,
-            consumer="scene_flow_fast",
+            consumer="scene_flow_fast_sky" if self.include_sky_training_data else "scene_flow_fast",
         )
         return self._build_item_from_payload(
             payload=payload,
@@ -468,7 +601,7 @@ class WaymoFlowCacheDataset(Dataset):
         sample["cache_index"] = int(entry.get("index", payload.get("meta", {}).get("manifest_index", -1)))
         predictions = self._build_predictions(payload, subset_payload)
         if mode_kind == "mode_a":
-            asset_pass_result = self._build_asset_pass(payload, subset_payload)
+            asset_pass_result = self._build_asset_pass(payload, subset_payload, cache_path=cache_path)
             mode_b_block = None
         else:
             meta = payload["meta"]
@@ -509,7 +642,7 @@ class WaymoFlowCacheDataset(Dataset):
             pass2_payload, subset_payload, dtype=self.lut_dtype,
         )
 
-        return {
+        item = {
             "sample": sample,
             "predictions": predictions,
             "asset_pass_result": asset_pass_result,
@@ -523,6 +656,8 @@ class WaymoFlowCacheDataset(Dataset):
             "splatted_tok_low_cached": splatted_tok_low_cached,
             "cache_schema_version": schema_version,
         }
+        item.update(self._cache_names_and_caption(payload.get("meta", {}), cache_path))
+        return item
 
     def _build_fast_item_from_payload(
         self,
@@ -544,13 +679,14 @@ class WaymoFlowCacheDataset(Dataset):
             pass2_payload, subset_payload
         )
         asset_pass_result = (
-            self._build_fast_asset_pass(payload, subset_payload)
+            self._build_fast_asset_pass(payload, subset_payload, cache_path=cache_path)
             if mode_kind == "mode_a"
             else _empty_asset_pass(patch_grid, int(meta["patch_start_idx"]))
         )
         flow_inputs = self._subset_flow_inputs(payload["flow_inputs"], subset_payload)
         flow_inputs["subset_frames"] = subset_t.clone()
-        return {
+        camera_gt = self._build_fast_camera_gt(payload, subset_payload)
+        item = {
             "predictions": predictions,
             "asset_pass_result": asset_pass_result,
             "mode_kind": mode_kind,
@@ -559,7 +695,32 @@ class WaymoFlowCacheDataset(Dataset):
             "cache_path": str(cache_path),
             "splatted_tok_low_quantized": splatted_tok_low_quantized,
             "flow_inputs_cached": flow_inputs,
+            "camera_gt": camera_gt,
             "cache_schema_version": int(payload["schema_version"]),
+        }
+        if self.include_sky_training_data:
+            sky_training = self._build_fast_sky_training(payload, subset_payload)
+            if sky_training is not None:
+                item["sky_training"] = sky_training
+        item.update(self._cache_names_and_caption(meta, cache_path))
+        return item
+
+    @staticmethod
+    def _build_fast_sky_training(payload: dict[str, Any], subset: torch.Tensor) -> dict[str, torch.Tensor] | None:
+        raw = payload.get("raw") or {}
+        images_u8 = raw.get("images_u8")
+        sky_mask = raw.get("sky_mask")
+        if not torch.is_tensor(images_u8) or not torch.is_tensor(sky_mask):
+            return None
+        if int(images_u8.shape[0]) == int(subset.numel()):
+            images_sel = images_u8
+            mask_sel = sky_mask
+        else:
+            images_sel = images_u8.index_select(0, subset)
+            mask_sel = sky_mask.index_select(0, subset)
+        return {
+            "images": images_sel.to(torch.float32).div(255.0).contiguous(),
+            "masks": mask_sel.to(torch.float32).contiguous(),
         }
 
     # ------------------------------------------------------------------ #
@@ -751,14 +912,18 @@ class WaymoFlowCacheDataset(Dataset):
         out["dataset_index"] = int(meta.get("dataset_index", -1))
         out["asset_meta"] = meta["asset_meta"]
 
-        if "camera_to_world_corrected" in obj:
-            out["camera_to_world_corrected"] = obj["camera_to_world_corrected"].index_select(0, subset)
-        else:
-            out["camera_to_world_corrected"] = torch.eye(4).view(1, 1, 4, 4).expand(subset.numel(), V, 4, 4).contiguous()
-        if "intrinsics" in obj:
-            out["intrinsics"] = obj["intrinsics"]
-        else:
-            out["intrinsics"] = torch.eye(3).view(1, 3, 3).expand(V, 3, 3).contiguous()
+        if "camera_to_world_corrected" not in obj:
+            raise RuntimeError(
+                "Cache payload is missing object_meta['camera_to_world_corrected']; "
+                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}."
+            )
+        if "intrinsics" not in obj:
+            raise RuntimeError(
+                "Cache payload is missing object_meta['intrinsics']; "
+                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}."
+            )
+        out["camera_to_world_corrected"] = obj["camera_to_world_corrected"].index_select(0, subset)
+        out["intrinsics"] = obj["intrinsics"]
 
         out["images"] = images_clean
         out["images_clean"] = images_clean
@@ -840,10 +1005,38 @@ class WaymoFlowCacheDataset(Dataset):
                 "scale": pass1["F_g_lut_scene_scale"].index_select(0, subset).contiguous(),
                 "layout": "NPLC",
             },
+            "pose_enc": pass1["pose_enc"].index_select(0, subset).unsqueeze(0).contiguous(),
             "patch_start_idx": int(payload["meta"]["patch_start_idx"]),
         }
 
-    def _build_fast_asset_pass(self, payload: dict[str, Any], subset: torch.Tensor) -> AssetPassResult:
+    @staticmethod
+    def _build_fast_camera_gt(payload: dict[str, Any], subset: torch.Tensor) -> dict[str, torch.Tensor | tuple[int, int]]:
+        meta = payload["meta"]
+        obj = payload["object_meta"]
+        if "camera_to_world_corrected" not in obj:
+            raise RuntimeError(
+                "Cache payload is missing object_meta['camera_to_world_corrected']; "
+                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}."
+            )
+        if "intrinsics" not in obj:
+            raise RuntimeError(
+                "Cache payload is missing object_meta['intrinsics']; "
+                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}."
+            )
+        camera_to_world = obj["camera_to_world_corrected"].index_select(0, subset).contiguous()
+        intrinsics = obj["intrinsics"].contiguous()
+        return {
+            "camera_to_world_corrected": camera_to_world,
+            "intrinsics": intrinsics,
+            "raw_image_size_hw": normalize_front_image_hw(meta.get("raw_image_size_hw")),
+        }
+
+    def _build_fast_asset_pass(
+        self,
+        payload: dict[str, Any],
+        subset: torch.Tensor,
+        cache_path: Path | None = None,
+    ) -> AssetPassResult:
         meta = payload["meta"]
         asset = payload.get("asset_pass") or {}
         patch_grid = tuple(int(v) for v in meta["patch_grid"])
@@ -861,15 +1054,21 @@ class WaymoFlowCacheDataset(Dataset):
                     subset=subset,
                     dtype=self.lut_dtype,
                 )
-                F_g_lut_asset[k] = _split_nplc_levels(F_sub)
+                levels = _split_nplc_levels(F_sub)
             else:
-                F_g_lut_asset[k] = _dequantize_nplc_subset_levels(
+                levels = _dequantize_nplc_subset_levels(
                     data=entry["F_g_lut_asset_int8"],
                     scale=entry["F_g_lut_asset_scale"],
                     subset=subset,
                     level_indices=self.asset_lut_level_indices,
                     dtype=self.lut_dtype,
                 )
+            _validate_asset_lut_levels(
+                levels,
+                obj_key=k,
+                cache_path=cache_path or Path(str(meta.get("clip_name", "?"))),
+            )
+            F_g_lut_asset[k] = levels
         return AssetPassResult(
             patch_grid=patch_grid,
             patch_start_idx=patch_start_idx,
@@ -886,7 +1085,12 @@ class WaymoFlowCacheDataset(Dataset):
         )
 
     # ------------------------------------------------------------------ #
-    def _build_asset_pass(self, payload: dict[str, Any], subset: torch.Tensor) -> AssetPassResult:
+    def _build_asset_pass(
+        self,
+        payload: dict[str, Any],
+        subset: torch.Tensor,
+        cache_path: Path | None = None,
+    ) -> AssetPassResult:
         meta = payload["meta"]
         asset = payload["asset_pass"]
         patch_grid = tuple(int(v) for v in meta["patch_grid"])
@@ -919,15 +1123,21 @@ class WaymoFlowCacheDataset(Dataset):
                     subset=subset,
                     dtype=self.lut_dtype,
                 )
-                F_g_lut_asset[k] = _split_nplc_levels(F_sub)
+                levels = _split_nplc_levels(F_sub)
             else:
-                F_g_lut_asset[k] = _dequantize_nplc_subset_levels(
+                levels = _dequantize_nplc_subset_levels(
                     data=entry["F_g_lut_asset_int8"],
                     scale=entry["F_g_lut_asset_scale"],
                     subset=subset,
                     level_indices=self.asset_lut_level_indices,
                     dtype=self.lut_dtype,
                 )
+            _validate_asset_lut_levels(
+                levels,
+                obj_key=k,
+                cache_path=cache_path or Path(str(meta.get("clip_name", "?"))),
+            )
+            F_g_lut_asset[k] = levels
 
             subset_list = subset.tolist()
             remap = {n: i for i, n in enumerate(subset_list)}

@@ -233,8 +233,6 @@ def dump_flow_features(
             "scaffold_tok": list(bundle.scaffold_tok.shape),
             "z_clean": list(bundle.z_clean.shape),
             "z_splat": list(bundle.z_splat.shape),
-            "z_init": list(bundle.z_init.shape),
-            "t_tok": list(bundle.t_tok.shape),
             "F_asset_tokens": list(bundle.F_asset_tokens.shape),
         },
     }
@@ -356,10 +354,6 @@ def _build_feature_pack(bundle) -> dict[str, Any]:
         "scaffold_tok": _f16(bundle.scaffold_tok),
         "z_clean": _f16(bundle.z_clean),
         "z_splat": _f16(bundle.z_splat),
-        "z_init": _f16(bundle.z_init),
-        "eps_noise": _f16(bundle.eps_noise),
-        "t_tok": _f16(bundle.t_tok),
-        "base_t": bundle.base_t.detach().cpu().float(),
         "F_asset_tokens": _f16(bundle.F_asset_tokens),
         "pointers_scene": _pack_ptr(bundle.pointers_scene),
         "pointers_asset_by_obj": {

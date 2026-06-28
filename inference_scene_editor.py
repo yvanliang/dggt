@@ -576,7 +576,7 @@ def _render_clean_with_dggt(
 ) -> torch.Tensor:
     images = sample["images_clean"].unsqueeze(0).to(device)
     sky_mask = sample["sky_mask"].unsqueeze(0).to(device).permute(0, 1, 3, 4, 2)
-    bg_mask = (sky_mask == 0).any(dim=-1)
+    bg_mask = (sky_mask < 0.5).any(dim=-1)
     timestamps = _repeat_timestamps_for_views(sample, images.shape[1]).to(device)
 
     _, _, _, height, width = images.shape

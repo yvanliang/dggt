@@ -23,7 +23,7 @@ from third_party.TAPIP3D.utils.inference_utils import load_model, read_video, in
 from dggt.models.vggt import VGGT
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.geometry import unproject_depth_map_to_point_map
-from dggt.utils.gs import concat_list, get_masked_gs, get_split_gs
+from dggt.utils.gs import concat_list, get_split_gs
 from dggt.utils.visual_track import visualize_tracks_on_images
 from gsplat.rendering import rasterization
 from datasets.dataset import WaymoOpenDataset
@@ -140,7 +140,7 @@ def main():
             gt_dy_map = batch['dynamic_mask'].to(device)
             gt_depth = batch['gt_depth'].to(device)
 
-            bg_mask = (sky_mask == 0).any(dim=-1)
+            bg_mask = (sky_mask < 0.5).any(dim=-1)
             timestamps = batch['timestamps'][0].to(device)
             
             if args.mode == 3:

@@ -19,12 +19,12 @@ This script combines two documented pipelines:
   consumed unchanged via the validation manifest.
 
 On top of the bundle it runs the trained ``WanSceneFlow`` with classifier-free
-guidance (mirroring ``train_scene_flow_pretrain.py:cfg_sample_pretrain_latents``,
-but conditioned on the assembler's real ``z_splat`` / ``scaffold_tok`` / dual
-masks / asset KV instead of the pretrain full-scene zeros), then decodes the
-edited latent and renders 3DGS exactly like
-``train_scene_flow_pretrain.py:render_validation_rgb`` (clean / edited /
-tokenizer-recon / input-GT grids, latent PCA, abs-error, mask grids).
+guidance (mirroring ``train_scene_flow.py:cfg_sample_edit_latents``: factored
+text CFG plus asset/control CFG, with non-edit tokens pinned to ``z_splat`` at
+every ODE step), then decodes the edited latent and renders 3DGS with
+``train_scene_flow.py:render_validation_rgb_gt_sky`` so formal offline
+validation matches training-time T1 validation: generated outputs are
+composited with GT sky mask / sky background.
 
 ================================ COMMANDS ================================
 
@@ -35,15 +35,16 @@ Environment (see docs/scene_flow_cmd.md §0 and docs/flow_cache_validation_cmd.m
     export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_waymo_views1/ckpt/scene_tokenizer_step_014000.pt
     export FEATURE_STATS=logs/scene_flow_pretrain/feature_stats_pretrain.pt
     export VAL_MANIFEST=/data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/validation/validation_manifest.jsonl
+    export SCENE_CAPTION_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions
 
 Sliding window: the validation clips are 29 frames but WanSceneFlow is trained
 on short windows (pretrain S=8 / T1 4-8). The clip is tiled into ``--window``
 (default 8) frame windows with stride ``--window_stride``; every window has
 exactly ``--window`` frames (the last start is clamped so the clip tail is
-covered, overlap is averaged). Each window is sampled independently (its own
-``FlowFeatureAssembler`` bundle, exactly how the trainer builds bundles from
-random windows of the same cache); the per-window edited latents are stitched
-back into a full 29-frame latent for the diagnostics and the final 3DGS render.
+covered). Sampling keeps one full-clip latent state; at each denoising step the
+model is run on window slices, window velocities are blended in overlap regions,
+and the full latent is updated once. Per-window bundles are still dumped for
+diagnostics, while the final 3DGS render uses the full-clip latent.
 
 A) Validation manifest, formal-training (T1) checkpoint, all entries:
 
@@ -56,8 +57,9 @@ A) Validation manifest, formal-training (T1) checkpoint, all entries:
         --split validation \
         --output_dir runs/scene_flow_val_t1 \
         --window 8 --window_stride 8 \
-        --sample_steps 30 --shift 3.0 \
+        --sample_steps 30 --shift 10.0 \
         --guidance_scales 1.0,2.0,4.0 \
+        --asset_control_guidance_scale 1.0 \
         --val_log_images 8 \
         --seed 0 --precision bf16
 
@@ -72,7 +74,7 @@ B) Pretrain checkpoint, cache_root scan (no manifest), EMA weights (default):
         --split validation \
         --output_dir runs/scene_flow_val_pretrain \
         --start 0 --end 5 \
-        --sample_steps 30 --shift 3.0 --guidance_scales 2.0 \
+        --sample_steps 30 --shift 10.0 --guidance_scales 2.0 \
         --window 8 --render_per_window
 
 C) Single entry smoke (entry 0 -> manifest index 0, combined variant):
@@ -100,9 +102,13 @@ Notes:
     ONLY the raw ``scene_flow`` (no EMA) — point at the FULL
     ``pretrain_step{N}.pt`` or ``pretrain_step{N}_ema_weights_only.pt`` to get
     EMA. The script warns if EMA is requested but absent.
-  * ``--shift`` defaults to 3.0 to match the current training schedule
-    (6e2c039f lowered it from ~11; flow-matching inference should use the
-    same schedule the model was trained on).
+  * ``--shift`` defaults to 10.0 to match ``docs/scene_flow_cmd.md`` and the
+    current pretrain / T1 training defaults. Flow-matching inference should use
+    the same schedule the model was trained on.
+  * ``--prediction_type`` defaults to ``x`` to match RAEv2-style SceneFlow
+    training. Checkpoints that record a different prediction type are rejected
+    before weights are loaded; pass ``--prediction_type v`` only for explicit
+    velocity-prediction checkpoints.
   * ``--feature_stats_path`` is optional: the checkpoint already carries
     ``mu_z``/``sigma_z`` buffers. Pass it only to override (same dim as
     ``--latent_dim``; e.g. ``feature_stats_pretrain.pt``).
@@ -122,7 +128,7 @@ Output (per entry, under ``{output_dir}/{tag}/``):
     tokenizer_recon_3dgs_rgb.jpg            # tokenizer round-trip of input
     input_rgb_gt.jpg                        # cached input frames
     generated_raw_3dgs_rgb__cfg{S}.jpg      # EDITED render per guidance scale
-    generated_pred_sky_mask__cfg{S}.jpg     # predicted sky mask (no GT leak)
+    generated_pred_sky_mask__cfg{S}.jpg     # DGGT semantic-head diagnostic only; render uses GT sky
     summary.json
 """
 from __future__ import annotations
@@ -130,45 +136,50 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
 
 from datasets.waymo_flow_cache_dataset import (
     WaymoFlowCacheDataset,
-    _empty_asset_pass,
 )
+from dggt.losses.flow_losses import rae_t_grid
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_stats import load_into_buffers
 from dggt.utils.flow_cache_io import load_flow_cache
 from dggt.utils.flow_viz import dump_flow_features, save_image_grid
+from dggt.utils.sliding_window import cosine_window, window_slices
 
 # Reuse the formal-training (train_scene_flow.py) cache->bundle helpers verbatim
 # so the bundle is byte-for-byte what the trainer feeds the model.
 from train_scene_flow import (
+    _asset_condition_kind_for_model,
+    _bundle_frame_ids,
     _infer_cache_patch_grid,
-    _move_asset_pass,
-    _move_mode_b,
-    _move_predictions,
-    _move_v6_fast_path_inputs,
-    _validate_item_patch_grid,
+    _slice_asset_time,
+    _slice_time,
+    build_flow_bundle as build_train_flow_bundle,
+    encode_text_condition,
     freeze_module,
+    normalize_asset_latents,
+    render_validation_rgb_gt_sky,
+    sampler_prediction_to_velocity,
+    setup_text_encoder,
 )
 
-# Reuse the pretrain (train_scene_flow_pretrain.py) model + render helpers so the
-# RGB / latent diagnostics match the documented training-time visualization.
+# Reuse pretrain latent-grid helpers; RGB rendering uses formal T1 GT-sky helper.
 from train_scene_flow_pretrain import (
+    DEFAULT_SKY_GRID,
+    SKY_TOKEN_DIM,
+    _image_grid,
     _latent_pca_grid,
     _mask_grid,
     _normalized_mask_grid,
     load_dggt_aggregator_and_tokenizer,
-    render_validation_rgb,
     unwrap_ddp,
 )
-
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
 
 # ---------------------------------------------------------------------- #
@@ -203,6 +214,26 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--latent_dim", type=int, default=1024,
                    help="Tokenizer latent channels (WanSceneFlow out_channels; "
                         "in_channels = 3*latent_dim + 3). Must match training.")
+    p.add_argument("--sky_grid_h", type=int, default=DEFAULT_SKY_GRID[0])
+    p.add_argument("--sky_grid_w", type=int, default=DEFAULT_SKY_GRID[1])
+    p.add_argument(
+        "--prediction_type",
+        type=str,
+        choices=("v", "x"),
+        default="x",
+        help=(
+            "SceneFlow output parameterization. Default 'x' matches RAEv2-style training; "
+            "use 'v' only for explicit velocity-prediction checkpoints."
+        ),
+    )
+    p.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B/",
+                   help="Qwen text encoder path used by RAE-style SceneFlow training.")
+    p.add_argument("--text_max_length", type=int, default=256)
+    p.add_argument("--caption_root", type=str,
+                   default="/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions",
+                   help="Caption root containing pinhole_front/{clip_id}_{trunk_id}.json.")
+    p.add_argument("--no_text_condition", action="store_true",
+                   help="Disable text conditioning and caption lookup.")
 
     # Data (mirrors train_scene_flow.py / WaymoFlowCacheDataset)
     p.add_argument("--cache_root", type=str, default=None,
@@ -215,8 +246,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--output_dir", type=str, required=True,
                    help="Root directory for per-entry validation inference outputs.")
 
-    # Sliding window over the (29-frame) clip; WanSceneFlow is trained on
-    # short windows so each window is sampled independently then stitched.
+    # Sliding window over the (29-frame) clip; each denoising step blends
+    # window velocities into one full-clip latent state.
     p.add_argument("--window", type=int, default=8,
                    help="Frames per scene_flow window (match training S; "
                         "pretrain S=8 / T1 4-8).")
@@ -233,22 +264,17 @@ def build_argparser() -> argparse.ArgumentParser:
     # Sampling
     p.add_argument("--sample_steps", type=int, default=30,
                    help="FlowMatch inference steps (15 smoke / 30 normal / 50 stable).")
-    p.add_argument("--shift", type=float, default=3.0,
-                   help="FlowMatch schedule shift. Default 3.0 matches the current "
-                        "training schedule (commit 6e2c039f lowered it from ~11); "
-                        "inference should use the shift the model was trained on.")
+    p.add_argument("--shift", type=float, default=10.0,
+                   help="FlowMatch / RAE time distribution shift used for sampling.")
     p.add_argument("--guidance_scales", type=str, default="1.0,2.0",
-                   help="Comma-sep CFG scales; one edited render per scale. For "
-                        "conditional T1 editing s~=1 is the converged optimum; "
-                        "s>1 mostly helps undertrained / unconditional models.")
+                   help="Comma-sep text CFG scales; one edited render per scale.")
+    p.add_argument("--asset_control_guidance_scale", type=float, default=1.0,
+                   help="Factored CFG scale for asset + edit-control conditions.")
     p.add_argument("--cond_norm", type=str, default="zsplat",
                    choices=("zsplat", "all", "none"),
-                   help="Which conditioning latents to normalize with the model's "
-                        "mu_z/sigma_z. 'zsplat' (default): z_splat only (it is a "
-                        "tokenizer latent like z_clean). 'all': also scaffold_tok. "
-                        "'none': pass both raw.")
+                   help="Deprecated no-op; inference now matches training: z_splat is normalized and scaffold_tok is raw.")
     p.add_argument("--no_preserve_blend", action="store_true",
-                   help="Do not pin M_preserve tokens back to the clean latent.")
+                   help="Deprecated compatibility flag; non-edit tokens are pinned to z_splat each ODE step.")
 
     # Visualization (consumed by reused pretrain render helpers)
     p.add_argument("--val_log_images", type=int, default=8,
@@ -273,37 +299,172 @@ def build_argparser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------- #
 @torch.no_grad()
 def build_bundle(item: dict[str, Any], assembler: FlowFeatureAssembler, device: torch.device):
-    sample = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item["sample"].items()}
-    predictions = _move_predictions(item["predictions"], device)
-    asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
-    _validate_item_patch_grid(asset_pass_result, assembler, item.get("cache_path"))
-    cameras_dggt = {k: v.to(device) for k, v in item["cameras_dggt"].items()}
-    mode_kind = str(item.get("mode_kind", sample.get("mode_kind", "mode_a")))
-    mode_b_payload = item.get("mode_b")
-    if mode_b_payload is not None:
-        mode_b_payload = _move_mode_b(mode_b_payload, device)
-    phase1_localized_lite, splatted_tok_low_cached = _move_v6_fast_path_inputs(
-        item, mode_kind, device
-    )
-    bundle = assembler(
-        sample=sample,
-        predictions=predictions,
-        asset_pass_result=asset_pass_result,
-        cameras_dggt=cameras_dggt,
-        object_slots_spec="all",
-        base_t=None,
-        device=device,
-        mode_kind=mode_kind,
-        mode_b=mode_b_payload,
-        phase1_localized_lite=phase1_localized_lite,
-        splatted_tok_low_cached=splatted_tok_low_cached,
-    )
-    return bundle, sample
+    bundle = build_train_flow_bundle(item, assembler, device)
+    variant = str(item.get("validation_variant", ""))
+    if variant:
+        bundle.asset_condition_kind = validation_asset_condition_kind(variant)
+    return bundle, item["sample"]
+
+
+def validation_asset_condition_kind(variant: str) -> str:
+    variant = str(variant)
+    has_asset = variant in {"combined", "insertion", "replacement", "repositioning"}
+    has_delete = variant in {"combined", "deletion", "replacement", "repositioning"}
+    if has_asset and has_delete:
+        return "mode_a_with_empty"
+    if has_delete:
+        return "mode_b_empty"
+    return "mode_a"
 
 
 # ---------------------------------------------------------------------- #
 # CFG editing sampler                                                     #
 # ---------------------------------------------------------------------- #
+@torch.no_grad()
+def _cfg_sample_edit_latents_sliding(
+    scene_flow: nn.Module,
+    bundle,
+    args: argparse.Namespace,
+    device: torch.device,
+    guidance_scale: float,
+    seed: int,
+    text_encoder: nn.Module | None,
+    *,
+    window: int,
+    stride: int,
+) -> torch.Tensor:
+    sf = unwrap_ddp(scene_flow)
+    z_clean_n = sf.normalize(bundle.z_clean.float())
+    t_steps = rae_t_grid(
+        num_steps=int(args.sample_steps),
+        time_shift=float(args.shift),
+        device=device,
+        dtype=torch.float32,
+    )
+    z_splat_n = sf.normalize(bundle.z_splat.float())
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+
+    M_preserve = bundle.M_preserve.to(device=device, dtype=z_clean_n.dtype)
+    M_source = bundle.M_source.to(device=device, dtype=z_clean_n.dtype)
+    M_dest = bundle.M_dest.to(device=device, dtype=z_clean_n.dtype)
+    M_edit = (M_source.float() + M_dest.float()).clamp(0.0, 1.0).to(device=device, dtype=z_clean_n.dtype)
+    M_keep = 1.0 - M_edit
+    batch_size = int(z_clean_n.shape[0])
+    seq_len = int(z_clean_n.shape[1])
+    frame_ids = _bundle_frame_ids(bundle, batch_size=batch_size, seq_len=seq_len, device=device)
+    windows = window_slices(seq_len, window, stride)
+
+    z = torch.empty_like(z_clean_n)
+    z.normal_(generator=generator)
+    z = M_edit * z + M_keep * z_splat_n
+
+    F_asset = normalize_asset_latents(sf, bundle.F_asset_tokens)
+    if F_asset.ndim in (4, 5):
+        F_uncond = torch.zeros_like(F_asset)
+        uncond_asset_mask = torch.zeros(F_asset.shape[:-1], device=F_asset.device, dtype=torch.bool)
+    else:
+        F_uncond = F_asset.new_zeros((batch_size, 0, F_asset.shape[-1]))
+        uncond_asset_mask = None
+    encoder_attention_mask = getattr(bundle, "encoder_attention_mask", None)
+    text_tokens, text_mask = encode_text_condition(text_encoder, getattr(bundle, "captions", None))
+    text_null, text_null_mask = encode_text_condition(
+        text_encoder,
+        [""] * batch_size if text_tokens is not None else None,
+    )
+    asset_kinds = _asset_condition_kind_for_model(bundle, batch_size)
+    asset_control_scale = float(getattr(args, "asset_control_guidance_scale", 1.0))
+    do_cfg = (
+        abs(float(guidance_scale) - 1.0) > 1e-6
+        or abs(asset_control_scale - 1.0) > 1e-6
+    )
+    drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
+    camera_pose_tokens = getattr(bundle, "camera_pose_tokens", None)
+    camera_attention_mask = getattr(bundle, "camera_attention_mask", None)
+
+    for i in range(int(args.sample_steps)):
+        step_h = t_steps[i] - t_steps[i + 1]
+        sigma = torch.full((batch_size,), float(t_steps[i].item()), device=device)
+        v_acc = torch.zeros_like(z)
+        v_weight = torch.zeros((1, seq_len, 1, 1), device=device, dtype=z.dtype)
+
+        for start, end in windows:
+            actual = int(end - start)
+            w = cosine_window(actual, device=device, dtype=z.dtype).view(1, actual, 1, 1)
+            z_w = z[:, start:end]
+            z_splat_w = z_splat_n[:, start:end]
+            M_preserve_w = M_preserve[:, start:end]
+            M_source_w = M_source[:, start:end]
+            M_dest_w = M_dest[:, start:end]
+            frame_ids_w = frame_ids[:, start:end]
+            camera_tokens_w = _slice_time(camera_pose_tokens, start, end, seq_len)
+            camera_mask_w = _slice_time(camera_attention_mask, start, end, seq_len)
+            F_asset_w = _slice_asset_time(F_asset, start, end, seq_len)
+            asset_mask_w = _slice_asset_time(encoder_attention_mask, start, end, seq_len)
+            F_uncond_w = _slice_asset_time(F_uncond, start, end, seq_len)
+            uncond_mask_w = _slice_asset_time(uncond_asset_mask, start, end, seq_len)
+            scaffold_w = bundle.scaffold_tok[:, start:end]
+
+            v_full = sf(
+                z_w, sigma, z_splat_w, scaffold_w,
+                M_preserve_w, M_source_w, M_dest_w, F_asset_w,
+                encoder_attention_mask=asset_mask_w,
+                text_tokens=text_tokens,
+                text_attention_mask=text_mask,
+                camera_pose_tokens=camera_tokens_w,
+                camera_attention_mask=camera_mask_w,
+                asset_condition_kind=asset_kinds,
+                return_mid=False,
+                frame_ids=frame_ids_w,
+                fps=None,
+            )
+            if do_cfg:
+                v_text = sf(
+                    z_w, sigma, z_splat_w, scaffold_w,
+                    M_preserve_w, M_source_w, M_dest_w, F_uncond_w,
+                    encoder_attention_mask=uncond_mask_w,
+                    text_tokens=text_tokens,
+                    text_attention_mask=text_mask,
+                    camera_pose_tokens=camera_tokens_w,
+                    camera_attention_mask=camera_mask_w,
+                    asset_condition_kind=["asset_uncond"] * batch_size,
+                    return_mid=False,
+                    control_drop_mask=drop_all_control,
+                    frame_ids=frame_ids_w,
+                    fps=None,
+                )
+                v_uncond = sf(
+                    z_w, sigma, z_splat_w, scaffold_w,
+                    M_preserve_w, M_source_w, M_dest_w, F_uncond_w,
+                    encoder_attention_mask=uncond_mask_w,
+                    text_tokens=text_null,
+                    text_attention_mask=text_null_mask,
+                    camera_pose_tokens=camera_tokens_w,
+                    camera_attention_mask=camera_mask_w,
+                    asset_condition_kind=["asset_uncond"] * batch_size,
+                    return_mid=False,
+                    control_drop_mask=drop_all_control,
+                    frame_ids=frame_ids_w,
+                    fps=None,
+                )
+                v_pred = (
+                    v_uncond
+                    + float(guidance_scale) * (v_text - v_uncond)
+                    + asset_control_scale * (v_full - v_text)
+                )
+            else:
+                v_pred = v_full
+            v = sampler_prediction_to_velocity(sf, v_pred, z_w, sigma)
+            v_acc[:, start:end] += v * w
+            v_weight[:, start:end] += w
+
+        v = v_acc / v_weight.clamp_min(1e-6)
+        z = z - step_h.to(dtype=z.dtype) * v
+        z = M_keep * z_splat_n + M_edit * z
+
+    return M_keep * z_splat_n + M_edit * z
+
+
 @torch.no_grad()
 def cfg_sample_edit_latents(
     scene_flow: nn.Module,
@@ -312,66 +473,130 @@ def cfg_sample_edit_latents(
     device: torch.device,
     guidance_scale: float,
     seed: int,
+    text_encoder: nn.Module | None = None,
+    *,
+    sliding_window: int | None = None,
+    sliding_stride: int | None = None,
 ) -> torch.Tensor:
-    """Conditional rectified-flow sampling from pure noise -> edited latent.
+    """Conditional rectified-flow sampling from noise -> edited latent.
 
-    Mirrors ``train_scene_flow_pretrain.cfg_sample_pretrain_latents`` but uses
-    the assembler's real edit conditioning (``z_splat`` / ``scaffold_tok`` /
-    ``M_preserve`` / ``M_source`` / ``M_dest`` / asset KV). Returns the latent
-    in the model's NORMALIZED space (``render_validation_rgb`` denormalizes it).
+    Mirrors ``train_scene_flow.cfg_sample_edit_latents`` but keeps the offline
+    inference seed explicit. Returns the latent in the model's normalized space.
     """
     sf = unwrap_ddp(scene_flow)
-    scheduler = FlowMatchEulerDiscreteScheduler(
-        num_train_timesteps=1000,
-        shift=float(args.shift),
-        invert_sigmas=True,
+    z_clean_n = sf.normalize(bundle.z_clean.float())
+    if sliding_window is not None and int(sliding_window) > 0 and int(z_clean_n.shape[1]) > int(sliding_window):
+        return _cfg_sample_edit_latents_sliding(
+            scene_flow,
+            bundle,
+            args,
+            device,
+            guidance_scale,
+            seed,
+            text_encoder,
+            window=int(sliding_window),
+            stride=int(sliding_stride or sliding_window),
+        )
+    t_steps = rae_t_grid(
+        num_steps=int(args.sample_steps),
+        time_shift=float(args.shift),
+        device=device,
+        dtype=torch.float32,
     )
-    scheduler.set_timesteps(num_inference_steps=int(args.sample_steps), device=device)
+    z_splat_n = sf.normalize(bundle.z_splat.float())
     generator = torch.Generator(device=device)
     generator.manual_seed(int(seed))
 
-    z_clean_n = sf.normalize(bundle.z_clean.float())
-    z_splat_in = bundle.z_splat.float()
-    scaffold_in = bundle.scaffold_tok.float()
-    if args.cond_norm in ("zsplat", "all"):
-        z_splat_in = sf.normalize(z_splat_in)
-    if args.cond_norm == "all":
-        scaffold_in = sf.normalize(scaffold_in)
-
-    M_preserve = bundle.M_preserve
-    M_source = bundle.M_source
-    M_dest = bundle.M_dest
-    F_asset = bundle.F_asset_tokens
+    M_preserve = bundle.M_preserve.to(device=device, dtype=z_clean_n.dtype)
+    M_source = bundle.M_source.to(device=device, dtype=z_clean_n.dtype)
+    M_dest = bundle.M_dest.to(device=device, dtype=z_clean_n.dtype)
+    M_edit = (M_source.float() + M_dest.float()).clamp(0.0, 1.0).to(device=device, dtype=z_clean_n.dtype)
+    M_keep = 1.0 - M_edit
     batch_size = z_clean_n.shape[0]
 
     z = torch.empty_like(z_clean_n)
     z.normal_(generator=generator)
+    z = M_edit * z + M_keep * z_splat_n
+    frame_ids = _bundle_frame_ids(bundle, batch_size=int(batch_size), seq_len=int(z.shape[1]), device=device)
 
-    F_uncond = F_asset.new_zeros((batch_size, 0, F_asset.shape[-1]))
-    do_cfg = abs(float(guidance_scale) - 1.0) > 1e-6 and F_asset.shape[1] > 0
+    F_asset = normalize_asset_latents(sf, bundle.F_asset_tokens)
+    if F_asset.ndim in (4, 5):
+        F_uncond = torch.zeros_like(F_asset)
+        uncond_asset_mask = torch.zeros(F_asset.shape[:-1], device=F_asset.device, dtype=torch.bool)
+    else:
+        F_uncond = F_asset.new_zeros((batch_size, 0, F_asset.shape[-1]))
+        uncond_asset_mask = None
+    encoder_attention_mask = getattr(bundle, "encoder_attention_mask", None)
+    text_tokens, text_mask = encode_text_condition(text_encoder, getattr(bundle, "captions", None))
+    text_null, text_null_mask = encode_text_condition(
+        text_encoder,
+        [""] * batch_size if text_tokens is not None else None,
+    )
+    asset_kinds = _asset_condition_kind_for_model(bundle, batch_size)
+    asset_control_scale = float(getattr(args, "asset_control_guidance_scale", 1.0))
+    do_cfg = (
+        abs(float(guidance_scale) - 1.0) > 1e-6
+        or abs(asset_control_scale - 1.0) > 1e-6
+    )
+    drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
 
-    for timestep in scheduler.timesteps:
-        sigma = (timestep / scheduler.config.num_train_timesteps).to(device=device)
-        sigma = sigma.expand(batch_size)
-        v_cond = sf(
-            z, sigma, z_splat_in, scaffold_in,
+    for i in range(int(args.sample_steps)):
+        step_h = t_steps[i] - t_steps[i + 1]
+        sigma = torch.full((batch_size,), float(t_steps[i].item()), device=device)
+        v_full = sf(
+            z, sigma, z_splat_n, bundle.scaffold_tok,
             M_preserve, M_source, M_dest, F_asset,
-            encoder_attention_mask=None, return_mid=False,
+            encoder_attention_mask=encoder_attention_mask,
+            text_tokens=text_tokens,
+            text_attention_mask=text_mask,
+            camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+            camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
+            asset_condition_kind=asset_kinds,
+            return_mid=False,
+            frame_ids=frame_ids,
+            fps=None,
         )
         if do_cfg:
-            v_uncond = sf(
-                z, sigma, z_splat_in, scaffold_in,
+            v_text = sf(
+                z, sigma, z_splat_n, bundle.scaffold_tok,
                 M_preserve, M_source, M_dest, F_uncond,
-                encoder_attention_mask=None, return_mid=False,
+                encoder_attention_mask=uncond_asset_mask,
+                text_tokens=text_tokens,
+                text_attention_mask=text_mask,
+                camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+                camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
+                asset_condition_kind=["asset_uncond"] * batch_size,
+                return_mid=False,
+                control_drop_mask=drop_all_control,
+                frame_ids=frame_ids,
+                fps=None,
             )
-            v = v_uncond + float(guidance_scale) * (v_cond - v_uncond)
+            v_uncond = sf(
+                z, sigma, z_splat_n, bundle.scaffold_tok,
+                M_preserve, M_source, M_dest, F_uncond,
+                encoder_attention_mask=uncond_asset_mask,
+                text_tokens=text_null,
+                text_attention_mask=text_null_mask,
+                camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+                camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
+                asset_condition_kind=["asset_uncond"] * batch_size,
+                return_mid=False,
+                control_drop_mask=drop_all_control,
+                frame_ids=frame_ids,
+                fps=None,
+            )
+            v = (
+                v_uncond
+                + float(guidance_scale) * (v_text - v_uncond)
+                + asset_control_scale * (v_full - v_text)
+            )
         else:
-            v = v_cond
-        z = scheduler.step(model_output=v, timestep=timestep, sample=z, return_dict=False)[0]
+            v = v_full
+        v = sampler_prediction_to_velocity(sf, v, z, sigma)
+        z = z - step_h.to(dtype=z.dtype) * v
+        z = M_keep * z_splat_n + M_edit * z
 
-    if not args.no_preserve_blend:
-        z = M_preserve * z_clean_n + (1.0 - M_preserve) * z
-    return z
+    return M_keep * z_splat_n + M_edit * z
 
 
 # ---------------------------------------------------------------------- #
@@ -422,11 +647,157 @@ def save_clean_mask_grids(
         )
 
 
+def save_gt_rgb_grid_from_sample(
+    sample: dict[str, Any],
+    out_dir: Path,
+    frames: int,
+) -> None:
+    """Save cached input/GT RGB frames without requiring 3DGS rendering."""
+    if int(frames) <= 0:
+        return
+    images = sample.get("images", sample.get("images_clean"))
+    if not torch.is_tensor(images):
+        return
+    if images.ndim == 4:
+        images = images.unsqueeze(0)
+    if images.ndim != 5:
+        raise ValueError(f"Expected GT images [S,3,H,W] or [B,S,3,H,W], got {tuple(images.shape)}")
+    save_image_grid(_image_grid(images, frames), out_dir / "input_rgb_gt.jpg", nrow=frames)
+
+
 # ---------------------------------------------------------------------- #
 # Checkpoint loading                                                      #
 # ---------------------------------------------------------------------- #
 def _strip_module(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
+
+
+def _format_key_list(keys: Sequence[str], limit: int = 32) -> str:
+    shown = list(keys[:limit])
+    suffix = "" if len(keys) <= limit else f", ... (+{len(keys) - limit} more)"
+    return "[" + ", ".join(repr(k) for k in shown) + suffix + "]"
+
+
+def _raise_on_state_dict_mismatch(
+    *,
+    ckpt_path: str | Path,
+    module_name: str,
+    source: str,
+    missing: Sequence[str],
+    unexpected: Sequence[str],
+) -> None:
+    if not missing and not unexpected:
+        return
+    parts = [
+        f"{ckpt_path} is not compatible with {module_name} when loading {source}.",
+    ]
+    if missing:
+        parts.append(f"missing keys ({len(missing)}): {_format_key_list(missing)}")
+    if unexpected:
+        parts.append(f"unexpected keys ({len(unexpected)}): {_format_key_list(unexpected)}")
+    parts.append("Refusing to run offline inference with a partially loaded checkpoint.")
+    raise RuntimeError(" ".join(parts))
+
+
+def _scene_flow_prediction_type(scene_flow: nn.Module) -> str:
+    cfg = getattr(unwrap_ddp(scene_flow), "config", None)
+    return str(getattr(cfg, "prediction_type", "x"))
+
+
+def _checkpoint_prediction_type(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    cfg = payload.get("scene_flow_config")
+    if isinstance(cfg, dict) and "prediction_type" in cfg:
+        return str(cfg["prediction_type"])
+    args = payload.get("args")
+    if isinstance(args, dict) and "prediction_type" in args:
+        return str(args["prediction_type"])
+    return None
+
+
+SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
+    "rope_layout_version",
+    "rope_theta",
+    "encoder_mrope_section",
+    "ddt_mrope_section",
+    "patch_grid",
+    "out_channels",
+    "sky_grid",
+    "camera_gen_dim",
+    "sky_rope_temporal_offset",
+    "camera_rope_spatial_mode",
+)
+
+
+def _normalize_config_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return tuple(_normalize_config_value(v) for v in value)
+    if isinstance(value, tuple):
+        return tuple(_normalize_config_value(v) for v in value)
+    return value
+
+
+def _config_values_match(current: Any, saved: Any) -> bool:
+    current = _normalize_config_value(current)
+    saved = _normalize_config_value(saved)
+    if isinstance(current, tuple) and isinstance(saved, tuple):
+        return len(current) == len(saved) and all(_config_values_match(c, s) for c, s in zip(current, saved))
+    if isinstance(current, float) or isinstance(saved, float):
+        try:
+            return abs(float(current) - float(saved)) <= 1e-6
+        except (TypeError, ValueError):
+            return False
+    return current == saved
+
+
+def _validate_scene_flow_checkpoint_config(scene_flow: nn.Module, payload: Any, path: str | Path) -> None:
+    _validate_scene_flow_prediction_type(scene_flow, payload, path)
+    if not isinstance(payload, dict):
+        return
+    saved_cfg = payload.get("scene_flow_config")
+    if not isinstance(saved_cfg, dict):
+        return
+    if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
+        raise ValueError(
+            f"{path} was saved with the legacy global mrope_temporal_margin RoPE layout. "
+            "The current SceneFlow model uses the fixed A1 layout "
+            "(video/asset/camera shared video time, camera center, sky temporal offset 128); "
+            "do not run inference across these incompatible position semantics."
+        )
+    current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)
+    mismatches: list[str] = []
+    for field in SCENE_FLOW_CONFIG_COMPAT_FIELDS:
+        if field not in saved_cfg or not hasattr(current_cfg, field):
+            continue
+        current_value = getattr(current_cfg, field)
+        saved_value = saved_cfg[field]
+        if not _config_values_match(current_value, saved_value):
+            mismatches.append(f"{field}: checkpoint={saved_value!r}, current={current_value!r}")
+    if mismatches:
+        joined = "; ".join(mismatches)
+        raise ValueError(
+            f"{path} SceneFlow config does not match the current model: {joined}. "
+            "Do not run inference across incompatible RoPE/model geometry settings."
+        )
+
+
+def _validate_scene_flow_prediction_type(scene_flow: nn.Module, payload: Any, path: str | Path) -> None:
+    current = _scene_flow_prediction_type(scene_flow)
+    saved = _checkpoint_prediction_type(payload)
+    if saved is None:
+        if current == "v":
+            raise ValueError(
+                f"{path} does not record SceneFlow prediction_type. Refusing to load it into "
+                "a velocity-prediction model because legacy checkpoints were x-prediction by default. "
+                "Use --prediction_type x for that checkpoint or use a checkpoint saved with scene_flow_config."
+            )
+        return
+    if saved != current:
+        raise ValueError(
+            f"{path} prediction_type={saved!r} does not match current model prediction_type={current!r}. "
+            "Do not run inference across x-prediction and velocity-prediction checkpoints."
+        )
 
 
 def load_scene_flow_ckpt(
@@ -437,7 +808,13 @@ def load_scene_flow_ckpt(
     device: torch.device,
 ) -> dict[str, Any]:
     payload = torch.load(ckpt_path, map_location="cpu")
-    info: dict[str, Any] = {"ckpt_path": ckpt_path, "ema_used": False}
+    _validate_scene_flow_checkpoint_config(scene_flow, payload, ckpt_path)
+    info: dict[str, Any] = {
+        "ckpt_path": ckpt_path,
+        "ema_used": False,
+        "prediction_type": _scene_flow_prediction_type(scene_flow),
+        "checkpoint_prediction_type": _checkpoint_prediction_type(payload),
+    }
 
     if not disable_ema and isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
         sf_state = payload["ema_scene_flow_state_dict"]
@@ -461,6 +838,13 @@ def load_scene_flow_ckpt(
         info["source"] = "raw_state_dict"
 
     missing, unexpected = scene_flow.load_state_dict(_strip_module(sf_state), strict=False)
+    _raise_on_state_dict_mismatch(
+        ckpt_path=ckpt_path,
+        module_name="WanSceneFlow",
+        source=str(info["source"]),
+        missing=missing,
+        unexpected=unexpected,
+    )
     info["missing"] = len(missing)
     info["unexpected"] = len(unexpected)
 
@@ -509,6 +893,13 @@ def load_scene_flow_ckpt(
     if isinstance(payload, dict) and "scaffold_packer" in payload:
         sp_missing, sp_unexpected = assembler.scaffold_packer.load_state_dict(
             _strip_module(payload["scaffold_packer"]), strict=False
+        )
+        _raise_on_state_dict_mismatch(
+            ckpt_path=ckpt_path,
+            module_name="FlowFeatureAssembler.scaffold_packer",
+            source="scaffold_packer",
+            missing=sp_missing,
+            unexpected=sp_unexpected,
         )
         info["scaffold_packer_missing"] = len(sp_missing)
         info["scaffold_packer_unexpected"] = len(sp_unexpected)
@@ -566,62 +957,33 @@ def _item_for_subset(
     idx: int,
     subset_t: torch.Tensor,
 ) -> dict[str, Any]:
-    """Reproduce ``WaymoFlowCacheDataset.__getitem__`` for an EXPLICIT frame
-    subset (no random sampling, payload loaded once by the caller).
-
-    Uses the dataset's own ``_build_*`` / ``_subset_*`` methods so every
-    per-frame tensor — including the flattened asset KV, cameras,
-    phase1_localized and pass2 splat cache — is sliced consistently, exactly
-    as the trainer does for its random windows.
+    """Build the same item shape as ``WaymoFlowCacheDataset.__getitem__`` for
+    an explicit validation window, while preserving the sample needed for RGB
+    rendering even when the cache uses the fast SceneFlow path.
     """
-    mode_kind = str(payload["mode_kind"])
-    meta = payload["meta"]
-    sample = dataset._build_sample(payload, subset_t)
-    sample["mode_kind"] = mode_kind
-    sample["cache_index"] = int(
-        entry.get("index", payload.get("meta", {}).get("manifest_index", idx))
+    item = dataset._build_item_from_payload(
+        payload=payload,
+        entry=entry,
+        cache_path=cache_path,
+        subset_t=subset_t,
+        subset_payload=subset_t,
     )
-    predictions = dataset._build_predictions(payload, subset_t)
-    if mode_kind == "mode_a":
-        asset_pass_result = dataset._build_asset_pass(payload, subset_t)
-        mode_b_block = None
-    else:
-        patch_grid = tuple(int(v) for v in meta["patch_grid"])
-        asset_pass_result = _empty_asset_pass(patch_grid, int(meta["patch_start_idx"]))
-        mode_b_block = dataset._build_mode_b(payload, subset_t)
-    cameras_dggt = dataset._build_cameras_dggt(payload, subset_t)
-    alignment = dataset._build_alignment(payload)
-
-    phase1_localized_subset = None
-    if mode_kind == "mode_a":
-        phase1_payload = payload.get("phase1_localized")
-        if phase1_payload is None:
-            raise RuntimeError(f"Mode-A cache {cache_path} missing phase1_localized.")
-        phase1_localized_subset = dataset._subset_phase1_localized(phase1_payload, subset_t)
-    pass2_payload = payload.get("pass2_splatted_tok_low")
-    if pass2_payload is None:
-        raise RuntimeError(f"Cache {cache_path} missing pass2_splatted_tok_low.")
-    splatted_tok_low_cached = dataset._subset_pass2_splatted_tok_low(
-        pass2_payload, subset_t, dtype=dataset.lut_dtype
-    )
-    return {
-        "sample": sample,
-        "predictions": predictions,
-        "asset_pass_result": asset_pass_result,
-        "cameras_dggt": cameras_dggt,
-        "alignment": alignment,
-        "mode_kind": mode_kind,
-        "mode_b": mode_b_block,
-        "subset_frames": subset_t,
-        "cache_path": str(cache_path),
-        "phase1_localized": phase1_localized_subset,
-        "splatted_tok_low_cached": splatted_tok_low_cached,
-        "cache_schema_version": int(payload["schema_version"]),
-    }
+    if "sample" not in item:
+        mode_kind = str(payload["mode_kind"])
+        sample = dataset._build_sample(payload, subset_t)
+        sample["mode_kind"] = mode_kind
+        sample["cache_index"] = int(
+            entry.get("index", payload.get("meta", {}).get("manifest_index", idx))
+        )
+        item["sample"] = sample
+    variant = entry.get("variant") or payload.get("meta", {}).get("variant")
+    if variant is not None:
+        item["validation_variant"] = str(variant)
+    return item
 
 
 def _make_batch(sample: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
-    """render_validation_rgb expects a raw-batch dict (B,S,...) of cached frames."""
+    """render_validation_rgb_gt_sky expects a raw-batch dict (B,S,...) of cached frames."""
     return {
         "images": sample["images"].unsqueeze(0).to(device),
         "masks": sample["masks"].unsqueeze(0).to(device),
@@ -689,9 +1051,11 @@ def main() -> None:
         min_frames=1,
         max_frames=1,
         seed=args.seed,
+        caption_root=None if bool(args.no_text_condition) else args.caption_root,
     )
     patch_grid = _infer_cache_patch_grid(dataset)
     args.patch_grid = (int(patch_grid[0]), int(patch_grid[1]))
+    args.sky_grid = (int(args.sky_grid_h), int(args.sky_grid_w))
     h_splat, w_splat = patch_grid[0] * 4, patch_grid[1] * 4
     print(f"[setup] cache patch_grid={patch_grid} H_splat={h_splat} W_splat={w_splat} "
           f"rows={len(dataset)}", flush=True)
@@ -722,6 +1086,10 @@ def main() -> None:
         patch_grid=patch_grid,
         in_channels=sf_in_channels,
         out_channels=int(args.latent_dim),
+        sky_token_dim=SKY_TOKEN_DIM,
+        sky_grid=args.sky_grid,
+        max_sky_tokens=int(args.sky_grid[0] * args.sky_grid[1]),
+        prediction_type=args.prediction_type,
     ).to(device)
     ckpt_info = load_scene_flow_ckpt(
         scene_flow, assembler, args.scene_flow_ckpt_path, args.no_ema, device
@@ -735,6 +1103,7 @@ def main() -> None:
               "pass --feature_stats_path if normalization was used in training.",
               flush=True)
     scene_flow.eval()
+    text_encoder = setup_text_encoder(args, device)
 
     # Index selection.
     n = len(dataset)
@@ -763,9 +1132,19 @@ def main() -> None:
         num_frames = int(payload["meta"]["num_frames"])
         windows = _window_starts(num_frames, args.window, args.window_stride)
 
-        # Full-clip sample (no model) for naming + the stitched final render.
+        # Full-clip bundle drives stepwise sliding sampling; model forward still
+        # receives only window slices, so asset/camera token counts stay bounded.
         all_frames_t = torch.arange(num_frames, dtype=torch.long)
-        sample_full = dataset._build_sample(payload, all_frames_t)
+        item_full = _item_for_subset(
+            dataset, payload, entry, cache_path, idx, all_frames_t
+        )
+        bundle_full, sample_full = build_bundle(item_full, assembler, device)
+        ldim_full = int(bundle_full.z_clean.shape[-1])
+        if ldim_full != int(args.latent_dim):
+            raise ValueError(
+                f"bundle latent_dim={ldim_full} != --latent_dim={args.latent_dim}; "
+                f"set --latent_dim {ldim_full} to match this cache/tokenizer."
+            )
         tag = _entry_tag(entry, sample_full, str(cache_path))
         out_dir = root / tag
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -774,12 +1153,13 @@ def main() -> None:
               f"windows={[ (w[0], w[-1]) for w in windows ]} -> {out_dir}",
               flush=True)
 
-        # Lazily-allocated full-clip stitch buffers (NORMALIZED latent space).
-        z_clean_full: torch.Tensor | None = None
+        z_clean_full = sf.normalize(bundle_full.z_clean.float())
+        Mp_full = bundle_full.M_preserve.float()
+        Ms_full = bundle_full.M_source.float()
+        Md_full = bundle_full.M_dest.float()
         z_edit_full: dict[float, torch.Tensor] = {}
-        Mp_full = Ms_full = Md_full = None
-        cnt = torch.zeros(num_frames, device=device)
         window_summaries: list[dict[str, Any]] = []
+        window_records: list[dict[str, Any]] = []
 
         for wi, fsel in enumerate(windows):
             a, b = fsel[0], fsel[-1] + 1
@@ -805,91 +1185,89 @@ def main() -> None:
                 save_masks=True, save_coverage=True, save_scaffold=True,
                 save_splat_pca=args.splat_pca,
             )
-
-            B = int(bundle_w.z_clean.shape[0])
-            P = int(bundle_w.z_clean.shape[2])
-            if z_clean_full is None:
-                z_clean_full = torch.zeros(B, num_frames, P, ldim, device=device)
-                Mp_full = torch.zeros(B, num_frames, P, 1, device=device)
-                Ms_full = torch.zeros(B, num_frames, P, 1, device=device)
-                Md_full = torch.zeros(B, num_frames, P, 1, device=device)
-
-            z_clean_full[:, a:b] += sf.normalize(bundle_w.z_clean.float())
-            Mp_full[:, a:b] += bundle_w.M_preserve.float()
-            Ms_full[:, a:b] += bundle_w.M_source.float()
-            Md_full[:, a:b] += bundle_w.M_dest.float()
-            cnt[a:b] += 1.0
-
-            win_scales: list[dict[str, Any]] = []
-            for scale in guidance_scales:
-                z_edit_w = cfg_sample_edit_latents(
-                    scene_flow, bundle_w, args, device,
-                    guidance_scale=scale,
-                    seed=int(args.seed) + idx * 1000 + wi,
-                )
-                if scale not in z_edit_full:
-                    z_edit_full[scale] = torch.zeros(
-                        B, num_frames, P, ldim, device=device
-                    )
-                z_edit_full[scale][:, a:b] += z_edit_w
-
-                if args.render_per_window and not args.no_render_rgb:
-                    if cuda:
-                        torch.cuda.empty_cache()
-                    rgb = render_validation_rgb(
-                        _make_batch(sample_w, device),
-                        vggt_model, scene_flow, z_edit_w, args, device,
-                    )
-                    _save_rgb_grids(
-                        rgb, win_dir, f"__cfg{scale:g}",
-                        min(int(args.val_log_images), len(fsel)),
-                        write_refs=(scale == guidance_scales[0]),
-                    )
-                    del rgb
-                    if cuda:
-                        torch.cuda.empty_cache()
-                win_scales.append({
-                    "guidance_scale": scale,
-                    "abs_error_mean": float(
-                        (z_edit_w - sf.normalize(bundle_w.z_clean.float()))
-                        .abs().mean().item()
-                    ),
-                })
+            save_gt_rgb_grid_from_sample(
+                sample_w,
+                win_dir,
+                min(int(args.val_log_images), len(fsel)),
+            )
 
             window_summaries.append({
                 "window": [fsel[0], fsel[-1]],
+                "shift": float(args.shift),
+                "asset_condition_kind": getattr(bundle_w, "asset_condition_kind", None),
                 "flow_features": win_flow_summary,
-                "per_scale": win_scales,
+                "per_scale": [],
             })
-            del bundle_w, sample_w, item_w
+            window_records.append({
+                "start": a,
+                "end": b,
+                "frames": list(fsel),
+                "sample": sample_w,
+                "win_dir": win_dir,
+                "summary_index": len(window_summaries) - 1,
+            })
+            del bundle_w, item_w
             if cuda:
                 torch.cuda.empty_cache()
-
-        # Average the window overlap so every frame is in [stitched] exactly once.
-        denom = cnt.clamp_min(1.0).view(1, num_frames, 1, 1)
-        z_clean_full = z_clean_full / denom
-        Mp_full = Mp_full / denom
-        Ms_full = Ms_full / denom
-        Md_full = Md_full / denom
-        for scale in z_edit_full:
-            z_edit_full[scale] = z_edit_full[scale] / denom
 
         frames = min(int(args.val_log_images), num_frames)
         save_clean_mask_grids(
             z_clean_full, Mp_full, Ms_full, Md_full, out_dir, args, frames
         )
+        save_gt_rgb_grid_from_sample(sample_full, out_dir, frames)
 
         scale_summaries: list[dict[str, Any]] = []
         for scale in guidance_scales:
             suffix = f"__cfg{scale:g}"
+            z_edit_full[scale] = cfg_sample_edit_latents(
+                scene_flow,
+                bundle_full,
+                args,
+                device,
+                guidance_scale=scale,
+                seed=int(args.seed) + idx * 1000,
+                text_encoder=text_encoder,
+                sliding_window=int(args.window),
+                sliding_stride=int(args.window_stride),
+            )
             save_edit_grids(
                 z_edit_full[scale], z_clean_full, out_dir, args, suffix, frames
             )
+            for record in window_records:
+                a = int(record["start"])
+                b = int(record["end"])
+                z_edit_w = z_edit_full[scale][:, a:b]
+                z_clean_w = z_clean_full[:, a:b]
+                window_summaries[int(record["summary_index"])]["per_scale"].append({
+                    "guidance_scale": scale,
+                    "abs_error_mean": float((z_edit_w - z_clean_w).abs().mean().item()),
+                })
+                if args.render_per_window and not args.no_render_rgb:
+                    if cuda:
+                        torch.cuda.empty_cache()
+                    rgb = render_validation_rgb_gt_sky(
+                        _make_batch(record["sample"], device),
+                        vggt_model,
+                        scene_flow,
+                        z_edit_w,
+                        args,
+                        device,
+                    )
+                    _save_rgb_grids(
+                        rgb,
+                        record["win_dir"],
+                        suffix,
+                        min(int(args.val_log_images), len(record["frames"])),
+                        write_refs=(scale == guidance_scales[0]),
+                    )
+                    del rgb
+                    if cuda:
+                        torch.cuda.empty_cache()
             # Default: ONE stitched full-clip render (per-window already done above).
             if not args.no_render_rgb and not args.render_per_window:
                 if cuda:
                     torch.cuda.empty_cache()
-                rgb = render_validation_rgb(
+                rgb = render_validation_rgb_gt_sky(
                     _make_batch(sample_full, device),
                     vggt_model, scene_flow, z_edit_full[scale], args, device,
                 )
@@ -923,17 +1301,20 @@ def main() -> None:
             "render_per_window": bool(args.render_per_window),
             "patch_grid": list(args.patch_grid),
             "guidance_scales": guidance_scales,
+            "asset_control_guidance_scale": float(args.asset_control_guidance_scale),
             "sample_steps": int(args.sample_steps),
             "shift": float(args.shift),
-            "cond_norm": args.cond_norm,
-            "preserve_blend": not args.no_preserve_blend,
+            "prediction_type": str(args.prediction_type),
+            "non_edit_clamp": "z_splat_each_step",
+            "legacy_clean_preserve_blend": False,
+            "sliding_sampling": "stepwise_velocity_blend",
             "ckpt": ckpt_info,
             "per_scale_stitched": scale_summaries,
             "windows": window_summaries,
         }
         (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
         all_summaries.append({"row_index": idx, "tag": tag, "output_dir": str(out_dir)})
-        del z_clean_full, z_edit_full, Mp_full, Ms_full, Md_full, payload
+        del z_clean_full, z_edit_full, Mp_full, Ms_full, Md_full, payload, bundle_full, item_full, window_records
         if cuda:
             torch.cuda.empty_cache()
 

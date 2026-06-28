@@ -824,11 +824,18 @@ def load_chunked_flow_cache_subset(
     with _open_chunked_ro(path) as conn:
         summary = _get_info(conn, "summary")
         meta_full = _get_chunk(conn, dctx, "global/meta")
-        fast_scene_flow = consumer == "scene_flow_fast" and bool(summary.get("has_flow_inputs", False))
+        fast_scene_flow = consumer in ("scene_flow_fast", "scene_flow_fast_sky") and bool(
+            summary.get("has_flow_inputs", False)
+        )
+        include_fast_raw = consumer == "scene_flow_fast_sky"
         object_meta_full = None if fast_scene_flow else _get_chunk(conn, dctx, "global/object_meta")
         phase1_alignment = {} if fast_scene_flow else _get_chunk(conn, dctx, "global/phase1_alignment")
 
-        raw_chunks = [] if fast_scene_flow else [_get_chunk(conn, dctx, f"frame/{f:02d}/raw") for f in subset_list]
+        raw_chunks = (
+            [_get_chunk(conn, dctx, f"frame/{f:02d}/raw") for f in subset_list]
+            if (not fast_scene_flow or include_fast_raw)
+            else []
+        )
         pass1_head_chunks = [] if fast_scene_flow else [_get_chunk(conn, dctx, f"frame/{f:02d}/pass1_heads") for f in subset_list]
         scene_lut_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/scene_lut") for f in subset_list]
         pass2_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/pass2") for f in subset_list]
@@ -879,7 +886,7 @@ def load_chunked_flow_cache_subset(
             "dino_tokens_patch_scale": None,
             "dino_tokens_special": None,
         }
-        raw = {} if fast_scene_flow else {
+        raw = {} if fast_scene_flow and not include_fast_raw else {
             "images_u8": torch.stack([chunk["images_u8"] for chunk in raw_chunks], dim=0).contiguous(),
             "sky_mask": torch.stack([chunk["sky_mask"] for chunk in raw_chunks], dim=0).contiguous(),
             "dynamic_mask": _stack_optional([chunk.get("dynamic_mask") for chunk in raw_chunks]),

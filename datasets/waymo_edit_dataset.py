@@ -141,6 +141,61 @@ def load_and_preprocess_images(image_path_list):
     return images
 
 
+def load_and_preprocess_binary_masks(mask_path_list, threshold=0.5):
+    if len(mask_path_list) == 0:
+        raise ValueError("At least 1 mask is required")
+
+    masks = []
+    shapes = set()
+    target_size = 518
+
+    for mask_path in mask_path_list:
+        mask = Image.open(mask_path).convert("L")
+
+        width, height = mask.size
+        new_width = target_size
+        new_height = round(height * (new_width / width) / 14) * 14
+        mask = mask.resize((new_width, new_height), Image.Resampling.NEAREST)
+        mask = torch.ByteTensor(torch.ByteStorage.from_buffer(mask.tobytes()))
+        mask = mask.view(new_height, new_width).float().div(255.0).unsqueeze(0)
+
+        if new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            mask = mask[:, start_y : start_y + target_size, :]
+
+        mask = mask.gt(float(threshold)).to(torch.float32)
+        mask = mask.expand(3, -1, -1).contiguous()
+
+        shapes.add((mask.shape[1], mask.shape[2]))
+        masks.append(mask)
+
+    if len(shapes) > 1:
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+        padded_masks = []
+        for mask in masks:
+            h_padding = max_height - mask.shape[1]
+            w_padding = max_width - mask.shape[2]
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+                mask = torch.nn.functional.pad(
+                    mask,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=0.0,
+                )
+            padded_masks.append(mask)
+        masks = padded_masks
+
+    masks = torch.stack(masks)
+    if len(mask_path_list) == 1 and masks.dim() == 3:
+        masks = masks.unsqueeze(0)
+    return masks
+
+
 def load_json(path, default=None):
     path = Path(path)
     if path.is_file():
@@ -1112,6 +1167,12 @@ class WaymoEditDataset(Dataset):
             return load_and_preprocess_images(path_list)
         raise ValueError(f"Failed to load images from {path_list}")
 
+    def _load_optional_mask_stack(self, path_list, like_tensor):
+        valid = [path for path in path_list if path and Path(path).is_file()]
+        if len(valid) == len(path_list) and len(valid) > 0:
+            return load_and_preprocess_binary_masks(path_list)
+        raise ValueError(f"Failed to load masks from {path_list}")
+
     def _load_optional_depth_stack(self, path_list, like_tensor):
         valid = [path for path in path_list if path and Path(path).is_file()]
         if len(valid) == len(path_list) and len(valid) > 0:
@@ -1662,8 +1723,8 @@ class WaymoEditDataset(Dataset):
                         resolve_image_path(dynamic_root, frame_idx, cam_id) if dynamic_root is not None else ""
                     )
             images = load_and_preprocess_images(image_paths)
-            sky_masks = self._load_optional_image_stack(sky_mask_paths, images)
-            dynamic_masks = self._load_optional_image_stack(dynamic_mask_paths, images)
+            sky_masks = self._load_optional_mask_stack(sky_mask_paths, images)
+            dynamic_masks = self._load_optional_mask_stack(dynamic_mask_paths, images)
             sample = self._build_base_sample(
                 record=record,
                 sample_index=sample_index,
@@ -1711,8 +1772,8 @@ class WaymoEditDataset(Dataset):
                 depth_flow_paths.append(str(depth_path) if depth_path.is_file() else "")
 
         images = load_and_preprocess_images(image_paths)
-        sky_masks = self._load_optional_image_stack(sky_mask_paths, images)
-        dynamic_masks = self._load_optional_image_stack(dynamic_mask_paths, images)
+        sky_masks = self._load_optional_mask_stack(sky_mask_paths, images)
+        dynamic_masks = self._load_optional_mask_stack(dynamic_mask_paths, images)
         gt_depth = self._load_optional_depth_stack(depth_flow_paths, images)
 
         timestamps = self._build_normalized_timestamps(local_indices)

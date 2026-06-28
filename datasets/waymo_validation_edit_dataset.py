@@ -43,6 +43,7 @@ from datasets.waymo_edit_dataset import (
     build_box_corners_world,
     build_intrinsic_matrix,
     compose_waymo_camera_to_world,
+    load_and_preprocess_binary_masks,
     load_and_preprocess_images,
     numpy_like_to_torch,
     read_image_size,
@@ -294,9 +295,9 @@ class WaymoValidationEditDataset:
                     else ""
                 )
         images = load_and_preprocess_images(image_paths)
-        sky_masks = load_and_preprocess_images(sky_paths)
+        sky_masks = load_and_preprocess_binary_masks(sky_paths)
         if all(p and Path(p).is_file() for p in dyn_paths):
-            dynamic_masks = load_and_preprocess_images(dyn_paths)
+            dynamic_masks = load_and_preprocess_binary_masks(dyn_paths)
         else:
             dynamic_masks = torch.zeros_like(images)
         model_hw = (int(images.shape[-2]), int(images.shape[-1]))

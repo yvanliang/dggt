@@ -1,6 +1,11 @@
-"""PerTokenNoiseScheduler — per-token noise level + z_init composition.
+"""Legacy PerTokenNoiseScheduler — per-token noise level + z_init composition.
 
 Implements research_plan.md §3.5.3 (t_tok) and §3.5.4 (z_init).
+
+Current RAEv2/FlowMatch SceneFlow training and inference do not use this
+module. Noisy states are constructed in the train/sampling loop from the global
+FlowMatch sigma, and per-token edit state is passed through `VIDEO_STATE_DIM`.
+This helper is kept for old experiments and tests only.
 
 * `t_tok[b,s,p,1] = clip(base_t * (M_source + gamma_dest * M_dest)
                          + (1 - M_preserve) * eps_floor, 0, 1)`

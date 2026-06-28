@@ -52,22 +52,6 @@ def concat_list(list_1, list_2):
     return concated_list
 
 
-def get_masked_gs(point_map, gs_map, mask, idx=None):
-    # point_map: B,S,H,W,3
-    # gs_map: B,S,H,W,C
-    # mask:, B,S,H,W
-    if idx is not None:
-        point_map = point_map[:,idx,...]
-        gs_map = gs_map[:,idx,...]
-        mask = mask[:,idx,...]
-    world_points = point_map[mask].reshape(-1, 3)
-    rgbs = gs_map[...,:3][mask].reshape(-1, 3)
-    opacity = gs_map[...,:3:4][mask].reshape(-1)
-    scales = gs_map[...,4:7][mask].reshape(-1, 3)
-    rotation = gs_map[...,7:11][mask].reshape(-1, 4)
-    return world_points, rgbs, opacity, scales, rotation
-
-
 def get_split_gs(gs_map, mask):
     rgbs = gs_map[..., :3][mask].reshape(-1, 3)
     opacity = gs_map[..., 3:4][mask].reshape(-1)
@@ -120,4 +104,3 @@ def downsample_3dgs(points, rgbs, opacity, scales, rotation, num_points=200000):
         scales[indices],
         rotation[indices]
     )
-

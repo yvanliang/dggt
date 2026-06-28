@@ -104,7 +104,7 @@ def main(args):
         for batch in dataloader:
             images = batch['images'].to(device)
             sky_mask = batch['masks'].to(device).permute(0, 1, 3, 4, 2)
-            bg_mask = (sky_mask == 0).any(dim=-1)
+            bg_mask = (sky_mask < 0.5).any(dim=-1)
             timestamps = batch['timestamps'][0].to(device)
 
             if 'dynamic_mask' in batch:

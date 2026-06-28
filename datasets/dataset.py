@@ -10,6 +10,60 @@ import open3d as o3d
 from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
+import json
+
+
+WAYMO_OPENCV2DATASET = np.array(
+    [
+        [0, 0, 1, 0],
+        [-1, 0, 0, 0],
+        [0, -1, 0, 0],
+        [0, 0, 0, 1],
+    ],
+    dtype=np.float32,
+)
+
+
+def _normalize_waymo_caption_base(name):
+    base = os.path.basename(str(name).lstrip("\ufeff").rstrip("/"))
+    if base.endswith(".tfrecord"):
+        base = base[: -len(".tfrecord")]
+    if base.startswith("segment-"):
+        base = base[len("segment-"):]
+    suffix = "_with_camera_labels"
+    if base.endswith(suffix):
+        base = base[:-len(suffix)]
+    return base
+
+
+def _load_waymo_matrix4(path, name):
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"Missing Waymo {name}: {path}")
+    values = np.loadtxt(path, dtype=np.float32)
+    if values.size != 16:
+        raise ValueError(f"Waymo {name} must contain 16 values, got shape {values.shape}: {path}")
+    return values.reshape(4, 4).astype(np.float32)
+
+
+def _load_waymo_intrinsics_matrix(path):
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"Missing Waymo intrinsics: {path}")
+    values = np.loadtxt(path, dtype=np.float32)
+    if values.shape == (3, 3):
+        return values.astype(np.float32)
+    flat = values.reshape(-1)
+    if flat.size < 4:
+        raise ValueError(f"Waymo intrinsics must contain at least fx, fy, cx, cy: {path}")
+    fx, fy, cx, cy = [float(v) for v in flat[:4]]
+    return np.array(
+        [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
 
 def resize_flow(flow, target_size):
     height, width = flow.shape[-3:-1]
@@ -136,8 +190,80 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     return images
 
 
+def load_and_preprocess_binary_masks(mask_path_list, mode="crop", threshold=0.5):
+    # Check for empty list
+    if len(mask_path_list) == 0:
+        raise ValueError("At least 1 mask is required")
+
+    masks = []
+    shapes = set()
+    to_tensor = TF.ToTensor()
+    target_size = 518
+
+    for mask_path in mask_path_list:
+        mask = Image.open(mask_path).convert("L")
+
+        width, height = mask.size
+        new_width = target_size
+        new_height = round(height * (new_width / width) / 14) * 14
+
+        mask = mask.resize((new_width, new_height), Image.Resampling.NEAREST)
+        mask = to_tensor(mask)
+
+        if new_height > target_size:
+            start_y = (new_height - target_size) // 2
+            mask = mask[:, start_y : start_y + target_size, :]
+
+        mask = mask.gt(float(threshold)).to(torch.float32)
+        mask = mask.expand(3, -1, -1).contiguous()
+
+        shapes.add((mask.shape[1], mask.shape[2]))
+        masks.append(mask)
+
+    if len(shapes) > 1:
+        print(f"Warning: Found masks with different shapes: {shapes}")
+        max_height = max(shape[0] for shape in shapes)
+        max_width = max(shape[1] for shape in shapes)
+
+        padded_masks = []
+        for mask in masks:
+            h_padding = max_height - mask.shape[1]
+            w_padding = max_width - mask.shape[2]
+
+            if h_padding > 0 or w_padding > 0:
+                pad_top = h_padding // 2
+                pad_bottom = h_padding - pad_top
+                pad_left = w_padding // 2
+                pad_right = w_padding - pad_left
+
+                mask = torch.nn.functional.pad(
+                    mask, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0
+                )
+            padded_masks.append(mask)
+        masks = padded_masks
+
+    masks = torch.stack(masks)
+    if len(mask_path_list) == 1 and masks.dim() == 3:
+        masks = masks.unsqueeze(0)
+
+    return masks
+
+
 class WaymoOpenDataset(Dataset):
-    def __init__(self, image_dir, scene_names = None, sequence_length= None, start_idx = -1, mode=1, views=1, intervals=2):
+    def __init__(
+        self,
+        image_dir,
+        scene_names=None,
+        sequence_length=None,
+        start_idx=-1,
+        mode=1,
+        views=1,
+        intervals=2,
+        caption_root=None,
+        scene_name_to_index_path="/data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/metadata/training/scene_name_to_index.json",
+        waymo_train_list_path=None,
+        waymo_val_list_path=None,
+    ):
         #mode 1 : train
         #mode 2 : pure reconstruction
         #mode 3 : interplation
@@ -168,6 +294,15 @@ class WaymoOpenDataset(Dataset):
         self.test_mode = test_mode
         self.load_flow = load_flow
         self.views = views
+        self.caption_root = caption_root
+        self.scene_name_to_index_path = scene_name_to_index_path
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.waymo_train_list_path = waymo_train_list_path or os.path.join(repo_root, "data", "waymo_train_list_full.txt")
+        self.waymo_val_list_path = waymo_val_list_path or os.path.join(repo_root, "data", "waymo_val_list_full.txt")
+        self.scene_name_to_base = self._build_scene_name_to_base(
+            scene_name_to_index_path=scene_name_to_index_path,
+            image_dir=image_dir,
+        )
 
         # Scan all scene folders and collect image paths
         if scene_names is None:
@@ -248,6 +383,8 @@ class WaymoOpenDataset(Dataset):
                 if os.path.isdir(ego_path):
                     ego_path =  os.path.join(ego_path, "0.txt")
                     self.ego_paths.append(ego_path)
+                else:
+                    self.ego_paths.append("")
 
                 # intrinsic
                 intrinsic_path = os.path.join(image_dir, scene_name, "intrinsics")
@@ -319,8 +456,173 @@ class WaymoOpenDataset(Dataset):
                     self.semantic_mask_path.append([] if self.views == 1 else [[] for _ in range(3)])
 
 
+    def _build_scene_name_to_base(self, scene_name_to_index_path, image_dir):
+        mapping = self._load_scene_name_to_base(scene_name_to_index_path)
+        list_paths = self._get_preferred_waymo_list_paths(image_dir)
+        list_mapping = self._load_scene_name_to_base_from_lists(list_paths)
+        # Prefer explicit train/val list indexing for numeric scene ids (000, 001, ...).
+        mapping.update(list_mapping)
+        return mapping
+
+    def _get_preferred_waymo_list_paths(self, image_dir):
+        image_dir_l = str(image_dir).lower()
+        has_train = os.path.exists(self.waymo_train_list_path)
+        has_val = os.path.exists(self.waymo_val_list_path)
+        if "validation" in image_dir_l or "/val" in image_dir_l:
+            return [p for p in (self.waymo_val_list_path, self.waymo_train_list_path) if os.path.exists(p)]
+        if "training" in image_dir_l or "/train" in image_dir_l:
+            return [p for p in (self.waymo_train_list_path, self.waymo_val_list_path) if os.path.exists(p)]
+        if has_train and has_val:
+            return [self.waymo_train_list_path, self.waymo_val_list_path]
+        if has_train:
+            return [self.waymo_train_list_path]
+        if has_val:
+            return [self.waymo_val_list_path]
+        return []
+
+    def _load_scene_name_to_base_from_lists(self, paths):
+        mapping = {}
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8-sig") as f:
+                    lines = [line.strip().lstrip("\ufeff") for line in f if line.strip()]
+            except Exception as exc:
+                if self.caption_root:
+                    raise RuntimeError(f"Failed to read Waymo list file: {path}") from exc
+                continue
+            for idx, item in enumerate(lines):
+                key = f"{idx:03d}"
+                if key not in mapping:
+                    mapping[key] = _normalize_waymo_caption_base(item)
+        return mapping
+
+
+    def _load_scene_name_to_base(self, path):
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except Exception as exc:
+            if self.caption_root:
+                raise RuntimeError(f"Failed to read scene_name_to_index mapping: {path}") from exc
+            return {}
+        if not isinstance(data, dict):
+            if self.caption_root:
+                raise ValueError(f"scene_name_to_index mapping must be a JSON object: {path}")
+            return {}
+        mapping = {}
+        for key, value in data.items():
+            key_s = str(key)
+            value_s = str(value)
+            if value_s.isdigit():
+                mapping[value_s.zfill(3)] = _normalize_waymo_caption_base(key_s)
+            if key_s.isdigit():
+                mapping[key_s.zfill(3)] = _normalize_waymo_caption_base(value_s)
+        return mapping
+
+    def _load_caption(self, scene_name, start_idx):
+        if not self.caption_root:
+            return None
+        scene_key = str(scene_name).zfill(3) if str(scene_name).isdigit() else str(scene_name)
+        scene_base = self.scene_name_to_base.get(scene_key, str(scene_name))
+        scene_base = _normalize_waymo_caption_base(scene_base)
+        clip_index = int(start_idx) // 29
+        path = os.path.join(str(self.caption_root), "pinhole_front", f"{scene_base}_{clip_index}.json")
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Caption file not found for scene={scene_name!r}, clip_index={clip_index}: {path}"
+            )
+        try:
+            with open(path, "r") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read caption JSON: {path}") from exc
+        if isinstance(payload, dict):
+            caption = payload.get("caption")
+            if caption is not None:
+                return str(caption)
+            raise KeyError(f"Caption JSON lacks 'caption': {path}")
+        raise ValueError(f"Caption JSON must be an object with key 'caption': {path}")
+
+
     def __len__(self):
         return len(self.scenes)
+
+    def _sample_start_within_caption_trunk(self, total_frames, trunk_frames=29):
+        """Sample a contiguous raw-pretrain window without crossing caption trunks."""
+        sequence_length = int(self.sequence_length)
+        total_frames = int(total_frames)
+        trunk_frames = int(trunk_frames)
+        if sequence_length <= 0:
+            raise ValueError(f"sequence_length must be positive, got {self.sequence_length}")
+        if total_frames <= sequence_length:
+            return 0
+        valid_trunks = []
+        for base in range(0, total_frames - trunk_frames + 1, trunk_frames):
+            end = base + trunk_frames
+            if end - base >= sequence_length:
+                valid_trunks.append((base, end))
+        if not valid_trunks:
+            return random.randint(0, max(0, total_frames - sequence_length))
+        base, end = random.choice(valid_trunks)
+        return random.randint(base, end - sequence_length)
+
+    def _fixed_start_within_caption_trunk(self, total_frames, trunk_frames=29):
+        """Return a deterministic start index without crossing caption trunks."""
+        sequence_length = int(self.sequence_length)
+        total_frames = int(total_frames)
+        trunk_frames = int(trunk_frames)
+        if sequence_length <= 0:
+            raise ValueError(f"sequence_length must be positive, got {self.sequence_length}")
+        max_start = max(0, total_frames - sequence_length)
+        start = min(max(0, int(self.start_idx)), max_start)
+        if total_frames <= sequence_length:
+            return 0
+
+        trunk_base = (start // trunk_frames) * trunk_frames
+        trunk_end = min(trunk_base + trunk_frames, total_frames)
+        if trunk_end - trunk_base < sequence_length:
+            return min(trunk_base, max_start)
+        if start + sequence_length > trunk_end:
+            start = trunk_end - sequence_length
+        return min(max(trunk_base, start), max_start)
+
+    def _load_front_waymo_camera_gt(self, idx, indices, image_seq):
+        if self.views != 1:
+            raise ValueError("Raw Waymo camera GT loading currently expects front-camera views=1 clips.")
+        ego_pose_paths = self.extrinsic_paths[idx]
+        camera_extrinsic_path = self.ego_paths[idx] if idx < len(self.ego_paths) else ""
+        intrinsic_path = self.intrinsic_paths[idx]
+        if isinstance(intrinsic_path, (list, tuple)):
+            intrinsic_path = intrinsic_path[0] if len(intrinsic_path) > 0 else ""
+        if len(ego_pose_paths) == 0:
+            raise RuntimeError(f"Scene {self.scenes[idx]} is missing ego_pose/*.txt files.")
+        if max(indices) >= len(ego_pose_paths):
+            raise RuntimeError(
+                f"Scene {self.scenes[idx]} has {len(ego_pose_paths)} ego poses, "
+                f"but clip needs frame {max(indices)}."
+            )
+
+        cam_to_ego = _load_waymo_matrix4(camera_extrinsic_path, "front camera extrinsics")
+        cam_to_ego = (cam_to_ego @ WAYMO_OPENCV2DATASET).astype(np.float32)
+        ego_to_world_start = _load_waymo_matrix4(ego_pose_paths[indices[0]], "ego pose")
+        ego_start_inv = np.linalg.inv(ego_to_world_start).astype(np.float32)
+        camera_to_world = []
+        for frame_idx in indices:
+            ego_to_world = _load_waymo_matrix4(ego_pose_paths[frame_idx], "ego pose")
+            camera_to_world.append((ego_start_inv @ ego_to_world @ cam_to_ego).astype(np.float32))
+        camera_to_world = np.stack(camera_to_world, axis=0)[:, None]
+
+        intrinsics = _load_waymo_intrinsics_matrix(intrinsic_path)[None]
+        with Image.open(image_seq[0]) as img:
+            raw_width, raw_height = img.size
+        raw_image_size_hw = torch.tensor([int(raw_height), int(raw_width)], dtype=torch.long)
+        return (
+            torch.from_numpy(camera_to_world).float(),
+            torch.from_numpy(intrinsics).float(),
+            raw_image_size_hw,
+        )
 
     def __getitem__(self, idx):
         image_paths = self.image_paths[idx]
@@ -329,7 +631,13 @@ class WaymoOpenDataset(Dataset):
         semantic_mask_paths = self.semantic_mask_path[idx]
 
         total_frames = len(image_paths[0] if self.views == 3 else image_paths)
-        start_idx = random.randint(0, max(0, total_frames - self.sequence_length))
+        start_idx = (
+            self._fixed_start_within_caption_trunk(total_frames)
+            if self.mode == 1 and int(self.start_idx) >= 0
+            else self._sample_start_within_caption_trunk(total_frames)
+            if self.mode == 1
+            else 0
+        )
 
         if self.mode == 1:
             indices = list(range(start_idx, start_idx + self.sequence_length))
@@ -348,38 +656,54 @@ class WaymoOpenDataset(Dataset):
             #sky masks
             if self.views == 1:
                 mask_seq = [sky_mask_paths[i] for i in indices]
-                masks = load_and_preprocess_images(mask_seq)  # [S, C, H, W]
+                masks = load_and_preprocess_binary_masks(mask_seq)  # [S, C, H, W]
             elif self.views == 3:
                 mask_seq = []
                 for i in indices:
                     for v in range(3):
                         mask_seq.append(sky_mask_paths[v][i])
-                masks = load_and_preprocess_images(mask_seq)  # [S*3, C, H, W]
+                masks = load_and_preprocess_binary_masks(mask_seq)  # [S*3, C, H, W]
 
             timestamps = np.array(indices) - start_idx
             timestamps = timestamps / timestamps[-1] * (self.sequence_length / 4)
+            frame_ids = np.array(indices, dtype=np.int64) - int(start_idx // 29) * 29
             if self.views == 3:
                 timestamps = np.repeat(timestamps, 3)
+                frame_ids = np.repeat(frame_ids, 3)
 
             input_dict = {
                 "images": images,
                 "masks": masks,
                 "image_paths": seq,
                 "timestamps": timestamps,
+                "frame_ids": frame_ids,
                 "interval": [1] * (self.sequence_length - 1),
+                "scene_name": self.scenes[idx],
+                "start_idx": start_idx,
+                "clip_index": start_idx // 29,
             }
+            caption = self._load_caption(self.scenes[idx], start_idx)
+            if caption is not None:
+                if self.views == 1:
+                    caption = caption.replace("multi-camera", "front-camera")
+                input_dict["caption"] = caption
 
+            if self.views == 1:
+                camera_to_world, intrinsics, raw_image_size_hw = self._load_front_waymo_camera_gt(idx, indices, seq)
+                input_dict["camera_to_world_corrected"] = camera_to_world
+                input_dict["intrinsics"] = intrinsics
+                input_dict["raw_image_size_hw"] = raw_image_size_hw
         
             if len(dynamic_mask_paths) > 0:
                 if self.views == 1:
                     dy_mask_seq = [dynamic_mask_paths[i] for i in indices]
-                    dynamic_mask = load_and_preprocess_images(dy_mask_seq)  # [S, C, H, W]
+                    dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)  # [S, C, H, W]
                 elif self.views == 3:
                     dy_mask_seq = []
                     for i in indices:
                         for v in range(3):
                             dy_mask_seq.append(dynamic_mask_paths[v][i])
-                    dynamic_mask = load_and_preprocess_images(dy_mask_seq)  # [S*3, C, H, W]
+                    dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)  # [S*3, C, H, W]
                 input_dict["dynamic_mask"] = dynamic_mask
 
             
@@ -407,8 +731,10 @@ class WaymoOpenDataset(Dataset):
             
             timestamps = np.array(indices) - start_idx
             timestamps = timestamps / timestamps[-1] * (self.sequence_length / 4)
+            frame_ids = np.array(indices, dtype=np.int64) - int(start_idx // 29) * 29
             if self.views == 3:
                 timestamps = np.repeat(timestamps, 3)
+                frame_ids = np.repeat(frame_ids, 3)
 
             #images
             if self.views == 1:
@@ -424,13 +750,13 @@ class WaymoOpenDataset(Dataset):
             #sky masks
             if self.views == 1:
                 mask_seq = [sky_mask_paths[i] for i in indices]
-                masks = load_and_preprocess_images(mask_seq)  # [S, C, H, W]
+                masks = load_and_preprocess_binary_masks(mask_seq)  # [S, C, H, W]
             elif self.views == 3:
                 mask_seq = []
                 for i in indices:
                     for v in range(3):
                         mask_seq.append(sky_mask_paths[v][i])
-                masks = load_and_preprocess_images(mask_seq)  # [S*3, C, H, W]
+                masks = load_and_preprocess_binary_masks(mask_seq)  # [S*3, C, H, W]
                 
 
 
@@ -439,18 +765,25 @@ class WaymoOpenDataset(Dataset):
                 "image_paths": seq,
                 "masks": masks,
                 "timestamps": timestamps,
+                "frame_ids": frame_ids,
                 "interval": intervals,
+                "scene_name": self.scenes[idx],
+                "start_idx": start_idx,
+                "clip_index": start_idx // 29,
             }
+            caption = self._load_caption(self.scenes[idx], start_idx)
+            if caption is not None:
+                input_dict["caption"] = caption
             if len(dynamic_mask_paths) > 0:
                 if self.views == 1:
                     dy_mask_seq = [dynamic_mask_paths[i] for i in indices]
-                    dynamic_mask = load_and_preprocess_images(dy_mask_seq)  # [S, C, H, W]
+                    dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)  # [S, C, H, W]
                 elif self.views == 3:
                     dy_mask_seq = []
                     for i in indices:
                         for v in range(3):
                             dy_mask_seq.append(dynamic_mask_paths[v][i])
-                    dynamic_mask = load_and_preprocess_images(dy_mask_seq)  # [S*3, C, H, W]
+                    dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)  # [S*3, C, H, W]
                 input_dict["dynamic_mask"] = dynamic_mask
 
             if len(self.depth_flow_paths) > 0 and len(self.depth_flow_paths[idx]) > 0:
@@ -515,21 +848,21 @@ class WaymoOpenDataset(Dataset):
             # sky masks
             if self.views == 1:
                 mask_seq = [sky_mask_paths[i] for i in indices]
-                masks = load_and_preprocess_images(mask_seq)  # [S, C, H, W]
+                masks = load_and_preprocess_binary_masks(mask_seq)  # [S, C, H, W]
                 target_mask_seq = [sky_mask_paths[i] for i in target_indices]
-                target_masks = load_and_preprocess_images(target_mask_seq)  # [T, C, H, W]
+                target_masks = load_and_preprocess_binary_masks(target_mask_seq)  # [T, C, H, W]
             elif self.views == 3:
                 mask_seq = []
                 for i in indices:
                     for v in range(3):
                         mask_seq.append(sky_mask_paths[v][i])
-                masks = load_and_preprocess_images(mask_seq)  # [S*3, C, H, W]
+                masks = load_and_preprocess_binary_masks(mask_seq)  # [S*3, C, H, W]
 
                 target_mask_seq = []
                 for i in target_indices:
                     for v in range(3):
                         target_mask_seq.append(sky_mask_paths[v][i])
-                target_masks = load_and_preprocess_images(target_mask_seq)  # [T*3, C, H, W]
+                target_masks = load_and_preprocess_binary_masks(target_mask_seq)  # [T*3, C, H, W]
 
             input_dict = {
                 "images": images,
@@ -540,14 +873,20 @@ class WaymoOpenDataset(Dataset):
                 # "target_timestamps": target_timestamps,
                 "interval": intervals,
                 "target_masks": target_masks,
+                "scene_name": self.scenes[idx],
+                "start_idx": start_idx,
+                "clip_index": start_idx // 29,
             }
+            caption = self._load_caption(self.scenes[idx], start_idx)
+            if caption is not None:
+                input_dict["caption"] = caption
 
             if len(dynamic_mask_paths) > 0:
                 if self.views == 1:
                     dy_mask_seq = [dynamic_mask_paths[i] for i in indices]
-                    dynamic_mask = load_and_preprocess_images(dy_mask_seq)  # [S, C, H, W]
+                    dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)  # [S, C, H, W]
                     target_dy_mask_seq = [dynamic_mask_paths[i] for i in target_indices]
-                    target_dynamic_mask = load_and_preprocess_images(target_dy_mask_seq)  # [T, C, H, W]
+                    target_dynamic_mask = load_and_preprocess_binary_masks(target_dy_mask_seq)  # [T, C, H, W]
                 elif self.views == 3:
                     dy_mask_seq = []
                     target_dy_mask_seq = []
@@ -557,8 +896,8 @@ class WaymoOpenDataset(Dataset):
                     for i in target_indices:
                         for v in range(3):
                             target_dy_mask_seq.append(dynamic_mask_paths[v][i])
-                    dynamic_mask = load_and_preprocess_images(dy_mask_seq)         # [S*3, C, H, W]
-                    target_dynamic_mask = load_and_preprocess_images(target_dy_mask_seq)  # [T*3, C, H, W]
+                    dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)         # [S*3, C, H, W]
+                    target_dynamic_mask = load_and_preprocess_binary_masks(target_dy_mask_seq)  # [T*3, C, H, W]
                 input_dict["dynamic_mask"] = target_dynamic_mask
 
             if len(self.depth_flow_paths) > 0 and len(self.depth_flow_paths[idx]) > 0:

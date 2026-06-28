@@ -10,7 +10,6 @@ portion of the FlowDGGT pipeline:
     Phase 2: FeatureSplatter → splatted_tok_low
     Phase 3: SoftMaskBuilder + ScaffoldPacker → soft masks, scaffold
     Phase 5 precursor: tokenizer.encode → z_clean, z_splat
-    Phase 6 input prep: PerTokenNoiseScheduler → t_tok, z_init
 
 The result is a `FlowFeatureBundle` dataclass consumed by training scripts and
 inference dumpers. Aggregator is NEVER invoked here — this module is strictly
@@ -38,7 +37,6 @@ from dggt.models.gaussian_scene_editor import (
     EditedSceneBundle,
     GaussianSceneEditor,
 )
-from dggt.models.per_token_noise import PerTokenNoiseScheduler
 from dggt.models.scaffold import ScaffoldPacker
 from dggt.models.scene_pointers import build_scene_pointers, concat_pointers
 from dggt.models.soft_mask import SoftMaskBuilder
@@ -99,16 +97,16 @@ class FlowFeatureBundle:
     scaffold_hires: torch.Tensor                               # [B, S, H, W, 7]
     scaffold_tok: torch.Tensor                                 # [B, S, P, 768]
 
-    # Phase 5/6 inputs
+    # Phase 5 inputs. Current RAEv2/FlowMatch SceneFlow constructs noisy states
+    # in the train/sampling loop from global sigma; assembler does not emit the
+    # legacy per-token z_init/t_tok/base_t fields.
     z_clean: torch.Tensor                                      # [B, S, P, 768]
     z_splat: torch.Tensor
-    z_init: torch.Tensor
-    eps_noise: torch.Tensor
-    t_tok: torch.Tensor                                        # [B, S, P, 1]
-    base_t: torch.Tensor                                       # [B]
 
-    # Flow cross-attn K/V (asset tokens flattened)
-    F_asset_tokens: torch.Tensor                               # [B, sum_k(S * P), 3072]
+    # Flow self-attn asset conditions. New RAE-style path stores tokenizer
+    # latents as [B, K, S, P, C_latent]; legacy callers may still pass [B,N,C].
+    F_asset_tokens: torch.Tensor
+    encoder_attention_mask: torch.Tensor | None
 
     # Metadata mirrors
     patch_grid: tuple[int, int]
@@ -211,8 +209,10 @@ def _flatten_asset_kv(
 class FlowFeatureAssembler(nn.Module):
     """Orchestrator for the online part of FlowDGGT.
 
-    Parameters mirror `SoftMaskBuilder`, `ScaffoldPacker`, `FeatureSplatter` and
-    `PerTokenNoiseScheduler` defaults from research_plan.md §3.3–3.6.
+    Parameters mirror `SoftMaskBuilder`, `ScaffoldPacker` and
+    `FeatureSplatter`. The legacy per-token noise parameters are accepted for
+    checkpoint/script compatibility, but are no-ops in the current
+    RAEv2/FlowMatch training path.
     """
 
     def __init__(
@@ -247,6 +247,8 @@ class FlowFeatureAssembler(nn.Module):
         self.asset_token_direct_blend = bool(asset_token_direct_blend)
         self.asset_token_full_alpha = float(asset_token_full_alpha)
         self.unedited_preserve_threshold = float(unedited_preserve_threshold)
+        # Kept only so older configs that still pass these fields keep loading.
+        del gamma_dest, eps_floor, sigma_partial
 
         self.editor = GaussianSceneEditor(**(editor_kwargs or {}))
         self.feature_splatter = FeatureSplatter(
@@ -258,11 +260,6 @@ class FlowFeatureAssembler(nn.Module):
         self.soft_mask = SoftMaskBuilder()
         self.scaffold_packer = ScaffoldPacker(
             in_channels=7, out_dim=int(scaffold_out_dim)
-        )
-        self.noise_scheduler = PerTokenNoiseScheduler(
-            gamma_dest=gamma_dest,
-            eps_floor=eps_floor,
-            sigma_partial=sigma_partial,
         )
 
     # ------------------------------------------------------------------ #
@@ -305,7 +302,8 @@ class FlowFeatureAssembler(nn.Module):
             "all" / comma-separated slot ids / explicit list. Passed to
             `parse_object_slots`.
         base_t
-            Optional `[B]` tensor; if None, sampled ~ U(0,1) from `generator`.
+            Legacy no-op. Current SceneFlow uses global FlowMatch sigma sampled
+            in the training/sampling loop, not assembler-level per-token noise.
         mode_kind
             "mode_a" or "mode_b". If None, taken from `sample["mode_kind"]`
             (default "mode_a").
@@ -320,16 +318,17 @@ class FlowFeatureAssembler(nn.Module):
             mode_kind = str(sample.get("mode_kind", "mode_a"))
 
         if mode_kind == "mode_b":
+            del base_t
             return self._forward_mode_b(
                 sample=sample,
                 predictions=predictions,
                 cameras_dggt=cameras_dggt,
                 mode_b=mode_b or {},
-                base_t=base_t,
                 generator=generator,
                 device=device,
                 splatted_tok_low_cached=splatted_tok_low_cached,
             )
+        del base_t
 
         # ----- Mode A path ----- #
         self._validate_mode_a_asset_pass(asset_pass_result)
@@ -605,16 +604,34 @@ class FlowFeatureAssembler(nn.Module):
                 f"z_clean shape {tuple(z_clean.shape)}"
             )
 
-        if base_t is None:
-            base_t = self.noise_scheduler.sample_base_t(B, device=device, generator=generator)
-        else:
-            base_t = base_t.to(device)
-        t_tok = self.noise_scheduler.build_t_tok(base_t, M_preserve, M_source, M_dest)
-        z_init, eps_noise = self.noise_scheduler.compose_z_init(
-            z_clean, z_splat, M_preserve, M_source, M_dest, generator=generator
-        )
+        del generator
 
-        F_asset_tokens = _flatten_asset_kv(F_g_lut_asset, device=device)
+        asset_latents: list[torch.Tensor] = []
+        asset_masks: list[torch.Tensor] = []
+        for obj_key in sorted(int(k) for k in F_g_lut_asset.keys())[:5]:
+            levels = F_g_lut_asset[obj_key]
+            if len(levels) != len(F_g_lut_scene):
+                continue
+            z_asset = self.scene_tokenizer.encode(levels, patch_grid=self.patch_grid)
+            valid = torch.ones(z_asset.shape[:-1], device=z_asset.device, dtype=torch.bool)
+            if obj_key < int(phase1_coverage.shape[0]):
+                cov = phase1_coverage[obj_key].to(device=z_asset.device, dtype=torch.bool)
+                if int(cov.numel()) == int(z_asset.shape[2]):
+                    valid = valid & cov.reshape(1, 1, -1)
+            asset_latents.append(z_asset)
+            asset_masks.append(valid)
+        F_asset_tokens = z_clean.new_zeros((B, 5, S, z_clean.shape[2], z_clean.shape[-1]))
+        encoder_attention_mask = torch.zeros((B, 5, S, z_clean.shape[2]), device=z_clean.device, dtype=torch.bool)
+        if asset_latents:
+            n_assets = min(len(asset_latents), 5)
+            F_asset_tokens[:, :n_assets] = torch.stack(asset_latents[:n_assets], dim=1).to(
+                device=z_clean.device,
+                dtype=z_clean.dtype,
+            )
+            encoder_attention_mask[:, :n_assets] = torch.stack(asset_masks[:n_assets], dim=1).to(
+                device=z_clean.device,
+                dtype=torch.bool,
+            )
 
         return FlowFeatureBundle(
             edit_bundle=edit_bundle,
@@ -644,15 +661,13 @@ class FlowFeatureAssembler(nn.Module):
             scaffold_tok=scaffold_tok,
             z_clean=z_clean,
             z_splat=z_splat,
-            z_init=z_init,
-            eps_noise=eps_noise,
-            t_tok=t_tok,
-            base_t=base_t,
             F_asset_tokens=F_asset_tokens,
+            encoder_attention_mask=encoder_attention_mask,
             patch_grid=self.patch_grid,
             patch_start_idx=self.patch_start_idx,
             extras={
                 "mode_kind": "mode_a",
+                "asset_condition_kind": "mode_a",
                 "object_slots_requested": object_slots,
                 "localized_objects": localized_objects,
             },
@@ -667,7 +682,6 @@ class FlowFeatureAssembler(nn.Module):
         predictions: dict[str, torch.Tensor],
         cameras_dggt: dict[str, torch.Tensor],
         mode_b: dict[str, Any],
-        base_t: torch.Tensor | None,
         generator: torch.Generator | None,
         device: torch.device,
         splatted_tok_low_cached: list[torch.Tensor] | None = None,
@@ -871,18 +885,10 @@ class FlowFeatureAssembler(nn.Module):
                 f"z_clean shape {tuple(z_clean.shape)} (Mode B)"
             )
 
-        if base_t is None:
-            base_t = self.noise_scheduler.sample_base_t(B, device=device, generator=generator)
-        else:
-            base_t = base_t.to(device)
-        t_tok = self.noise_scheduler.build_t_tok(base_t, M_preserve, M_source, M_dest)
-        z_init, eps_noise = self.noise_scheduler.compose_z_init(
-            z_clean, z_splat, M_preserve, M_source, M_dest, generator=generator
-        )
+        del generator
 
-        F_asset_tokens = torch.zeros(
-            (B, 0, self.channels), dtype=z_clean.dtype, device=z_clean.device
-        )
+        F_asset_tokens = z_clean.new_zeros((B, 5, S, z_clean.shape[2], z_clean.shape[-1]))
+        encoder_attention_mask = torch.zeros((B, 5, S, z_clean.shape[2]), device=z_clean.device, dtype=torch.bool)
 
         # Build a slim AssetPassResult / EditedSceneBundle so downstream consumers
         # (viz, loss) work without a Mode A path.
@@ -963,15 +969,13 @@ class FlowFeatureAssembler(nn.Module):
             scaffold_tok=scaffold_tok,
             z_clean=z_clean,
             z_splat=z_splat,
-            z_init=z_init,
-            eps_noise=eps_noise,
-            t_tok=t_tok,
-            base_t=base_t,
             F_asset_tokens=F_asset_tokens,
+            encoder_attention_mask=encoder_attention_mask,
             patch_grid=self.patch_grid,
             patch_start_idx=self.patch_start_idx,
             extras={
                 "mode_kind": "mode_b",
+                "asset_condition_kind": "mode_b_empty",
                 "imagined_objects": list(mode_b.get("imagined_objects", [])),
                 "num_imagined_objects": int(mode_b.get("num_imagined_objects", 0)),
                 "rejection_reason": str(mode_b.get("rejection_reason", "")),
