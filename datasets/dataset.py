@@ -249,6 +249,256 @@ def load_and_preprocess_binary_masks(mask_path_list, mode="crop", threshold=0.5)
     return masks
 
 
+def _waymo_resize_geometry(image_hw, target_width=518):
+    image_h, image_w = [int(v) for v in image_hw]
+    new_width = int(target_width)
+    new_height = round(image_h * (new_width / image_w) / 14) * 14
+    crop_top = max((new_height - new_width) // 2, 0) if new_height > new_width else 0
+    out_height = new_width if new_height > new_width else new_height
+    return {
+        "scale_x": new_width / float(image_w),
+        "scale_y": new_height / float(image_h),
+        "crop_top": crop_top,
+        "out_hw": (int(out_height), int(new_width)),
+    }
+
+
+def _transform_waymo_box_to_model(box_xyxy, image_hw, target_width=518):
+    geom = _waymo_resize_geometry(image_hw, target_width=target_width)
+    box = np.asarray(box_xyxy, dtype=np.float32).copy()
+    box[[0, 2]] *= float(geom["scale_x"])
+    box[[1, 3]] = box[[1, 3]] * float(geom["scale_y"]) - float(geom["crop_top"])
+    out_h, out_w = geom["out_hw"]
+    box[[0, 2]] = np.clip(box[[0, 2]], 0.0, float(out_w))
+    box[[1, 3]] = np.clip(box[[1, 3]], 0.0, float(out_h))
+    return box.astype(np.float32), geom
+
+
+def _build_waymo_box_corners_world(obj_to_world, box_size):
+    length, width, height = np.asarray(box_size, dtype=np.float32).reshape(3).tolist()
+    local = np.array(
+        [
+            [-length / 2, -width / 2, -height / 2, 1.0],
+            [-length / 2, -width / 2, height / 2, 1.0],
+            [-length / 2, width / 2, -height / 2, 1.0],
+            [-length / 2, width / 2, height / 2, 1.0],
+            [length / 2, -width / 2, -height / 2, 1.0],
+            [length / 2, -width / 2, height / 2, 1.0],
+            [length / 2, width / 2, -height / 2, 1.0],
+            [length / 2, width / 2, height / 2, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return (np.asarray(obj_to_world, dtype=np.float32) @ local.T).T[:, :3].astype(np.float32)
+
+
+def _project_world_points_to_raw(points_world, camera_to_world, intrinsics, image_hw, eps=1e-6):
+    points_world = np.asarray(points_world, dtype=np.float32)
+    world_to_camera = np.linalg.inv(np.asarray(camera_to_world, dtype=np.float32))
+    points_h = np.concatenate(
+        [points_world, np.ones((points_world.shape[0], 1), dtype=np.float32)],
+        axis=1,
+    )
+    points_cam = (world_to_camera @ points_h.T).T[:, :3]
+    depths = points_cam[:, 2]
+    valid = np.isfinite(points_cam).all(axis=1) & (depths > float(eps))
+    if not np.any(valid):
+        return None, points_cam
+    projected_h = (np.asarray(intrinsics, dtype=np.float32) @ points_cam[valid].T).T
+    if not np.isfinite(projected_h).all():
+        return None, points_cam
+    projected = projected_h[:, :2] / np.maximum(projected_h[:, 2:3], float(eps))
+    image_h, image_w = [int(v) for v in image_hw]
+    x1 = float(np.clip(projected[:, 0].min(), 0.0, float(image_w)))
+    x2 = float(np.clip(projected[:, 0].max(), 0.0, float(image_w)))
+    y1 = float(np.clip(projected[:, 1].min(), 0.0, float(image_h)))
+    y2 = float(np.clip(projected[:, 1].max(), 0.0, float(image_h)))
+    if x2 <= x1 or y2 <= y1:
+        return None, points_cam
+    return np.array([x1, y1, x2, y2], dtype=np.float32), points_cam
+
+
+def _model_box_to_patch_mask(box_xyxy, model_hw, patch_grid):
+    gh, gw = int(patch_grid[0]), int(patch_grid[1])
+    model_h, model_w = int(model_hw[0]), int(model_hw[1])
+    box = np.asarray(box_xyxy, dtype=np.float32)
+    x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+    if x2 <= x1 or y2 <= y1 or model_h <= 0 or model_w <= 0 or gh <= 0 or gw <= 0:
+        return np.zeros((gh * gw,), dtype=np.bool_), 0.0
+    patch_w = float(model_w) / float(gw)
+    patch_h = float(model_h) / float(gh)
+    px1 = max(0, min(gw, int(np.floor(x1 / patch_w))))
+    px2 = max(0, min(gw, int(np.ceil(x2 / patch_w))))
+    py1 = max(0, min(gh, int(np.floor(y1 / patch_h))))
+    py2 = max(0, min(gh, int(np.ceil(y2 / patch_h))))
+    mask = np.zeros((gh, gw), dtype=np.bool_)
+    if px2 > px1 and py2 > py1:
+        mask[py1:py2, px1:px2] = True
+    return mask.reshape(gh * gw), float(mask.sum())
+
+
+def _load_waymo_dynamic_mask_model(mask_path, target_width=518, threshold=0.5):
+    if not mask_path or not os.path.exists(mask_path):
+        return None
+    mask = Image.open(mask_path).convert("L")
+    width, height = mask.size
+    new_width = int(target_width)
+    new_height = round(height * (new_width / width) / 14) * 14
+    mask = mask.resize((new_width, new_height), Image.Resampling.NEAREST)
+    if new_height > target_width:
+        start_y = (new_height - target_width) // 2
+        mask = mask.crop((0, start_y, new_width, start_y + target_width))
+    arr = np.asarray(mask, dtype=np.float32) / 255.0
+    return arr > float(threshold)
+
+
+def _largest_connected_component_4n(mask_grid):
+    gh, gw = int(mask_grid.shape[0]), int(mask_grid.shape[1])
+    visited = np.zeros((gh, gw), dtype=np.bool_)
+    best = []
+    for y in range(gh):
+        for x in range(gw):
+            if not bool(mask_grid[y, x]) or bool(visited[y, x]):
+                continue
+            stack = [(y, x)]
+            visited[y, x] = True
+            comp = []
+            while stack:
+                cy, cx = stack.pop()
+                comp.append((cy, cx))
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if ny < 0 or ny >= gh or nx < 0 or nx >= gw:
+                        continue
+                    if bool(mask_grid[ny, nx]) and not bool(visited[ny, nx]):
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+            if len(comp) > len(best):
+                best = comp
+    out = np.zeros((gh, gw), dtype=np.bool_)
+    for y, x in best:
+        out[y, x] = True
+    return out
+
+
+def _dynamic_mask_box_to_patch_mask(dynamic_model_mask, box_xyxy, model_hw, patch_grid, padding_px=4):
+    gh, gw = int(patch_grid[0]), int(patch_grid[1])
+    model_h, model_w = int(model_hw[0]), int(model_hw[1])
+    empty = np.zeros((gh * gw,), dtype=np.bool_)
+    if dynamic_model_mask is None:
+        return empty, 0.0
+    if model_h <= 0 or model_w <= 0 or gh <= 0 or gw <= 0:
+        return empty, 0.0
+    dyn = np.asarray(dynamic_model_mask, dtype=np.bool_)
+    if dyn.shape[0] != model_h or dyn.shape[1] != model_w:
+        return empty, 0.0
+
+    x1, y1, x2, y2 = [float(v) for v in np.asarray(box_xyxy, dtype=np.float32).tolist()]
+    if x2 <= x1 or y2 <= y1:
+        return empty, 0.0
+    pad = int(max(0, padding_px))
+    ix1 = max(0, min(model_w, int(np.floor(x1)) - pad))
+    ix2 = max(0, min(model_w, int(np.ceil(x2)) + pad))
+    iy1 = max(0, min(model_h, int(np.floor(y1)) - pad))
+    iy2 = max(0, min(model_h, int(np.ceil(y2)) + pad))
+    if ix2 <= ix1 or iy2 <= iy1:
+        return empty, 0.0
+
+    roi = dyn[iy1:iy2, ix1:ix2]
+    if not np.any(roi):
+        return empty, 0.0
+
+    ys, xs = np.nonzero(roi)
+    xs = xs.astype(np.float32) + float(ix1)
+    ys = ys.astype(np.float32) + float(iy1)
+    patch_w = float(model_w) / float(gw)
+    patch_h = float(model_h) / float(gh)
+    patch_x = np.clip(np.floor(xs / patch_w).astype(np.int64), 0, gw - 1)
+    patch_y = np.clip(np.floor(ys / patch_h).astype(np.int64), 0, gh - 1)
+    grid = np.zeros((gh, gw), dtype=np.bool_)
+    grid[patch_y, patch_x] = True
+    grid = _largest_connected_component_4n(grid)
+    return grid.reshape(gh * gw), float(grid.sum())
+
+
+def _dynamic_mask_to_patch_grid(dynamic_model_mask, model_hw, patch_grid):
+    gh, gw = int(patch_grid[0]), int(patch_grid[1])
+    model_h, model_w = int(model_hw[0]), int(model_hw[1])
+    empty = np.zeros((gh * gw,), dtype=np.bool_)
+    if dynamic_model_mask is None or model_h <= 0 or model_w <= 0 or gh <= 0 or gw <= 0:
+        return empty
+    dyn = np.asarray(dynamic_model_mask, dtype=np.bool_)
+    if dyn.shape[0] != model_h or dyn.shape[1] != model_w:
+        return empty
+    out = np.zeros((gh, gw), dtype=np.bool_)
+    for y in range(gh):
+        y1 = int(round(y * model_h / gh))
+        y2 = int(round((y + 1) * model_h / gh))
+        for x in range(gw):
+            x1 = int(round(x * model_w / gw))
+            x2 = int(round((x + 1) * model_w / gw))
+            out[y, x] = bool(np.any(dyn[y1:y2, x1:x2]))
+    return out.reshape(gh * gw)
+
+
+def _patch_center_xy(model_hw, patch_grid):
+    gh, gw = int(patch_grid[0]), int(patch_grid[1])
+    model_h, model_w = int(model_hw[0]), int(model_hw[1])
+    yy = (np.arange(gh, dtype=np.float32) + 0.5) * (float(model_h) / float(gh))
+    xx = (np.arange(gw, dtype=np.float32) + 0.5) * (float(model_w) / float(gw))
+    grid_x, grid_y = np.meshgrid(xx, yy)
+    return np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=1).astype(np.float32)
+
+
+def _assign_dynamic_patch_masks_to_boxes(dynamic_model_mask, boxes_xyxy, model_hw, patch_grid, padding_px=6):
+    boxes = np.asarray(boxes_xyxy, dtype=np.float32)
+    if boxes.ndim != 2 or boxes.shape[0] == 0 or boxes.shape[1] != 4:
+        return np.zeros((0, int(patch_grid[0]) * int(patch_grid[1])), dtype=np.bool_)
+    gh, gw = int(patch_grid[0]), int(patch_grid[1])
+    model_h, model_w = int(model_hw[0]), int(model_hw[1])
+    dynamic_patch = _dynamic_mask_to_patch_grid(dynamic_model_mask, model_hw, (gh, gw))
+    assigned = np.zeros((boxes.shape[0], gh * gw), dtype=np.bool_)
+    if not np.any(dynamic_patch):
+        return assigned
+
+    centers = _patch_center_xy(model_hw, (gh, gw))
+    scores = np.full((boxes.shape[0], gh * gw), np.inf, dtype=np.float32)
+    pad = float(max(0, padding_px))
+    for obj_idx, box in enumerate(boxes):
+        x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+        if x2 <= x1 or y2 <= y1:
+            continue
+        x1p = max(0.0, x1 - pad)
+        y1p = max(0.0, y1 - pad)
+        x2p = min(float(model_w), x2 + pad)
+        y2p = min(float(model_h), y2 + pad)
+        inside = (
+            (centers[:, 0] >= x1p)
+            & (centers[:, 0] <= x2p)
+            & (centers[:, 1] >= y1p)
+            & (centers[:, 1] <= y2p)
+            & dynamic_patch
+        )
+        if not np.any(inside):
+            continue
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        half_w = max(0.5 * (x2 - x1), 1.0)
+        half_h = max(0.5 * (y2 - y1), 1.0)
+        dx = (centers[:, 0] - cx) / half_w
+        dy = (centers[:, 1] - cy) / half_h
+        # Lower is better. The normalized distance makes overlapping boxes
+        # compete for each dynamic patch instead of duplicating connected masks.
+        scores[obj_idx, inside] = dx[inside] * dx[inside] + dy[inside] * dy[inside]
+
+    eligible = np.isfinite(scores).any(axis=0)
+    if not np.any(eligible):
+        return assigned
+    owner = np.argmin(scores[:, eligible], axis=0)
+    patch_ids = np.nonzero(eligible)[0]
+    assigned[owner, patch_ids] = True
+    return assigned
+
+
 class WaymoOpenDataset(Dataset):
     def __init__(
         self,
@@ -263,6 +513,8 @@ class WaymoOpenDataset(Dataset):
         scene_name_to_index_path="/data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/metadata/training/scene_name_to_index.json",
         waymo_train_list_path=None,
         waymo_val_list_path=None,
+        pretrain_patch_grid=(25, 37),
+        pretrain_max_objects=5,
     ):
         #mode 1 : train
         #mode 2 : pure reconstruction
@@ -295,6 +547,8 @@ class WaymoOpenDataset(Dataset):
         self.load_flow = load_flow
         self.views = views
         self.caption_root = caption_root
+        self.pretrain_patch_grid = (int(pretrain_patch_grid[0]), int(pretrain_patch_grid[1]))
+        self.pretrain_max_objects = int(pretrain_max_objects)
         self.scene_name_to_index_path = scene_name_to_index_path
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.waymo_train_list_path = waymo_train_list_path or os.path.join(repo_root, "data", "waymo_train_list_full.txt")
@@ -318,12 +572,15 @@ class WaymoOpenDataset(Dataset):
         self.semantic_mask_path = []
         self.depth_flow_paths = []
         self.ego_paths = []
+        self.scene_roots = []
+        self._instance_metadata_cache = {}
 
         self.start_idx = start_idx
 
         for scene_name in scene_names:
             scene_path = os.path.join(image_dir, scene_name, "images")
             if os.path.isdir(scene_path):
+                self.scene_roots.append(os.path.join(image_dir, scene_name))
                 # image
                 if self.views == 1:
                     image_paths = sorted(
@@ -619,10 +876,280 @@ class WaymoOpenDataset(Dataset):
             raw_width, raw_height = img.size
         raw_image_size_hw = torch.tensor([int(raw_height), int(raw_width)], dtype=torch.long)
         return (
-            torch.from_numpy(camera_to_world).float(),
-            torch.from_numpy(intrinsics).float(),
+            torch.tensor(camera_to_world.tolist(), dtype=torch.float32),
+            torch.tensor(intrinsics.tolist(), dtype=torch.float32),
             raw_image_size_hw,
         )
+
+    def _load_instance_metadata(self, idx):
+        scene_name = str(self.scenes[idx])
+        if scene_name in self._instance_metadata_cache:
+            return self._instance_metadata_cache[scene_name]
+        scene_root = self.scene_roots[idx] if idx < len(self.scene_roots) else os.path.join(self.image_dir, scene_name)
+        instances_root = os.path.join(scene_root, "instances")
+        paths = {
+            "instances_info": os.path.join(instances_root, "instances_info.json"),
+            "frame_instances": os.path.join(instances_root, "frame_instances.json"),
+            "object_id_map": os.path.join(instances_root, "object_id_map.json"),
+        }
+        if not os.path.exists(paths["instances_info"]):
+            payload = None
+        else:
+            try:
+                with open(paths["instances_info"], "r") as f:
+                    instances_info = json.load(f)
+                frame_instances = {}
+                if os.path.exists(paths["frame_instances"]):
+                    with open(paths["frame_instances"], "r") as f:
+                        frame_instances = json.load(f)
+                object_id_map = {}
+                if os.path.exists(paths["object_id_map"]):
+                    with open(paths["object_id_map"], "r") as f:
+                        object_id_map = json.load(f)
+                payload = {
+                    "instances_info": instances_info if isinstance(instances_info, dict) else {},
+                    "frame_instances": frame_instances if isinstance(frame_instances, dict) else {},
+                    "object_id_map": object_id_map if isinstance(object_id_map, dict) else {},
+                }
+            except Exception:
+                payload = None
+        self._instance_metadata_cache[scene_name] = payload
+        return payload
+
+    def _candidate_instance_ids_for_clip(self, metadata, indices):
+        instances_info = metadata.get("instances_info", {})
+        frame_instances = metadata.get("frame_instances", {})
+        candidate_ids = []
+        seen = set()
+        for frame_idx in indices:
+            frame_key = str(int(frame_idx))
+            for object_id in frame_instances.get(frame_key, []):
+                object_key = str(object_id)
+                if object_key in instances_info and object_key not in seen:
+                    candidate_ids.append(object_key)
+                    seen.add(object_key)
+        if candidate_ids:
+            return candidate_ids
+        return [str(k) for k in instances_info.keys()]
+
+    def _class_priority_bonus(self, class_name):
+        name = str(class_name).lower()
+        if "vehicle" in name or "car" in name or "truck" in name or "bus" in name:
+            return 50.0
+        if "pedestrian" in name or "cyclist" in name or "person" in name:
+            return 25.0
+        return 0.0
+
+    def _project_pretrain_object_slots(self, idx, indices, image_seq):
+        max_objects = max(0, int(self.pretrain_max_objects))
+        gh, gw = self.pretrain_patch_grid
+        empty = {
+            "pretrain_object_ids": [""] * max_objects,
+            "pretrain_object_class_names": [""] * max_objects,
+            "pretrain_object_bbox_model": torch.zeros((max_objects, len(indices), 4), dtype=torch.float32),
+            "pretrain_object_patch_mask": torch.zeros((max_objects, len(indices), gh * gw), dtype=torch.bool),
+            "pretrain_object_valid_mask": torch.zeros((max_objects, len(indices)), dtype=torch.bool),
+            "pretrain_object_scores": torch.zeros((max_objects,), dtype=torch.float32),
+            "pretrain_asset_source_kind": "legacy_fallback",
+        }
+        if max_objects <= 0 or self.views != 1:
+            return empty
+        metadata = self._load_instance_metadata(idx)
+        if metadata is None:
+            return empty
+        instances_info = metadata.get("instances_info", {})
+        if not instances_info:
+            empty["pretrain_asset_source_kind"] = "instances_empty"
+            return empty
+
+        ego_pose_paths = self.extrinsic_paths[idx]
+        camera_extrinsic_path = self.ego_paths[idx] if idx < len(self.ego_paths) else ""
+        intrinsic_path = self.intrinsic_paths[idx]
+        if isinstance(intrinsic_path, (list, tuple)):
+            intrinsic_path = intrinsic_path[0] if len(intrinsic_path) > 0 else ""
+        try:
+            camera_to_ego_front = _load_waymo_matrix4(camera_extrinsic_path, "front camera extrinsics")
+            intrinsics = _load_waymo_intrinsics_matrix(intrinsic_path)
+        except Exception:
+            return empty
+        if len(ego_pose_paths) == 0 or max(indices) >= len(ego_pose_paths):
+            return empty
+        with Image.open(image_seq[0]) as img:
+            raw_width, raw_height = img.size
+        raw_hw = (int(raw_height), int(raw_width))
+        model_hw = _waymo_resize_geometry(raw_hw, target_width=518)["out_hw"]
+        dynamic_mask_paths = self.dynamic_mask_path[idx] if idx < len(self.dynamic_mask_path) else []
+        dynamic_model_masks_by_frame = {}
+        if isinstance(dynamic_mask_paths, list) and len(dynamic_mask_paths) > 0:
+            for frame_idx in indices:
+                if int(frame_idx) >= len(dynamic_mask_paths):
+                    continue
+                try:
+                    dynamic_model_masks_by_frame[int(frame_idx)] = _load_waymo_dynamic_mask_model(
+                        dynamic_mask_paths[int(frame_idx)],
+                        target_width=518,
+                        threshold=0.5,
+                    )
+                except Exception:
+                    dynamic_model_masks_by_frame[int(frame_idx)] = None
+        has_dynamic_model_mask = any(
+            mask is not None and bool(np.any(mask))
+            for mask in dynamic_model_masks_by_frame.values()
+        )
+        camera_to_world_by_frame = {}
+        for frame_idx in indices:
+            try:
+                ego_to_world = _load_waymo_matrix4(ego_pose_paths[frame_idx], "ego pose")
+            except Exception:
+                return empty
+            camera_to_world_by_frame[int(frame_idx)] = (
+                ego_to_world @ camera_to_ego_front @ WAYMO_OPENCV2DATASET
+            ).astype(np.float32)
+
+        projected_candidates = []
+        for object_id in self._candidate_instance_ids_for_clip(metadata, indices):
+            instance_info = instances_info.get(str(object_id))
+            if not isinstance(instance_info, dict):
+                continue
+            frame_annotations = instance_info.get("frame_annotations", {})
+            frame_indices = [int(v) for v in frame_annotations.get("frame_idx", [])]
+            obj_to_world_seq = frame_annotations.get("obj_to_world", [])
+            box_size_seq = frame_annotations.get("box_size", [])
+            if len(frame_indices) == 0 or len(obj_to_world_seq) == 0 or len(box_size_seq) == 0:
+                continue
+            track_lookup = {frame_idx: pos for pos, frame_idx in enumerate(frame_indices)}
+            bbox_model = np.zeros((len(indices), 4), dtype=np.float32)
+            box_valid_mask = np.zeros((len(indices),), dtype=np.bool_)
+            depth_by_frame = np.zeros((len(indices),), dtype=np.float32)
+            for local_idx, frame_idx in enumerate(indices):
+                track_idx = track_lookup.get(int(frame_idx))
+                if track_idx is None:
+                    continue
+                try:
+                    obj_to_world = np.asarray(obj_to_world_seq[track_idx], dtype=np.float32).reshape(4, 4)
+                    box_size = np.asarray(box_size_seq[track_idx], dtype=np.float32).reshape(3)
+                except Exception:
+                    continue
+                camera_to_world = camera_to_world_by_frame[int(frame_idx)]
+                world_to_camera = np.linalg.inv(camera_to_world)
+                center_world = obj_to_world[:3, 3]
+                center_cam = world_to_camera[:3, :3] @ center_world + world_to_camera[:3, 3]
+                depth_z = float(center_cam[2])
+                if not np.isfinite(depth_z) or depth_z <= 1e-6:
+                    continue
+                corners_world = _build_waymo_box_corners_world(obj_to_world, box_size)
+                raw_box, _ = _project_world_points_to_raw(corners_world, camera_to_world, intrinsics, raw_hw)
+                if raw_box is None:
+                    continue
+                model_box, _ = _transform_waymo_box_to_model(raw_box, raw_hw, target_width=518)
+                if float(model_box[2] - model_box[0]) <= 0.0 or float(model_box[3] - model_box[1]) <= 0.0:
+                    continue
+                bbox_model[local_idx] = model_box
+                box_valid_mask[local_idx] = True
+                depth_by_frame[local_idx] = float(depth_z)
+            if not bool(box_valid_mask.any()):
+                continue
+            projected_candidates.append(
+                {
+                    "object_id": str(instance_info.get("raw_object_id", instance_info.get("id", object_id))),
+                    "class_name": str(instance_info.get("class_name", "")),
+                    "is_moving_track": bool(instance_info.get("is_moving_track", False)),
+                    "bbox_model": bbox_model,
+                    "box_valid_mask": box_valid_mask,
+                    "depth_by_frame": depth_by_frame,
+                    "patch_mask": np.zeros((len(indices), gh * gw), dtype=np.bool_),
+                    "valid_mask": np.zeros((len(indices),), dtype=np.bool_),
+                    "patch_areas": [],
+                    "inverse_depths": [],
+                }
+            )
+
+        for local_idx, frame_idx in enumerate(indices):
+            frame_items = [
+                item
+                for item in projected_candidates
+                if bool(item["box_valid_mask"][local_idx])
+            ]
+            if not frame_items:
+                continue
+            boxes = np.stack([item["bbox_model"][local_idx] for item in frame_items], axis=0)
+            assigned_masks = _assign_dynamic_patch_masks_to_boxes(
+                dynamic_model_masks_by_frame.get(int(frame_idx)),
+                boxes,
+                model_hw,
+                (gh, gw),
+            )
+            for item, frame_patch_mask in zip(frame_items, assigned_masks):
+                patch_area = float(np.asarray(frame_patch_mask, dtype=np.bool_).sum())
+                if patch_area <= 0.0:
+                    continue
+                item["patch_mask"][local_idx] = frame_patch_mask
+                item["valid_mask"][local_idx] = True
+                item["patch_areas"].append(patch_area)
+                depth_z = float(item["depth_by_frame"][local_idx])
+                item["inverse_depths"].append(1.0 / max(depth_z, 1e-6))
+
+        candidates = []
+        for item in projected_candidates:
+            valid_mask = item["valid_mask"]
+            patch_areas = item["patch_areas"]
+            inverse_depths = item["inverse_depths"]
+            coverage_frames = int(valid_mask.sum())
+            if coverage_frames <= 0:
+                continue
+            median_area_patch = float(np.median(np.asarray(patch_areas, dtype=np.float32))) if patch_areas else 0.0
+            if median_area_patch <= 0.0:
+                continue
+            foreground_score = float(np.mean(np.asarray(inverse_depths, dtype=np.float32))) if inverse_depths else 0.0
+            class_name = str(item["class_name"])
+            moving_bonus = 100.0 if bool(item["is_moving_track"]) else 0.0
+            score = (
+                float(coverage_frames) * 1000.0
+                + median_area_patch * 20.0
+                + foreground_score * 20000.0
+                + moving_bonus
+                + self._class_priority_bonus(class_name)
+            )
+            candidates.append(
+                {
+                    "object_id": str(item["object_id"]),
+                    "class_name": class_name,
+                    "bbox_model": item["bbox_model"],
+                    "patch_mask": item["patch_mask"],
+                    "valid_mask": valid_mask,
+                    "score": float(score),
+                }
+            )
+
+        if not candidates:
+            empty["pretrain_asset_source_kind"] = (
+                "instances_no_dynamic_projection" if has_dynamic_model_mask else "instances_no_dynamic_mask"
+            )
+            return empty
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        selected = candidates[:max_objects]
+        object_ids = [""] * max_objects
+        class_names = [""] * max_objects
+        bbox_model = np.zeros((max_objects, len(indices), 4), dtype=np.float32)
+        patch_mask = np.zeros((max_objects, len(indices), gh * gw), dtype=np.bool_)
+        valid_mask = np.zeros((max_objects, len(indices)), dtype=np.bool_)
+        scores = np.zeros((max_objects,), dtype=np.float32)
+        for slot, item in enumerate(selected):
+            object_ids[slot] = str(item["object_id"])
+            class_names[slot] = str(item["class_name"])
+            bbox_model[slot] = item["bbox_model"]
+            patch_mask[slot] = item["patch_mask"]
+            valid_mask[slot] = item["valid_mask"]
+            scores[slot] = float(item["score"])
+        return {
+            "pretrain_object_ids": object_ids,
+            "pretrain_object_class_names": class_names,
+            "pretrain_object_bbox_model": torch.tensor(bbox_model.tolist(), dtype=torch.float32),
+            "pretrain_object_patch_mask": torch.tensor(patch_mask.tolist(), dtype=torch.bool),
+            "pretrain_object_valid_mask": torch.tensor(valid_mask.tolist(), dtype=torch.bool),
+            "pretrain_object_scores": torch.tensor(scores.tolist(), dtype=torch.float32),
+            "pretrain_asset_source_kind": "instances_projected",
+        }
 
     def __getitem__(self, idx):
         image_paths = self.image_paths[idx]
@@ -705,6 +1232,9 @@ class WaymoOpenDataset(Dataset):
                             dy_mask_seq.append(dynamic_mask_paths[v][i])
                     dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)  # [S*3, C, H, W]
                 input_dict["dynamic_mask"] = dynamic_mask
+
+            if self.views == 1:
+                input_dict.update(self._project_pretrain_object_slots(idx, indices, seq))
 
             
             # if len(semantic_mask_paths) > 0:

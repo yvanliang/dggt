@@ -52,7 +52,10 @@ from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_split_gs
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
-from dggt.utils.pretrain_asset_slots import build_pretrain_asset_slots_from_dynamic_mask
+from dggt.utils.pretrain_asset_slots import (
+    build_pretrain_asset_slots_from_dynamic_mask,
+    build_pretrain_asset_slots_from_object_patch_mask,
+)
 from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
 from dggt.utils.sliding_window import cosine_window, window_slices
 from dggt.utils.tokens import (
@@ -3556,6 +3559,15 @@ def train_step(
             )
 
     logs["kv_tokens_mean"] = float(bundle.F_asset_lengths.float().mean().item())
+    asset_source_kinds = getattr(bundle, "asset_condition_source_kind", None)
+    if asset_source_kinds is not None:
+        source_values = [str(v) for v in (asset_source_kinds if not isinstance(asset_source_kinds, str) else [asset_source_kinds])]
+        denom = max(1, len(source_values))
+        logs["asset_source_instances_projected_frac"] = sum(v == "instances_projected" for v in source_values) / float(denom)
+        logs["asset_source_legacy_dynamic_mask_frac"] = sum(v == "legacy_dynamic_mask" for v in source_values) / float(denom)
+        logs["asset_source_empty_frac"] = sum(
+            v not in ("instances_projected", "legacy_dynamic_mask") for v in source_values
+        ) / float(denom)
     sky_weight = getattr(bundle, "sky_gen_loss_weight", None)
     logs["sky_token_loss_weight_mean"] = (
         float(sky_weight.float().mean().item()) if torch.is_tensor(sky_weight) and sky_weight.numel() > 0 else 0.0
@@ -3706,30 +3718,63 @@ def build_pretrain_bundle_from_batch(
         sky_mask_refined_clean=sky_mask_refined_clean,
         frame_ids=frame_ids.contiguous(),
     )
-    dynamic_mask = batch.get("dynamic_mask")
-    if not torch.is_tensor(dynamic_mask):
-        scene_name = batch.get("scene_name", "<unknown>")
-        start_idx = batch.get("start_idx", "<unknown>")
-        raise RuntimeError(
-            "SceneFlow pretrain requires `dynamic_mask` for asset conditioning, "
-            "but the current batch is missing it. Ensure every selected raw Waymo "
-            "scene under --image_dir contains `fine_dynamic_masks/all/` and that "
-            f"WaymoOpenDataset returns `dynamic_mask`. scene={scene_name!r}, start_idx={start_idx!r}"
+    object_patch_mask = batch.get("pretrain_object_patch_mask")
+    source_kind_raw = batch.get("pretrain_asset_source_kind")
+    if isinstance(source_kind_raw, str):
+        asset_source_kinds = [source_kind_raw] * int(z_clean_n.shape[0])
+    elif source_kind_raw is None or torch.is_tensor(source_kind_raw):
+        asset_source_kinds = ["unknown"] * int(z_clean_n.shape[0])
+    else:
+        asset_source_kinds = [str(v) for v in list(source_kind_raw)]
+        if len(asset_source_kinds) != int(z_clean_n.shape[0]):
+            asset_source_kinds = ["unknown"] * int(z_clean_n.shape[0])
+
+    if torch.is_tensor(object_patch_mask):
+        asset_tokens, asset_mask, asset_lengths, asset_kinds = build_pretrain_asset_slots_from_object_patch_mask(
+            z_clean_n,
+            object_patch_mask,
+            max_assets=5,
+            # z_clean_n is normalized to roughly unit scale. A small 0.15 std
+            # perturbation keeps coarse appearance conditioning while weakening
+            # exact per-patch latent copying from the target scene.
+            corruption_noise_std=0.0,  # 0.15
         )
-    asset_tokens, asset_mask, asset_lengths, asset_kinds = build_pretrain_asset_slots_from_dynamic_mask(
-        z_clean_n,
-        dynamic_mask,
-        args.patch_grid,
-        max_assets=5,
-        # z_clean_n is normalized to roughly unit scale. A small 0.15 std
-        # perturbation keeps coarse appearance conditioning while weakening
-        # exact per-patch latent copying from the target scene.
-        corruption_noise_std=0,
-    )
+        for row, length in enumerate(asset_lengths.detach().cpu().tolist()):
+            if int(length) > 0:
+                asset_source_kinds[row] = "instances_projected"
+    else:
+        asset_tokens, asset_mask, asset_lengths, asset_kinds = build_pretrain_asset_slots_from_object_patch_mask(
+            z_clean_n,
+            None,
+            max_assets=5,
+            corruption_noise_std=0.0,
+        )
+
+    dynamic_mask = batch.get("dynamic_mask")
+    needs_legacy = asset_lengths.detach().to(device=z_clean_n.device).eq(0)
+    if torch.is_tensor(dynamic_mask) and bool(needs_legacy.any().item()):
+        legacy_tokens, legacy_mask, legacy_lengths, legacy_kinds = build_pretrain_asset_slots_from_dynamic_mask(
+            z_clean_n,
+            dynamic_mask,
+            args.patch_grid,
+            max_assets=5,
+            corruption_noise_std=0.0,  # 0.15
+        )
+        for row, needs_row in enumerate(needs_legacy.detach().cpu().tolist()):
+            if not needs_row:
+                continue
+            asset_tokens[row] = legacy_tokens[row]
+            asset_mask[row] = legacy_mask[row]
+            asset_lengths[row] = legacy_lengths[row]
+            asset_kinds[row] = legacy_kinds[row]
+            if int(legacy_lengths[row].detach().cpu().item()) > 0:
+                asset_source_kinds[row] = "legacy_dynamic_mask"
+
     bundle.F_asset_tokens = asset_tokens
     bundle.encoder_attention_mask = asset_mask
     bundle.F_asset_lengths = asset_lengths
     bundle.asset_condition_kind = asset_kinds
+    bundle.asset_condition_source_kind = asset_source_kinds
     bundle.captions = captions_from_pretrain_batch(batch, int(z_clean_n.shape[0]))
     return bundle
 
@@ -4482,6 +4527,7 @@ def main() -> None:
         mode=1,
         views=1,
         caption_root=args.caption_root,
+        pretrain_patch_grid=args.patch_grid,
     )
     sampler = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
     loader = DataLoader(
@@ -4505,6 +4551,7 @@ def main() -> None:
             mode=1,
             views=1,
             caption_root=args.val_caption_root,
+            pretrain_patch_grid=args.patch_grid,
         )
         val_loader = DataLoader(
             val_dataset,
