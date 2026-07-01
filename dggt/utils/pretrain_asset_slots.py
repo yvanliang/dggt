@@ -89,6 +89,7 @@ def build_pretrain_asset_slots_from_dynamic_mask(
     *,
     max_assets: int = 5,
     threshold: float = 0.5,
+    corruption_noise_std: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
     B, S, P, C = z_clean_n.shape
     gh, gw = int(patch_grid[0]), int(patch_grid[1])
@@ -123,4 +124,8 @@ def build_pretrain_asset_slots_from_dynamic_mask(
                 break
         lengths[row] = slot
         kinds.append("mode_a" if slot > 0 else "none")
+    noise_std = float(corruption_noise_std)
+    if noise_std > 0.0 and bool(asset_mask.any().item()):
+        noise = torch.randn_like(asset_tokens) * noise_std
+        asset_tokens = torch.where(asset_mask.unsqueeze(-1), asset_tokens + noise, asset_tokens)
     return asset_tokens, asset_mask, lengths, kinds

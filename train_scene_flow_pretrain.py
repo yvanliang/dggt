@@ -3721,6 +3721,10 @@ def build_pretrain_bundle_from_batch(
         dynamic_mask,
         args.patch_grid,
         max_assets=5,
+        # z_clean_n is normalized to roughly unit scale. A small 0.15 std
+        # perturbation keeps coarse appearance conditioning while weakening
+        # exact per-patch latent copying from the target scene.
+        corruption_noise_std=0,
     )
     bundle.F_asset_tokens = asset_tokens
     bundle.encoder_attention_mask = asset_mask
