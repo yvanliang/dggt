@@ -63,6 +63,7 @@ VIDEO_STATE_DIM = 6
 ROPE_LAYOUT_VERSION = "a1_camera_center_sky128"
 SKY_MROPE_TEMPORAL_OFFSET = 128
 CAMERA_ROPE_SPATIAL_MODE = "center"
+ASSET_POSITION_MODES = ("localized", "canonical")
 
 
 def _scaled_mrope_section(
@@ -230,7 +231,11 @@ def get_3d_mrope_ids_vae_tokens(
 
 class Config(SimpleNamespace):
     def to_dict(self) -> dict[str, Any]:
-        return dict(self.__dict__)
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if key != "asset_position_mode"
+        }
 
 
 class RMSNorm(nn.Module):
@@ -736,6 +741,7 @@ class RAEVideoSceneFlow(nn.Module):
         rope_theta: float = 5000000.0,
         encoder_mrope_section: tuple[int, int, int] | list[int] | None = None,
         ddt_mrope_section: tuple[int, int, int] | list[int] | None = None,
+        asset_position_mode: str = "localized",
         timestep_scale: float = 1.0,
         t_eps: float = 0.05,
         **unused: Any,
@@ -763,6 +769,11 @@ class RAEVideoSceneFlow(nn.Module):
         )
         if prediction_type not in ("x", "v"):
             raise ValueError("prediction_type must be 'x' or 'v'")
+        asset_position_mode_i = str(asset_position_mode).lower()
+        if asset_position_mode_i not in ASSET_POSITION_MODES:
+            raise ValueError(
+                f"asset_position_mode must be one of {ASSET_POSITION_MODES}, got {asset_position_mode!r}"
+            )
         sky_grid_t = None
         if sky_grid is not None:
             if len(sky_grid) != 2:
@@ -851,6 +862,7 @@ class RAEVideoSceneFlow(nn.Module):
             rope_theta=float(rope_theta),
             encoder_mrope_section=encoder_mrope_section_i,
             ddt_mrope_section=ddt_mrope_section_i,
+            asset_position_mode=asset_position_mode_i,
             t_eps=float(t_eps),
         )
         self.gradient_checkpointing = False
@@ -1558,29 +1570,78 @@ class RAEVideoSceneFlow(nn.Module):
                 .expand(-1, k, -1, -1, -1)
                 .reshape(b * k * int(seq_len), num_patches, 3)
             )
-            patch_pos = visual_pos_flat.gather(1, sampled.unsqueeze(-1).expand(-1, -1, 3))
-            patch_pos = torch.where(sample_mask.unsqueeze(-1), patch_pos, torch.zeros_like(patch_pos))
-
             patch_y = torch.div(torch.arange(num_patches, device=device, dtype=torch.long), gw, rounding_mode="floor")
             patch_x = torch.arange(num_patches, device=device, dtype=torch.long) % gw
-            counts_f = valid_f.sum(dim=1).clamp_min(1.0)
-            mean_y = (flat_valid.to(dtype=torch.float32) * patch_y.to(dtype=torch.float32).view(1, -1)).sum(dim=1) / counts_f
-            mean_x = (flat_valid.to(dtype=torch.float32) * patch_x.to(dtype=torch.float32).view(1, -1)).sum(dim=1) / counts_f
-            summary_t = visual_pos[row_ids_flat, frame_idx_t.reshape(-1), 0, 0]
-            summary_y = mean_y.round().clamp(0, gh - 1)
-            summary_x = mean_x.round().clamp(0, gw - 1)
-            if visual_pos.dtype.is_floating_point:
-                summary_pos = torch.stack([summary_t, summary_y, summary_x], dim=-1).to(dtype=visual_pos.dtype)
-            else:
+            frame_has_tokens = flat_valid.any(dim=1)
+            asset_position_mode = str(getattr(self.config, "asset_position_mode", "localized"))
+            if asset_position_mode not in ASSET_POSITION_MODES:
+                raise ValueError(
+                    f"asset_position_mode must be one of {ASSET_POSITION_MODES}, got {asset_position_mode!r}"
+                )
+            if asset_position_mode == "canonical":
+                valid_f32 = flat_valid.to(dtype=torch.float32)
+                y_full = patch_y.to(dtype=torch.float32).view(1, -1).expand(flat_valid.shape[0], -1)
+                x_full = patch_x.to(dtype=torch.float32).view(1, -1).expand(flat_valid.shape[0], -1)
+                min_y = torch.where(
+                    flat_valid,
+                    y_full,
+                    torch.full_like(y_full, float(gh)),
+                ).min(dim=1).values
+                min_x = torch.where(
+                    flat_valid,
+                    x_full,
+                    torch.full_like(x_full, float(gw)),
+                ).min(dim=1).values
+                min_y = torch.where(frame_has_tokens, min_y, torch.zeros_like(min_y))
+                min_x = torch.where(frame_has_tokens, min_x, torch.zeros_like(min_x))
+                local_y = y_full - min_y.view(-1, 1)
+                local_x = x_full - min_x.view(-1, 1)
+                canonical_pos_flat = torch.zeros(
+                    visual_pos_flat.shape,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                canonical_pos_flat[..., 0] = visual_pos_flat[..., 0].to(dtype=torch.float32)
+                canonical_pos_flat[..., 1] = float(gh) + local_y
+                canonical_pos_flat[..., 2] = float(gw) + local_x
+                patch_pos = canonical_pos_flat.gather(1, sampled.unsqueeze(-1).expand(-1, -1, 3))
+                patch_pos = torch.where(sample_mask.unsqueeze(-1), patch_pos, torch.zeros_like(patch_pos))
+                counts_f = valid_f32.sum(dim=1).clamp_min(1.0)
+                mean_y = (valid_f32 * local_y).sum(dim=1) / counts_f
+                mean_x = (valid_f32 * local_x).sum(dim=1) / counts_f
+                summary_t = visual_pos[row_ids_flat, frame_idx_t.reshape(-1), 0, 0].to(dtype=torch.float32)
                 summary_pos = torch.stack(
                     [
-                        summary_t.to(dtype=torch.long),
-                        summary_y.to(dtype=torch.long),
-                        summary_x.to(dtype=torch.long),
+                        summary_t,
+                        torch.full_like(mean_y, float(gh)) + mean_y,
+                        torch.full_like(mean_x, float(gw)) + mean_x,
                     ],
                     dim=-1,
                 )
-            frame_has_tokens = flat_valid.any(dim=1)
+            else:
+                patch_pos = visual_pos_flat.gather(1, sampled.unsqueeze(-1).expand(-1, -1, 3))
+                patch_pos = torch.where(sample_mask.unsqueeze(-1), patch_pos, torch.zeros_like(patch_pos))
+                counts_f = valid_f.sum(dim=1).clamp_min(1.0)
+                mean_y = (
+                    flat_valid.to(dtype=torch.float32) * patch_y.to(dtype=torch.float32).view(1, -1)
+                ).sum(dim=1) / counts_f
+                mean_x = (
+                    flat_valid.to(dtype=torch.float32) * patch_x.to(dtype=torch.float32).view(1, -1)
+                ).sum(dim=1) / counts_f
+                summary_t = visual_pos[row_ids_flat, frame_idx_t.reshape(-1), 0, 0]
+                summary_y = mean_y.round().clamp(0, gh - 1)
+                summary_x = mean_x.round().clamp(0, gw - 1)
+                if visual_pos.dtype.is_floating_point:
+                    summary_pos = torch.stack([summary_t, summary_y, summary_x], dim=-1).to(dtype=visual_pos.dtype)
+                else:
+                    summary_pos = torch.stack(
+                        [
+                            summary_t.to(dtype=torch.long),
+                            summary_y.to(dtype=torch.long),
+                            summary_x.to(dtype=torch.long),
+                        ],
+                        dim=-1,
+                    )
             block_tokens = torch.cat([patch_h, summary_h[:, None, :]], dim=1).reshape(
                 b, k * int(seq_len) * (max_patch + 1), hidden_size
             )

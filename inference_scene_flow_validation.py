@@ -1090,6 +1090,7 @@ def main() -> None:
         sky_grid=args.sky_grid,
         max_sky_tokens=int(args.sky_grid[0] * args.sky_grid[1]),
         prediction_type=args.prediction_type,
+        asset_position_mode="localized",
     ).to(device)
     ckpt_info = load_scene_flow_ckpt(
         scene_flow, assembler, args.scene_flow_ckpt_path, args.no_ema, device
