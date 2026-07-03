@@ -31,9 +31,9 @@ v8 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend �
 chunked v8 包含：
 
 * SceneFlow fallback / debug：`raw`、`pass1` heads、由 `semantic_logits` 派生出的 `semantic_vehicle_prob/mask`、scene LUT、`pass2_splatted_tok_low`、Mode-A `phase1_localized`/`asset_pass`、Mode-B planner/delete masks。
-* SceneFlow fast training：scene LUT、`pass2_splatted_tok_low`、`flow_inputs`、Mode-A 最后一层 asset LUT。训练时 tokenizer.encode 和可训练的 `ScaffoldPacker.mlp` 仍在线运行；FeatureSplatter、SoftMask render、CleanSceneState 构建和 asset Gaussian 读取都会跳过。
+* SceneFlow fast training：scene LUT、`pass2_splatted_tok_low`、`flow_inputs`、Mode-A 完整 4-level asset LUT。训练时 tokenizer.encode 和可训练的 `ScaffoldPacker.mlp` 仍在线运行；FeatureSplatter、SoftMask render、CleanSceneState 构建和 asset Gaussian 读取都会跳过。
 * tokenizer Stage-B：`raw`、`pass1` heads、scene LUT、`pass2_splatted_tok_low`。
-* 不再保存训练读取路径未消费的 `aggregated_tokens_*`、`dino_tokens_*`、special tokens、全量 `semantic_logits`；Mode-A asset LUT 只保存正式 T1 默认使用的最后一层。
+* 不再保存训练读取路径未消费的 `aggregated_tokens_*`、`dino_tokens_*`、special tokens、全量 `semantic_logits`；Mode-A asset LUT 保留 4 层以支持正式 SceneFlow asset conditioning。
 
 因此 `cache.index_select(subset)` 不应该和“先把 `gs_map` 裁成 subset，再 live 重跑 `FeatureSplatter`”逐 token 相等。后者的 source Gaussian 少了其他帧，遮挡和补洞都会变。验证时应检查 full clip cache 与 full clip live recompute 一致；对子集只检查缓存切片结构正常，以及 mask、`z_clean`、asset tokens、scaffold 等非 pass2 字段一致。这个语义更接近实际推理：推理通常对完整 clip 做 live splat。
 
@@ -74,10 +74,12 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/precompute_flow_features.py \
     --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_mode_a_views1.jsonl \
     --candidate_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/metadata/training/mode_a_candidates.jsonl \
     --views 1 \
-    --save_compression chunked_zstd --gzip_level 1
+    --save_compression chunked_zstd --gzip_level 1 \
+    --overwrite_v7 \
+    --max_save_threads 1
 ```
 
-如果已有 v6/v7 cache，只想升级旧文件并保留已生成的 v8 文件，可在 Mode A / Mode B 预计算命令里加 `--overwrite_v7`。它会读取已存在 `.pt` 的 `schema_version`：v8 直接跳过，非 v8 或无法读取的文件会重新生成并覆盖。`--force_overwrite` 仍表示无条件重算覆盖。
+如果已有旧 cache，只想升级旧文件并保留已生成的当前格式文件，可在 Mode A / Mode B 预计算命令里加 `--overwrite_v7`。它会读取已存在 `.pt` 的 `schema_version` 和 chunked `format_version`：当前 v8 chunked format 直接跳过，v6/v7、旧 chunked format v1、非 chunked 或无法读取的文件会重新生成并覆盖。`--force_overwrite` 仍表示无条件重算覆盖。
 
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python inference_scene_editor.py \
     --output_dir runs/mode_a_all_vis \

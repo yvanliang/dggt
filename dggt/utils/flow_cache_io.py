@@ -26,7 +26,7 @@ GZIP_MAGIC = b"\x1f\x8b"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SQLITE_MAGIC = b"SQLite format 3\x00"
 CHUNKED_FLOW_CACHE_FORMAT = "flow_cache_chunked_zstd_sqlite"
-CHUNKED_FLOW_CACHE_FORMAT_VERSION = 1
+CHUNKED_FLOW_CACHE_FORMAT_VERSION = 2
 CURRENT_FLOW_CACHE_SCHEMA_VERSION = 8
 
 
@@ -388,7 +388,7 @@ def save_flow_cache_chunked(
         asset = payload.get("asset_pass") or {}
         asset_keys = sorted(int(k) for k in asset.keys())
         asset_num_levels = {
-            str(k): 1
+            str(k): int(asset[int(k)]["F_g_lut_asset_int8"].shape[2])
             for k in asset_keys
         }
         summary = {
@@ -534,15 +534,20 @@ def save_flow_cache_chunked(
 
             for obj_key in asset_keys:
                 entry = asset[obj_key]
+                num_levels = int(entry["F_g_lut_asset_int8"].shape[2])
+                if num_levels <= 0:
+                    raise RuntimeError(
+                        f"Mode-A chunked cache asset {obj_key} has no LUT levels"
+                    )
                 zbytes, raw_bytes = _put_chunk(
                     conn,
                     cctx,
                     f"mode_a/asset/{obj_key}/meta",
                     {
                         "object_key": obj_key,
-                        "num_levels": 1,
-                        "source_num_levels": int(entry["F_g_lut_asset_int8"].shape[2]),
-                        "source_level_index": int(entry["F_g_lut_asset_int8"].shape[2]) - 1,
+                        "num_levels": num_levels,
+                        "source_num_levels": num_levels,
+                        "source_level_index": None,
                         "has_fit_metrics": entry.get("fit_metrics") is not None,
                     },
                 )
@@ -569,23 +574,23 @@ def save_flow_cache_chunked(
                     total_zbytes += zbytes
                     total_raw_bytes += raw_bytes
                     chunk_count += 1
-                    source_level = int(entry["F_g_lut_asset_int8"].shape[2]) - 1
-                    zbytes, raw_bytes = _put_chunk(
-                        conn,
-                        cctx,
-                        f"mode_a/asset/{obj_key}/frame/{frame:02d}/lut/00",
-                        {
-                            "F_g_lut_asset_int8": entry["F_g_lut_asset_int8"][
-                                frame, :, source_level : source_level + 1, :
-                            ],
-                            "F_g_lut_asset_scale": entry["F_g_lut_asset_scale"][
-                                frame, source_level : source_level + 1
-                            ],
-                        },
-                    )
-                    total_zbytes += zbytes
-                    total_raw_bytes += raw_bytes
-                    chunk_count += 1
+                    for level in range(num_levels):
+                        zbytes, raw_bytes = _put_chunk(
+                            conn,
+                            cctx,
+                            f"mode_a/asset/{obj_key}/frame/{frame:02d}/lut/{level:02d}",
+                            {
+                                "F_g_lut_asset_int8": entry["F_g_lut_asset_int8"][
+                                    frame, :, level : level + 1, :
+                                ],
+                                "F_g_lut_asset_scale": entry["F_g_lut_asset_scale"][
+                                    frame, level : level + 1
+                                ],
+                            },
+                        )
+                        total_zbytes += zbytes
+                        total_raw_bytes += raw_bytes
+                        chunk_count += 1
         elif mode_kind == "mode_b":
             block = payload.get("mode_b") or {}
             offsets = _frame_gauss_offsets_from_payload(payload)
@@ -824,11 +829,29 @@ def load_chunked_flow_cache_subset(
     with _open_chunked_ro(path) as conn:
         summary = _get_info(conn, "summary")
         meta_full = _get_chunk(conn, dctx, "global/meta")
-        fast_scene_flow = consumer in ("scene_flow_fast", "scene_flow_fast_sky") and bool(
+        if consumer == "scene_flow_rgb_context":
+            subset_list = subset.to(dtype=torch.long).view(-1).tolist()
+            raw_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/raw") for f in subset_list]
+            pass1_head_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/pass1_heads") for f in subset_list]
+            return {
+                "schema_version": int(summary["schema_version"]),
+                "mode_kind": str(summary["mode_kind"]),
+                "meta": _slice_meta_for_frames(meta_full, subset),
+                "raw": {
+                    "images_u8": torch.stack([chunk["images_u8"] for chunk in raw_chunks], dim=0).contiguous(),
+                    "sky_mask": torch.stack([chunk["sky_mask"] for chunk in raw_chunks], dim=0).contiguous(),
+                },
+                "pass1": {
+                    "pose_enc": torch.stack([chunk["pose_enc"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+                    "depth": torch.stack([chunk["depth"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+                },
+            }
+        fast_scene_flow = consumer in ("scene_flow_fast", "scene_flow_fast_sky", "scene_flow_fast_rgb") and bool(
             summary.get("has_flow_inputs", False)
         )
-        include_fast_raw = consumer == "scene_flow_fast_sky"
-        object_meta_full = None if fast_scene_flow else _get_chunk(conn, dctx, "global/object_meta")
+        include_fast_raw = consumer in ("scene_flow_fast_sky", "scene_flow_fast_rgb")
+        include_fast_heads = consumer == "scene_flow_fast_rgb"
+        object_meta_full = _get_chunk(conn, dctx, "global/object_meta")
         phase1_alignment = {} if fast_scene_flow else _get_chunk(conn, dctx, "global/phase1_alignment")
 
         raw_chunks = (
@@ -836,14 +859,18 @@ def load_chunked_flow_cache_subset(
             if (not fast_scene_flow or include_fast_raw)
             else []
         )
-        pass1_head_chunks = [] if fast_scene_flow else [_get_chunk(conn, dctx, f"frame/{f:02d}/pass1_heads") for f in subset_list]
+        pass1_head_chunks = (
+            []
+            if (fast_scene_flow and not include_fast_heads)
+            else [_get_chunk(conn, dctx, f"frame/{f:02d}/pass1_heads") for f in subset_list]
+        )
         scene_lut_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/scene_lut") for f in subset_list]
         pass2_chunks = [_get_chunk(conn, dctx, f"frame/{f:02d}/pass2") for f in subset_list]
 
         cams = {}
         semantic_vehicle_prob = None
         semantic_vehicle_mask = None
-        if not fast_scene_flow:
+        if not fast_scene_flow or include_fast_heads:
             cams = {
                 key: torch.stack([chunk["cameras_dggt"][key] for chunk in pass1_head_chunks], dim=0).contiguous()
                 for key in ("viewmats", "Ks", "camera_to_world")
@@ -864,11 +891,11 @@ def load_chunked_flow_cache_subset(
                     )
         pass1 = {
             "cameras_dggt": cams,
-            "pose_enc": None if fast_scene_flow else torch.stack([chunk["pose_enc"] for chunk in pass1_head_chunks], dim=0).contiguous(),
-            "gs_map": None if fast_scene_flow else torch.stack([chunk["gs_map"] for chunk in pass1_head_chunks], dim=0).contiguous(),
-            "depth": None if fast_scene_flow else torch.stack([chunk["depth"] for chunk in pass1_head_chunks], dim=0).contiguous(),
-            "dynamic_conf": None if fast_scene_flow else torch.stack([chunk["dynamic_conf"] for chunk in pass1_head_chunks], dim=0).contiguous(),
-            "gs_conf": None if fast_scene_flow else torch.stack([chunk["gs_conf"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "pose_enc": None if (fast_scene_flow and not include_fast_heads) else torch.stack([chunk["pose_enc"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "gs_map": None if (fast_scene_flow and not include_fast_heads) else torch.stack([chunk["gs_map"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "depth": None if (fast_scene_flow and not include_fast_heads) else torch.stack([chunk["depth"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "dynamic_conf": None if (fast_scene_flow and not include_fast_heads) else torch.stack([chunk["dynamic_conf"] for chunk in pass1_head_chunks], dim=0).contiguous(),
+            "gs_conf": None if (fast_scene_flow and not include_fast_heads) else torch.stack([chunk["gs_conf"] for chunk in pass1_head_chunks], dim=0).contiguous(),
             "semantic_logits": None,
             "semantic_vehicle_prob": semantic_vehicle_prob,
             "semantic_vehicle_mask": semantic_vehicle_mask,

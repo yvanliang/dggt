@@ -61,6 +61,7 @@ from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens, quantize_tokens
 from dggt.utils.flow_cache_io import (
     CURRENT_FLOW_CACHE_SCHEMA_VERSION,
+    is_current_flow_cache_summary,
     is_chunked_flow_cache,
     load_chunked_flow_cache_summary,
     load_flow_cache,
@@ -228,6 +229,16 @@ def _should_skip_existing_cache(path: Path, args: argparse.Namespace) -> tuple[b
     if bool(getattr(args, "overwrite_v7", False)):
         version = _read_cache_schema_version(path)
         if version == CACHE_SCHEMA_VERSION:
+            if str(getattr(args, "save_compression", "")) == "chunked_zstd":
+                try:
+                    if not is_chunked_flow_cache(path):
+                        return False, f"schema_v{CACHE_SCHEMA_VERSION}_non_chunked"
+                    summary = load_chunked_flow_cache_summary(path)
+                except Exception:
+                    return False, f"schema_v{CACHE_SCHEMA_VERSION}_unreadable_chunked"
+                if not is_current_flow_cache_summary(summary):
+                    fmt = summary.get("format_version", "unknown")
+                    return False, f"schema_v{CACHE_SCHEMA_VERSION}_chunked_format_v{fmt}"
             return True, f"schema_v{CACHE_SCHEMA_VERSION}"
         return False, f"schema_v{version if version is not None else 'unreadable'}"
     return True, "exists"

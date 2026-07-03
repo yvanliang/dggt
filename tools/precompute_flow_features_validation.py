@@ -221,7 +221,10 @@ def _should_skip_existing_validation_cache(
     except Exception:
         return False, "unreadable_chunked"
     if not is_current_flow_cache_summary(summary):
-        return False, f"schema_v{schema_version}"
+        if schema_version != CURRENT_FLOW_CACHE_SCHEMA_VERSION:
+            return False, f"schema_v{schema_version}"
+        fmt = summary.get("format_version", "unknown")
+        return False, f"schema_v{schema_version}_chunked_format_v{fmt}"
     try:
         probe = load_chunked_flow_cache_probe(path)
         policy = str(

@@ -5,6 +5,7 @@
 
 * 逻辑 schema：`schema_version=8`、`mode_kind="mode_a"`；
 * 物理格式：chunked-zstd SQLite container，文件扩展名仍为 `.pt`；
+* chunked format：当前为 `format_version=2`，Mode-A asset LUT 保存完整 4 levels；
 * 读取入口：`dggt.utils.flow_cache_io`，不要直接假定是普通 `torch.save` 文件。
 
 因此下游 `WaymoFlowCacheDataset` / `FlowFeatureAssembler` / `SceneFlowMatching`
@@ -15,8 +16,8 @@ v8 同时包含旧版本问题的修复：
 * v7 修复：`pass1.gs_conf` 以 finite fp32 保存，避免 v6 的 fp16 `inf` 溢出；
 * v8 修复：pass2 splat 使用与当前 training 一致的动态 Gaussian 生命周期阈值
   `sigmoid(0.5)`，不再使用旧的 `0.5` 概率阈值；
-* validation 生成器只复用已有的 v8 chunked cache。已有 v6/v7 或 monolithic
-  v8 文件会默认自动重算，避免静默混用旧数据。
+* validation 生成器只复用已有的当前 v8 chunked cache。已有 v6/v7、旧 chunked
+  format v1 或 monolithic v8 文件会默认自动重算，避免静默混用旧数据。
 
 与训练 Mode A 的区别：
 
@@ -75,10 +76,14 @@ conda activate dggt
 ## 1. 生成 validation 缓存
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u tools/precompute_flow_features_validation.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. conda run -n dggt --no-capture-output \
+    python -u tools/precompute_flow_features_validation.py \
     --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
     --asset_root /data/disk2/lyy_dataset/test_transfer/objects_ply_transformed \
-    --out_root  /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_validation
+    --out_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_validation \
+    --save_compression chunked_zstd \
+    --gzip_level 1 \
+    --max_save_threads 1
 ```
 
 输出使用与 training 相同的六位数字补零，再接单下划线和完整编辑名称：
@@ -112,8 +117,8 @@ manifest 中仍保留逻辑数字 `index = entry_index*5 + variant_ord`，只用
 
 * `--variants combined,deletion` —— 只生成指定 variant（调试 / 省时）。
 * `--start N --end M` —— 只处理 entry 索引 `[N, M)`（0..32）。
-* `--force_overwrite` —— 无条件覆盖已存在的 `.pt`。默认只跳过合法的 v8
-  chunked-zstd cache；v6/v7 或非 chunked 文件会自动重算。
+* `--force_overwrite` —— 无条件覆盖已存在的 `.pt`。默认只跳过合法的当前 v8
+  chunked-zstd cache；v6/v7、旧 chunked format v1 或非 chunked 文件会自动重算。
 * `--save_compression chunked_zstd` —— 默认值，与 training 一致。`gzip/zstd/none`
   仅保留用于调试，不应作为正式 validation cache 格式。
 * `--asset_yaw_correction_deg 180 --max_pose_refine_yaw_deg 15` —— 与 Mode A 默认一致。
