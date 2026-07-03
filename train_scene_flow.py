@@ -3084,7 +3084,6 @@ def main() -> None:
         sky_grid=args.sky_grid,
         max_sky_tokens=int(args.sky_grid[0] * args.sky_grid[1]),
         prediction_type=args.prediction_type,
-        asset_position_mode="localized",
     ).to(device)
     scene_flow.enable_gradient_checkpointing()
     load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))

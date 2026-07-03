@@ -3734,10 +3734,10 @@ def build_pretrain_bundle_from_batch(
             z_clean_n,
             object_patch_mask,
             max_assets=5,
-            # z_clean_n is normalized to roughly unit scale. A small std
+            # z_clean_n is normalized to roughly unit scale. A small 0.15 std
             # perturbation keeps coarse appearance conditioning while weakening
             # exact per-patch latent copying from the target scene.
-            corruption_noise_std=0.1,
+            corruption_noise_std=0.0,  # 0.15
         )
         for row, length in enumerate(asset_lengths.detach().cpu().tolist()):
             if int(length) > 0:
@@ -3747,7 +3747,7 @@ def build_pretrain_bundle_from_batch(
             z_clean_n,
             None,
             max_assets=5,
-            corruption_noise_std=0.1,
+            corruption_noise_std=0.0,
         )
 
     dynamic_mask = batch.get("dynamic_mask")
@@ -3758,7 +3758,7 @@ def build_pretrain_bundle_from_batch(
             dynamic_mask,
             args.patch_grid,
             max_assets=5,
-            corruption_noise_std=0.1,
+            corruption_noise_std=0.0,  # 0.15
         )
         for row, needs_row in enumerate(needs_legacy.detach().cpu().tolist()):
             if not needs_row:
@@ -4119,6 +4119,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "(we have hidden=1440, OK up to latent_dim=1440)."
         ),
     )
+
     parser.add_argument("--scene_start", type=int, default=0)
     parser.add_argument("--scene_end", type=int, default=600)
     parser.add_argument("--sequence_length", type=int, default=4)
@@ -4513,7 +4514,6 @@ def main() -> None:
         sky_mask_refine_scale=int(args.sky_mask_refine_scale),
         sky_mask_refine_channels=int(args.sky_mask_refine_channels),
         prediction_type=args.prediction_type,
-        asset_position_mode="canonical",
     ).to(device)
     scene_flow.enable_gradient_checkpointing()
     load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))

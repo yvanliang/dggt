@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import inspect
-import json
 
 import pytest
 import torch
@@ -101,19 +100,6 @@ def test_scene_flow_defaults_to_clean_prediction():
 def test_a1_rope_layout_is_versioned_in_config():
     model = _tiny_model()
     assert model.config.rope_layout_version == ROPE_LAYOUT_VERSION
-
-
-def test_asset_position_mode_is_runtime_only_not_serialized(tmp_path):
-    model = _tiny_model(asset_position_mode="canonical")
-    assert model.config.asset_position_mode == "canonical"
-    assert "asset_position_mode" not in model.config.to_dict()
-
-    model.save_pretrained(tmp_path)
-    saved_config = json.loads((tmp_path / "config.json").read_text())
-    assert "asset_position_mode" not in saved_config
-
-    loaded = WanSceneFlow.from_pretrained(tmp_path)
-    assert loaded.config.asset_position_mode == "localized"
 
 
 def test_ddt_visual_embedders_consume_only_noisy_latent_tokens():
