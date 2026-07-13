@@ -28,6 +28,8 @@ export QWEN_TEXT_ENCODER=/home/dancer/model/Qwen/Qwen3-0.6B/
 * `pretrained/model__latest_waymo.pt` 当前是断链，不要用它；使用上面的 `$DGGT_CKPT`。
 * 这份 DGGT Waymo 数据的 tokenizer patch grid 是 `25x37`，pretrain 必须传 `--patch_grid_h 25 --patch_grid_w 37`。
 * `logs/tokenizer_t0_waymo_views1/feature_stats.pt` 是 tokenizer 训练用的 `4x3072` aggregator stats，不能直接给 SceneFlow pretrain；SceneFlow 需要下面重新计算的 latent stats（维度 = tokenizer latent dim）。
+* **删除 ae29c424 及所有 v2 camera stats/checkpoint，重新计算 stats 并从头 pretrain。** 当前代码不提供旧 v2 resume、推理或迁移兼容。
+* camera stats 固定来自 `$DGGT_CKPT` 的冻结 CameraHead；即使使用 `--latent_stats_path` 复用 latent stats，仍必须传 `--dggt_ckpt_path`。stats/pretrain/T1/offline inference 会核对同一 DGGT SHA256。
 * **正式 pretrain 和正式训练统一使用 1024-dim tokenizer latent**：`$TOKENIZER_CKPT`、`$FEATURE_STATS`、`--latent_dim 1024`、`$SCENE_FLOW_PRETRAIN_CKPT` 必须来自同一套 1024 tokenizer / SceneFlow pretrain。三者维度不一致会在 `load_into_buffers`/`set_latent_stats` 或 warm-start 时直接报错。
 * 实现设计说明见 `docs/scene_flow_model_design.md`。本文档只维护运行命令和参数。
 * `--shift 10.0`、`--weighting_scheme waver --mode_scale 1.29`、`--lambda_repa 0.5`、EMA 验证默认开启；pretrain 和正式训练保持一致。
@@ -35,7 +37,11 @@ export QWEN_TEXT_ENCODER=/home/dancer/model/Qwen/Qwen3-0.6B/
 
 ## 1. Pretrain 正式参数
 
-先计算正式 latent stats。`--max_batches 800` 是校准预算，可根据时间增减。
+先用同一次冻结 DGGT forward 同时计算 tokenizer latent stats 与 DGGT CameraHead-derived
+camera anchor/delta 11D stats。该路径不读取 Waymo extrinsics/intrinsics。输出文件必须包含
+`mu_z/sigma_z`、`camera_anchor_mean/std`、`camera_delta_mean/std`、target space/source/version、
+DGGT checkpoint SHA256 与 anchor/delta count；
+`--max_batches 800` 是校准预算，可根据时间增减。
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 python -u tools/compute_pretrain_feature_stats.py \
@@ -97,6 +103,10 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
     --guidance_scale 1.0 \
     --asset_control_guidance_scale 1.0 \
     --camera_guidance_scale 1.0 \
+    --camera_text_guidance_scale 1.0 \
+    --camera_absolute_weight 1.0 \
+    --camera_relative_weight 1.0 \
+    --camera_smoothness_weight 0.25 \
     --val_guidance_scales "1.0,2.0,4.0" \
     --val_scene_start 0 --val_scene_end 100 \
     --val_every 1000 \
@@ -153,7 +163,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
 * mRoPE A1 固定坐标：video/asset/edit-control 使用真实 `(t,y,x)`；camera condition 和 camera generation 使用同一帧 `t`、空间中心 `(H//2,W//2)`，避免把全局相机条件绑到左上角 patch；sky generation 使用独立 sky atlas grid 和 temporal offset `128`，避免 scene-level 天空 token 与视频 patch 共享位置。这个设置是模型结构的一部分，不通过命令行覆盖，并通过 `rope_layout_version=a1_camera_center_sky128` 写入 checkpoint config。
 * `--weighting_scheme waver --mode_scale 1.29 --shift 10.0 --prediction_type x`：pretrain、正式训练、训练内 validation、离线 inference 需要保持一致。`logit_mean/logit_std` 只在显式切回 `--weighting_scheme logit_normal` 做 ablation 时使用。`x` 是 RAEv2 T2I 的 clean-latent 输出参数化；代码仍会把它转换成 velocity 做 flow matching loss 和 ODE 采样。
 * `--lambda_repa 0.5`：推荐命令显式打开；CLI 默认仍是 `0.0`。
-* `--guidance_scale --asset_control_guidance_scale --camera_guidance_scale`：pretrain validation 采样的 factored CFG scale，默认 `1.0` 为 no-op。`--val_guidance_scales` 和 offline `--cfg` 只扫描 text scale；asset/camera 默认固定为 `1.0`，与 Cosmos 保留 clean structural condition、只对 text 做 CFG 的语义一致。只有显式传 offline `--asset_control_guidance_scale` / `--camera_guidance_scale` 才放大对应控制残差。pretrain 推理中 asset/camera 条件可选；缺失某类条件时，对应 scale 会自动退化为 `1.0`，并使用 learned null condition。具体分支设计见 `docs/scene_flow_model_design.md`。
+* `--guidance_scale --asset_control_guidance_scale --camera_guidance_scale --camera_text_guidance_scale`：前三者分别控制全局 text、asset/control residual、camera condition residual；最后一个只控制 camera 输出的 text residual，默认 `1.0`。因此 `--val_guidance_scales` / offline `--cfg` 扫描全局 text scale 时 camera trajectory 保持不变。
 * 扩散/flow 的训练 loss 只能作为粗略健康检查；样本质量以 EMA validation 图像为准。
 
 正式配置已切到 **1024-dim 6 万 iter tokenizer**。切 tokenizer 时务必重算 `$FEATURE_STATS`，并保持 pretrain / T1 的 `--latent_dim 1024` 与 warm-start checkpoint 维度一致。tokenizer 续训时建议跑满 RAE 式 decoder noise augmentation（denoise-recon 阶段），让 decoder 对 SceneFlow latent 误差鲁棒，这直接削 grid。
@@ -269,7 +279,58 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 
 注意：正式训练 validation 会保存 loss 标量、latent PCA / mask / CFG 采样诊断图到 `logs/scene_flow_t1_1024/validation/step_xxxxxx/` 并写入 wandb。训练内 validation 保持轻量，避免每 1000 step 做 3DGS 渲染拖慢训练。
 
-注意：`inference_scene_flow_validation.py --window --window_stride` 的 offline 推理现在不是“每个窗口独立采样后平均 latent”，而是维护 full 29 帧 latent，在每个采样步对窗口 velocity 做 cosine 加权融合后统一更新。`--window` 应与训练 `--sequence_length` 对齐；`--window_stride < --window` 可让重叠区更平滑，但推理更慢。
+注意：正式 offline 入口是 `inference_scene_flow.py --window 8 --window_stride 4`，不是不存在的 `inference_scene_flow_validation.py`。它维护 full 29 帧 latent，在每个采样步对窗口 velocity 做 cosine coverage 归一化后统一更新；正式阶段始终使用 input DGGT camera 与 GT sky/mask，不生成 11D camera/sky。
+
+## 2.1 Camera cache 修复与旧 checkpoint 迁移
+
+cache 缺少相机 GT 或原图尺寸时，普通 `.pt` 与 SQLite chunk cache 使用同一命令修复：
+
+```bash
+python tools/backfill_flow_cache_camera_gt.py \
+    --cache_root /path/to/cache_or_root \
+    --processed_root /data/disk2/lyy_dataset/waymo_processed_dggt \
+    --split training --force
+```
+
+旧 48K pretrain 的 `dggt_hidden_v1/2048D` camera head 不能 resume 到 v3。先用上面的
+stats 工具生成 v3 stats，然后把显式允许的 legacy shared-trunk checkpoint（265bd939）传给 `--warm_start_path`：程序只迁移 EMA
+materialized shared trunk 中同名同 shape 参数，跳过 camera generation projection/decoder、
+role embedding 与 stats，重置 EMA step/optimizer/scheduler，并从 pretrain step 0 开始。
+`--resume_path` 只接受 representation、dimension、stats version 完全一致的新完整 checkpoint。
+
+## 4. 四类 validation / offline inference
+
+训练内 pretrain validation 使用 `train_scene_flow_pretrain.py` 的
+`--val_sliding_window 8 --val_sliding_stride 4 --val_sample_steps 35`；正式训练 validation
+使用 `train_scene_flow.py` 的同名滑窗参数。正式 validation 不 pack、不加噪、不预测 camera/sky
+generation state。
+
+Pretrain offline 单窗：
+
+```bash
+python inference_scene_flow_pretrain.py \
+  --weights $SCENE_FLOW_PRETRAIN_CKPT --dggt_ckpt_path $DGGT_CKPT \
+  --tokenizer_ckpt_path $TOKENIZER_CKPT --feature_stats_path $FEATURE_STATS \
+  --val_image_dir $WAYMO_DGGT_VAL_ROOT --val_caption_root $SCENE_CAPTION_VAL_ROOT \
+  --num_frames 8 --val_sliding_window 8 --val_sliding_stride 4 --cfg 1 2 4
+```
+
+Pretrain offline 重叠长窗只需改为 `--num_frames 29 --val_sliding_window 8
+--val_sliding_stride 4`。两者默认 `--camera_text_guidance_scale 1`，所以全局 CFG sweep 不改变
+camera trajectory。
+
+正式 offline 单窗/短 clip 与重叠长 clip 统一使用真实入口：
+
+```bash
+python inference_scene_flow.py \
+  --scene_flow_ckpt_path /path/to/flow_stepXXXXXX.pt --ckpt_path $DGGT_CKPT \
+  --tokenizer_ckpt_path $TOKENIZER_CKPT --manifest_path $SCENE_FLOW_VAL_MANIFEST \
+  --output_dir runs/scene_flow_offline --window 8 --window_stride 4 \
+  --guidance_scales 1,2,4
+```
+
+长度不超过 8 时公共 scheduler 自动返回单窗；长 clip 自动走 overlap schedule。所有入口都禁止
+`stride>=window`（只有 `sequence_length<=window` 的天然单窗不受该限制）。
 
 旧 monolithic cache 转换为当前 chunked cache：
 

@@ -19,7 +19,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from dggt.utils.camera_condition import CAMERA_POSE_SUMMARY_DIM
+from dggt.utils.camera_condition import CAMERA_CONDITION_REPRESENTATION, CAMERA_POSE_SUMMARY_DIM
+from dggt.utils.camera_generation import (
+    CAMERA_GENERATION_DIM,
+    CAMERA_GENERATION_REPRESENTATION,
+    CAMERA_STATS_STD_FLOOR,
+    CAMERA_STATS_VERSION,
+    denormalize_camera_state,
+    normalize_camera_state,
+)
 
 
 def _normalize_patch_grid(
@@ -744,7 +752,12 @@ class RAEVideoSceneFlow(nn.Module):
         max_control_tokens_per_frame: int = 128,
         max_control_tokens: int = 1024,
         camera_cond_dim: int = CAMERA_POSE_SUMMARY_DIM,
-        camera_gen_dim: int = 2048,
+        camera_gen_dim: int = CAMERA_GENERATION_DIM,
+        camera_generation_representation: str | None = None,
+        camera_stats_version: str = CAMERA_STATS_VERSION,
+        camera_condition_representation: str = CAMERA_CONDITION_REPRESENTATION,
+        mask_compositing_version: str = "soft_opacity_premultiplied_v2",
+        asset_position_mode: str = "localized",
         sky_token_dim: int = 3,
         sky_grid: tuple[int, int] | list[int] | None = (16, 32),
         max_sky_tokens: int = 512,
@@ -782,6 +795,31 @@ class RAEVideoSceneFlow(nn.Module):
         )
         if prediction_type not in ("x", "v"):
             raise ValueError("prediction_type must be 'x' or 'v'")
+        if str(camera_condition_representation) != CAMERA_CONDITION_REPRESENTATION:
+            raise ValueError(
+                f"camera_condition_representation must be {CAMERA_CONDITION_REPRESENTATION!r}, "
+                f"got {camera_condition_representation!r}"
+            )
+        if camera_generation_representation is None:
+            camera_generation_representation = (
+                CAMERA_GENERATION_REPRESENTATION
+                if int(camera_gen_dim) == CAMERA_GENERATION_DIM
+                else "dggt_hidden_v1"
+            )
+        if str(camera_generation_representation) == CAMERA_GENERATION_REPRESENTATION:
+            if int(camera_gen_dim) != CAMERA_GENERATION_DIM:
+                raise ValueError(
+                    f"{CAMERA_GENERATION_REPRESENTATION} requires camera_gen_dim={CAMERA_GENERATION_DIM}, "
+                    f"got {camera_gen_dim}"
+                )
+            if str(camera_stats_version) != CAMERA_STATS_VERSION:
+                raise ValueError(
+                    f"{CAMERA_GENERATION_REPRESENTATION} requires camera_stats_version={CAMERA_STATS_VERSION!r}"
+                )
+        elif str(camera_generation_representation) != "dggt_hidden_v1":
+            raise ValueError(f"unsupported camera generation representation {camera_generation_representation!r}")
+        if str(asset_position_mode) not in ("localized", "canonical"):
+            raise ValueError("asset_position_mode must be 'localized' or 'canonical'")
         sky_grid_t = None
         if sky_grid is not None:
             if len(sky_grid) != 2:
@@ -821,6 +859,19 @@ class RAEVideoSceneFlow(nn.Module):
                 "mrope_temporal_margin has been removed. SceneFlow now uses fixed A1 RoPE positions: "
                 "video/asset/control temporal offset 0, camera on the video frame center, and sky temporal offset 128."
             )
+        # These are serialized derived/version fields. They are accepted on a
+        # config round-trip but recomputed or fixed by the current model.
+        for derived_name in (
+            "asset_dim",
+            "hidden_size",
+            "rope_layout_version",
+            "sky_rope_temporal_offset",
+            "camera_rope_spatial_mode",
+        ):
+            unused.pop(derived_name, None)
+        if unused:
+            names = ", ".join(sorted(str(name) for name in unused))
+            raise TypeError(f"Unexpected SceneFlow config field(s): {names}")
 
         self.config = Config(
             patch_size=tuple(patch_size),
@@ -857,6 +908,11 @@ class RAEVideoSceneFlow(nn.Module):
             max_control_tokens=int(max_control_tokens),
             camera_cond_dim=int(camera_cond_dim),
             camera_gen_dim=int(camera_gen_dim),
+            camera_generation_representation=str(camera_generation_representation),
+            camera_stats_version=str(camera_stats_version),
+            camera_condition_representation=str(camera_condition_representation),
+            mask_compositing_version=str(mask_compositing_version),
+            asset_position_mode=str(asset_position_mode),
             sky_token_dim=int(sky_token_dim),
             sky_grid=sky_grid_t,
             max_sky_tokens=int(max_sky_tokens),
@@ -906,13 +962,9 @@ class RAEVideoSceneFlow(nn.Module):
         self.asset_frame_embed = nn.Embedding(max(1, int(max_frames)), hidden_size)
         self.control_norm = RMSNorm(int(out_channels) * 2 + 3, eps=float(eps))
         self.control_proj = nn.Linear(int(out_channels) * 2 + 3, hidden_size)
-        self.camera_norm = RMSNorm(int(camera_cond_dim), eps=float(eps))
-        self.camera_proj = nn.Sequential(
-            nn.Linear(int(camera_cond_dim), hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
-        self.camera_gen_norm = RMSNorm(int(camera_gen_dim), eps=float(eps))
+        self.camera_norm = ChannelScale(int(camera_cond_dim))
+        self.camera_proj = nn.Linear(int(camera_cond_dim), hidden_size)
+        self.camera_gen_norm = ChannelScale(int(camera_gen_dim))
         self.camera_gen_proj = nn.Linear(int(camera_gen_dim), hidden_size)
         self.camera_gen_decoder = nn.Sequential(
             RMSNorm(hidden_size, eps=float(eps)),
@@ -949,6 +1001,7 @@ class RAEVideoSceneFlow(nn.Module):
         self.text_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
         self.camera_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
         self.camera_gen_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
+        self.camera_gen_role_embed = nn.Embedding(2, hidden_size)
         self.sky_gen_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
         self.asset_patch_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
         self.asset_summary_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
@@ -988,6 +1041,11 @@ class RAEVideoSceneFlow(nn.Module):
 
         self.register_buffer("mu_z", torch.zeros(int(out_channels)))
         self.register_buffer("sigma_z", torch.ones(int(out_channels)))
+        self.register_buffer("camera_anchor_mean", torch.zeros(int(camera_gen_dim)))
+        self.register_buffer("camera_anchor_std", torch.ones(int(camera_gen_dim)))
+        self.register_buffer("camera_delta_mean", torch.zeros(int(camera_gen_dim)))
+        self.register_buffer("camera_delta_std", torch.ones(int(camera_gen_dim)))
+        self.register_buffer("camera_stats_valid", torch.tensor(False, dtype=torch.bool))
         self.repa_layer_depth = repa_layer_depth_i
         self.repa_block_idx = repa_layer_depth_i - 1
         self.repa_proj = nn.Sequential(
@@ -1017,15 +1075,13 @@ class RAEVideoSceneFlow(nn.Module):
             self.control_proj,
             self.asset_direct_proj,
             self.asset_encoded_proj,
+            self.camera_proj,
             self.camera_gen_proj,
             self.sky_gen_proj,
         ):
             nn.init.xavier_uniform_(module.weight)
             nn.init.zeros_(module.bias)
-        for module in self.camera_proj:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                nn.init.zeros_(module.bias)
+        nn.init.normal_(self.camera_gen_role_embed.weight, std=1.0 / math.sqrt(float(self.config.hidden_size)))
         for module in self.camera_gen_decoder:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -1100,6 +1156,19 @@ class RAEVideoSceneFlow(nn.Module):
             key = prefix + param_name
             if key not in state_dict:
                 state_dict[key] = getattr(self, param_name).detach().clone()
+        if str(self.config.camera_generation_representation) != CAMERA_GENERATION_REPRESENTATION:
+            for name in (
+                "camera_gen_role_embed.weight",
+                "camera_anchor_mean",
+                "camera_anchor_std",
+                "camera_delta_mean",
+                "camera_delta_std",
+                "camera_stats_valid",
+            ):
+                key = prefix + name
+                if key not in state_dict:
+                    value = self.state_dict()[name]
+                    state_dict[key] = value.detach().clone()
         for name, value in self.state_dict().items():
             if name.startswith(("sky_mask_decoder.", "sky_mask_refine_decoder.")):
                 key = prefix + name
@@ -1182,7 +1251,63 @@ class RAEVideoSceneFlow(nn.Module):
         if tuple(sigma.shape) != tuple(self.sigma_z.shape):
             raise ValueError(f"sigma shape {tuple(sigma.shape)} != {tuple(self.sigma_z.shape)}")
         self.mu_z.copy_(mu.to(device=self.mu_z.device, dtype=self.mu_z.dtype))
-        self.sigma_z.copy_(sigma.to(device=self.sigma_z.device, dtype=self.sigma_z.dtype).clamp_min(1e-6))
+        self.sigma_z.copy_(sigma.to(device=self.sigma_z.device, dtype=self.sigma_z.dtype).clamp_min(CAMERA_STATS_STD_FLOOR))
+
+    def set_camera_stats(
+        self,
+        anchor_mean: torch.Tensor,
+        anchor_std: torch.Tensor,
+        delta_mean: torch.Tensor,
+        delta_std: torch.Tensor,
+    ) -> None:
+        expected = (int(self.config.camera_gen_dim),)
+        values = {
+            "camera_anchor_mean": anchor_mean,
+            "camera_anchor_std": anchor_std,
+            "camera_delta_mean": delta_mean,
+            "camera_delta_std": delta_std,
+        }
+        for name, value in values.items():
+            value = torch.as_tensor(value)
+            if tuple(value.shape) != expected or not bool(torch.isfinite(value).all()):
+                raise ValueError(f"{name} must be finite with shape {expected}, got {tuple(value.shape)}")
+            target = getattr(self, name)
+            if name.endswith("_std"):
+                value = value.clamp_min(CAMERA_STATS_STD_FLOOR)
+            target.copy_(value.to(device=target.device, dtype=target.dtype))
+        self.camera_stats_valid.fill_(True)
+
+    def require_camera_stats(self) -> None:
+        if str(self.config.camera_generation_representation) != CAMERA_GENERATION_REPRESENTATION:
+            return
+        if not bool(self.camera_stats_valid.item()):
+            raise RuntimeError(
+                "DGGT v3 camera generation requires anchor/delta statistics. Recompute them with "
+                "`python tools/compute_pretrain_feature_stats.py ... --output <stats.pt>` and pass "
+                "the resulting file via --feature_stats_path."
+            )
+
+    def normalize_camera(self, state: torch.Tensor, anchor_mask: torch.Tensor) -> torch.Tensor:
+        self.require_camera_stats()
+        return normalize_camera_state(
+            state,
+            anchor_mask,
+            self.camera_anchor_mean,
+            self.camera_anchor_std,
+            self.camera_delta_mean,
+            self.camera_delta_std,
+        )
+
+    def denormalize_camera(self, state: torch.Tensor, anchor_mask: torch.Tensor) -> torch.Tensor:
+        self.require_camera_stats()
+        return denormalize_camera_state(
+            state,
+            anchor_mask,
+            self.camera_anchor_mean,
+            self.camera_anchor_std,
+            self.camera_delta_mean,
+            self.camera_delta_std,
+        )
 
     def normalize(self, z: torch.Tensor) -> torch.Tensor:
         return (z - self.mu_z.to(device=z.device, dtype=z.dtype)) / self.sigma_z.to(
@@ -1608,10 +1733,32 @@ class RAEVideoSceneFlow(nn.Module):
             mean_y = (flat_valid.to(dtype=torch.float32) * patch_y.to(dtype=torch.float32).view(1, -1)).sum(dim=1) / counts_f
             mean_x = (flat_valid.to(dtype=torch.float32) * patch_x.to(dtype=torch.float32).view(1, -1)).sum(dim=1) / counts_f
             summary_t = visual_pos[row_ids_flat, local_frame_idx.reshape(-1), 0, 0]
-            summary_y = mean_y.round().clamp(0, gh - 1)
-            summary_x = mean_x.round().clamp(0, gw - 1)
-            if visual_pos.dtype.is_floating_point:
-                summary_pos = torch.stack([summary_t, summary_y, summary_x], dim=-1).to(dtype=visual_pos.dtype)
+            if str(self.config.asset_position_mode) == "canonical":
+                large_y = torch.full_like(patch_y.view(1, -1).expand_as(flat_valid), gh)
+                large_x = torch.full_like(patch_x.view(1, -1).expand_as(flat_valid), gw)
+                min_y = torch.where(flat_valid, patch_y.view(1, -1), large_y).amin(dim=1).clamp_max(gh - 1)
+                min_x = torch.where(flat_valid, patch_x.view(1, -1), large_x).amin(dim=1).clamp_max(gw - 1)
+                sampled_y = torch.div(sampled, gw, rounding_mode="floor")
+                sampled_x = sampled % gw
+                canonical_y = sampled_y - min_y[:, None] + gh
+                canonical_x = sampled_x - min_x[:, None] + gw
+                patch_pos = torch.stack(
+                    (
+                        patch_pos[..., 0].to(dtype=torch.float32),
+                        canonical_y.to(dtype=torch.float32),
+                        canonical_x.to(dtype=torch.float32),
+                    ),
+                    dim=-1,
+                )
+                patch_pos = torch.where(sample_mask.unsqueeze(-1), patch_pos, torch.zeros_like(patch_pos))
+                summary_y = mean_y - min_y.to(dtype=mean_y.dtype) + float(gh)
+                summary_x = mean_x - min_x.to(dtype=mean_x.dtype) + float(gw)
+            else:
+                summary_y = mean_y.round().clamp(0, gh - 1)
+                summary_x = mean_x.round().clamp(0, gw - 1)
+            if str(self.config.asset_position_mode) == "canonical" or visual_pos.dtype.is_floating_point:
+                summary_dtype = torch.float32 if str(self.config.asset_position_mode) == "canonical" else visual_pos.dtype
+                summary_pos = torch.stack([summary_t, summary_y, summary_x], dim=-1).to(dtype=summary_dtype)
             else:
                 summary_pos = torch.stack(
                     [
@@ -2058,7 +2205,7 @@ class RAEVideoSceneFlow(nn.Module):
     def _build_camera_condition(
         self,
         z_t: torch.Tensor,
-        camera_pose_tokens: torch.Tensor | None,
+        camera_condition_tokens: torch.Tensor | None,
         camera_attention_mask: torch.Tensor | None,
         *,
         camera_condition_kind: Any = None,
@@ -2069,10 +2216,10 @@ class RAEVideoSceneFlow(nn.Module):
         b, s = int(z_t.shape[0]), int(z_t.shape[1])
         hidden_size = int(self.config.hidden_size)
         null_rows = self._camera_null_rows(camera_condition_kind, b, z_t.device)
-        if camera_pose_tokens is None:
+        if camera_condition_tokens is None:
             if null_rows is not None and bool(null_rows.any().item()):
                 if not bool(null_rows.all().item()):
-                    raise ValueError("camera_pose_tokens=None is only valid when all rows use camera_uncond.")
+                    raise ValueError("camera_condition_tokens=None is only valid when all rows use camera_uncond.")
                 tokens = self.camera_null_condition_embed.to(device=z_t.device, dtype=z_t.dtype).expand(b, s, -1)
                 mask = torch.ones((b, s), device=z_t.device, dtype=torch.bool)
                 pos = self._camera_position_ids(
@@ -2087,20 +2234,22 @@ class RAEVideoSceneFlow(nn.Module):
             empty_tokens = z_t.new_zeros((b, 0, hidden_size))
             empty_pos = torch.zeros((b, 0, 3), device=z_t.device, dtype=torch.long)
             return empty_tokens, None, empty_pos
-        if camera_pose_tokens.ndim != 3 or int(camera_pose_tokens.shape[0]) != b:
-            raise ValueError(f"camera_pose_tokens must be [B,S,C], got {tuple(camera_pose_tokens.shape)}")
-        if int(camera_pose_tokens.shape[1]) != s:
+        if camera_condition_tokens.ndim != 3 or int(camera_condition_tokens.shape[0]) != b:
+            raise ValueError(f"camera condition tokens must be [B,S,C], got {tuple(camera_condition_tokens.shape)}")
+        if int(camera_condition_tokens.shape[1]) != s:
             raise ValueError(
-                f"camera_pose_tokens must have one token per video frame: "
-                f"got {camera_pose_tokens.shape[1]} for S={s}"
+                f"camera_condition_tokens must have one token per video frame: "
+                f"got {camera_condition_tokens.shape[1]} for S={s}"
             )
-        if int(camera_pose_tokens.shape[-1]) != int(self.config.camera_cond_dim):
+        if int(camera_condition_tokens.shape[-1]) != int(self.config.camera_cond_dim):
             raise ValueError(
-                f"camera_pose_tokens dim {camera_pose_tokens.shape[-1]} "
+                f"camera_condition_tokens dim {camera_condition_tokens.shape[-1]} "
                 f"!= camera_cond_dim {self.config.camera_cond_dim}"
             )
-        camera_dtype = self.camera_proj[0].weight.dtype
-        tokens = self.camera_proj(self.camera_norm(camera_pose_tokens).to(dtype=camera_dtype))
+        if not bool(torch.isfinite(camera_condition_tokens).all()):
+            raise ValueError("Waymo camera condition tokens contain non-finite values")
+        camera_dtype = self.camera_proj.weight.dtype
+        tokens = self.camera_proj(self.camera_norm(camera_condition_tokens).to(dtype=camera_dtype))
         tokens = tokens + self.camera_modality_embed.to(device=tokens.device, dtype=tokens.dtype)
         if camera_attention_mask is None:
             mask = torch.ones((b, s), device=z_t.device, dtype=torch.bool)
@@ -2130,6 +2279,7 @@ class RAEVideoSceneFlow(nn.Module):
         z_t: torch.Tensor,
         camera_gen_tokens: torch.Tensor | None,
         camera_gen_attention_mask: torch.Tensor | None,
+        camera_gen_anchor_mask: torch.Tensor | None,
         *,
         patch_grid: tuple[int, int] | None = None,
         frame_ids: torch.Tensor | None = None,
@@ -2153,9 +2303,18 @@ class RAEVideoSceneFlow(nn.Module):
                 f"camera_gen_tokens dim {camera_gen_tokens.shape[-1]} "
                 f"!= camera_gen_dim {self.config.camera_gen_dim}"
             )
+        if not bool(torch.isfinite(camera_gen_tokens).all()):
+            raise ValueError("DGGT camera generation tokens contain non-finite values")
         camera_dtype = self.camera_gen_proj.weight.dtype
         tokens = self.camera_gen_proj(self.camera_gen_norm(camera_gen_tokens).to(dtype=camera_dtype))
         tokens = tokens + self.camera_gen_modality_embed.to(device=tokens.device, dtype=tokens.dtype)
+        if str(self.config.camera_generation_representation) == CAMERA_GENERATION_REPRESENTATION:
+            if camera_gen_anchor_mask is None:
+                raise ValueError("camera_gen_anchor_mask is required for DGGT v3 camera generation")
+            roles = camera_gen_anchor_mask.to(device=z_t.device, dtype=torch.bool)
+            if roles.shape != (b, s):
+                raise ValueError(f"camera_gen_anchor_mask shape {tuple(roles.shape)} != {(b, s)}")
+            tokens = tokens + self.camera_gen_role_embed(roles.to(dtype=torch.long)).to(dtype=tokens.dtype)
         if camera_gen_attention_mask is None:
             mask = torch.ones((b, s), device=z_t.device, dtype=torch.bool)
         else:
@@ -2301,10 +2460,12 @@ class RAEVideoSceneFlow(nn.Module):
         return_dict: bool = False,
         text_tokens: torch.Tensor | None = None,
         text_attention_mask: torch.Tensor | None = None,
+        camera_condition_tokens: torch.Tensor | None = None,
         camera_pose_tokens: torch.Tensor | None = None,
         camera_attention_mask: torch.Tensor | None = None,
         camera_gen_tokens: torch.Tensor | None = None,
         camera_gen_attention_mask: torch.Tensor | None = None,
+        camera_gen_anchor_mask: torch.Tensor | None = None,
         sky_gen_tokens: torch.Tensor | None = None,
         sky_gen_attention_mask: torch.Tensor | None = None,
         return_base: bool = False,
@@ -2316,6 +2477,10 @@ class RAEVideoSceneFlow(nn.Module):
         control_drop_mask: torch.Tensor | None = None,
         return_sky_mask: bool = False,
     ):
+        if camera_condition_tokens is not None and camera_pose_tokens is not None:
+            raise ValueError("pass camera_condition_tokens, not both camera condition aliases")
+        if camera_condition_tokens is None:
+            camera_condition_tokens = camera_pose_tokens
         self._validate_video_control_inputs(z_t, z_splat, scaffold_tok, M_preserve, M_source, M_dest)
         b, s, p, _ = z_t.shape
         patch_grid = _normalize_patch_grid(p, self.config.patch_grid)
@@ -2342,7 +2507,7 @@ class RAEVideoSceneFlow(nn.Module):
         text_seq, text_mask = self._build_text_condition(z_t, text_tokens, text_attention_mask)
         camera_seq, camera_mask, camera_pos = self._build_camera_condition(
             z_t,
-            camera_pose_tokens,
+            camera_condition_tokens,
             camera_attention_mask,
             camera_condition_kind=camera_condition_kind,
             patch_grid=patch_grid,
@@ -2353,6 +2518,7 @@ class RAEVideoSceneFlow(nn.Module):
             z_t,
             camera_gen_tokens,
             camera_gen_attention_mask,
+            camera_gen_anchor_mask,
             patch_grid=patch_grid,
             frame_ids=frame_ids,
             fps=fps,
@@ -2595,7 +2761,7 @@ class RAEVideoSceneFlow(nn.Module):
         asset_control_guidance_scale: float = 1.0,
         text_tokens: torch.Tensor | None = None,
         text_attention_mask: torch.Tensor | None = None,
-        camera_pose_tokens: torch.Tensor | None = None,
+        camera_condition_tokens: torch.Tensor | None = None,
         camera_attention_mask: torch.Tensor | None = None,
         negative_text_tokens: torch.Tensor | None = None,
         negative_text_attention_mask: torch.Tensor | None = None,
@@ -2622,7 +2788,7 @@ class RAEVideoSceneFlow(nn.Module):
             asset_control_guidance_scale,
             text_tokens,
             text_attention_mask,
-            camera_pose_tokens,
+            camera_condition_tokens,
             camera_attention_mask,
             negative_text_tokens,
             negative_text_attention_mask,

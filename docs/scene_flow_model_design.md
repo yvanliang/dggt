@@ -11,7 +11,7 @@ SceneFlow 的主模型类是 `RAEVideoSceneFlow`，对外别名仍为 `WanSceneF
 | 类别 | token | 说明 |
 |---|---|---|
 | generation state | `video z_t` | 当前噪声状态，shape 为 `[B,S,P,C]` |
-| generation state | `camera_gen_tokens` | pretrain 使用的 per-frame DGGT CameraHead normalized pose-token 状态 |
+| generation state | `camera_gen_tokens` | pretrain 使用的 normalized 11D relative-SE(3) camera 状态 |
 | generation state | `sky_gen_tokens` | pretrain 使用的 scene-level sky atlas 状态 |
 | condition | timestep tokens | RAEv2 Gaussian Fourier timestep tokens |
 | condition | text tokens | Qwen text encoder 输出，经线性投影进入 full attention |
@@ -149,7 +149,7 @@ asset 有三种不同语义，不能混用：
 Camera 有两条不同链路：
 
 1. **camera condition tokens**：用户输入或 GT 模拟用户输入的 per-frame pose summary。
-2. **camera generation tokens**：pretrain 中和 video 一起生成的 DGGT CameraHead normalized pose-token 状态。
+2. **camera generation tokens**：pretrain 中和 video 一起生成的显式 11D camera trajectory 状态。
 
 camera condition summary 维度是 `CAMERA_POSE_SUMMARY_DIM`，当前为 20D。pretrain 和正式训练主链路都必须从 Waymo `camera_to_world_corrected + intrinsics` 构造该摘要，每帧一个 token，经 projection 后以 `(t,H//2,W//2)` RoPE position 进入 full attention。DGGT-space `pose_enc` 只能作为 pretrain camera generation target、pose loss target 或渲染相机来源，不能回灌成 SceneFlow 的 camera condition。
 
@@ -161,11 +161,37 @@ camera_condition_kind = "camera_uncond"
 
 模型会为每帧插入一个 learned `camera_null_condition_embed`，mask=true，position 仍是 `(t,H//2,W//2)`。
 
-pretrain 的 camera generation token 是采样 state。模型输出 normalized CameraHead pose-token velocity；训练同时计算 token flow loss，并用冻结 DGGT CameraHead trunk 解码出 DGGT-space `pose_enc` 计算 pose loss。
+camera condition 的版本固定为
+`waymo_rel_delta_rot6d_fov20d_direct_v2`。camera generation 的版本固定为
+`dggt_relative_se3_rot6d_logfov_v3`，它只能由冻结 DGGT CameraHead 的
+`pose_enc_dggt=[t_w2c,q_xyzw,FOVy,FOVx]` 构造：先求 `W2C` 与 `C2W`，第 0 帧
+取绝对 `C2W[0]`，后续帧取 `inv(C2W[t-1]) @ C2W[t]`，再写成每帧 11D
+`[translation(3), rotation-6D(6), log(tan(FOVx/2)), log(tan(FOVy/2))]`。
+Waymo camera 不做坐标转换，也不能进入这个入口。解码必须显式传全局 anchor mask；
+零向量或共线 rotation-6D 也稳定投影为有限、右手、`det=+1` 的 SO(3) 矩阵。
+
+全局 `camera_gen_anchor_mask` 只在 clip 第 0 帧为 true。滑窗只能切片这个 mask，
+不能把窗口首帧提升成 anchor；因此相对轨迹始终在窗口融合结束后一次性积分。
+anchor 与 delta 分别使用 11D per-channel mean/std，stats 版本为
+`dggt_camera_anchor_delta_per_channel_v3`，std 下限 `1e-4`。stats 同时记录 target
+space/source、DGGT checkpoint SHA256 与 anchor/delta count；缺失、非有限、旧版本或
+checkpoint hash 不匹配会直接终止。camera condition/generation 在统计归一化后只经过
+保幅值的 `ChannelScale -> Linear`，不会被 per-token RMSNorm 消除尺度。训练包含 normalized-state flow loss，以及完整轨迹上的绝对
+translation/SO(3) geodesic/log-FOV、相邻 relative pose、与 GT 二阶变化残差损失。
+
+Waymo condition 的 FOV 使用主点感知公式 `atan2(cx,fx)+atan2(W-cx,fx)`（y 轴同理）。
+DGGT generation target 的 FOV 直接读取 CameraHead `pose_enc`。原图尺寸
+`raw_image_size_hw` 只对 Waymo condition 是必需元数据，禁止用 `2*cx/2*cy` 猜尺寸。
 
 渲染用 camera 和 SceneFlow 输入 camera condition 是两个概念。即使用户不提供 camera condition，RGB render 仍需要 camera；它可以来自用户/default/generated camera，但不能在无条件采样时把 render camera 偷偷回灌成模型条件。
 
-正式训练的局部编辑不启用 optional camera condition；camera 条件必须给定。
+正式训练、训练时 validation 与正式 offline inference 始终给定同一 Waymo 20D condition，
+永远不传 camera generation token。渲染相机始终由输入图像经冻结 DGGT CameraHead 得到；
+edited/generated token 不重新预测或覆盖相机。
+
+全局 text CFG 只作用于 video/sky/mask。camera generation 使用独立
+`camera_text_guidance_scale`（默认 1），而 `camera_guidance_scale` 仍只缩放 camera
+condition residual。因此扫描全局 CFG 1/2/4 不会把 11D camera 状态外推。
 
 ## 9. Sky Token 设计
 

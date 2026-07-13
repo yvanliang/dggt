@@ -86,7 +86,8 @@ except ModuleNotFoundError:
 
 from datasets.dataset import WaymoOpenDataset
 from dggt.models.scene_flow import WanSceneFlow
-from dggt.utils.feature_stats import load_into_buffers
+from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers, load_into_buffers
+from dggt.utils.camera_generation import CAMERA_GENERATION_DIM, CAMERA_GENERATION_REPRESENTATION
 from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.gaussian_edit import CleanSceneState, build_clean_scene_state
 from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
@@ -179,7 +180,7 @@ def apply_condition_mode(bundle: Any, mode: str) -> Any:
     if not use_camera:
         # Do not pass GT-derived pose summaries at all.  The sampler inserts one
         # learned camera-null token per generated frame via camera_condition_kind.
-        bundle.camera_pose_tokens = None
+        bundle.camera_condition_tokens = None
         bundle.camera_attention_mask = None
         bundle.camera_condition_kind = ["camera_uncond"] * batch_size
     elif getattr(bundle, "camera_condition_kind", None) is None:
@@ -204,7 +205,7 @@ def actual_condition_rows(bundle: Any) -> dict[str, list[bool]]:
             bool(row) and str(asset_kinds[idx]).lower() not in {"none", "asset_uncond", "asset_null"}
             for idx, row in enumerate(asset_rows)
         ]
-    camera_tokens = getattr(bundle, "camera_pose_tokens", None)
+    camera_tokens = getattr(bundle, "camera_condition_tokens", None)
     camera_rows = (
         _row_has_any(getattr(bundle, "camera_attention_mask", None), batch_size)
         if torch.is_tensor(camera_tokens)
@@ -249,6 +250,13 @@ def build_scene_flow_from_checkpoint(
     payload = torch.load(path, map_location="cpu", weights_only=False)
     config = _checkpoint_config(payload)
     if config is not None:
+        camera_dim = int(config.get("camera_gen_dim", 2048))
+        config.setdefault(
+            "camera_generation_representation",
+            "dggt_hidden_v1" if camera_dim == 2048 else CAMERA_GENERATION_REPRESENTATION,
+        )
+        config.setdefault("asset_position_mode", "localized")
+        config.setdefault("mask_compositing_version", "legacy_hard_mask_v1")
         scene_flow = WanSceneFlow(**config)
     else:
         scene_flow = WanSceneFlow.from_scene_config(
@@ -257,6 +265,7 @@ def build_scene_flow_from_checkpoint(
             in_channels=3 * int(fallback_args.latent_dim) + 3,
             out_channels=int(fallback_args.latent_dim),
             camera_gen_dim=int(fallback_args.camera_gen_dim),
+            camera_generation_representation="dggt_hidden_v1",
             sky_token_dim=SKY_TOKEN_DIM,
             sky_grid=fallback_args.sky_grid,
             max_sky_tokens=int(fallback_args.sky_grid[0] * fallback_args.sky_grid[1]),
@@ -313,6 +322,7 @@ def build_scene_flow_from_checkpoint(
         "weight_source": source,
         "step": int(payload.get("step", 0)) if isinstance(payload, dict) else 0,
         "scene_flow_config": config,
+        "camera_dggt_provenance": payload.get("camera_dggt_provenance") if isinstance(payload, dict) else None,
     }
     del payload
     return scene_flow, info
@@ -327,6 +337,7 @@ def sync_args_from_model(args: argparse.Namespace, scene_flow: nn.Module) -> Non
     args.sky_grid_h, args.sky_grid_w = args.sky_grid
     args.sky_mask_refine_scale = int(config.sky_mask_refine_scale)
     args.sky_mask_refine_channels = int(config.sky_mask_refine_channels)
+    args.asset_position_mode = str(getattr(config, "asset_position_mode", "localized"))
 
 
 def build_generated_dggt_scene_state(
@@ -471,7 +482,7 @@ def render_and_export_generated(
     suffix: str,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     z_generated = generated_sample.video
-    camera_generated = generated_sample.camera
+    camera_generated = generated_sample.camera_state_dggt
     sky_generated = generated_sample.sky
     sky_mask_patch = generated_sample.sky_mask_patch
     sky_mask_refined = generated_sample.sky_mask_refined
@@ -700,6 +711,12 @@ def build_argparser() -> argparse.ArgumentParser:
             "trajectory fixed while --cfg sweeps text guidance."
         ),
     )
+    parser.add_argument(
+        "--camera_text_guidance_scale",
+        type=float,
+        default=1.0,
+        help="Independent text-CFG scale for generated camera state.",
+    )
     parser.add_argument("--sample_steps", "--val_sample_steps", dest="val_sample_steps", type=int, default=35)
     parser.add_argument("--shift", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -754,6 +771,7 @@ def main() -> None:
     cfg_scales = validate_args(args)
     args.patch_grid = (int(args.patch_grid_h), int(args.patch_grid_w))
     args.sky_grid = (int(args.sky_grid_h), int(args.sky_grid_w))
+    # Bare legacy checkpoints have no config and are interpreted as CameraHead hidden v1.
     args.camera_gen_dim = 2048
     args.caption_root = args.val_caption_root
     args.val_log_images = int(args.num_frames)
@@ -775,8 +793,26 @@ def main() -> None:
         fallback_args=args,
     )
     sync_args_from_model(args, scene_flow)
+    dggt_sha256 = checkpoint_sha256(args.dggt_ckpt_path)
+    provenance = checkpoint_info.get("camera_dggt_provenance")
+    recorded_hash = provenance.get("dggt_checkpoint_sha256") if isinstance(provenance, dict) else None
+    if recorded_hash != dggt_sha256:
+        raise ValueError(
+            "Pretrain inference DGGT checkpoint does not match camera provenance: "
+            f"checkpoint={recorded_hash!r}, current={dggt_sha256!r}."
+        )
     if args.feature_stats_path:
-        load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
+        if str(scene_flow.config.camera_generation_representation) == CAMERA_GENERATION_REPRESENTATION:
+            load_all_stats_into_buffers(
+                scene_flow,
+                args.feature_stats_path,
+                token_dim=int(args.latent_dim),
+                dggt_ckpt_path=args.dggt_ckpt_path,
+            )
+        else:
+            load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
+    if str(scene_flow.config.camera_generation_representation) == CAMERA_GENERATION_REPRESENTATION:
+        scene_flow.require_camera_stats()
 
     print(
         f"[checkpoint] {checkpoint_info['weight_source']} step={checkpoint_info['step']} "
@@ -786,11 +822,12 @@ def main() -> None:
     vggt_model = load_dggt_aggregator_and_tokenizer(
         args.dggt_ckpt_path, args.tokenizer_ckpt_path, device
     )
-    camera_dim = int(vggt_model.camera_head.token_norm.normalized_shape[0])
-    if int(scene_flow.config.camera_gen_dim) != camera_dim:
+    if (
+        str(scene_flow.config.camera_generation_representation) == CAMERA_GENERATION_REPRESENTATION
+        and int(scene_flow.config.camera_gen_dim) != CAMERA_GENERATION_DIM
+    ):
         raise ValueError(
-            f"SceneFlow camera_gen_dim={scene_flow.config.camera_gen_dim} does not match "
-            f"DGGT CameraHead dim={camera_dim}."
+            f"DGGT v3 SceneFlow camera_gen_dim={scene_flow.config.camera_gen_dim} must be {CAMERA_GENERATION_DIM}."
         )
     text_encoder = setup_text_encoder(args, device)
 
@@ -903,6 +940,7 @@ def main() -> None:
                         "text": float(scale),
                         "asset": float(args.asset_control_guidance_scale),
                         "camera": float(args.camera_guidance_scale),
+                        "camera_text": float(args.camera_text_guidance_scale),
                     },
                     "images": image_paths,
                     "pointcloud": ply_summary,
@@ -953,6 +991,7 @@ def main() -> None:
         "cfg_scales": cfg_scales,
         "asset_control_guidance_scale": float(args.asset_control_guidance_scale),
         "camera_guidance_scale": float(args.camera_guidance_scale),
+        "camera_text_guidance_scale": float(args.camera_text_guidance_scale),
         "condition_cycle": list(CONDITION_MODES),
         "num_frames": int(args.num_frames),
         "sample_steps": int(args.val_sample_steps),

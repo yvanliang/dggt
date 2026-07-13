@@ -10,14 +10,14 @@ MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 MASTER_PORT="${MASTER_PORT:-22229}"
 
 NNODES=1
-NPROC_PER_NODE=8
+NPROC_PER_NODE=4
 
 # ============================================================
 # Project and environment
 # ============================================================
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/vol1/liangyy_workspace/dggt}"
-DATASET_ROOT="${DATASET_ROOT:-/mnt/vol1/liangyy_workspace/waymo_processed_dggt}"
-CONDA_SH="${CONDA_SH:-/mnt/vol1/liangyy_workspace/miniconda3/etc/profile.d/conda.sh}"
+PROJECT_ROOT="${PROJECT_ROOT:-/home/dancer/code/dm/dggt}"
+DATASET_ROOT="${DATASET_ROOT:-/data/disk2/lyy_dataset/waymo_processed_dggt/}"
+CONDA_SH="${CONDA_SH:-/home/dancer/anaconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-dggt}"
 
 # ============================================================
@@ -25,12 +25,12 @@ CONDA_ENV="${CONDA_ENV:-dggt}"
 # ============================================================
 WAYMO_DGGT_ROOT="${DATASET_ROOT}/training"
 WAYMO_DGGT_VAL_ROOT="${DATASET_ROOT}/validation"
-DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
+DGGT_CKPT="/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt"
 TOKENIZER_CKPT="${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
-FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_camera_v2.pt"
+FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_camera_v2.pt}"
 SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
-QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-/mnt/vol1/liangyy_workspace/model/Qwen/Qwen3-0.6B}"
+QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-/home/dancer/model/Qwen/Qwen3-0.6B}"
 
 LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024"
 LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/single_node_launch"
@@ -38,12 +38,12 @@ LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/single_node_launch"
 # ============================================================
 # Training config. Aligned with pretrain_two_nodes.sh except:
 #   - NNODES=1
-#   - NPROC_PER_NODE=8
-#   - BATCH_SIZE_PER_GPU=8
-# This keeps global batch size at 64.
+#   - NPROC_PER_NODE=4
+#   - BATCH_SIZE_PER_GPU=1
+# This keeps global batch size at 32.
 # ============================================================
-BATCH_SIZE_PER_GPU=8
-GRAD_ACCUM_STEPS=1
+BATCH_SIZE_PER_GPU=1
+GRAD_ACCUM_STEPS=8
 NUM_WORKERS=4
 PREFETCH_FACTOR=2
 
@@ -58,7 +58,7 @@ ASSET_CONTROL_GUIDANCE_SCALE=1.0
 CAMERA_GUIDANCE_SCALE=1.0
 VAL_GUIDANCE_SCALES="1.0,2.0,4.0"
 
-WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_1node_8gpu_b8_gb64_lr1e4_optcond}"
+WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_1node_4gpu_b8_gb32_lr1e4_rgbloss}"
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
 
 cuda_visible_devices() {
@@ -90,6 +90,10 @@ setup_common_env() {
 
     # Single-node training does not need InfiniBand bootstrap constraints.
     export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+    export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+    export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
+    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-lo}"
+    export NCCL_ALGO="${NCCL_ALGO:-Ring}"
     export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
     export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 }
@@ -231,8 +235,12 @@ check_python_and_gpu
 cd "${PROJECT_ROOT}"
 build_train_args
 
-echo "=== Starting single-node 8-GPU pretraining ==="
+echo "=== Starting single-node 4-GPU pretraining ==="
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE}"
+echo "NCCL_SHM_DISABLE=${NCCL_SHM_DISABLE}"
+echo "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
+echo "NCCL_ALGO=${NCCL_ALGO}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${NNODES} node x ${NPROC_PER_NODE} gpu/node x ${BATCH_SIZE_PER_GPU} batch/gpu x ${GRAD_ACCUM_STEPS} accum"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG_DIR}/single_node.log"

@@ -46,9 +46,23 @@ from dggt.losses.flow_losses import (
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.vggt import VGGT
-from dggt.utils.feature_stats import load_into_buffers
+from dggt.utils.feature_stats import load_all_stats_into_buffers
 from dggt.utils.gaussian_render import composite_gsplat_rgb
-from dggt.utils.camera_condition import camera_summary_from_waymo_gt
+from dggt.utils.camera_condition import (
+    camera_summary_from_waymo_gt,
+)
+from dggt.utils.camera_generation import (
+    CAMERA_GENERATION_DIM,
+    CAMERA_GENERATION_REPRESENTATION,
+    CAMERA_TARGET_SOURCE,
+    CAMERA_TARGET_SPACE,
+    camera_anchor_mask,
+    camera_state_from_dggt_pose_enc,
+    camera_geometry_loss,
+    decode_camera_trajectory,
+    rotation_6d_to_matrix,
+    so3_geodesic_angle,
+)
 from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_split_gs
@@ -334,12 +348,72 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "out_channels",
     "sky_grid",
     "camera_gen_dim",
+    "camera_generation_representation",
+    "camera_stats_version",
+    "camera_condition_representation",
+    "mask_compositing_version",
+    "asset_position_mode",
     "sky_rope_temporal_offset",
     "camera_rope_spatial_mode",
     "sky_mask_head_version",
     "sky_mask_refine_scale",
     "sky_mask_refine_channels",
 )
+
+
+def _checkpoint_camera_representation(payload: Any) -> tuple[str, int]:
+    cfg = payload.get("scene_flow_config") if isinstance(payload, dict) else None
+    if not isinstance(cfg, dict):
+        return "dggt_hidden_v1", 2048
+    return str(cfg.get("camera_generation_representation", "dggt_hidden_v1")), int(cfg.get("camera_gen_dim", 2048))
+
+
+def migrate_legacy_camera_checkpoint(scene_flow: nn.Module, payload: Any) -> tuple[int, int, str]:
+    """Load only shape-compatible shared EMA trunk weights from camera v1."""
+    representation, camera_dim = _checkpoint_camera_representation(payload)
+    if representation != "dggt_hidden_v1" or camera_dim != 2048:
+        raise ValueError(
+            f"legacy camera migration expects dggt_hidden_v1/2048D, got {representation}/{camera_dim}D"
+        )
+    if isinstance(payload, dict) and isinstance(payload.get("ema_scene_flow_state_dict"), dict):
+        source = payload["ema_scene_flow_state_dict"]
+        source_name = "ema_scene_flow_state_dict"
+    elif isinstance(payload, dict) and isinstance(payload.get("scene_flow"), dict):
+        source = payload["scene_flow"]
+        source_name = "scene_flow"
+    elif isinstance(payload, dict):
+        source = payload
+        source_name = "state_dict"
+    else:
+        raise TypeError("legacy warm-start checkpoint must contain a state dict")
+    source = strip_module_prefix(source)
+    target = unwrap_ddp(scene_flow)
+    current = target.state_dict()
+    camera_prefixes = (
+        "camera_norm.",
+        "camera_proj.",
+        "camera_modality_embed",
+        "camera_null_condition_embed",
+        "camera_gen_norm.",
+        "camera_gen_proj.",
+        "camera_gen_decoder.",
+        "camera_gen_modality_embed",
+        "camera_gen_role_embed.",
+        "camera_anchor_",
+        "camera_delta_",
+        "camera_stats_valid",
+    )
+    transferred = {
+        key: value
+        for key, value in source.items()
+        if torch.is_tensor(value)
+        and key in current
+        and tuple(value.shape) == tuple(current[key].shape)
+        and not key.startswith(camera_prefixes)
+    }
+    current.update(transferred)
+    target.load_state_dict(current, strict=True)
+    return len(transferred), len(source) - len(transferred), source_name
 
 
 def _normalize_config_value(value: Any) -> Any:
@@ -363,13 +437,42 @@ def _config_values_match(current: Any, saved: Any) -> bool:
     return current == saved
 
 
-def validate_scene_flow_checkpoint_config(scene_flow: nn.Module, payload: Any, path: str | Path) -> None:
+def validate_scene_flow_checkpoint_config(
+    scene_flow: nn.Module,
+    payload: Any,
+    path: str | Path,
+    expected_dggt_sha256: str | None = None,
+) -> None:
     validate_prediction_type_checkpoint(scene_flow, payload, path)
     if not isinstance(payload, dict):
         return
     saved_cfg = payload.get("scene_flow_config")
     if not isinstance(saved_cfg, dict):
         return
+    if saved_cfg.get("camera_generation_representation") == CAMERA_GENERATION_REPRESENTATION:
+        provenance = payload.get("camera_dggt_provenance")
+        recorded_hash = provenance.get("dggt_checkpoint_sha256") if isinstance(provenance, dict) else None
+        if expected_dggt_sha256 is not None and recorded_hash != expected_dggt_sha256:
+            raise ValueError(
+                f"{path} DGGT camera provenance mismatch: "
+                f"checkpoint={recorded_hash!r}, current={expected_dggt_sha256!r}"
+            )
+        state = payload.get("scene_flow")
+        if isinstance(state, dict):
+            state = strip_module_prefix(state)
+            required_camera_stats = {
+                "camera_anchor_mean",
+                "camera_anchor_std",
+                "camera_delta_mean",
+                "camera_delta_std",
+                "camera_stats_valid",
+                "camera_gen_role_embed.weight",
+            }
+            missing_camera_stats = sorted(required_camera_stats.difference(state))
+            if missing_camera_stats:
+                raise ValueError(f"{path} is a DGGT v3 camera checkpoint missing {missing_camera_stats}")
+            if not bool(torch.as_tensor(state["camera_stats_valid"]).item()):
+                raise ValueError(f"{path} records DGGT v3 camera generation but camera statistics are not valid")
     if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
         raise ValueError(
             f"{path} was saved with the legacy global mrope_temporal_margin RoPE layout. "
@@ -464,7 +567,7 @@ def _init_pretrain_camera_noise(
     *,
     return_camera: bool,
 ) -> torch.Tensor | None:
-    camera_clean = getattr(bundle, "camera_gen_clean", None)
+    camera_clean = getattr(bundle, "camera_target_clean_n", None)
     if torch.is_tensor(camera_clean):
         camera_z = torch.empty_like(camera_clean)
         camera_z.normal_(generator=generator)
@@ -479,7 +582,7 @@ def _init_pretrain_camera_noise(
     camera_dim = getattr(config, "camera_gen_dim", None)
     if camera_dim is None:
         raise RuntimeError(
-            "Pretrain camera sampling was requested without bundle.camera_gen_clean, "
+            "Pretrain camera sampling was requested without bundle.camera_target_clean_n, "
             "but scene_flow.config.camera_gen_dim is unavailable."
         )
     camera_z = z_template.new_empty((int(z_template.shape[0]), int(z_template.shape[1]), int(camera_dim)))
@@ -533,9 +636,14 @@ def decode_pose_from_camera_features(
     vggt_model: VGGT,
     camera_features: torch.Tensor,
 ) -> torch.Tensor:
-    """Decode DGGT CameraHead pose from generated normalized pose tokens."""
+    """Decode legacy CameraHead tokens or a denormalized v2 11D trajectory."""
     if camera_features.ndim != 3:
-        raise ValueError(f"camera_features must be normalized camera tokens [B,S,C], got {tuple(camera_features.shape)}")
+        raise ValueError(f"camera_features must be camera state [B,S,C], got {tuple(camera_features.shape)}")
+    if int(camera_features.shape[-1]) == CAMERA_GENERATION_DIM:
+        anchors = camera_anchor_mask(
+            int(camera_features.shape[0]), int(camera_features.shape[1]), device=camera_features.device
+        )
+        return decode_camera_trajectory(camera_features, anchors).pose_encoding
     return vggt_model.camera_head.trunk_fn(camera_features.float(), num_iterations=4)[-1]
 
 
@@ -729,15 +837,15 @@ def _asset_condition_rows(
 
 
 def _camera_condition_rows(
-    camera_pose_tokens: torch.Tensor | None,
+    camera_condition_tokens: torch.Tensor | None,
     camera_attention_mask: torch.Tensor | None,
     camera_condition_kind: Any,
     batch_size: int,
 ) -> list[bool]:
-    if torch.is_tensor(camera_pose_tokens):
-        if int(camera_pose_tokens.shape[0]) != int(batch_size):
-            raise ValueError(f"camera token batch size {int(camera_pose_tokens.shape[0])} != {int(batch_size)}")
-        if camera_pose_tokens.ndim >= 2 and int(camera_pose_tokens.shape[1]) > 0:
+    if torch.is_tensor(camera_condition_tokens):
+        if int(camera_condition_tokens.shape[0]) != int(batch_size):
+            raise ValueError(f"camera token batch size {int(camera_condition_tokens.shape[0])} != {int(batch_size)}")
+        if camera_condition_tokens.ndim >= 2 and int(camera_condition_tokens.shape[1]) > 0:
             mask_rows = _row_has_any(camera_attention_mask, batch_size)
             rows = list(mask_rows) if mask_rows is not None else [True] * int(batch_size)
         else:
@@ -779,7 +887,7 @@ def resolve_pretrain_optional_cfg_conditions(
         int(batch_size),
     )
     camera_rows = _camera_condition_rows(
-        getattr(bundle, "camera_pose_tokens", None),
+        getattr(bundle, "camera_condition_tokens", None),
         getattr(bundle, "camera_attention_mask", None),
         getattr(bundle, "camera_condition_kind", None),
         int(batch_size),
@@ -802,7 +910,7 @@ def resolve_pretrain_optional_cfg_conditions(
         default="camera",
         null_kind="camera_uncond",
     )
-    full_camera_tokens = getattr(bundle, "camera_pose_tokens", None)
+    full_camera_tokens = getattr(bundle, "camera_condition_tokens", None)
     full_camera_mask = getattr(bundle, "camera_attention_mask", None)
     if not has_camera:
         full_camera_tokens = None
@@ -862,7 +970,7 @@ def apply_camera_uncond_drop(
 ) -> SimpleNamespace:
     if drop_mask is None:
         return bundle
-    ref = getattr(bundle, "camera_pose_tokens", None)
+    ref = getattr(bundle, "camera_condition_tokens", None)
     if torch.is_tensor(ref):
         device = ref.device
         batch_size = int(ref.shape[0])
@@ -963,6 +1071,11 @@ def save_checkpoint(
     scene_flow_state = sf.state_dict()
     ema_scene_flow_state = materialize_ema_state_dict(scene_flow, ema)
     scene_flow_config = sf.config.to_dict() if hasattr(sf, "config") and hasattr(sf.config, "to_dict") else {}
+    provenance = {
+        "dggt_checkpoint_sha256": str(args.dggt_checkpoint_sha256),
+        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
+        "camera_target_source": "frozen_dggt_camera_head",
+    }
     payload = {
         "step": int(step),
         "scene_flow": scene_flow_state,
@@ -972,10 +1085,11 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
         "args": vars(args),
+        "camera_dggt_provenance": provenance,
     }
     torch.save(payload, ckpt_dir / f"pretrain_step{step:06d}.pt")
     torch.save(
-        {"scene_flow": scene_flow_state, "scene_flow_config": scene_flow_config},
+        {"scene_flow": scene_flow_state, "scene_flow_config": scene_flow_config, "camera_dggt_provenance": provenance},
         ckpt_dir / f"pretrain_step{step:06d}_weights_only.pt",
     )
     torch.save(
@@ -984,6 +1098,7 @@ def save_checkpoint(
             "scene_flow_config": scene_flow_config,
             "step": int(step),
             "is_ema_weights": True,
+            "camera_dggt_provenance": provenance,
         },
         ckpt_dir / f"pretrain_step{step:06d}_ema_weights_only.pt",
     )
@@ -996,13 +1111,16 @@ def load_resume_checkpoint(
     lr_scheduler: LambdaLR,
     resume_path: str | None,
     device: torch.device,
+    expected_dggt_sha256: str | None = None,
 ) -> int:
     if not resume_path:
         return 0
     payload = torch.load(resume_path, map_location=device)
     if not isinstance(payload, dict) or "scene_flow" not in payload:
         raise ValueError(f"Unsupported resume checkpoint format: {resume_path}")
-    validate_scene_flow_checkpoint_config(scene_flow, payload, resume_path)
+    validate_scene_flow_checkpoint_config(
+        scene_flow, payload, resume_path, expected_dggt_sha256=expected_dggt_sha256
+    )
     required_keys = {"step", "scene_flow", "ema_scene_flow", "optimizer", "lr_scheduler"}
     missing_keys = sorted(required_keys.difference(payload.keys()))
     if missing_keys:
@@ -2674,6 +2792,7 @@ def _cfg_sample_pretrain_latents_sliding(
     text_null, text_null_mask = encode_text_condition(text_encoder, [""] * batch_size if text_tokens is not None else None)
     asset_control_scale = float(getattr(args, "asset_control_guidance_scale", 1.0))
     camera_scale = float(getattr(args, "camera_guidance_scale", 1.0))
+    camera_text_scale = float(getattr(args, "camera_text_guidance_scale", 1.0))
     optional_cfg = resolve_pretrain_optional_cfg_conditions(
         bundle,
         batch_size,
@@ -2684,6 +2803,7 @@ def _cfg_sample_pretrain_latents_sliding(
     camera_scale = optional_cfg.camera_scale
     do_cfg = (
         abs(scale - 1.0) > 1e-6
+        or abs(camera_text_scale - 1.0) > 1e-6
         or abs(asset_control_scale - 1.0) > 1e-6
         or abs(camera_scale - 1.0) > 1e-6
     )
@@ -2738,6 +2858,9 @@ def _cfg_sample_pretrain_latents_sliding(
             camera_tokens_w = _slice_time(full_camera_tokens, start, end, seq_len)
             camera_mask_w = _slice_time(full_camera_mask, start, end, seq_len)
             camera_z_w = camera_z[:, start:end] if camera_z is not None else None
+            camera_anchor_w = _slice_time(
+                getattr(bundle, "camera_gen_anchor_mask", None), start, end, seq_len
+            )
 
             def _run_branch(
                 *,
@@ -2761,10 +2884,11 @@ def _cfg_sample_pretrain_latents_sliding(
                     encoder_attention_mask=_slice_asset_time(asset_mask, start, end, seq_len),
                     text_tokens=branch_text_tokens,
                     text_attention_mask=branch_text_mask,
-                    camera_pose_tokens=camera_tokens_w,
+                    camera_condition_tokens=camera_tokens_w,
                     camera_attention_mask=camera_mask_w,
                     camera_condition_kind=camera_kind,
                     camera_gen_tokens=camera_z_w,
+                    camera_gen_anchor_mask=camera_anchor_w,
                     sky_gen_tokens=sky_z,
                     sky_gen_attention_mask=None,
                     return_mid=False,
@@ -2794,7 +2918,7 @@ def _cfg_sample_pretrain_latents_sliding(
                 out_no_text_full = None
                 out_text = None
                 out_text_asset = None
-                if abs(scale - 1.0) > 1e-6:
+                if abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6:
                     # Cosmos-style text CFG: keep all clean structural
                     # conditions identical and remove text only.
                     out_no_text_full = _run_branch(
@@ -2838,11 +2962,12 @@ def _cfg_sample_pretrain_latents_sliding(
                     if full is None:
                         return None
                     guided = full
-                    if out_no_text_full is not None:
+                    text_guidance = camera_text_scale if key == "camera" else scale
+                    if out_no_text_full is not None and abs(text_guidance - 1.0) > 1e-6:
                         no_text_full = out_no_text_full.get(key)
                         if no_text_full is None:
                             raise RuntimeError(f"Text-CFG branch is missing `{key}` predictions.")
-                        guided = guided + (scale - 1.0) * (full - no_text_full)
+                        guided = guided + (text_guidance - 1.0) * (full - no_text_full)
                     if abs(asset_control_scale - 1.0) > 1e-6:
                         assert out_text is not None and out_text_asset is not None
                         text = out_text.get(key)
@@ -2944,9 +3069,16 @@ def _cfg_sample_pretrain_latents_sliding(
     if return_sky_mask and (sky_mask_patch is None or sky_mask_refined is None):
         raise RuntimeError("Sampling requested a sky mask but the final denoising step did not produce one.")
     if return_camera or return_sky or return_sky_mask:
+        camera_output = camera_z
+        if camera_output is not None and str(getattr(sf.config, "camera_generation_representation", "dggt_hidden_v1")) == CAMERA_GENERATION_REPRESENTATION:
+            anchor_mask = getattr(bundle, "camera_gen_anchor_mask", None)
+            if anchor_mask is None:
+                raise RuntimeError("DGGT v3 camera sampling is missing the global camera anchor mask")
+            camera_output = sf.denormalize_camera(camera_output, anchor_mask)
         return SimpleNamespace(
             video=z,
-            camera=camera_z,
+            camera_state_dggt=camera_output,
+            camera_anchor_mask=getattr(bundle, "camera_gen_anchor_mask", None),
             sky=sky_z,
             sky_mask_logits=sky_mask_logits,
             sky_mask_patch=sky_mask_patch,
@@ -3038,6 +3170,7 @@ def cfg_sample_pretrain_latents(
     text_null, text_null_mask = encode_text_condition(text_encoder, [""] * batch_size if text_tokens is not None else None)
     asset_control_scale = float(getattr(args, "asset_control_guidance_scale", 1.0))
     camera_scale = float(getattr(args, "camera_guidance_scale", 1.0))
+    camera_text_scale = float(getattr(args, "camera_text_guidance_scale", 1.0))
     optional_cfg = resolve_pretrain_optional_cfg_conditions(
         bundle,
         int(batch_size),
@@ -3048,6 +3181,7 @@ def cfg_sample_pretrain_latents(
     camera_scale = optional_cfg.camera_scale
     do_cfg = (
         abs(scale - 1.0) > 1e-6
+        or abs(camera_text_scale - 1.0) > 1e-6
         or abs(asset_control_scale - 1.0) > 1e-6
         or abs(camera_scale - 1.0) > 1e-6
     )
@@ -3088,10 +3222,11 @@ def cfg_sample_pretrain_latents(
                 encoder_attention_mask=asset_mask,
                 text_tokens=branch_text_tokens,
                 text_attention_mask=branch_text_mask,
-                camera_pose_tokens=full_camera_tokens,
+                camera_condition_tokens=full_camera_tokens,
                 camera_attention_mask=full_camera_mask,
                 camera_condition_kind=camera_kind,
                 camera_gen_tokens=camera_z,
+                camera_gen_anchor_mask=getattr(bundle, "camera_gen_anchor_mask", None),
                 sky_gen_tokens=sky_z,
                 sky_gen_attention_mask=None,
                 return_mid=False,
@@ -3123,7 +3258,7 @@ def cfg_sample_pretrain_latents(
             out_no_text_full = None
             out_text = None
             out_text_asset = None
-            if abs(scale - 1.0) > 1e-6:
+            if abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6:
                 out_no_text_full = _run_branch(
                     F_asset_tokens=bundle.F_asset_tokens,
                     asset_mask=bundle.encoder_attention_mask,
@@ -3165,11 +3300,12 @@ def cfg_sample_pretrain_latents(
                 if full is None:
                     return None
                 guided = full
-                if out_no_text_full is not None:
+                text_guidance = camera_text_scale if key == "camera" else scale
+                if out_no_text_full is not None and abs(text_guidance - 1.0) > 1e-6:
                     no_text_full = out_no_text_full.get(key)
                     if no_text_full is None:
                         raise RuntimeError(f"Text-CFG branch is missing `{key}` predictions.")
-                    guided = guided + (scale - 1.0) * (full - no_text_full)
+                    guided = guided + (text_guidance - 1.0) * (full - no_text_full)
                 if abs(asset_control_scale - 1.0) > 1e-6:
                     assert out_text is not None and out_text_asset is not None
                     text = out_text.get(key)
@@ -3229,9 +3365,16 @@ def cfg_sample_pretrain_latents(
     if return_sky_mask and (sky_mask_patch is None or sky_mask_refined is None):
         raise RuntimeError("Sampling requested a sky mask but the final denoising step did not produce one.")
     if return_camera or return_sky or return_sky_mask:
+        camera_output = camera_z
+        if camera_output is not None and str(getattr(sf.config, "camera_generation_representation", "dggt_hidden_v1")) == CAMERA_GENERATION_REPRESENTATION:
+            anchor_mask = getattr(bundle, "camera_gen_anchor_mask", None)
+            if anchor_mask is None:
+                raise RuntimeError("DGGT v3 camera sampling is missing the global camera anchor mask")
+            camera_output = sf.denormalize_camera(camera_output, anchor_mask)
         return SimpleNamespace(
             video=z,
-            camera=camera_z,
+            camera_state_dggt=camera_output,
+            camera_anchor_mask=getattr(bundle, "camera_gen_anchor_mask", None),
             sky=sky_z,
             sky_mask_logits=sky_mask_logits,
             sky_mask_patch=sky_mask_patch,
@@ -3256,11 +3399,13 @@ def sample_pretrain_latents(
 def build_full_scene_bundle(
     z_clean_n: torch.Tensor,
     kv_dim: int,
-    camera_pose_tokens: torch.Tensor | None = None,
+    camera_condition_tokens: torch.Tensor | None = None,
     camera_attention_mask: torch.Tensor | None = None,
     camera_condition_kind: Any = None,
-    camera_gen_clean: torch.Tensor | None = None,
-    camera_pose_gt: torch.Tensor | None = None,
+    camera_target_clean_n: torch.Tensor | None = None,
+    camera_target_state_dggt: torch.Tensor | None = None,
+    camera_gen_anchor_mask: torch.Tensor | None = None,
+    camera_pose_gt_dggt: torch.Tensor | None = None,
     sky_gen_clean: torch.Tensor | None = None,
     sky_gen_loss_weight: torch.Tensor | None = None,
     sky_gen_attention_mask: torch.Tensor | None = None,
@@ -3279,11 +3424,18 @@ def build_full_scene_bundle(
         M_dest=torch.ones_like(mask),
         F_asset_tokens=asset_tokens,
         encoder_attention_mask=asset_mask,
-        camera_pose_tokens=camera_pose_tokens,
+        camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
         camera_condition_kind=camera_condition_kind,
-        camera_gen_clean=camera_gen_clean,
-        camera_pose_gt=camera_pose_gt,
+        camera_target_clean_n=camera_target_clean_n,
+        camera_target_state_dggt=camera_target_state_dggt,
+        camera_gen_anchor_mask=camera_gen_anchor_mask,
+        camera_pose_gt_dggt=camera_pose_gt_dggt,
+        camera_target_space=CAMERA_TARGET_SPACE,
+        camera_target_source=CAMERA_TARGET_SOURCE,
+        camera_loss_gt_space=CAMERA_TARGET_SPACE,
+        camera_validation_gt_space=CAMERA_TARGET_SPACE,
+        camera_render_pose_space=CAMERA_TARGET_SPACE,
         sky_gen_clean=sky_gen_clean,
         sky_gen_loss_weight=sky_gen_loss_weight,
         # Kept for old checkpoints/callers. Pretrain no longer passes this to
@@ -3438,7 +3590,7 @@ def train_step(
         loss_weighting_scheme=args.loss_weighting_scheme,
         time_shift=float(args.shift),
     )
-    camera_target = build_camera_rectified_flow_target(getattr(bundle, "camera_gen_clean", None), target)
+    camera_target = build_camera_rectified_flow_target(getattr(bundle, "camera_target_clean_n", None), target)
     sky_target = build_sky_rectified_flow_target(
         getattr(bundle, "sky_gen_clean", None),
         target,
@@ -3466,10 +3618,11 @@ def train_step(
             encoder_attention_mask=bundle.encoder_attention_mask,
             text_tokens=text_tokens,
             text_attention_mask=text_mask,
-            camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+            camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
             camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
             camera_condition_kind=getattr(bundle, "camera_condition_kind", None),
             camera_gen_tokens=None if camera_target is None else camera_target.z_t,
+            camera_gen_anchor_mask=getattr(bundle, "camera_gen_anchor_mask", None),
             sky_gen_tokens=None if sky_target is None else sky_target.z_t,
             sky_gen_attention_mask=None,
             return_mid=use_repa,
@@ -3528,12 +3681,47 @@ def train_step(
             loss = loss + float(args.lambda_camera_flow) * loss_camera_flow
             logs["loss_camera_flow"] = float(loss_camera_flow.detach().item())
             if float(args.lambda_camera_pose) != 0.0:
-                with torch.amp.autocast(device_type=device.type, enabled=False):
-                    pred_pose = decode_pose_from_camera_features(vggt_model, z_camera_pred.float())
-                loss_cam_pose, pose_logs = camera_pose_loss(pred_pose, bundle.camera_pose_gt, args)
+                if getattr(bundle, "camera_loss_gt_space", None) != CAMERA_TARGET_SPACE:
+                    raise RuntimeError("camera geometry loss GT must be explicitly marked as DGGT CameraHead space")
+                camera_anchor_mask = bundle.camera_gen_anchor_mask
+                pred_camera_state = unwrap_ddp(scene_flow).denormalize_camera(
+                    z_camera_pred.float(), camera_anchor_mask
+                )
+                loss_cam_pose, geometry_logs = camera_geometry_loss(
+                    pred_camera_state,
+                    bundle.camera_target_state_dggt.to(device=pred_camera_state.device, dtype=pred_camera_state.dtype),
+                    camera_anchor_mask,
+                    absolute_weight=float(getattr(args, "camera_absolute_weight", 1.0)),
+                    relative_weight=float(getattr(args, "camera_relative_weight", 1.0)),
+                    smoothness_weight=float(getattr(args, "camera_smoothness_weight", 0.25)),
+                )
                 loss = loss + float(args.lambda_camera_pose) * loss_cam_pose
                 logs["loss_camera_pose"] = float(loss_cam_pose.detach().item())
-                logs.update(pose_logs)
+                for name, value in geometry_logs.items():
+                    logs[name] = float(value.detach().item())
+                decoded_pred = decode_camera_trajectory(pred_camera_state, camera_anchor_mask)
+                decoded_gt = decode_camera_trajectory(bundle.camera_target_state_dggt, camera_anchor_mask)
+                logs["camera_translation_error"] = float(
+                    (decoded_pred.camera_to_world[..., :3, 3] - decoded_gt.camera_to_world[..., :3, 3])
+                    .norm(dim=-1).mean().detach().item()
+                )
+                logs["camera_rotation_error_deg"] = float(
+                    torch.rad2deg(so3_geodesic_angle(
+                        decoded_pred.camera_to_world[..., :3, :3],
+                        decoded_gt.camera_to_world[..., :3, :3],
+                    )).mean().detach().item()
+                )
+                logs["camera_fov_error_deg"] = float(
+                    torch.rad2deg((decoded_pred.fov_xy - decoded_gt.fov_xy).abs()).mean().detach().item()
+                )
+                pred_rot = rotation_6d_to_matrix(pred_camera_state[..., 3:9])
+                identity = torch.eye(3, device=pred_rot.device, dtype=pred_rot.dtype)
+                logs["camera_so3_determinant_error"] = float(
+                    (torch.det(pred_rot) - 1.0).abs().mean().detach().item()
+                )
+                logs["camera_so3_orthogonality_error"] = float(
+                    (pred_rot.transpose(-1, -2) @ pred_rot - identity).abs().amax(dim=(-2, -1)).mean().detach().item()
+                )
             else:
                 loss = loss + 0.0 * pred_camera.sum()
                 logs["loss_camera_pose"] = 0.0
@@ -3621,6 +3809,14 @@ def train_step(
     logs["camera_uncond_drop_frac"] = _mask_frac(camera_drop_mask)
     logs["all_cond_drop_frac"] = _mask_frac(all_drop_mask)
     logs["loss"] = float(loss.detach().item())
+    camera_clean = getattr(bundle, "camera_target_clean_n", None)
+    if torch.is_tensor(camera_clean):
+        logs["camera_clean_token_norm"] = float(camera_clean.float().norm(dim=-1).mean().item())
+    if camera_target is not None:
+        logs["camera_noise_token_norm"] = float(camera_target.eps.float().norm(dim=-1).mean().item())
+    logs["cfg_text_scale"] = float(getattr(args, "guidance_scale", 1.0))
+    logs["cfg_camera_text_scale"] = float(getattr(args, "camera_text_guidance_scale", 1.0))
+    logs["cfg_camera_condition_scale"] = float(getattr(args, "camera_guidance_scale", 1.0))
     return loss, logs
 
 
@@ -3653,12 +3849,10 @@ def build_pretrain_bundle_from_batch(
                     f"got {image_tokens_last.shape[-2]}."
                 )
             z_clean = vggt_model.scene_tokenizer.encode(tokens_4, patch_grid=args.patch_grid)
-            with torch.amp.autocast(device_type=device.type, enabled=False):
-                camera_gen_clean = camera_generation_tokens_from_aggregated(
-                    vggt_model,
-                    aggregated_tokens_list,
-                ).float()
-                pose_enc = decode_pose_from_camera_features(vggt_model, camera_gen_clean)
+            # One frozen DGGT aggregator pass feeds both the tokenizer and the
+            # CameraHead.  This pose is the sole camera generation/loss/render
+            # target; Waymo cameras below remain 20D conditioning only.
+            camera_pose_gt_dggt = vggt_model.camera_head(aggregated_tokens_list)[-1].float()
         z_clean_n = sf_root.normalize(z_clean.float())
         camera_to_world_gt = batch.get("camera_to_world_corrected")
         intrinsics_gt = batch.get("intrinsics")
@@ -3667,13 +3861,26 @@ def build_pretrain_bundle_from_batch(
                 "Raw Waymo pretrain batch is missing camera_to_world_corrected/intrinsics; "
                 "SceneFlow camera conditioning must use Waymo camera parameters, while camera generation targets stay in DGGT space."
             )
-        camera_pose_tokens, camera_attention_mask = camera_summary_from_waymo_gt(
-            camera_to_world_gt.to(device=device, dtype=torch.float32, non_blocking=True),
-            intrinsics_gt.to(device=device, dtype=torch.float32, non_blocking=True),
-            image_hw=batch.get("raw_image_size_hw"),
+        raw_hw = batch.get("raw_image_size_hw")
+        if raw_hw is None:
+            raise RuntimeError(
+                "Raw Waymo pretrain batch is missing raw_image_size_hw. Repair the data/cache metadata before training."
+            )
+        c2w_all = camera_to_world_gt.to(device=device, dtype=torch.float32, non_blocking=True)
+        intrinsics_all = intrinsics_gt.to(device=device, dtype=torch.float32, non_blocking=True)
+        raw_hw_front = torch.as_tensor(raw_hw, device=device)
+        if raw_hw_front.ndim >= 3 and raw_hw_front.shape[-1] == 2:
+            raw_hw_front = raw_hw_front[:, 0]
+        camera_target_state_dggt, camera_gen_anchor_mask = camera_state_from_dggt_pose_enc(
+            camera_pose_gt_dggt
         )
-        camera_pose_gt = pose_enc.float()
-        del outputs, aggregated_tokens_list, image_tokens_list, tokens_4, z_clean, pose_enc
+        camera_target_clean_n = sf_root.normalize_camera(camera_target_state_dggt, camera_gen_anchor_mask)
+        camera_condition_tokens, camera_attention_mask = camera_summary_from_waymo_gt(
+            c2w_all,
+            intrinsics_all,
+            image_hw=raw_hw_front,
+        )
+        del outputs, aggregated_tokens_list, image_tokens_list, tokens_4, z_clean
 
     masks = batch.get("masks", batch.get("sky_mask"))
     masks_device = None if masks is None else masks.to(device, non_blocking=True)
@@ -3692,7 +3899,7 @@ def build_pretrain_bundle_from_batch(
     if sky_generation_enabled(args):
         sky_h, sky_w = sky_grid_shape(args)
         sky_extrinsics, sky_intrinsics = pose_encoding_to_extri_intri(
-            camera_pose_gt,
+            camera_pose_gt_dggt,
             (int(images.shape[-2]), int(images.shape[-1])),
         )
         sky_gen_clean, sky_gen_loss_weight = build_sky_tokens_from_images(
@@ -3736,10 +3943,12 @@ def build_pretrain_bundle_from_batch(
     bundle = build_full_scene_bundle(
         z_clean_n,
         kv_dim=z_clean_n.shape[-1],
-        camera_pose_tokens=camera_pose_tokens,
+        camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
-        camera_gen_clean=camera_gen_clean,
-        camera_pose_gt=camera_pose_gt,
+        camera_target_clean_n=camera_target_clean_n,
+        camera_target_state_dggt=camera_target_state_dggt,
+        camera_gen_anchor_mask=camera_gen_anchor_mask,
+        camera_pose_gt_dggt=camera_pose_gt_dggt,
         sky_gen_clean=sky_gen_clean,
         sky_gen_loss_weight=sky_gen_loss_weight,
         sky_gen_attention_mask=None,
@@ -3903,17 +4112,17 @@ def run_validation(
                 return_sky_mask=True,
             )
             z_generated_raw = generated_sample.video
-            camera_generated_raw = generated_sample.camera
+            camera_generated_raw = generated_sample.camera_state_dggt
             sky_generated_raw = generated_sample.sky
             sky_mask_generated_patch = generated_sample.sky_mask_patch
             sky_mask_generated_refined = generated_sample.sky_mask_refined
             if camera_generated_raw is None:
-                raise RuntimeError("Pretrain validation sampling did not return generated normalized camera tokens.")
+                raise RuntimeError("Pretrain validation sampling did not return generated camera state.")
             if sky_mask_generated_patch is None or sky_mask_generated_refined is None:
                 raise RuntimeError("Pretrain validation sampling did not return generated sky mask.")
-            camera_pose_gt = getattr(first_bundle, "camera_pose_gt", None)
-            camera_feature_gt = getattr(first_bundle, "camera_gen_clean", None)
-            if camera_pose_gt is None or camera_feature_gt is None:
+            camera_pose_gt_dggt = getattr(first_bundle, "camera_pose_gt_dggt", None)
+            camera_target_state_dggt = getattr(first_bundle, "camera_target_state_dggt", None)
+            if camera_pose_gt_dggt is None or camera_target_state_dggt is None:
                 raise RuntimeError("Pretrain validation bundle is missing DGGT-space camera GT.")
             with torch.amp.autocast(device_type=device.type, enabled=False):
                 camera_generated_pose = decode_pose_from_camera_features(
@@ -3923,14 +4132,14 @@ def run_validation(
             metrics.update(
                 camera_pose_validation_metrics(
                     camera_generated_pose,
-                    camera_pose_gt,
+                    camera_pose_gt_dggt,
                     prefix="sample_camera",
                 )
             )
             metrics.update(
                 camera_feature_validation_metrics(
                     camera_generated_raw,
-                    camera_feature_gt,
+                    camera_target_state_dggt,
                     prefix="sample_camera_feature",
                 )
             )
@@ -4001,12 +4210,12 @@ def run_validation(
                     return_sky_mask=True,
                 )
                 z_extra = extra_sample.video
-                camera_extra = extra_sample.camera
+                camera_extra = extra_sample.camera_state_dggt
                 sky_extra = extra_sample.sky
                 sky_mask_extra = extra_sample.sky_mask_patch
                 sky_mask_refined_extra = extra_sample.sky_mask_refined
                 if camera_extra is None:
-                    raise RuntimeError("Pretrain validation sampling did not return generated normalized camera tokens.")
+                    raise RuntimeError("Pretrain validation sampling did not return generated camera state.")
                 if sky_mask_extra is None or sky_mask_refined_extra is None:
                     raise RuntimeError("Pretrain validation sampling did not return generated sky mask.")
                 with torch.amp.autocast(device_type=device.type, enabled=False):
@@ -4017,14 +4226,14 @@ def run_validation(
                 metrics.update(
                     camera_pose_validation_metrics(
                         camera_extra_pose,
-                        camera_pose_gt,
+                        camera_pose_gt_dggt,
                         prefix=_cfg_metric_prefix("sample_camera", s_val),
                     )
                 )
                 metrics.update(
                     camera_feature_validation_metrics(
                         camera_extra,
-                        camera_feature_gt,
+                        camera_target_state_dggt,
                         prefix=_cfg_metric_prefix("sample_camera_feature", s_val),
                     )
                 )
@@ -4281,11 +4490,14 @@ def build_argparser() -> argparse.ArgumentParser:
         "--lambda_camera_pose",
         type=float,
         default=1.0,
-        help="Pose loss weight after decoding generated normalized camera tokens with the frozen DGGT CameraHead.",
+        help="Geometry loss weight after denormalizing and integrating the generated 11D camera trajectory.",
     )
     parser.add_argument("--camera_translation_weight", type=float, default=1.0)
     parser.add_argument("--camera_rotation_weight", type=float, default=1.0)
     parser.add_argument("--camera_fov_weight", type=float, default=1.0)
+    parser.add_argument("--camera_absolute_weight", type=float, default=1.0)
+    parser.add_argument("--camera_relative_weight", type=float, default=1.0)
+    parser.add_argument("--camera_smoothness_weight", type=float, default=0.25)
     parser.add_argument(
         "--no_sky_generation",
         action="store_true",
@@ -4381,6 +4593,13 @@ def build_argparser() -> argparse.ArgumentParser:
             "1.0 is no-op; values >1 compare text+asset+camera against text+asset+camera-null."
         ),
     )
+    parser.add_argument(
+        "--camera_text_guidance_scale",
+        type=float,
+        default=1.0,
+        help="Independent text-CFG scale for generated camera state; global text CFG does not affect camera.",
+    )
+    parser.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
     parser.add_argument("--uncond_drop_prob", type=float, default=0.1,
                         help="Legacy fallback per-sample condition dropout probability for text/asset/camera.")
     parser.add_argument(
@@ -4550,13 +4769,15 @@ def main() -> None:
     # [z_t, z_splat, scaffold_tok, M_preserve, M_source, M_dest]. The RAEv2 DDT
     # visual embedders consume z_t only; edit context enters as condition tokens.
     sf_in_channels = 3 * int(args.latent_dim) + 3
-    camera_gen_dim = int(vggt_model.camera_head.token_norm.normalized_shape[0])
+    camera_gen_dim = CAMERA_GENERATION_DIM
     scene_flow = WanSceneFlow.from_scene_config(
         bring_up=False,
         patch_grid=args.patch_grid,
         in_channels=sf_in_channels,
         out_channels=int(args.latent_dim),
         camera_gen_dim=camera_gen_dim,
+        camera_generation_representation=CAMERA_GENERATION_REPRESENTATION,
+        asset_position_mode=str(args.asset_position_mode),
         sky_token_dim=SKY_TOKEN_DIM,
         sky_grid=args.sky_grid,
         max_sky_tokens=int(args.sky_grid[0] * args.sky_grid[1]),
@@ -4565,7 +4786,12 @@ def main() -> None:
         prediction_type=args.prediction_type,
     ).to(device)
     scene_flow.enable_gradient_checkpointing()
-    load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
+    args.dggt_checkpoint_sha256 = load_all_stats_into_buffers(
+        scene_flow,
+        args.feature_stats_path,
+        token_dim=int(args.latent_dim),
+        dggt_ckpt_path=args.dggt_ckpt_path,
+    )
     text_encoder = setup_text_encoder(args, device)
 
     scene_names = discover_scene_names(args.image_dir, args.scene_start, args.scene_end)
@@ -4655,13 +4881,29 @@ def main() -> None:
         lr_scheduler,
         args.resume_path,
         device,
+        expected_dggt_sha256=args.dggt_checkpoint_sha256,
     )
     # 如果指定了 warm_start_path，则覆盖模型和 EMA 的权重，但保留 global_step = 0
     if args.warm_start_path:
         payload = torch.load(args.warm_start_path, map_location=device)
-        validate_scene_flow_checkpoint_config(scene_flow, payload, args.warm_start_path)
+        saved_camera_rep, saved_camera_dim = _checkpoint_camera_representation(payload)
+        legacy_camera_migration = saved_camera_rep == "dggt_hidden_v1" and saved_camera_dim == 2048
+        if legacy_camera_migration:
+            validate_prediction_type_checkpoint(scene_flow, payload, args.warm_start_path)
+            loaded_count, skipped_count, warm_source = migrate_legacy_camera_checkpoint(scene_flow, payload)
+            sync_ema_shadow_from_model(scene_flow, ema)
+            warm_source = f"{warm_source}:shared={loaded_count}:skipped={skipped_count}"
+        else:
+            validate_scene_flow_checkpoint_config(
+                scene_flow,
+                payload,
+                args.warm_start_path,
+                expected_dggt_sha256=args.dggt_checkpoint_sha256,
+            )
 
-        if isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
+        if legacy_camera_migration:
+            pass
+        elif isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
             unwrap_ddp(scene_flow).load_state_dict(payload["ema_scene_flow_state_dict"], strict=True)
             if "ema_scene_flow" in payload:
                 load_warm_start_ema_or_sync(scene_flow, ema, payload["ema_scene_flow"])

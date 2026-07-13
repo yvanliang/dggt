@@ -47,14 +47,24 @@ def extri_intri_to_pose_encoding(
     # intrinsics: BxSx3x3
 
     if pose_encoding_type == "absT_quaR_FoV":
+        if image_size_hw is None:
+            raise ValueError("image_size_hw is required to compute camera FOV")
         R = extrinsics[:, :, :3, :3]  # BxSx3x3
         T = extrinsics[:, :, :3, 3]  # BxSx3
 
         quat = mat_to_quat(R)
         # Note the order of h and w here
         H, W = image_size_hw
-        fov_h = 2 * torch.atan((H / 2) / intrinsics[..., 1, 1])
-        fov_w = 2 * torch.atan((W / 2) / intrinsics[..., 0, 0])
+        fx, fy = intrinsics[..., 0, 0], intrinsics[..., 1, 1]
+        cx, cy = intrinsics[..., 0, 2], intrinsics[..., 1, 2]
+        if not bool(torch.isfinite(torch.stack((fx, fy, cx, cy), dim=-1)).all()):
+            raise ValueError("intrinsics contain non-finite values")
+        if bool((fx <= 0).any()) or bool((fy <= 0).any()):
+            raise ValueError("intrinsic focal lengths must be positive")
+        if bool(((cx < 0) | (cx > W) | (cy < 0) | (cy > H)).any()):
+            raise ValueError("intrinsic principal point must lie inside image_size_hw")
+        fov_h = torch.atan2(cy, fy) + torch.atan2(torch.as_tensor(H, device=fy.device, dtype=fy.dtype) - cy, fy)
+        fov_w = torch.atan2(cx, fx) + torch.atan2(torch.as_tensor(W, device=fx.device, dtype=fx.dtype) - cx, fx)
         pose_encoding = torch.cat([T, quat, fov_h[..., None], fov_w[..., None]], dim=-1).float()
     else:
         raise NotImplementedError

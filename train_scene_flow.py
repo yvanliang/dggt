@@ -38,7 +38,7 @@ from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
-from dggt.utils.feature_stats import load_into_buffers
+from dggt.utils.feature_stats import checkpoint_sha256, load_into_buffers, validate_camera_stats_provenance
 from dggt.utils.camera_condition import (
     camera_summary_from_waymo_gt,
     normalize_front_image_hw,
@@ -379,9 +379,39 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "out_channels",
     "sky_grid",
     "camera_gen_dim",
+    "camera_generation_representation",
+    "camera_stats_version",
+    "camera_condition_representation",
+    "mask_compositing_version",
+    "asset_position_mode",
     "sky_rope_temporal_offset",
     "camera_rope_spatial_mode",
 )
+
+
+def build_scene_flow_from_checkpoint_config(
+    checkpoint_path: str | Path,
+    *,
+    patch_grid: tuple[int, int],
+    latent_dim: int,
+    device: torch.device,
+) -> WanSceneFlow:
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(payload, dict) or not isinstance(payload.get("scene_flow_config"), dict):
+        raise ValueError(
+            f"{checkpoint_path} has no scene_flow_config. Formal training must construct the exact "
+            "pretrained architecture from a versioned checkpoint."
+        )
+    config = dict(payload["scene_flow_config"])
+    camera_dim = int(config.get("camera_gen_dim", 2048))
+    config.setdefault("camera_generation_representation", "dggt_hidden_v1" if camera_dim == 2048 else "relative_se3_rot6d_logfov_v2")
+    config.setdefault("asset_position_mode", "localized")
+    config.setdefault("mask_compositing_version", "legacy_hard_mask_v1")
+    if tuple(config.get("patch_grid", ())) != tuple(patch_grid):
+        raise ValueError(f"checkpoint patch_grid={config.get('patch_grid')} != cache patch_grid={patch_grid}")
+    if int(config.get("out_channels", -1)) != int(latent_dim):
+        raise ValueError(f"checkpoint out_channels={config.get('out_channels')} != --latent_dim={latent_dim}")
+    return WanSceneFlow(**config).to(device)
 
 
 def _normalize_config_value(value: Any) -> Any:
@@ -1242,13 +1272,13 @@ def build_cached_flow_bundle(
         mode_kind=mode_kind,
     )
     camera_gt = item.get("camera_gt") or {}
-    camera_pose_tokens, camera_attention_mask = build_camera_condition_from_waymo_gt(
+    camera_condition_tokens, camera_attention_mask = build_camera_condition_from_waymo_gt(
         camera_gt.get("camera_to_world_corrected"),
         camera_gt.get("intrinsics"),
         device=device,
         image_hw=camera_gt.get("raw_image_size_hw"),
     )
-    if camera_pose_tokens is None:
+    if camera_condition_tokens is None:
         raise RuntimeError(
             f"Formal SceneFlow cache item {item.get('cache_path', '<unknown>')} "
             "is missing Waymo camera_gt; camera conditioning must use Waymo camera parameters."
@@ -1262,7 +1292,7 @@ def build_cached_flow_bundle(
         M_dest=M_dest,
         F_asset_tokens=F_asset_tokens,
         encoder_attention_mask=asset_mask,
-        camera_pose_tokens=camera_pose_tokens,
+        camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
         asset_condition_kind="mode_b_empty" if mode_kind == "mode_b" else "mode_a",
         phase4_slots=list(flow_inputs.get("phase4_slots", [])),
@@ -1371,10 +1401,10 @@ def build_cached_flow_batch_bundle(
                 else torch.ones(camera_tokens_i.shape[:2], device=device, dtype=torch.bool)
             )
     if len(camera_token_rows) == len(items):
-        camera_pose_tokens = torch.cat(camera_token_rows, dim=0)
+        camera_condition_tokens = torch.cat(camera_token_rows, dim=0)
         camera_attention_mask = torch.cat(camera_mask_rows, dim=0)
     else:
-        camera_pose_tokens, camera_attention_mask = None, None
+        camera_condition_tokens, camera_attention_mask = None, None
     # Keep formal T1 train conditioning identical to validation/offline sampling:
     # no generated-sky tokens are packed into the SceneFlow sequence.
     sky_gen_clean = None
@@ -1401,7 +1431,7 @@ def build_cached_flow_batch_bundle(
         M_dest=M_dest,
         F_asset_tokens=F_asset_tokens,
         encoder_attention_mask=asset_mask,
-        camera_pose_tokens=camera_pose_tokens,
+        camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
         sky_gen_clean=sky_gen_clean,
         sky_gen_attention_mask=sky_gen_attention_mask,
@@ -1457,13 +1487,13 @@ def build_flow_bundle(
         phase1_localized_lite=phase1_localized_lite,
         splatted_tok_low_cached=splatted_tok_low_cached,
     )
-    camera_pose_tokens, camera_attention_mask = build_camera_condition_from_sample(sample, device=device)
-    if camera_pose_tokens is None:
+    camera_condition_tokens, camera_attention_mask = build_camera_condition_from_sample(sample, device=device)
+    if camera_condition_tokens is None:
         raise RuntimeError(
             f"Formal SceneFlow item {item.get('cache_path', '<unknown>')} "
             "sample is missing camera_to_world_corrected/intrinsics; camera conditioning must use Waymo camera parameters."
         )
-    bundle.camera_pose_tokens = camera_pose_tokens
+    bundle.camera_condition_tokens = camera_condition_tokens
     bundle.camera_attention_mask = camera_attention_mask
     bundle.captions = [str(item.get("caption", ""))]
     bundle.frame_ids = _frame_ids_from_item(item, seq_len=int(bundle.z_clean.shape[1]), device=device, sample=sample)
@@ -1604,9 +1634,9 @@ def _pad_asset_tokens_for_batch(bundles: list[Any]) -> tuple[torch.Tensor, torch
 def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor | None, list[int]]:
     asset_tokens, asset_mask = _pad_asset_tokens_for_batch(bundles)
     lengths = [int(bundle.F_asset_tokens.shape[1]) for bundle in bundles]
-    camera_tokens_list = [getattr(bundle, "camera_pose_tokens", None) for bundle in bundles]
+    camera_tokens_list = [getattr(bundle, "camera_condition_tokens", None) for bundle in bundles]
     if all(torch.is_tensor(tokens) for tokens in camera_tokens_list):
-        camera_pose_tokens = torch.cat(camera_tokens_list, dim=0)
+        camera_condition_tokens = torch.cat(camera_tokens_list, dim=0)
         camera_masks = [getattr(bundle, "camera_attention_mask", None) for bundle in bundles]
         camera_attention_mask = (
             torch.cat(camera_masks, dim=0)
@@ -1614,7 +1644,7 @@ def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor
             else None
         )
     else:
-        camera_pose_tokens = None
+        camera_condition_tokens = None
         camera_attention_mask = None
     sky_tokens_list = [getattr(bundle, "sky_gen_clean", None) for bundle in bundles]
     if all(torch.is_tensor(tokens) for tokens in sky_tokens_list):
@@ -1642,7 +1672,7 @@ def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor
         M_dest=torch.cat([bundle.M_dest for bundle in bundles], dim=0),
         F_asset_tokens=asset_tokens,
         encoder_attention_mask=asset_mask,
-        camera_pose_tokens=camera_pose_tokens,
+        camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
         sky_gen_clean=sky_gen_clean,
         sky_gen_attention_mask=sky_gen_attention_mask,
@@ -1733,7 +1763,7 @@ def train_step(
                 encoder_attention_mask=asset_mask,
                 text_tokens=text_tokens,
                 text_attention_mask=text_mask,
-                camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
                 camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
                 return_mid=use_repa,
                 return_base=float(args.base_model_coeff) != 0.0,
@@ -1871,7 +1901,7 @@ def train_step(
         encoder_attention_mask=getattr(bundle, "encoder_attention_mask", None),
         text_tokens=text_tokens,
         text_attention_mask=text_mask,
-        camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+        camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
         camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
         return_mid=use_repa,
         return_base=float(args.base_model_coeff) != 0.0,
@@ -2095,7 +2125,7 @@ def _cfg_sample_edit_latents_sliding(
         or abs(asset_control_scale - 1.0) > 1e-6
     )
     drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
-    camera_pose_tokens = getattr(bundle, "camera_pose_tokens", None)
+    camera_condition_tokens = getattr(bundle, "camera_condition_tokens", None)
     camera_attention_mask = getattr(bundle, "camera_attention_mask", None)
 
     for i in range(int(args.val_sample_steps)):
@@ -2114,7 +2144,7 @@ def _cfg_sample_edit_latents_sliding(
             M_source_w = bundle.M_source[:, start:end]
             M_dest_w = bundle.M_dest[:, start:end]
             frame_ids_w = frame_ids[:, start:end]
-            camera_tokens_w = _slice_time(camera_pose_tokens, start, end, seq_len)
+            camera_tokens_w = _slice_time(camera_condition_tokens, start, end, seq_len)
             camera_mask_w = _slice_time(camera_attention_mask, start, end, seq_len)
             F_asset_w = _slice_asset_time(F_asset, start, end, seq_len)
             asset_mask_w = _slice_asset_time(encoder_attention_mask, start, end, seq_len)
@@ -2133,7 +2163,7 @@ def _cfg_sample_edit_latents_sliding(
                 encoder_attention_mask=asset_mask_w,
                 text_tokens=text_tokens,
                 text_attention_mask=text_mask,
-                camera_pose_tokens=camera_tokens_w,
+                camera_condition_tokens=camera_tokens_w,
                 camera_attention_mask=camera_mask_w,
                 asset_condition_kind=asset_kinds,
                 return_mid=False,
@@ -2153,7 +2183,7 @@ def _cfg_sample_edit_latents_sliding(
                     encoder_attention_mask=uncond_mask_w,
                     text_tokens=text_tokens,
                     text_attention_mask=text_mask,
-                    camera_pose_tokens=camera_tokens_w,
+                    camera_condition_tokens=camera_tokens_w,
                     camera_attention_mask=camera_mask_w,
                     asset_condition_kind=["asset_uncond"] * batch_size,
                     return_mid=False,
@@ -2173,7 +2203,7 @@ def _cfg_sample_edit_latents_sliding(
                     encoder_attention_mask=uncond_mask_w,
                     text_tokens=text_null,
                     text_attention_mask=text_null_mask,
-                    camera_pose_tokens=camera_tokens_w,
+                    camera_condition_tokens=camera_tokens_w,
                     camera_attention_mask=camera_mask_w,
                     asset_condition_kind=["asset_uncond"] * batch_size,
                     return_mid=False,
@@ -2273,7 +2303,7 @@ def cfg_sample_edit_latents(
             encoder_attention_mask=encoder_attention_mask,
             text_tokens=text_tokens,
             text_attention_mask=text_mask,
-            camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+            camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
             camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
             asset_condition_kind=asset_kinds,
             return_mid=False,
@@ -2293,7 +2323,7 @@ def cfg_sample_edit_latents(
                 encoder_attention_mask=uncond_asset_mask,
                 text_tokens=text_tokens,
                 text_attention_mask=text_mask,
-                camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
                 camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
                 asset_condition_kind=["asset_uncond"] * batch_size,
                 return_mid=False,
@@ -2313,7 +2343,7 @@ def cfg_sample_edit_latents(
                 encoder_attention_mask=uncond_asset_mask,
                 text_tokens=text_null,
                 text_attention_mask=text_null_mask,
-                camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
                 camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
                 asset_condition_kind=["asset_uncond"] * batch_size,
                 return_mid=False,
@@ -2530,7 +2560,9 @@ def render_validation_rgb_gt_sky(
             # T1/formal editing keeps the render camera fixed to the DGGT
             # camera predicted from the input images.  Generated/recon patch
             # tokens must not define a new camera trajectory.
-            render_pose_enc = vggt_model.camera_head(aggregated_tokens_list)[-1]
+            render_pose_enc_dggt = vggt_model.camera_head(aggregated_tokens_list)[-1]
+            if render_pose_enc_dggt.ndim != 3 or render_pose_enc_dggt.shape[-1] != 9 or not bool(torch.isfinite(render_pose_enc_dggt).all()):
+                raise RuntimeError("render_pose_enc_dggt must be finite [B,S,9] from the input DGGT CameraHead")
             depth, _ = vggt_model.depth_head(aggregated_tokens_list, images, patch_start_idx)
             dynamic_conf, _ = vggt_model.instance_head(dino_token_list, images, patch_start_idx)
             clean_gs_map, clean_gs_conf = vggt_model.gs_head(image_tokens_list, images, patch_start_idx)
@@ -2542,7 +2574,7 @@ def render_validation_rgb_gt_sky(
         images,
         masks,
         timestamps,
-        render_pose_enc,
+        render_pose_enc_dggt,
         depth,
         clean_gs_map,
         clean_gs_conf,
@@ -2574,7 +2606,7 @@ def render_validation_rgb_gt_sky(
         images,
         masks,
         timestamps,
-        render_pose_enc,
+        render_pose_enc_dggt,
         generated_depth,
         raw_gs_map,
         raw_gs_conf,
@@ -2608,7 +2640,7 @@ def render_validation_rgb_gt_sky(
         images,
         masks,
         timestamps,
-        render_pose_enc,
+        render_pose_enc_dggt,
         recon_depth,
         recon_gs_map,
         recon_gs_conf,
@@ -2618,7 +2650,7 @@ def render_validation_rgb_gt_sky(
         background_mode="sky",
         use_sky_mask=True,
     )
-    del render_pose_enc, recon_depth, recon_dynamic_conf, recon_gs_map, recon_gs_conf
+    del render_pose_enc_dggt, recon_depth, recon_dynamic_conf, recon_gs_map, recon_gs_conf
     _cuda_empty_cache_if_available()
 
     result["input_rgb_gt"] = _image_grid(images, frames)
@@ -2648,7 +2680,9 @@ def render_validation_generated_rgb_gt_sky(
         image_tokens_list = outputs["image_tokens_list"]
         patch_start_idx = int(outputs["patch_start_idx"])
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            render_pose_enc = vggt_model.camera_head(aggregated_tokens_list)[-1]
+            render_pose_enc_dggt = vggt_model.camera_head(aggregated_tokens_list)[-1]
+            if render_pose_enc_dggt.ndim != 3 or render_pose_enc_dggt.shape[-1] != 9 or not bool(torch.isfinite(render_pose_enc_dggt).all()):
+                raise RuntimeError("render_pose_enc_dggt must be finite [B,S,9] from the input DGGT CameraHead")
         del outputs, aggregated_tokens_list
 
         z_generated = sf.denormalize(z_generated_raw_n.float())
@@ -2687,7 +2721,7 @@ def render_validation_generated_rgb_gt_sky(
             images,
             masks,
             timestamps,
-            render_pose_enc,
+            render_pose_enc_dggt,
             generated_depth,
             raw_gs_map,
             raw_gs_conf,
@@ -2699,7 +2733,7 @@ def render_validation_generated_rgb_gt_sky(
         ),
     }
     del (
-        render_pose_enc,
+        render_pose_enc_dggt,
         generated_depth,
         raw_gs_map,
         raw_gs_conf,
@@ -3083,21 +3117,39 @@ def main() -> None:
     freeze_module(assembler.soft_mask)  # no params but safe.
     freeze_module(assembler.feature_splatter)
 
-    # Legacy config compatibility: in_channels records the old packed control
-    # vector, while the RAEv2 DDT visual embedders consume z_t only.
-    sf_in_channels = 3 * int(args.latent_dim) + 3
-    scene_flow = WanSceneFlow.from_scene_config(
-        bring_up=False,
+    architecture_checkpoint = args.resume_path or args.scene_flow_pretrain_path
+    if not architecture_checkpoint:
+        raise ValueError(
+            "Formal SceneFlow training requires --scene_flow_pretrain_path (new pretrain checkpoint) "
+            "or --resume_path; constructing a default camera architecture is not supported."
+        )
+    scene_flow = build_scene_flow_from_checkpoint_config(
+        architecture_checkpoint,
         patch_grid=patch_grid,
-        in_channels=sf_in_channels,
-        out_channels=int(args.latent_dim),
-        sky_token_dim=SKY_TOKEN_DIM,
-        sky_grid=args.sky_grid,
-        max_sky_tokens=int(args.sky_grid[0] * args.sky_grid[1]),
-        prediction_type=args.prediction_type,
-    ).to(device)
+        latent_dim=int(args.latent_dim),
+        device=device,
+    )
+    args.dggt_checkpoint_sha256 = checkpoint_sha256(args.ckpt_path)
+    architecture_payload = torch.load(architecture_checkpoint, map_location="cpu")
+    provenance = architecture_payload.get("camera_dggt_provenance") if isinstance(architecture_payload, dict) else None
+    recorded_hash = provenance.get("dggt_checkpoint_sha256") if isinstance(provenance, dict) else None
+    if recorded_hash != args.dggt_checkpoint_sha256:
+        raise ValueError(
+            "Formal training DGGT checkpoint does not match the pretrain camera provenance: "
+            f"pretrain={recorded_hash!r}, current={args.dggt_checkpoint_sha256!r}."
+        )
+    if str(scene_flow.config.asset_position_mode) != str(args.asset_position_mode):
+        raise ValueError(
+            f"checkpoint asset_position_mode={scene_flow.config.asset_position_mode!r} "
+            f"!= --asset_position_mode={args.asset_position_mode!r}"
+        )
     scene_flow.enable_gradient_checkpointing()
     load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
+    if args.feature_stats_path:
+        stats_payload = torch.load(args.feature_stats_path, map_location="cpu")
+        if not isinstance(stats_payload, dict):
+            raise TypeError("feature stats payload must be a dict")
+        validate_camera_stats_provenance(stats_payload, args.dggt_checkpoint_sha256)
     text_encoder = setup_text_encoder(args, device)
     warm_start_info = load_scene_flow_warm_start(
         scene_flow,
@@ -3378,6 +3430,11 @@ def _save_checkpoint(
     scene_flow_state = sf.state_dict()
     ema_scene_flow_state = materialize_ema_state_dict(scene_flow, ema)
     scene_flow_config = sf.config.to_dict() if hasattr(sf, "config") and hasattr(sf.config, "to_dict") else {}
+    provenance = {
+        "dggt_checkpoint_sha256": str(args.dggt_checkpoint_sha256),
+        "camera_generation_representation": str(scene_flow_config.get("camera_generation_representation")),
+        "camera_target_source": "frozen_dggt_camera_head",
+    }
     state = {
         "step": int(step),
         "scene_flow": scene_flow_state,
@@ -3388,10 +3445,11 @@ def _save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
         "args": vars(args),
+        "camera_dggt_provenance": provenance,
     }
     torch.save(state, ckpt_dir / f"flow_step{step:06d}.pt")
     torch.save(
-        {"scene_flow": scene_flow_state, "scene_flow_config": scene_flow_config},
+        {"scene_flow": scene_flow_state, "scene_flow_config": scene_flow_config, "camera_dggt_provenance": provenance},
         ckpt_dir / f"flow_step{step:06d}_weights_only.pt",
     )
     torch.save(
@@ -3400,6 +3458,7 @@ def _save_checkpoint(
             "scene_flow_config": scene_flow_config,
             "step": int(step),
             "is_ema_weights": True,
+            "camera_dggt_provenance": provenance,
         },
         ckpt_dir / f"flow_step{step:06d}_ema_weights_only.pt",
     )

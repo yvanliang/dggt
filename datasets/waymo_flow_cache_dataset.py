@@ -905,6 +905,12 @@ class WaymoFlowCacheDataset(Dataset):
         out["cam_ids"] = cam_ids
         out["frame_indices"] = meta["frame_indices_scene"].index_select(0, subset)
         out["timestamps"] = meta["timestamps"].index_select(0, subset)
+        if not torch.is_tensor(meta.get("raw_image_size_hw")):
+            raise RuntimeError(
+                "Cache payload is missing meta['raw_image_size_hw']; camera FOV cannot be reconstructed safely. "
+                "Repair it with `python tools/backfill_flow_cache_camera_gt.py --cache_root <cache> "
+                "--processed_root <processed_root> --force`."
+            )
         out["raw_image_size_hw"] = meta["raw_image_size_hw"]
         out["scene_name"] = meta["scene_name"]
         out["clip_name"] = meta["clip_name"]
@@ -915,12 +921,14 @@ class WaymoFlowCacheDataset(Dataset):
         if "camera_to_world_corrected" not in obj:
             raise RuntimeError(
                 "Cache payload is missing object_meta['camera_to_world_corrected']; "
-                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}."
+                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}. "
+                "Run tools/backfill_flow_cache_camera_gt.py to repair the cache."
             )
         if "intrinsics" not in obj:
             raise RuntimeError(
                 "Cache payload is missing object_meta['intrinsics']; "
-                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}."
+                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}. "
+                "Run tools/backfill_flow_cache_camera_gt.py to repair the cache."
             )
         out["camera_to_world_corrected"] = obj["camera_to_world_corrected"].index_select(0, subset)
         out["intrinsics"] = obj["intrinsics"]
@@ -1016,19 +1024,28 @@ class WaymoFlowCacheDataset(Dataset):
         if "camera_to_world_corrected" not in obj:
             raise RuntimeError(
                 "Cache payload is missing object_meta['camera_to_world_corrected']; "
-                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}."
+                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}. "
+                "Run tools/backfill_flow_cache_camera_gt.py to repair the cache."
             )
         if "intrinsics" not in obj:
             raise RuntimeError(
                 "Cache payload is missing object_meta['intrinsics']; "
-                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}."
+                f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}. "
+                "Run tools/backfill_flow_cache_camera_gt.py to repair the cache."
+            )
+        raw_image_size_hw = normalize_front_image_hw(meta.get("raw_image_size_hw"))
+        if raw_image_size_hw is None:
+            raise RuntimeError(
+                "Cache payload is missing meta['raw_image_size_hw']; camera FOV cannot be reconstructed safely. "
+                "Repair it with `python tools/backfill_flow_cache_camera_gt.py --cache_root <cache> "
+                "--processed_root <processed_root> --force`."
             )
         camera_to_world = obj["camera_to_world_corrected"].index_select(0, subset).contiguous()
         intrinsics = obj["intrinsics"].contiguous()
         return {
             "camera_to_world_corrected": camera_to_world,
             "intrinsics": intrinsics,
-            "raw_image_size_hw": normalize_front_image_hw(meta.get("raw_image_size_hw")),
+            "raw_image_size_hw": raw_image_size_hw,
         }
 
     def _build_fast_asset_pass(

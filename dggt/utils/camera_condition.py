@@ -2,10 +2,46 @@ from __future__ import annotations
 
 import torch
 
-from dggt.utils.pose_enc import pose_encoding_to_extri_intri
-
-
 CAMERA_POSE_SUMMARY_DIM = 20
+CAMERA_CONDITION_REPRESENTATION = "waymo_rel_delta_rot6d_fov20d_direct_v2"
+
+
+def fov_from_intrinsics(intrinsics: torch.Tensor, image_size_hw) -> torch.Tensor:
+    """Waymo-only principal-point-aware ``[FOVx,FOVy]`` in radians."""
+    if image_size_hw is None:
+        raise ValueError("raw image size is required for Waymo camera FOV")
+    Ks = intrinsics.float()
+    squeezed = Ks.ndim == 3
+    if squeezed:
+        Ks = Ks.unsqueeze(0)
+    if Ks.ndim != 4 or Ks.shape[-2:] != (3, 3):
+        raise ValueError(f"intrinsics must be [B,S,3,3] or [S,3,3], got {tuple(intrinsics.shape)}")
+    b, s = Ks.shape[:2]
+    hw = torch.as_tensor(image_size_hw, device=Ks.device, dtype=Ks.dtype)
+    if hw.shape == (2,):
+        hw = hw.view(1, 1, 2).expand(b, s, 2)
+    elif hw.ndim == 2 and hw.shape == (b, 2):
+        hw = hw[:, None].expand(b, s, 2)
+    elif hw.ndim == 2 and hw.shape == (s, 2):
+        hw = hw[None].expand(b, s, 2)
+    elif hw.ndim == 3 and hw.shape[-1] == 2:
+        hw = hw.expand(b, s, 2)
+    else:
+        raise ValueError(f"image_size_hw cannot map to B={b}, S={s}: {tuple(hw.shape)}")
+    height, width = hw.unbind(-1)
+    fx, fy = Ks[..., 0, 0], Ks[..., 1, 1]
+    cx, cy = Ks[..., 0, 2], Ks[..., 1, 2]
+    values = torch.stack((fx, fy, cx, cy, height, width), dim=-1)
+    if not bool(torch.isfinite(values).all()) or bool((fx <= 0).any()) or bool((fy <= 0).any()):
+        raise ValueError("Waymo intrinsics/image size must be finite with positive focal lengths")
+    if bool(((cx < 0) | (cx > width) | (cy < 0) | (cy > height)).any()):
+        raise ValueError("Waymo principal point must lie inside the raw image bounds")
+    result = torch.stack(
+        (torch.atan2(cx, fx) + torch.atan2(width - cx, fx),
+         torch.atan2(cy, fy) + torch.atan2(height - cy, fy)),
+        dim=-1,
+    )
+    return result.squeeze(0) if squeezed else result
 
 
 def normalize_front_image_hw(image_hw) -> tuple[int, int] | None:
@@ -94,79 +130,6 @@ def _camera_summary_from_c2w(
     return features, finite
 
 
-def camera_summary_from_pose_enc(
-    pose_enc: torch.Tensor,
-    *,
-    image_hw: tuple[int, int] | None = None,
-    translation_scale: float = 10.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build per-frame camera condition tokens from DGGT pose encoding.
-
-    The output is a relative trajectory summary `[rel_t, rel_R6d, delta_t,
-    delta_R6d, fov]` with shape `[B,S,20]`. Relative/delta transforms are
-    computed in the first camera's coordinate system so global world origin does
-    not leak into the condition.
-    """
-    pose = _to_batched_sequence(pose_enc.float(), last_dims=2, name="pose_enc")
-    if pose.shape[-1] != 9:
-        raise ValueError(f"pose_enc must end in 9 channels, got {tuple(pose.shape)}")
-    if image_hw is None:
-        image_hw = (1, 1)
-    extrinsics, _ = pose_encoding_to_extri_intri(
-        pose,
-        image_size_hw=image_hw,
-        build_intrinsics=False,
-    )
-    bottom = torch.zeros(
-        pose.shape[:2] + (1, 4),
-        device=pose.device,
-        dtype=pose.dtype,
-    )
-    bottom[..., 0, 3] = 1.0
-    world_to_camera = torch.cat([extrinsics, bottom], dim=-2)
-    camera_to_world = _invert_se3(world_to_camera)
-    return _camera_summary_from_c2w(
-        camera_to_world,
-        pose[..., 7:9],
-        translation_scale=translation_scale,
-    )
-
-
-def camera_summary_from_cameras_dggt(
-    cameras_dggt: dict[str, torch.Tensor],
-    *,
-    image_hw: tuple[int, int] | None = None,
-    translation_scale: float = 10.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build camera summary tokens from cached DGGT camera matrices."""
-    if "camera_to_world" in cameras_dggt:
-        camera_to_world = cameras_dggt["camera_to_world"]
-    elif "viewmats" in cameras_dggt:
-        camera_to_world = _invert_se3(cameras_dggt["viewmats"].float())
-    else:
-        raise ValueError("cameras_dggt must contain 'camera_to_world' or 'viewmats'")
-    c2w = _to_batched_sequence(camera_to_world.float(), last_dims=3, name="camera_to_world")
-
-    if "Ks" not in cameras_dggt:
-        fov = c2w.new_zeros(c2w.shape[:2] + (2,))
-        return _camera_summary_from_c2w(c2w, fov, translation_scale=translation_scale)
-
-    Ks = _to_batched_sequence(cameras_dggt["Ks"].float(), last_dims=3, name="Ks")
-    if Ks.shape[:2] != c2w.shape[:2] or Ks.shape[-2:] != (3, 3):
-        raise ValueError(f"Ks shape {tuple(Ks.shape)} is incompatible with camera_to_world {tuple(c2w.shape)}")
-    image_hw = normalize_front_image_hw(image_hw)
-    if image_hw is None:
-        height = (Ks[..., 1, 2] * 2.0).clamp_min(1.0)
-        width = (Ks[..., 0, 2] * 2.0).clamp_min(1.0)
-    else:
-        height = torch.full(Ks.shape[:2], float(image_hw[0]), device=Ks.device, dtype=Ks.dtype)
-        width = torch.full(Ks.shape[:2], float(image_hw[1]), device=Ks.device, dtype=Ks.dtype)
-    fov_h = 2.0 * torch.atan((height * 0.5) / Ks[..., 1, 1].clamp_min(1e-6))
-    fov_w = 2.0 * torch.atan((width * 0.5) / Ks[..., 0, 0].clamp_min(1e-6))
-    fov = torch.stack([fov_h, fov_w], dim=-1)
-    return _camera_summary_from_c2w(c2w, fov, translation_scale=translation_scale)
-
-
 def _select_front_camera_to_world(camera_to_world: torch.Tensor, intrinsics: torch.Tensor | None = None) -> torch.Tensor:
     c2w = camera_to_world.float()
     if c2w.ndim == 5 and c2w.shape[-2:] == (4, 4):
@@ -233,13 +196,6 @@ def camera_summary_from_waymo_gt(
     b, s = int(c2w.shape[0]), int(c2w.shape[1])
     Ks = _select_front_intrinsics(intrinsics, batch_size=b, seq_len=s)
     image_hw = normalize_front_image_hw(image_hw)
-    if image_hw is None:
-        height = (Ks[..., 1, 2] * 2.0).clamp_min(1.0)
-        width = (Ks[..., 0, 2] * 2.0).clamp_min(1.0)
-    else:
-        height = torch.full((b, s), float(image_hw[0]), device=Ks.device, dtype=Ks.dtype)
-        width = torch.full((b, s), float(image_hw[1]), device=Ks.device, dtype=Ks.dtype)
-    fov_h = 2.0 * torch.atan((height * 0.5) / Ks[..., 1, 1].clamp_min(1e-6))
-    fov_w = 2.0 * torch.atan((width * 0.5) / Ks[..., 0, 0].clamp_min(1e-6))
-    fov = torch.stack([fov_h, fov_w], dim=-1)
+    fov_xy = fov_from_intrinsics(Ks, image_hw)
+    fov = torch.stack((fov_xy[..., 1], fov_xy[..., 0]), dim=-1)
     return _camera_summary_from_c2w(c2w, fov, translation_scale=translation_scale)

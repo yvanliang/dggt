@@ -373,7 +373,7 @@ def test_forward_accepts_camera_uncond_without_camera_tokens():
         masks,
         torch.ones_like(masks),
         assets,
-        camera_pose_tokens=None,
+        camera_condition_tokens=None,
         camera_attention_mask=None,
         camera_condition_kind=["camera_uncond"],
     )

@@ -1,4 +1,4 @@
-"""Compute tokenizer-latent feature stats for SceneFlow pretraining."""
+"""Compute tokenizer-latent and DGGT CameraHead v3 stats in one frozen pass."""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +7,7 @@ import random
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import numpy as np
 import torch
@@ -20,7 +20,20 @@ if str(REPO_ROOT) not in sys.path:
 
 from datasets.dataset import WaymoOpenDataset
 from dggt.models.vggt import VGGT
-from dggt.utils.feature_stats import compute_per_channel_stats, save_feature_stats
+from dggt.utils.camera_generation import (
+    CAMERA_GENERATION_DIM,
+    CAMERA_GENERATION_REPRESENTATION,
+    CAMERA_STATS_STD_FLOOR,
+    CAMERA_STATS_VERSION,
+    CAMERA_TARGET_SOURCE,
+    CAMERA_TARGET_SPACE,
+    camera_state_from_dggt_pose_enc,
+)
+from dggt.utils.feature_stats import (
+    checkpoint_sha256,
+    load_feature_stats,
+    save_feature_stats,
+)
 from dggt.utils.tokens import select_patch_pyramid
 
 
@@ -121,6 +134,7 @@ def load_dggt_aggregator_and_tokenizer(
 
     model.eval()
     freeze_module(model.aggregator)
+    freeze_module(model.camera_head)
     freeze_module(model.scene_tokenizer)
     return model
 
@@ -200,12 +214,21 @@ def infer_patch_grid(num_patches: int) -> tuple[int, int]:
 
 
 @torch.no_grad()
-def iter_latents(
+def compute_dggt_stats_single_pass(
     model: VGGT,
     loader: DataLoader,
     args: argparse.Namespace,
     device: torch.device,
-) -> Iterator[torch.Tensor]:
+    *,
+    compute_latents: bool,
+    dggt_checkpoint_sha256: str,
+) -> tuple[dict[str, torch.Tensor] | None, dict[str, Any]]:
+    latent_total = 0
+    latent_sum = torch.zeros(int(args.latent_dim), dtype=torch.float64)
+    latent_sum2 = torch.zeros_like(latent_sum)
+    camera_sums = {role: torch.zeros(CAMERA_GENERATION_DIM, dtype=torch.float64) for role in ("anchor", "delta")}
+    camera_sums2 = {role: value.clone() for role, value in camera_sums.items()}
+    camera_counts = {"anchor": 0, "delta": 0}
     yielded = 0
     for batch_idx, batch in enumerate(loader):
         if args.max_batches is not None and batch_idx >= args.max_batches:
@@ -217,27 +240,80 @@ def iter_latents(
         images = batch["images"].to(device, non_blocking=True)
         with autocast_context(args, device):
             outputs = model.get_aggregator_token_outputs(images)
-            image_tokens_all = outputs["image_tokens_list"]
-            patch_start_idx = int(outputs["patch_start_idx"])
-            image_patch = select_patch_pyramid(image_tokens_all, DEFAULT_LEVELS, patch_start_idx)
-            patch_count = int(image_patch[-1].shape[-2])
-            patch_grid = (
-                DEFAULT_PATCH_GRID
-                if patch_count == DEFAULT_PATCH_GRID[0] * DEFAULT_PATCH_GRID[1]
-                else infer_patch_grid(patch_count)
-            )
-            z = model.scene_tokenizer.encode(image_patch, patch_grid=patch_grid)
-        yield z.float().cpu()
+            pose_enc_dggt = model.camera_head(outputs["aggregated_tokens_list"])[-1]
+            camera_state_dggt, anchor_mask = camera_state_from_dggt_pose_enc(pose_enc_dggt)
+            flat_camera = camera_state_dggt.detach().cpu().double().reshape(-1, CAMERA_GENERATION_DIM)
+            flat_anchor = anchor_mask.detach().cpu().bool().reshape(-1)
+            for role, select in (("anchor", flat_anchor), ("delta", ~flat_anchor)):
+                values = flat_camera[select]
+                camera_counts[role] += int(values.shape[0])
+                if values.numel():
+                    camera_sums[role] += values.sum(0)
+                    camera_sums2[role] += values.square().sum(0)
+            if not compute_latents:
+                z = None
+            else:
+                image_tokens_all = outputs["image_tokens_list"]
+                patch_start_idx = int(outputs["patch_start_idx"])
+                image_patch = select_patch_pyramid(image_tokens_all, DEFAULT_LEVELS, patch_start_idx)
+                patch_count = int(image_patch[-1].shape[-2])
+                patch_grid = (
+                    DEFAULT_PATCH_GRID
+                    if patch_count == DEFAULT_PATCH_GRID[0] * DEFAULT_PATCH_GRID[1]
+                    else infer_patch_grid(patch_count)
+                )
+                z = model.scene_tokenizer.encode(image_patch, patch_grid=patch_grid)
+        if z is not None:
+            flat = z.detach().cpu().double().reshape(-1, int(args.latent_dim))
+            latent_total += int(flat.shape[0])
+            latent_sum += flat.sum(0)
+            latent_sum2 += flat.square().sum(0)
         yielded += 1
         if yielded % max(1, args.log_every) == 0:
             print(f"[stats] processed_batches={yielded}", flush=True)
+    if camera_counts["anchor"] == 0 or camera_counts["delta"] == 0:
+        raise ValueError("DGGT camera stats require at least one anchor and one delta token")
+    camera_stats: dict[str, Any] = {
+        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
+        "camera_stats_version": CAMERA_STATS_VERSION,
+        "camera_target_space": CAMERA_TARGET_SPACE,
+        "camera_target_source": CAMERA_TARGET_SOURCE,
+        "dggt_checkpoint_sha256": str(dggt_checkpoint_sha256),
+        "camera_dim": CAMERA_GENERATION_DIM,
+    }
+    for role in ("anchor", "delta"):
+        count = camera_counts[role]
+        mean = camera_sums[role] / float(count)
+        variance = (camera_sums2[role] / float(count) - mean.square()).clamp_min(CAMERA_STATS_STD_FLOOR**2)
+        camera_stats[f"camera_{role}_mean"] = mean.float()
+        camera_stats[f"camera_{role}_std"] = variance.sqrt().float().clamp_min(CAMERA_STATS_STD_FLOOR)
+        camera_stats[f"camera_{role}_count"] = torch.tensor(count, dtype=torch.long)
+    if not compute_latents:
+        return None, camera_stats
+    if latent_total == 0:
+        raise ValueError("Cannot compute latent stats from an empty loader")
+    mean = latent_sum / float(latent_total)
+    variance = (latent_sum2 / float(latent_total) - mean.square()).clamp_min(1.0e-6)
+    return {
+        "mu_z": mean.float(),
+        "sigma_z": variance.sqrt().float(),
+        "count": torch.tensor(latent_total, dtype=torch.long),
+    }, camera_stats
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Compute SceneFlow pretraining latent feature stats.")
+    parser = argparse.ArgumentParser(description="Compute SceneFlow latent plus camera anchor/delta statistics.")
     parser.add_argument("--image_dir", type=str, required=True)
-    parser.add_argument("--dggt_ckpt_path", type=str, required=True)
+    parser.add_argument("--dggt_ckpt_path", type=str, default=None)
     parser.add_argument("--tokenizer_ckpt_path", type=str, default=None)
+    parser.add_argument(
+        "--latent_stats_path",
+        type=str,
+        default=None,
+        help=(
+            "Reuse validated mu_z/sigma_z while still running frozen DGGT CameraHead for v3 camera stats."
+        ),
+    )
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--scene_list", type=str, default=None)
     parser.add_argument("--scene_names", type=str, default=None)
@@ -269,6 +345,9 @@ def main() -> None:
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    if not args.dggt_ckpt_path:
+        raise ValueError("--dggt_ckpt_path is always required: camera stats come from frozen DGGT CameraHead")
+    dggt_sha256 = checkpoint_sha256(args.dggt_ckpt_path)
     model = load_dggt_aggregator_and_tokenizer(args.dggt_ckpt_path, args.tokenizer_ckpt_path, device)
     dataset = WaymoOpenDataset(
         image_dir=args.image_dir,
@@ -293,16 +372,34 @@ def main() -> None:
         flush=True,
     )
 
-    stats = compute_per_channel_stats(
-        iter_latents(model, loader, args, device),
-        token_dim=int(args.latent_dim),
+    computed_latent_stats, camera_stats = compute_dggt_stats_single_pass(
+        model,
+        loader,
+        args,
+        device,
+        compute_latents=args.latent_stats_path is None,
+        dggt_checkpoint_sha256=dggt_sha256,
     )
+    if args.latent_stats_path is not None:
+        mu_z, sigma_z = load_feature_stats(args.latent_stats_path, token_dim=int(args.latent_dim))
+        latent_payload = torch.load(args.latent_stats_path, map_location="cpu", weights_only=False)
+        stats = {
+            "mu_z": mu_z,
+            "sigma_z": sigma_z,
+            "count": torch.as_tensor(latent_payload.get("count", 0), dtype=torch.long),
+        }
+        print(f"[stats] reused latent stats from {args.latent_stats_path}", flush=True)
+    else:
+        assert computed_latent_stats is not None
+        stats = computed_latent_stats
+    stats.update(camera_stats)
     stats["source"] = {
         "image_dir": args.image_dir,
         "scene_names": parse_scene_names(args),
         "sequence_length": int(args.sequence_length),
         "max_batches": args.max_batches,
         "levels": list(DEFAULT_LEVELS),
+        "latent_stats_path": args.latent_stats_path,
     }
     save_feature_stats(stats, args.output_path)
     print(

@@ -147,7 +147,7 @@ from datasets.waymo_flow_cache_dataset import (
 from dggt.losses.flow_losses import rae_t_grid
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
-from dggt.utils.feature_stats import load_into_buffers
+from dggt.utils.feature_stats import checkpoint_sha256, load_into_buffers, validate_camera_stats_provenance
 from dggt.utils.flow_cache_io import load_flow_cache
 from dggt.utils.flow_viz import dump_flow_features, save_image_grid
 from dggt.utils.sliding_window import cosine_window, window_slices
@@ -379,7 +379,7 @@ def _cfg_sample_edit_latents_sliding(
         or abs(asset_control_scale - 1.0) > 1e-6
     )
     drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
-    camera_pose_tokens = getattr(bundle, "camera_pose_tokens", None)
+    camera_condition_tokens = getattr(bundle, "camera_condition_tokens", None)
     camera_attention_mask = getattr(bundle, "camera_attention_mask", None)
 
     for i in range(int(args.sample_steps)):
@@ -397,7 +397,7 @@ def _cfg_sample_edit_latents_sliding(
             M_source_w = M_source[:, start:end]
             M_dest_w = M_dest[:, start:end]
             frame_ids_w = frame_ids[:, start:end]
-            camera_tokens_w = _slice_time(camera_pose_tokens, start, end, seq_len)
+            camera_tokens_w = _slice_time(camera_condition_tokens, start, end, seq_len)
             camera_mask_w = _slice_time(camera_attention_mask, start, end, seq_len)
             F_asset_w = _slice_asset_time(F_asset, start, end, seq_len)
             asset_mask_w = _slice_asset_time(encoder_attention_mask, start, end, seq_len)
@@ -411,7 +411,7 @@ def _cfg_sample_edit_latents_sliding(
                 encoder_attention_mask=asset_mask_w,
                 text_tokens=text_tokens,
                 text_attention_mask=text_mask,
-                camera_pose_tokens=camera_tokens_w,
+                camera_condition_tokens=camera_tokens_w,
                 camera_attention_mask=camera_mask_w,
                 asset_condition_kind=asset_kinds,
                 return_mid=False,
@@ -425,7 +425,7 @@ def _cfg_sample_edit_latents_sliding(
                     encoder_attention_mask=uncond_mask_w,
                     text_tokens=text_tokens,
                     text_attention_mask=text_mask,
-                    camera_pose_tokens=camera_tokens_w,
+                    camera_condition_tokens=camera_tokens_w,
                     camera_attention_mask=camera_mask_w,
                     asset_condition_kind=["asset_uncond"] * batch_size,
                     return_mid=False,
@@ -439,7 +439,7 @@ def _cfg_sample_edit_latents_sliding(
                     encoder_attention_mask=uncond_mask_w,
                     text_tokens=text_null,
                     text_attention_mask=text_null_mask,
-                    camera_pose_tokens=camera_tokens_w,
+                    camera_condition_tokens=camera_tokens_w,
                     camera_attention_mask=camera_mask_w,
                     asset_condition_kind=["asset_uncond"] * batch_size,
                     return_mid=False,
@@ -549,7 +549,7 @@ def cfg_sample_edit_latents(
             encoder_attention_mask=encoder_attention_mask,
             text_tokens=text_tokens,
             text_attention_mask=text_mask,
-            camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+            camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
             camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
             asset_condition_kind=asset_kinds,
             return_mid=False,
@@ -563,7 +563,7 @@ def cfg_sample_edit_latents(
                 encoder_attention_mask=uncond_asset_mask,
                 text_tokens=text_tokens,
                 text_attention_mask=text_mask,
-                camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
                 camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
                 asset_condition_kind=["asset_uncond"] * batch_size,
                 return_mid=False,
@@ -577,7 +577,7 @@ def cfg_sample_edit_latents(
                 encoder_attention_mask=uncond_asset_mask,
                 text_tokens=text_null,
                 text_attention_mask=text_null_mask,
-                camera_pose_tokens=getattr(bundle, "camera_pose_tokens", None),
+                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
                 camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
                 asset_condition_kind=["asset_uncond"] * batch_size,
                 return_mid=False,
@@ -725,9 +725,35 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "out_channels",
     "sky_grid",
     "camera_gen_dim",
+    "camera_generation_representation",
+    "camera_stats_version",
+    "camera_condition_representation",
+    "mask_compositing_version",
+    "asset_position_mode",
     "sky_rope_temporal_offset",
     "camera_rope_spatial_mode",
 )
+
+
+def build_scene_flow_from_checkpoint_config(
+    ckpt_path: str | Path,
+    *,
+    patch_grid: tuple[int, int],
+    device: torch.device,
+) -> WanSceneFlow:
+    payload = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(payload, dict) or not isinstance(payload.get("scene_flow_config"), dict):
+        raise ValueError(
+            f"{ckpt_path} has no scene_flow_config; formal offline inference requires a versioned checkpoint."
+        )
+    config = dict(payload["scene_flow_config"])
+    camera_dim = int(config.get("camera_gen_dim", 2048))
+    config.setdefault("camera_generation_representation", "dggt_hidden_v1" if camera_dim == 2048 else "relative_se3_rot6d_logfov_v2")
+    config.setdefault("asset_position_mode", "localized")
+    config.setdefault("mask_compositing_version", "legacy_hard_mask_v1")
+    if tuple(config.get("patch_grid", ())) != tuple(patch_grid):
+        raise ValueError(f"checkpoint patch_grid={config.get('patch_grid')} != cache patch_grid={patch_grid}")
+    return WanSceneFlow(**config).to(device)
 
 
 def _normalize_config_value(value: Any) -> Any:
@@ -1038,6 +1064,22 @@ def main() -> None:
     print(f"[setup] cache patch_grid={patch_grid} H_splat={h_splat} W_splat={w_splat} "
           f"rows={len(dataset)}", flush=True)
 
+    # The checkpoint is authoritative for all SceneFlow architecture fields,
+    # including latent and camera dimensions. Construct it before dependent
+    # modules such as the scaffold packer.
+    scene_flow = build_scene_flow_from_checkpoint_config(
+        args.scene_flow_ckpt_path,
+        patch_grid=patch_grid,
+        device=device,
+    )
+    args.latent_dim = int(scene_flow.config.out_channels)
+    args.prediction_type = str(scene_flow.config.prediction_type)
+    if str(scene_flow.config.asset_position_mode) != str(args.asset_position_mode):
+        raise ValueError(
+            f"checkpoint asset_position_mode={scene_flow.config.asset_position_mode!r} "
+            f"!= --asset_position_mode={args.asset_position_mode!r}"
+        )
+
     # Full VGGT (aggregator + dense heads + sky_model + scene_tokenizer).
     vggt_model = load_dggt_aggregator_and_tokenizer(
         args.ckpt_path, args.tokenizer_ckpt_path, device
@@ -1057,24 +1099,25 @@ def main() -> None:
     freeze_module(assembler.feature_splatter)
     assembler.eval()
 
-    # WanSceneFlow — same config as train_scene_flow_pretrain.py.
-    sf_in_channels = 3 * int(args.latent_dim) + 3
-    scene_flow = WanSceneFlow.from_scene_config(
-        bring_up=args.bring_up,
-        patch_grid=patch_grid,
-        in_channels=sf_in_channels,
-        out_channels=int(args.latent_dim),
-        sky_token_dim=SKY_TOKEN_DIM,
-        sky_grid=args.sky_grid,
-        max_sky_tokens=int(args.sky_grid[0] * args.sky_grid[1]),
-        prediction_type=args.prediction_type,
-    ).to(device)
     ckpt_info = load_scene_flow_ckpt(
         scene_flow, assembler, args.scene_flow_ckpt_path, args.no_ema, device
     )
     print(f"[ckpt:scene_flow] {ckpt_info}", flush=True)
+    dggt_sha256 = checkpoint_sha256(args.ckpt_path)
+    checkpoint_payload = torch.load(args.scene_flow_ckpt_path, map_location="cpu")
+    provenance = checkpoint_payload.get("camera_dggt_provenance") if isinstance(checkpoint_payload, dict) else None
+    recorded_hash = provenance.get("dggt_checkpoint_sha256") if isinstance(provenance, dict) else None
+    if recorded_hash != dggt_sha256:
+        raise ValueError(
+            "Formal offline inference DGGT checkpoint does not match SceneFlow provenance: "
+            f"checkpoint={recorded_hash!r}, current={dggt_sha256!r}."
+        )
     if args.feature_stats_path:
         load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
+        stats_payload = torch.load(args.feature_stats_path, map_location="cpu")
+        if not isinstance(stats_payload, dict):
+            raise TypeError("feature stats payload must be a dict")
+        validate_camera_stats_provenance(stats_payload, dggt_sha256)
         print(f"[stats] overrode mu_z/sigma_z from {args.feature_stats_path}", flush=True)
     elif float(scene_flow.sigma_z.std().item()) < 1e-8 and float(scene_flow.mu_z.abs().max().item()) < 1e-8:
         print("[warn] checkpoint latent stats look like defaults (mu=0, sigma=1); "
