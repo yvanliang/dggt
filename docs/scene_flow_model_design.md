@@ -175,7 +175,7 @@ sky generation 只属于 full-scene pretrain。sky token 是 scene-level directi
 [r, g, b]
 ```
 
-训练时从输入图像、sky mask 和 DGGT-space camera 构造 sky token target。sky mask 只用于构造 RGB target 和 per-token `sky_gen_loss_weight`，绝不能作为模型输入 attention mask；训练和开放推理都 pack 完整 `16x32` sky atlas。每个 token 对应上半球一个方向 bin；该方向投影到各帧后，在 GT sky mask 内采样 RGB 并跨可见帧平均。低覆盖 atlas cell 保留 fallback RGB，loss weight 使用较小值（默认 `0.05`），避免伪 target 主导训练。
+训练时从输入图像、sky mask 和 DGGT-space camera 构造 sky token target。sky mask 只用于构造 RGB target 和 per-token `sky_gen_loss_weight`，绝不能作为模型输入 attention mask；训练和开放推理都 pack 完整 `16x32` sky atlas。每个 token 对应上半球一个无穷远方向 bin；target 投影只使用 DGGT world-to-camera rotation，不使用 translation，和 renderer 的 camera-ray 环境贴图定义严格互逆。该方向投影到各帧后，在 GT sky mask 内采样 RGB 并跨可见帧平均。低覆盖 atlas cell 保留 fallback RGB，loss weight 使用较小值（默认 `0.05`），避免伪 target 主导训练。
 
 pretrain 采样时，sky token 和 video/camera 一起作为 generation state 更新；RGB validation 使用 generated sky directional atlas，并按 generated DGGT camera 逐帧渲染 sky background。正式训练、训练内采样和离线 inference 都不 pack generated sky token，也不计算 `loss_sky_flow`；正式编辑渲染保持 GT sky mask + sky model 背景。
 
@@ -271,7 +271,7 @@ sky_mask_refine_boundary_loss_weight = 0.25
 
 `pos_weight` 按当前 batch 的 sky/non-sky 比例动态计算并 clamp，避免天空正类比例低时被 BCE 淹没。Dice 约束区域重叠，boundary BCE 专门提高地平线、树冠、电线杆等边界附近的监督强度。
 
-pretrain validation 采样结束后，用最终 `z/camera_z/sky_z` 做一次 `sigma=0` forward 读取 `sky_mask_logits` 和 `sky_mask_refined_logits`。RGB render 优先使用 refined mask；如果只有 patch mask，则回退到 patch mask 上采样。当前 render 仍在 `_render_gs_map_rgb` 内把 sky mask hard-threshold 成 non-sky Gaussian 选择，因此 refined mask 主要减少粗 patch 边界造成的误删、漏光、黑边或黄边。
+sky mask head 和 video clean prediction 在同一个随机 `sigma` denoising forward 上训练。采样时从最后一个**非零、训练分布内**的去噪步直接读取 `sky_mask_logits` 和 `sky_mask_refined_logits`；启用 factored CFG 时，对 mask logits 使用同一组分支和 scale，再做 sigmoid。不能在采样结束后对 clean state 额外做 `sigma=0` forward，因为训练 timestep 不覆盖该输入面。RGB render 优先使用 refined mask；如果只有 patch mask，则回退到 patch mask 上采样。render 在 `_render_gs_map_rgb` 内把 sky mask hard-threshold 成 non-sky Gaussian 选择，这与 DGGT 用 GT sky mask 排除 sky Gaussian、再由 rasterizer transmittance 合成背景的定义一致；mask target 不应替换成 renderer alpha。
 
 ## 11. DDT Head 与输出头
 
@@ -324,18 +324,23 @@ all_cond_drop_prob
 
 dropout 只隐藏输入条件，不改变 video/camera/sky 的 clean target 和 loss。
 
-Pretrain 采样使用 factored CFG：
+Pretrain 默认 text CFG 对齐 Cosmos conditional generation：
 
 ```text
-v_uncond     = null text + asset_null + camera_null
-v_text       = text      + asset_null + camera_null
-v_text_asset = text      + asset      + camera_null
-v_full       = text      + asset      + camera
+v_full         = text      + asset + camera
+v_no_text_full = null text + asset + camera
 
-v = v_uncond
-  + text_scale   * (v_text       - v_uncond)
-  + asset_scale  * (v_text_asset - v_text)
-  + camera_scale * (v_full       - v_text_asset)
+v = v_full + (text_scale - 1) * (v_full - v_no_text_full)
+```
+
+因此 text conditional/unconditional 两个分支拥有完全相同的 asset 与 camera，仅文本不同。显式设置独立 control scale 时，再加入分解残差：
+
+```text
+v_text       = text + asset_null + camera_null
+v_text_asset = text + asset      + camera_null
+
+v += (asset_scale  - 1) * (v_text_asset - v_text)
+v += (camera_scale - 1) * (v_full       - v_text_asset)
 ```
 
 对应 CLI：
@@ -347,6 +352,8 @@ v = v_uncond
 ```
 
 三个 scale 默认都是 `1.0`，表示 no-op。pretrain 推理允许用户不输入 asset 或 camera 条件；采样端会逐行检测有效 token，空行改为 `asset_uncond`/`camera_uncond`，整批缺失某类条件时对应 scale 强制退回 `1.0`。`asset_control_guidance_scale` 在正式训练中仍控制 asset + edit-control guidance；pretrain full-scene 没有局部 edit-control token，但保留同名参数以对齐两阶段采样接口。
+
+默认的 CFG sweep 只改变 `text_scale`，asset/camera scale 保持 `1.0`。这与 Cosmos conditional generation 的两分支设计一致：clean visual/structural condition 在 conditional 与 text-unconditional 分支中都保留，CFG 只放大上下文相关的文本残差。同时放大三个 scale 会额外外推目标外观与相机轨迹，不应作为普通 `cfg2/cfg4` 的默认含义；需要研究控制强度时可显式单独设置 asset/camera scale。
 
 正式训练不设计 optional asset/camera condition，因为正式训练是局部目标编辑，asset 条件和 camera
 条件必须由用户/样本给定。正式训练里的 `asset_uncond` 只用于训练 dropout 和 CFG 分支，不作为用户

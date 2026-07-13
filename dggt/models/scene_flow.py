@@ -244,6 +244,22 @@ class RMSNorm(nn.Module):
         return y.to(dtype=x.dtype) * self.weight.to(device=x.device, dtype=x.dtype)
 
 
+class ChannelScale(nn.Module):
+    """Learned per-channel scale without sample-dependent normalization.
+
+    This intentionally keeps the same ``weight`` state-dict surface as
+    ``RMSNorm``.  It is used for low-dimensional physical states whose vector
+    magnitude carries information and therefore must not be normalized away.
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight.to(device=x.device, dtype=x.dtype)
+
+
 class SwiGLUFFN(nn.Module):
     def __init__(self, in_features: int, hidden_features: int) -> None:
         super().__init__()
@@ -523,6 +539,9 @@ class AssetFrameCompressor(nn.Module):
         self.pool_gate = nn.Linear(hidden_size, 1)
         self.asset_type_embed = nn.Parameter(torch.randn(1, hidden_size) / math.sqrt(float(hidden_size)))
         self.asset_slot_embed = nn.Embedding(max_assets, hidden_size)
+        # Legacy checkpoint-compatible bias table.  This compressor predates
+        # sparse per-frame asset tokens and is not used by the current forward
+        # path; never index it by a window-local/clamped frame id.
         self.frame_embed = nn.Embedding(max_frames, hidden_size)
 
     def forward(
@@ -552,12 +571,12 @@ class AssetFrameCompressor(nn.Module):
         h = h + _build_2d_sincos(p, self.hidden_size, patch_grid, h.device, h.dtype).view(1, 1, 1, p, -1)
 
         slot_ids = torch.arange(k, device=x.device)
-        frame_ids = torch.arange(s, device=x.device).clamp_max(self.max_frames - 1)
+        frame_bias = self.frame_embed.weight.mean(dim=0).to(dtype=h.dtype)
         h = (
             h
             + self.asset_type_embed.to(device=x.device, dtype=h.dtype).view(1, 1, 1, 1, -1)
             + self.asset_slot_embed(slot_ids).to(dtype=h.dtype).view(1, k, 1, 1, -1)
-            + self.frame_embed(frame_ids).to(dtype=h.dtype).view(1, 1, s, 1, -1)
+            + frame_bias.view(1, 1, 1, 1, -1)
         )
         gate = torch.sigmoid(self.pool_gate(h)).squeeze(-1) * valid_patch.to(dtype=h.dtype)
         pooled = (h * gate.unsqueeze(-1)).sum(dim=(2, 3)) / gate.sum(dim=(2, 3)).unsqueeze(-1).clamp_min(1e-6)
@@ -877,6 +896,13 @@ class RAEVideoSceneFlow(nn.Module):
         self.asset_latent_norm = RMSNorm(int(out_channels), eps=float(eps))
         self.asset_latent_proj = nn.Linear(int(out_channels), hidden_size)
         self.asset_slot_embed = nn.Embedding(max(1, int(max_assets)), hidden_size)
+        # Kept under the legacy parameter name so existing SceneFlow checkpoints
+        # and optimizer states remain strictly loadable.  Its rows are reduced to
+        # one frame-independent asset bias in ``_build_sparse_asset_condition``;
+        # global temporal position is represented exclusively by the asset
+        # tokens' Cosmos 3D mRoPE ids.  Looking up/clamping this table by a local
+        # window index made overlapping windows disagree and collapsed every
+        # frame after ``max_frames`` onto the last learned embedding.
         self.asset_frame_embed = nn.Embedding(max(1, int(max_frames)), hidden_size)
         self.control_norm = RMSNorm(int(out_channels) * 2 + 3, eps=float(eps))
         self.control_proj = nn.Linear(int(out_channels) * 2 + 3, hidden_size)
@@ -894,7 +920,13 @@ class RAEVideoSceneFlow(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, int(camera_gen_dim)),
         )
-        self.sky_gen_norm = RMSNorm(int(sky_token_dim), eps=float(eps))
+        # Sky tokens are RGB states.  Their norm encodes absolute brightness,
+        # so RMSNorm over the three channels would make proportional colors
+        # (for example a dim and a bright grey) indistinguishable.  Retain a
+        # learned channel calibration, but never normalize each RGB token.
+        # ``ChannelScale.weight`` deliberately preserves strict compatibility
+        # with the legacy ``sky_gen_norm.weight`` checkpoint entry.
+        self.sky_gen_norm = ChannelScale(int(sky_token_dim))
         self.sky_gen_proj = nn.Linear(int(sky_token_dim), hidden_size)
         self.sky_gen_decoder = nn.Sequential(
             RMSNorm(hidden_size, eps=float(eps)),
@@ -1534,13 +1566,22 @@ class RAEVideoSceneFlow(nn.Module):
             summary_h = (projected_flat * valid_f.unsqueeze(-1)).sum(dim=1) / valid_f.sum(dim=1, keepdim=True).clamp_min(1.0)
 
             asset_ids = torch.arange(k, device=device, dtype=torch.long).view(1, k, 1).expand(b, -1, int(seq_len))
-            frame_idx_t = torch.arange(int(seq_len), device=device, dtype=torch.long).view(1, 1, int(seq_len)).expand(b, k, -1)
+            local_frame_idx = (
+                torch.arange(int(seq_len), device=device, dtype=torch.long)
+                .view(1, 1, int(seq_len))
+                .expand(b, k, -1)
+            )
             row_ids = torch.arange(b, device=device, dtype=torch.long).view(b, 1, 1).expand(-1, k, int(seq_len))
             asset_ids_flat = asset_ids.reshape(-1).clamp_max(self.asset_slot_embed.num_embeddings - 1)
-            frame_idx_flat = frame_idx_t.reshape(-1).clamp_max(self.asset_frame_embed.num_embeddings - 1)
             row_ids_flat = row_ids.reshape(-1)
             slot_emb = self.asset_slot_embed(asset_ids_flat).to(dtype=projected.dtype)
-            frame_emb = self.asset_frame_embed(frame_idx_flat).to(dtype=projected.dtype)
+            # Do not inject a second, window-local absolute time embedding here.
+            # The mean preserves a trainable checkpoint-compatible asset bias,
+            # while being identical for the same token in every sliding window.
+            # Temporal distinctions (including ids >= max_frames) remain in
+            # ``visual_pos`` and are applied by the Cosmos mRoPE attention path.
+            frame_emb = self.asset_frame_embed.weight.mean(dim=0).to(dtype=projected.dtype)
+            frame_emb = frame_emb.view(1, -1).expand(b * k * int(seq_len), -1)
             patch_h = (
                 patch_h
                 + slot_emb[:, None, :]
@@ -1566,7 +1607,7 @@ class RAEVideoSceneFlow(nn.Module):
             counts_f = valid_f.sum(dim=1).clamp_min(1.0)
             mean_y = (flat_valid.to(dtype=torch.float32) * patch_y.to(dtype=torch.float32).view(1, -1)).sum(dim=1) / counts_f
             mean_x = (flat_valid.to(dtype=torch.float32) * patch_x.to(dtype=torch.float32).view(1, -1)).sum(dim=1) / counts_f
-            summary_t = visual_pos[row_ids_flat, frame_idx_t.reshape(-1), 0, 0]
+            summary_t = visual_pos[row_ids_flat, local_frame_idx.reshape(-1), 0, 0]
             summary_y = mean_y.round().clamp(0, gh - 1)
             summary_x = mean_x.round().clamp(0, gw - 1)
             if visual_pos.dtype.is_floating_point:

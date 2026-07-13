@@ -5,6 +5,7 @@ import inspect
 import pytest
 import torch
 
+from dggt.losses.flow_losses import preserve_loss
 from dggt.models.scene_flow import (
     AssetFrameCompressor,
     DDTEncoderBlock,
@@ -76,6 +77,70 @@ def test_asset_frame_compressor_fixed_slots_and_mask():
     assert mask.shape == (2, 5)
     assert mask[:, :2].all()
     assert not mask[:, 2:].any()
+
+
+def test_legacy_asset_compressor_has_no_max_frame_clamp():
+    compressor = AssetFrameCompressor(in_dim=8, hidden_size=16, max_assets=1, max_frames=4)
+    frame = torch.randn(1, 1, 1, 4, 8)
+    short = frame.expand(-1, -1, 4, -1, -1).clone()
+    long = frame.expand(-1, -1, 9, -1, -1).clone()
+
+    short_tokens, short_mask = compressor(short, patch_grid=(2, 2))
+    long_tokens, long_mask = compressor(long, patch_grid=(2, 2))
+
+    assert short_mask.all() and long_mask.all()
+    assert torch.allclose(short_tokens, long_tokens, atol=1e-6, rtol=1e-6)
+
+
+def test_sparse_asset_tokens_are_identical_across_overlapping_global_windows():
+    model = _tiny_model(
+        max_frames=16,
+        max_asset_patch_tokens_per_asset_frame=4,
+        max_asset_tokens=256,
+    )
+    assets = torch.randn(1, 1, 24, 4, 8)
+    valid = torch.ones(1, 1, 24, 4, dtype=torch.bool)
+
+    tokens_a, mask_a, pos_a = model._build_sparse_asset_condition(
+        assets[:, :, :16],
+        valid[:, :, :16],
+        seq_len=16,
+        num_patches=4,
+        patch_grid=(2, 2),
+        frame_ids=torch.arange(16),
+    )
+    tokens_b, mask_b, pos_b = model._build_sparse_asset_condition(
+        assets[:, :, 8:24],
+        valid[:, :, 8:24],
+        seq_len=16,
+        num_patches=4,
+        patch_grid=(2, 2),
+        frame_ids=torch.arange(8, 24),
+    )
+
+    # Four patch tokens plus one summary token are retained per asset/frame.
+    tokens_per_frame = 5
+    overlap_a = slice(8 * tokens_per_frame, 16 * tokens_per_frame)
+    overlap_b = slice(0, 8 * tokens_per_frame)
+    assert mask_a is not None and mask_b is not None
+    assert mask_a[:, overlap_a].all() and mask_b[:, overlap_b].all()
+    assert torch.equal(tokens_a[:, overlap_a], tokens_b[:, overlap_b])
+    assert torch.equal(pos_a[:, overlap_a], pos_b[:, overlap_b])
+
+    # Temporal identity remains unbounded in mRoPE rather than clamping at 15.
+    assert pos_b[0, 8 * tokens_per_frame, 0].item() == 16
+    assert pos_b[0, 15 * tokens_per_frame, 0].item() == 23
+
+
+def test_preserve_loss_velocity_fallback_recovers_clean_as_noise_minus_velocity():
+    z_clean = torch.randn(2, 3, 4, 8)
+    eps = torch.randn_like(z_clean)
+    v_pred = eps - z_clean
+    preserve = torch.ones(2, 3, 4, 1)
+
+    loss = preserve_loss(v_pred, eps, z_clean, preserve)
+
+    assert float(loss.item()) < 1e-12
 
 
 def test_scene_flow_optional_qwen_text_tokens_and_padding_mask():

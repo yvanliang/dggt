@@ -616,8 +616,13 @@ class FlowFeatureAssembler(nn.Module):
             valid = torch.ones(z_asset.shape[:-1], device=z_asset.device, dtype=torch.bool)
             if obj_key < int(phase1_coverage.shape[0]):
                 cov = phase1_coverage[obj_key].to(device=z_asset.device, dtype=torch.bool)
-                if int(cov.numel()) == int(z_asset.shape[2]):
-                    valid = valid & cov.reshape(1, 1, -1)
+                if cov.ndim != 1 or int(cov.numel()) != int(z_asset.shape[1]):
+                    raise ValueError(
+                        f"Asset {obj_key} coverage must be [S]={int(z_asset.shape[1])}, "
+                        f"got {tuple(cov.shape)} for latent {tuple(z_asset.shape)}."
+                    )
+                # z_asset/valid are [B,S,P,C]/[B,S,P]. Coverage is temporal.
+                valid = valid & cov.reshape(1, -1, 1)
             asset_latents.append(z_asset)
             asset_masks.append(valid)
         F_asset_tokens = z_clean.new_zeros((B, 5, S, z_clean.shape[2], z_clean.shape[-1]))

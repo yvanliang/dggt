@@ -30,15 +30,17 @@ Each sample gets one directory whose name includes its condition mode.  In
 addition to training-validation image grids (except ``abs_error``), each CFG
 result contains:
 
-* ``generated_raw_gaussians__cfg*.ply``: DGGT/3DGS Gaussian PLY schema;
-* ``generated_raw_points__cfg*.ply``: xyz + uchar RGB, directly viewable in
-  MeshLab.
+* ``generated_raw_gaussians__cfg*_frame*.ply``: per-frame DGGT/3DGS Gaussian
+  PLY schema;
+* ``generated_raw_points__cfg*_frame*.ply``: per-frame xyz + uchar RGB,
+  directly viewable in MeshLab.
 
 The PLYs are built by DGGT's canonical ``build_clean_scene_state`` and written
 by its shared PLY writers.  Consequently they use the same non-sky + valid-depth
 selection, world-coordinate unprojection, Gaussian activations and serialization
-as ``inference_scene_editor.py``.  As in DGGT, overlapping input frames can
-contain duplicate surface samples; no unrequested fusion heuristic is applied.
+as ``inference_scene_editor.py``.  As in DGGT, frames are exported separately
+so overlapping input frames do not visually over-densify a single point cloud;
+no unrequested fusion heuristic is applied.
 """
 from __future__ import annotations
 
@@ -353,7 +355,12 @@ def build_generated_dggt_scene_state(
         raise ValueError(f"sky_mask must be [1,S,1/3,H,W], got {tuple(sky_mask.shape)}")
     seq_len, height, width = int(sky_mask.shape[1]), int(sky_mask.shape[-2]), int(sky_mask.shape[-1])
     images_clean = torch.zeros((seq_len, 3, height, width), dtype=torch.float32)
-    sky_mask_cpu = sky_mask[0].detach().cpu().float().contiguous()
+    sky_probability = sky_mask[0].detach().cpu().float().mean(dim=1).clamp(0.0, 1.0)
+    non_sky_probability = 1.0 - sky_probability
+    # DGGT's canonical builder accepts a binary validity mask. Keep every point
+    # with meaningful foreground mass, then apply the soft probability to its
+    # Gaussian opacity below.
+    sky_mask_cpu = (non_sky_probability <= 1.0e-4).float().unsqueeze(1)
     sample = {
         "images_clean": images_clean,
         # build_clean_scene_state's fallback expression accesses `masks`
@@ -369,7 +376,14 @@ def build_generated_dggt_scene_state(
         "gs_conf": gs_conf,
         "dynamic_conf": dynamic_conf,
     }
-    return build_clean_scene_state(sample, predictions)
+    state = build_clean_scene_state(sample, predictions)
+    point_non_sky = non_sky_probability[
+        state.source_image_ids,
+        state.source_y,
+        state.source_x,
+    ].reshape(-1, 1)
+    state.opacities = state.opacities * point_non_sky
+    return state
 
 
 def export_generated_pointclouds(
@@ -379,45 +393,68 @@ def export_generated_pointclouds(
     suffix: str,
     stride: int,
 ) -> dict[str, Any]:
-    """Write DGGT canonical Gaussian PLY plus MeshLab RGB point PLY."""
+    """Write one DGGT canonical Gaussian/point PLY pair per generated frame.
+
+    DGGT's inspection/export utilities write frame-local point clouds such as
+    ``sample00_frame00.ply``.  Keeping that convention matters for MeshLab:
+    opening an all-frame merged cloud makes the per-pixel samples from adjacent
+    camera poses overlap densely, which visually reads as oversized points even
+    though the PLY schema has no point-size field.
+    """
     stride = max(1, int(stride))
-    keep = torch.ones_like(scene_state.source_image_ids, dtype=torch.bool)
-    if stride > 1:
-        keep &= torch.remainder(scene_state.source_y, stride) == 0
-        keep &= torch.remainder(scene_state.source_x, stride) == 0
-
-    points = scene_state.means[keep]
-    colors = scene_state.colors[keep]
-    opacities = scene_state.opacities[keep]
-    scales = scene_state.scales[keep]
-    quats = scene_state.quats[keep]
-    source_ids = scene_state.source_image_ids[keep]
     seq_len = int(scene_state.images.shape[0])
-    frame_counts = torch.bincount(source_ids, minlength=seq_len).tolist()
+    frame_summaries: list[dict[str, Any]] = []
+    frame_counts: list[int] = []
+    total_points = 0
+    for frame_idx in range(seq_len):
+        keep = scene_state.source_image_ids == int(frame_idx)
+        if stride > 1:
+            keep &= torch.remainder(scene_state.source_y, stride) == 0
+            keep &= torch.remainder(scene_state.source_x, stride) == 0
 
-    gaussian_path = output_dir / f"generated_raw_gaussians__{suffix}.ply"
-    point_path = output_dir / f"generated_raw_points__{suffix}.ply"
-    write_gaussian_ply(
-        {
-            "means": points,
-            "features_dc_rgb": colors,
-            "opacities": opacities,
-            "scales": scales,
-            "quats": quats,
-        },
-        gaussian_path,
-    )
-    write_point_ply(points, colors, point_path)
+        points = scene_state.means[keep]
+        colors = scene_state.colors[keep]
+        opacities = scene_state.opacities[keep]
+        scales = scene_state.scales[keep]
+        quats = scene_state.quats[keep]
+        count = int(points.shape[0])
+        frame_counts.append(count)
+        total_points += count
+
+        frame_suffix = f"{suffix}_frame{frame_idx:02d}"
+        gaussian_path = output_dir / f"generated_raw_gaussians__{frame_suffix}.ply"
+        point_path = output_dir / f"generated_raw_points__{frame_suffix}.ply"
+        write_gaussian_ply(
+            {
+                "means": points,
+                "features_dc_rgb": colors,
+                "opacities": opacities,
+                "scales": scales,
+                "quats": quats,
+            },
+            gaussian_path,
+        )
+        write_point_ply(points, colors, point_path)
+        frame_summaries.append(
+            {
+                "frame": int(frame_idx),
+                "gaussian_ply": str(gaussian_path),
+                "point_ply": str(point_path),
+                "num_points": count,
+            }
+        )
+
     return {
-        "gaussian_ply": str(gaussian_path),
-        "point_ply": str(point_path),
-        "num_points": int(points.shape[0]),
+        "frames": frame_summaries,
+        "num_points": int(total_points),
         "frame_counts": frame_counts,
         "stride": stride,
-        "schema": "DGGT Gaussian PLY + MeshLab xyz/uchar-RGB PLY",
+        "schema": "Per-frame DGGT Gaussian PLY + MeshLab xyz/uchar-RGB PLY",
         "scene_builder": "dggt.utils.gaussian_edit.build_clean_scene_state",
         "validity_rule": "generated non-sky mask AND generated depth > 1e-4",
         "coordinates": "DGGT generated-camera world coordinates",
+        "merged_ply_saved": False,
+        "meshlab_note": "Open one frame PLY at a time; merged multi-frame clouds visually over-densify points.",
     }
 
 
@@ -508,6 +545,7 @@ def render_and_export_generated(
             use_sky_mask=True,
             background_override=sky_background,
             image_hw=(height, width),
+            soft_sky_mask=True,
         ),
     }
     if sky_grid_image is not None:
@@ -644,6 +682,24 @@ def build_argparser() -> argparse.ArgumentParser:
         default=["1.0"],
         help="One or more comma/space-separated CFG scales (default: 1.0).",
     )
+    parser.add_argument(
+        "--asset_control_guidance_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Independent asset-condition guidance scale. Default 1.0 keeps the supplied visual "
+            "condition fixed while --cfg sweeps text guidance, matching Cosmos conditional generation."
+        ),
+    )
+    parser.add_argument(
+        "--camera_guidance_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Independent camera-condition guidance scale. Default 1.0 keeps the requested camera "
+            "trajectory fixed while --cfg sweeps text guidance."
+        ),
+    )
     parser.add_argument("--sample_steps", "--val_sample_steps", dest="val_sample_steps", type=int, default=35)
     parser.add_argument("--shift", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -660,8 +716,8 @@ def build_argparser() -> argparse.ArgumentParser:
             "Default 1 preserves the exact DGGT scene; >1 is explicit export-only downsampling."
         ),
     )
-    parser.add_argument("--val_sliding_window", type=int, default=0)
-    parser.add_argument("--val_sliding_stride", type=int, default=0)
+    parser.add_argument("--val_sliding_window", type=int, default=8)
+    parser.add_argument("--val_sliding_stride", type=int, default=4)
 
     # Fallback architecture only; saved scene_flow_config takes precedence.
     parser.add_argument("--patch_grid_h", type=int, default=25)
@@ -672,6 +728,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--sky_grid_w", type=int, default=DEFAULT_SKY_GRID[1])
     parser.add_argument("--sky_mask_refine_scale", type=int, default=4)
     parser.add_argument("--sky_mask_refine_channels", type=int, default=256)
+    parser.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
     parser.add_argument("--sky_unobserved_loss_weight", type=float, default=0.05)
     return parser
 
@@ -700,11 +757,11 @@ def main() -> None:
     args.camera_gen_dim = 2048
     args.caption_root = args.val_caption_root
     args.val_log_images = int(args.num_frames)
-    # These are overwritten per CFG.  Equal scales implement ordinary CFG for
-    # precisely the optional modalities present in the current mode.
+    # `--cfg` is text guidance.  As in Cosmos conditional video generation,
+    # clean structural conditions remain present in both CFG branches instead
+    # of being amplified together with text. Asset/camera can still be swept
+    # explicitly through their independent flags.
     args.guidance_scale = 1.0
-    args.asset_control_guidance_scale = 1.0
-    args.camera_guidance_scale = 1.0
 
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -812,8 +869,6 @@ def main() -> None:
             # Same sample step across CFG values => identical initial video,
             # camera and sky noise, matching training validation comparisons.
             args.guidance_scale = float(scale)
-            args.asset_control_guidance_scale = float(scale)
-            args.camera_guidance_scale = float(scale)
             generated = cfg_sample_pretrain_latents(
                 scene_flow,
                 bundle,
@@ -846,8 +901,8 @@ def main() -> None:
                     "noise_seed": int(args.seed) + dataset_index,
                     "factored_scales": {
                         "text": float(scale),
-                        "asset": float(scale),
-                        "camera": float(scale),
+                        "asset": float(args.asset_control_guidance_scale),
+                        "camera": float(args.camera_guidance_scale),
                     },
                     "images": image_paths,
                     "pointcloud": ply_summary,
@@ -896,6 +951,8 @@ def main() -> None:
         "rgb_compositing": "gsplat_premultiplied_over_background",
         "selected_range": [start, end],
         "cfg_scales": cfg_scales,
+        "asset_control_guidance_scale": float(args.asset_control_guidance_scale),
+        "camera_guidance_scale": float(args.camera_guidance_scale),
         "condition_cycle": list(CONDITION_MODES),
         "num_frames": int(args.num_frames),
         "sample_steps": int(args.val_sample_steps),

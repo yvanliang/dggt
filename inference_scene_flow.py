@@ -226,6 +226,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "use 'v' only for explicit velocity-prediction checkpoints."
         ),
     )
+    p.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
     p.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B/",
                    help="Qwen text encoder path used by RAE-style SceneFlow training.")
     p.add_argument("--text_max_length", type=int, default=256)
@@ -251,9 +252,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--window", type=int, default=8,
                    help="Frames per scene_flow window (match training S; "
                         "pretrain S=8 / T1 4-8).")
-    p.add_argument("--window_stride", type=int, default=8,
-                   help="Window step in frames (==window: non-overlapping tiles; "
-                        "<window: overlap, averaged on stitch).")
+    p.add_argument("--window_stride", type=int, default=4,
+                   help="Window step in frames; overlap is mandatory for clips longer than --window.")
 
     # Selection
     p.add_argument("--index", type=int, default=None,
@@ -495,7 +495,7 @@ def cfg_sample_edit_latents(
             seed,
             text_encoder,
             window=int(sliding_window),
-            stride=int(sliding_stride or sliding_window),
+            stride=int(sliding_stride or max(1, int(sliding_window) // 2)),
         )
     t_steps = rae_t_grid(
         num_steps=int(args.sample_steps),
@@ -927,28 +927,6 @@ def _entry_tag(entry: dict[str, Any], sample: dict[str, Any], cache_path: str) -
     return "_".join(parts)
 
 
-# ---------------------------------------------------------------------- #
-# Sliding window over the clip                                            #
-# ---------------------------------------------------------------------- #
-def _window_starts(n: int, window: int, stride: int) -> list[list[int]]:
-    """Tile ``n`` frames into windows of exactly ``window`` frames.
-
-    The last start is clamped to ``n - window`` so the clip tail is covered
-    (the overlap is averaged during stitching). If ``n <= window`` a single
-    full-clip window is returned.
-    """
-    w = min(int(window), int(n))
-    if w <= 0:
-        raise ValueError(f"window must be positive, got {window}")
-    if n <= w:
-        return [list(range(n))]
-    step = max(1, int(stride))
-    starts = list(range(0, n - w + 1, step))
-    if starts[-1] != n - w:
-        starts.append(n - w)
-    return [list(range(s, s + w)) for s in starts]
-
-
 def _item_for_subset(
     dataset: WaymoFlowCacheDataset,
     payload: dict[str, Any],
@@ -1130,7 +1108,10 @@ def main() -> None:
             payload, cache_path=cache_path, entry=entry
         )
         num_frames = int(payload["meta"]["num_frames"])
-        windows = _window_starts(num_frames, args.window, args.window_stride)
+        windows = [
+            list(range(start, end))
+            for start, end in window_slices(num_frames, args.window, args.window_stride)
+        ]
 
         # Full-clip bundle drives stepwise sliding sampling; model forward still
         # receives only window slices, so asset/camera token counts stay bounded.

@@ -143,7 +143,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
 * sky mask 只用于构造 sky RGB target 和 `sky_gen_loss_weight`；SceneFlow forward 不接收 GT 派生的 sky attention mask。`--sky_unobserved_loss_weight 0.05` 给未观测 atlas cell 弱监督，保持开放推理时完整 sky atlas 可生成。
 * validation 图像会保存到 `logs/scene_flow_pretrain_1024/validation/step_xxxxxx/`；默认包含 `generated_raw_3dgs_rgb__cfg*.jpg`、`generated_sky_rgb__cfg*.jpg`、`generated_pred_sky_mask__cfg*.jpg`、latent PCA 和误差图。额外 CFG scale 会追加 `*_cfg{scale}` 后缀。
 * `--val_sample_steps` 只控制 validation 图像采样步数，不影响训练本身。`15` 偏少，适合 smoke test；正式看图建议先用 `30`，需要更稳定的样本再用 `50`。FlowMatch/RAE 的生成采样也不是训练时的 1000 timestep 全跑，而是在 scheduler timestep 上做几十步推理。
-* `--val_sliding_window 0` 默认关闭训练内 validation 滑窗。若 validation clip 长于训练窗口，使用 `--val_sliding_window 8 --val_sliding_stride 4` 或 `8`；采样会维护 full video/camera/sky 状态，在每个 denoise step 对窗口 velocity 做重叠融合。text 复用整段 caption，asset/camera 条件按窗口切片，sky token 不按帧切。
+* 训练内 validation 默认 `--val_sliding_window 8 --val_sliding_stride 4`。长序列必须满足 `1 <= stride < window`；`stride=0` 自动取半窗，`stride>=window` 直接报错。采样维护 full video/camera/sky 状态，对 video/camera/mask logits 用 cosine coverage 逐帧归一化；scene-global sky 使用 `sum(w/C)` 窗口权重，使每个全局帧贡献相等。
 * 如需只记录 latent/mask 诊断图并跳过较慢的 3DGS RGB 渲染，可额外加 `--no_val_render_rgb`。
 * 若当前机器未登录 wandb，可先执行 `wandb login`，或临时去掉 `--wandb` 相关参数。
 
@@ -153,7 +153,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
 * mRoPE A1 固定坐标：video/asset/edit-control 使用真实 `(t,y,x)`；camera condition 和 camera generation 使用同一帧 `t`、空间中心 `(H//2,W//2)`，避免把全局相机条件绑到左上角 patch；sky generation 使用独立 sky atlas grid 和 temporal offset `128`，避免 scene-level 天空 token 与视频 patch 共享位置。这个设置是模型结构的一部分，不通过命令行覆盖，并通过 `rope_layout_version=a1_camera_center_sky128` 写入 checkpoint config。
 * `--weighting_scheme waver --mode_scale 1.29 --shift 10.0 --prediction_type x`：pretrain、正式训练、训练内 validation、离线 inference 需要保持一致。`logit_mean/logit_std` 只在显式切回 `--weighting_scheme logit_normal` 做 ablation 时使用。`x` 是 RAEv2 T2I 的 clean-latent 输出参数化；代码仍会把它转换成 velocity 做 flow matching loss 和 ODE 采样。
 * `--lambda_repa 0.5`：推荐命令显式打开；CLI 默认仍是 `0.0`。
-* `--guidance_scale --asset_control_guidance_scale --camera_guidance_scale`：pretrain validation 采样的 CFG scale，默认 `1.0` 为 no-op。pretrain 推理中 asset/camera 条件可选；缺失某类条件时，对应 CFG scale 会自动退化为 `1.0`，并使用 learned null condition。具体分支设计见 `docs/scene_flow_model_design.md`。
+* `--guidance_scale --asset_control_guidance_scale --camera_guidance_scale`：pretrain validation 采样的 factored CFG scale，默认 `1.0` 为 no-op。`--val_guidance_scales` 和 offline `--cfg` 只扫描 text scale；asset/camera 默认固定为 `1.0`，与 Cosmos 保留 clean structural condition、只对 text 做 CFG 的语义一致。只有显式传 offline `--asset_control_guidance_scale` / `--camera_guidance_scale` 才放大对应控制残差。pretrain 推理中 asset/camera 条件可选；缺失某类条件时，对应 scale 会自动退化为 `1.0`，并使用 learned null condition。具体分支设计见 `docs/scene_flow_model_design.md`。
 * 扩散/flow 的训练 loss 只能作为粗略健康检查；样本质量以 EMA validation 图像为准。
 
 正式配置已切到 **1024-dim 6 万 iter tokenizer**。切 tokenizer 时务必重算 `$FEATURE_STATS`，并保持 pretrain / T1 的 `--latent_dim 1024` 与 warm-start checkpoint 维度一致。tokenizer 续训时建议跑满 RAE 式 decoder noise augmentation（denoise-recon 阶段），让 decoder 对 SceneFlow latent 误差鲁棒，这直接削 grid。

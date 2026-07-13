@@ -58,7 +58,12 @@ from dggt.utils.pretrain_asset_slots import (
     build_pretrain_asset_slots_from_object_patch_mask,
 )
 from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
-from dggt.utils.sliding_window import cosine_window, window_slices
+from dggt.utils.sliding_window import (
+    cosine_coverage,
+    cosine_window,
+    scene_global_window_weight,
+    window_slices,
+)
 from dggt.utils.tokens import (
     reattach_special_tokens,
     replace_selected_levels,
@@ -423,17 +428,32 @@ def scene_flow_t_eps(scene_flow: nn.Module) -> float:
     return float(getattr(cfg, "t_eps", 0.05))
 
 
+# Unlike the legacy RAE-compatible video target, sky uses the exact derivative
+# of its linear clean-to-noise path.  The floor is only a numerical guard for
+# x-prediction conversion; sampled sigmoid times and ODE evaluation times are
+# strictly positive whenever the model is called.
+SKY_FLOW_T_EPS = 1.0e-6
+
+
 def model_prediction_to_clean(scene_flow: nn.Module, prediction: torch.Tensor, target) -> torch.Tensor:
     if scene_flow_prediction_type(scene_flow) == "x":
         return prediction
     return target.z_t - target.sigmas4.to(device=prediction.device, dtype=prediction.dtype) * prediction
 
 
-def sampler_prediction_to_velocity(scene_flow: nn.Module, prediction: torch.Tensor, z: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
+def sampler_prediction_to_velocity(
+    scene_flow: nn.Module,
+    prediction: torch.Tensor,
+    z: torch.Tensor,
+    sigma: torch.Tensor,
+    *,
+    t_eps: float | None = None,
+) -> torch.Tensor:
     if scene_flow_prediction_type(scene_flow) == "x":
         while sigma.ndim < z.ndim:
             sigma = sigma.view(*sigma.shape, 1)
-        return (z - prediction) / sigma.to(device=z.device, dtype=z.dtype).clamp_min(scene_flow_t_eps(scene_flow))
+        denom_floor = scene_flow_t_eps(scene_flow) if t_eps is None else float(t_eps)
+        return (z - prediction) / sigma.to(device=z.device, dtype=z.dtype).clamp_min(denom_floor)
     return prediction
 
 
@@ -1496,7 +1516,6 @@ def _build_directional_sky_tokens_from_images(
     intrinsics: torch.Tensor,
     valid_threshold: float,
     unobserved_weight: float,
-    sphere_radius: float = 50.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     b, s, _, height, width = images.shape
     sky = _sky_mask_1ch(masks, images)
@@ -1511,13 +1530,17 @@ def _build_directional_sky_tokens_from_images(
     )
     dirs = _sky_direction_grid(grid_h, grid_w, device=images.device, dtype=work_dtype)
     k = int(dirs.shape[0])
-    points = dirs * float(sphere_radius)
-    points_h = torch.cat([points, torch.ones((k, 1), device=images.device, dtype=work_dtype)], dim=-1)
-    cam_points = torch.einsum("bsij,kj->bski", extrinsics4, points_h)
-    z = cam_points[..., 2]
+    # The sky atlas is an environment map at infinity.  Its renderer below
+    # transforms camera rays by rotation only, so target construction must do
+    # the exact inverse operation: world directions -> camera directions using
+    # R_world_to_camera.  Treating the atlas as a finite sphere and applying
+    # camera translation makes the learned target change when the camera moves
+    # even though the renderer is translation invariant.
+    cam_dirs = torch.einsum("bsij,kj->bski", extrinsics4[..., :3, :3], dirs)
+    z = cam_dirs[..., 2]
     z_safe = z.clamp_min(1e-6)
-    px = intrinsics3[..., 0, 0].unsqueeze(-1) * (cam_points[..., 0] / z_safe) + intrinsics3[..., 0, 2].unsqueeze(-1)
-    py = intrinsics3[..., 1, 1].unsqueeze(-1) * (cam_points[..., 1] / z_safe) + intrinsics3[..., 1, 2].unsqueeze(-1)
+    px = intrinsics3[..., 0, 0].unsqueeze(-1) * (cam_dirs[..., 0] / z_safe) + intrinsics3[..., 0, 2].unsqueeze(-1)
+    py = intrinsics3[..., 1, 1].unsqueeze(-1) * (cam_dirs[..., 1] / z_safe) + intrinsics3[..., 1, 2].unsqueeze(-1)
     visible = z.gt(1e-6) & px.ge(0.0) & px.le(float(width - 1)) & py.ge(0.0) & py.le(float(height - 1))
 
     x_norm = (2.0 * px / float(max(width - 1, 1))) - 1.0
@@ -1674,7 +1697,10 @@ def build_sky_rectified_flow_target(
     sigmas3 = sigmas.view(b, 1, 1)
     eps = torch.randn_like(sky_clean)
     z_t = (1.0 - sigmas3) * sky_clean + sigmas3 * eps
-    v_gt = (z_t - sky_clean) / sigmas3.clamp_min(float(getattr(video_target, "t_eps", 0.05)))
+    # The path is affine in sigma, hence its translation/velocity is exactly
+    # eps - clean for every sigma.  Recovering it by division through a
+    # t_eps-clamped sigma incorrectly shrinks the target when sigma < t_eps.
+    v_gt = eps - sky_clean
     return SimpleNamespace(
         sigmas=video_target.sigmas,
         sigmas4=sigmas3,
@@ -1682,7 +1708,7 @@ def build_sky_rectified_flow_target(
         v_gt=v_gt,
         eps=eps,
         weights=torch.ones((b, 1, 1), device=sky_clean.device, dtype=sky_clean.dtype),
-        t_eps=float(getattr(video_target, "t_eps", 0.05)),
+        t_eps=SKY_FLOW_T_EPS,
         loss_weight=token_weight,
     )
 
@@ -1772,8 +1798,10 @@ def render_sky_tokens_directional_background(
     elevation = torch.asin(upper)
     v = (1.0 - elevation / (0.5 * float(np.pi))).clamp(0.0, 1.0)
 
-    x_idx = u * float(gw) + 1.0
-    x_norm = (2.0 * x_idx / float(gw + 1)) - 1.0
+    # Atlas values live at bin centres. With align_corners=False, 2*u-1 maps
+    # (j+0.5)/W exactly to pixel j. The azimuth axis has one wrapped padding
+    # column on either side, hence the corresponding padded-grid coordinate.
+    x_norm = (2.0 * (u * float(gw) + 1.0) / float(gw + 2)) - 1.0
     y_norm = (2.0 * v) - 1.0
     sample_grid = torch.stack([x_norm, y_norm], dim=-1)
     bg = torch.nn.functional.grid_sample(
@@ -1781,7 +1809,7 @@ def render_sky_tokens_directional_background(
         sample_grid,
         mode="bilinear",
         padding_mode="border",
-        align_corners=True,
+        align_corners=False,
     )
     return bg.permute(0, 2, 3, 1).contiguous()
 
@@ -1964,6 +1992,7 @@ def _render_gs_map_rgb(
     use_sky_mask: bool = True,
     background_override: torch.Tensor | None = None,
     image_hw: tuple[int, int] | None = None,
+    soft_sky_mask: bool = False,
 ) -> torch.Tensor:
     """Render 3DGS with DGGT mode-2 scene assembly and correct compositing.
 
@@ -2018,9 +2047,13 @@ def _render_gs_map_rgb(
 
     if masks is not None and use_sky_mask:
         sky_mask = masks.to(device).permute(0, 1, 3, 4, 2)
-        bg_mask = (sky_mask < 0.5).any(dim=-1)
+        sky_probability = sky_mask.float().mean(dim=-1).clamp(0.0, 1.0)
+        non_sky_probability = 1.0 - sky_probability
+        threshold = 1.0e-4 if soft_sky_mask else 0.5
+        bg_mask = non_sky_probability > threshold
     else:
         bg_mask = torch.ones((1, seq_len, height, width), dtype=torch.bool, device=device)
+        non_sky_probability = torch.ones_like(bg_mask, dtype=torch.float32)
 
     if background_override is not None:
         bg_render = background_override.to(device=device, dtype=image_dtype)
@@ -2061,6 +2094,8 @@ def _render_gs_map_rgb(
     static_dynamic_prob = dy_map[static_mask].sigmoid()
     static_rgbs, static_opacity, static_scales, static_rotations = get_split_gs(gs_map, static_mask)
     static_opacity = static_opacity * (1.0 - static_dynamic_prob)
+    if soft_sky_mask:
+        static_opacity = static_opacity * non_sky_probability[static_mask]
     static_gs_conf = gs_conf[static_mask]
     static_frame_idx = torch.nonzero(static_mask, as_tuple=False)[:, 1]
     gs_timestamps = timestamps[static_frame_idx] if static_frame_idx.numel() > 0 else timestamps.new_zeros((0,))
@@ -2073,6 +2108,8 @@ def _render_gs_map_rgb(
         dynamic_rgb, dynamic_opacity, dynamic_scale, dynamic_rotation = get_split_gs(gs_map[:, frame_idx], bg_mask_i)
         dynamic_prob = dy_map[:, frame_idx][bg_mask_i].sigmoid()
         dynamic_opacity = dynamic_opacity * dynamic_prob
+        if soft_sky_mask:
+            dynamic_opacity = dynamic_opacity * non_sky_probability[:, frame_idx][bg_mask_i]
         dynamic_points.append(dynamic_point)
         dynamic_rgbs.append(dynamic_rgb)
         dynamic_opacitys.append(dynamic_opacity)
@@ -2363,6 +2400,7 @@ def render_validation_rgb(
         generated_dynamic_conf,
         device, frames, background_mode="black", use_sky_mask=True,
         background_override=generated_sky_background,
+        soft_sky_mask=True,
     )
     del (
         generated_pose_enc,
@@ -2496,6 +2534,7 @@ def render_validation_generated_rgb(
             device, frames, background_mode="black", use_sky_mask=True,
             background_override=generated_sky_background,
             image_hw=(height, width),
+            soft_sky_mask=True,
         ),
     }
     if sky_grid_image is not None:
@@ -2559,152 +2598,8 @@ def _validation_sliding_params(args: argparse.Namespace, seq_len: int) -> tuple[
         return None
     stride = int(getattr(args, "val_sliding_stride", 0) or 0)
     if stride <= 0:
-        stride = window
+        stride = max(1, window // 2)
     return min(window, int(seq_len)), max(1, stride)
-
-
-@torch.no_grad()
-def _predict_generated_sky_mask_patch(
-    scene_flow: nn.Module,
-    bundle,
-    args: argparse.Namespace,
-    device: torch.device,
-    *,
-    z: torch.Tensor,
-    camera_z: torch.Tensor | None,
-    sky_z: torch.Tensor | None,
-    text_encoder: nn.Module | None,
-    sliding: tuple[int, int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Read the auxiliary sky-mask heads at the final generated state."""
-    batch_size = int(z.shape[0])
-    seq_len = int(z.shape[1])
-    z_splat = getattr(bundle, "z_splat_n", None)
-    if z_splat is None:
-        z_splat = torch.zeros_like(bundle.z_clean_n)
-    scaffold_tok = torch.zeros_like(bundle.z_clean_n)
-    sigma = torch.zeros((batch_size,), device=device, dtype=torch.float32)
-    sf = unwrap_ddp(scene_flow)
-    frame_ids = _bundle_frame_ids(bundle, batch_size=batch_size, seq_len=seq_len, device=device)
-    text_tokens, text_mask = encode_text_condition(text_encoder, getattr(bundle, "captions", None))
-    optional_cfg = resolve_pretrain_optional_cfg_conditions(
-        bundle,
-        batch_size,
-        asset_control_scale=1.0,
-        camera_scale=1.0,
-    )
-
-    if sliding is None:
-        out = sf(
-            z,
-            sigma,
-            z_splat,
-            scaffold_tok,
-            bundle.M_preserve,
-            bundle.M_source,
-            bundle.M_dest,
-            bundle.F_asset_tokens,
-            encoder_attention_mask=bundle.encoder_attention_mask,
-            text_tokens=text_tokens,
-            text_attention_mask=text_mask,
-            camera_pose_tokens=optional_cfg.full_camera_tokens,
-            camera_attention_mask=optional_cfg.full_camera_mask,
-            camera_condition_kind=optional_cfg.full_camera_kind,
-            camera_gen_tokens=camera_z,
-            sky_gen_tokens=sky_z,
-            sky_gen_attention_mask=None,
-            return_mid=False,
-            return_dict=True,
-            return_sky_mask=True,
-            asset_condition_kind=optional_cfg.full_asset_kind,
-            frame_ids=frame_ids,
-            fps=None,
-        )
-        if (
-            not isinstance(out, dict)
-            or out.get("sky_mask_logits") is None
-            or out.get("sky_mask_refined_logits") is None
-        ):
-            raise RuntimeError("SceneFlow final mask prediction did not return sky mask logits.")
-        logits = out["sky_mask_logits"]
-        refined_logits = out["sky_mask_refined_logits"]
-        assert torch.is_tensor(logits)
-        assert torch.is_tensor(refined_logits)
-        return (
-            logits,
-            torch.sigmoid(logits.float()).to(dtype=logits.dtype),
-            refined_logits,
-            torch.sigmoid(refined_logits.float()).to(dtype=refined_logits.dtype),
-        )
-
-    window, stride = sliding
-    windows = window_slices(seq_len, window, stride)
-    logit_acc = torch.zeros(z.shape[:3] + (1,), device=device, dtype=z.dtype)
-    logit_weight = torch.zeros((1, seq_len, 1, 1), device=device, dtype=z.dtype)
-    refined_acc = None
-    refined_weight = None
-    for start, end in windows:
-        actual = int(end - start)
-        weight = cosine_window(actual, device=device, dtype=z.dtype).view(1, actual, 1, 1)
-        camera_z_w = camera_z[:, start:end] if camera_z is not None else None
-        out = sf(
-            z[:, start:end],
-            sigma,
-            z_splat[:, start:end],
-            scaffold_tok[:, start:end],
-            bundle.M_preserve[:, start:end],
-            bundle.M_source[:, start:end],
-            bundle.M_dest[:, start:end],
-            _slice_asset_time(bundle.F_asset_tokens, start, end, seq_len),
-            encoder_attention_mask=_slice_asset_time(bundle.encoder_attention_mask, start, end, seq_len),
-            text_tokens=text_tokens,
-            text_attention_mask=text_mask,
-            camera_pose_tokens=_slice_time(optional_cfg.full_camera_tokens, start, end, seq_len),
-            camera_attention_mask=_slice_time(optional_cfg.full_camera_mask, start, end, seq_len),
-            camera_condition_kind=optional_cfg.full_camera_kind,
-            camera_gen_tokens=camera_z_w,
-            sky_gen_tokens=sky_z,
-            sky_gen_attention_mask=None,
-            return_mid=False,
-            return_dict=True,
-            return_sky_mask=True,
-            asset_condition_kind=optional_cfg.full_asset_kind,
-            frame_ids=frame_ids[:, start:end],
-            fps=None,
-        )
-        if (
-            not isinstance(out, dict)
-            or out.get("sky_mask_logits") is None
-            or out.get("sky_mask_refined_logits") is None
-        ):
-            raise RuntimeError("SceneFlow sliding final mask prediction did not return sky mask logits.")
-        logits_w = out["sky_mask_logits"]
-        refined_w = out["sky_mask_refined_logits"]
-        assert torch.is_tensor(logits_w)
-        assert torch.is_tensor(refined_w)
-        logit_acc[:, start:end] += logits_w.to(dtype=logit_acc.dtype) * weight
-        logit_weight[:, start:end] += weight
-        if refined_acc is None:
-            refined_acc = torch.zeros(
-                (batch_size, seq_len) + tuple(refined_w.shape[2:]),
-                device=device,
-                dtype=refined_w.dtype,
-            )
-            refined_weight = torch.zeros((1, seq_len, 1, 1, 1), device=device, dtype=refined_w.dtype)
-        refined_w_weight = weight.view(1, actual, 1, 1, 1).to(dtype=refined_w.dtype)
-        refined_acc[:, start:end] += refined_w * refined_w_weight
-        assert refined_weight is not None
-        refined_weight[:, start:end] += refined_w_weight
-    logits = logit_acc / logit_weight.clamp_min(1e-6)
-    if refined_acc is None or refined_weight is None:
-        raise RuntimeError("No sliding windows produced refined sky mask logits.")
-    refined_logits = refined_acc / refined_weight.clamp_min(1e-6)
-    return (
-        logits,
-        torch.sigmoid(logits.float()).to(dtype=logits.dtype),
-        refined_logits,
-        torch.sigmoid(refined_logits.float()).to(dtype=refined_logits.dtype),
-    )
 
 
 @torch.no_grad()
@@ -2762,6 +2657,7 @@ def _cfg_sample_pretrain_latents_sliding(
     sf = unwrap_ddp(scene_flow)
     frame_ids_full = _bundle_frame_ids(bundle, batch_size=batch_size, seq_len=seq_len, device=device)
     windows = window_slices(seq_len, window, stride)
+    coverage = cosine_coverage(seq_len, windows, device=device, dtype=z.dtype)
 
     kv_dim = bundle.F_asset_tokens.shape[-1]
     if bundle.F_asset_tokens.ndim in (4, 5):
@@ -2798,8 +2694,11 @@ def _cfg_sample_pretrain_latents_sliding(
     full_camera_kind = optional_cfg.full_camera_kind
     full_camera_tokens = optional_cfg.full_camera_tokens
     full_camera_mask = optional_cfg.full_camera_mask
+    final_sky_mask_logits = None
+    final_sky_mask_refined_logits = None
 
     for i in range(int(args.val_sample_steps)):
+        read_final_sky_mask = bool(return_sky_mask) and i == int(args.val_sample_steps) - 1
         step_h = t_steps[i] - t_steps[i + 1]
         sigma = torch.full((batch_size,), float(t_steps[i].item()), device=device)
         v_acc = torch.zeros_like(z)
@@ -2812,6 +2711,14 @@ def _cfg_sample_pretrain_latents_sliding(
         )
         sky_acc = torch.zeros_like(sky_z) if sky_z is not None else None
         sky_weight = 0.0
+        mask_logit_acc = torch.zeros(z.shape[:3] + (1,), device=device, dtype=z.dtype) if read_final_sky_mask else None
+        mask_logit_weight = (
+            torch.zeros((1, seq_len, 1, 1), device=device, dtype=z.dtype)
+            if read_final_sky_mask
+            else None
+        )
+        mask_refined_acc = None
+        mask_refined_weight = None
 
         for start, end in windows:
             actual = int(end - start)
@@ -2862,6 +2769,7 @@ def _cfg_sample_pretrain_latents_sliding(
                     sky_gen_attention_mask=None,
                     return_mid=False,
                     return_dict=True,
+                    return_sky_mask=read_final_sky_mask,
                     asset_condition_kind=asset_kind,
                     control_drop_mask=control_drop_mask,
                     frame_ids=frame_ids_w,
@@ -2883,58 +2791,86 @@ def _cfg_sample_pretrain_latents_sliding(
             v_camera_full = out_full.get("camera")
             v_sky_full = out_full.get("sky")
             if do_cfg:
-                out_text = _run_branch(
-                    F_asset_tokens=F_uncond,
-                    asset_mask=uncond_asset_mask,
-                    asset_kind=asset_null_kind,
-                    branch_text_tokens=text_tokens,
-                    branch_text_mask=text_mask,
-                    camera_kind=camera_null_kind,
-                    control_drop_mask=drop_all_control,
-                )
-                out_text_asset = _run_branch(
-                    F_asset_tokens=bundle.F_asset_tokens,
-                    asset_mask=bundle.encoder_attention_mask,
-                    asset_kind=full_asset_kind,
-                    branch_text_tokens=text_tokens,
-                    branch_text_mask=text_mask,
-                    camera_kind=camera_null_kind,
-                )
-                out_uncond = _run_branch(
-                    F_asset_tokens=F_uncond,
-                    asset_mask=uncond_asset_mask,
-                    asset_kind=asset_null_kind,
-                    branch_text_tokens=text_null,
-                    branch_text_mask=text_null_mask,
-                    camera_kind=camera_null_kind,
-                    control_drop_mask=drop_all_control,
-                )
+                out_no_text_full = None
+                out_text = None
+                out_text_asset = None
+                if abs(scale - 1.0) > 1e-6:
+                    # Cosmos-style text CFG: keep all clean structural
+                    # conditions identical and remove text only.
+                    out_no_text_full = _run_branch(
+                        F_asset_tokens=bundle.F_asset_tokens,
+                        asset_mask=bundle.encoder_attention_mask,
+                        asset_kind=full_asset_kind,
+                        branch_text_tokens=text_null,
+                        branch_text_mask=text_null_mask,
+                        camera_kind=full_camera_kind,
+                    )
+                if abs(asset_control_scale - 1.0) > 1e-6:
+                    out_text = _run_branch(
+                        F_asset_tokens=F_uncond,
+                        asset_mask=uncond_asset_mask,
+                        asset_kind=asset_null_kind,
+                        branch_text_tokens=text_tokens,
+                        branch_text_mask=text_mask,
+                        camera_kind=camera_null_kind,
+                        control_drop_mask=drop_all_control,
+                    )
+                    out_text_asset = _run_branch(
+                        F_asset_tokens=bundle.F_asset_tokens,
+                        asset_mask=bundle.encoder_attention_mask,
+                        asset_kind=full_asset_kind,
+                        branch_text_tokens=text_tokens,
+                        branch_text_mask=text_mask,
+                        camera_kind=camera_null_kind,
+                    )
+                elif abs(camera_scale - 1.0) > 1e-6:
+                    out_text_asset = _run_branch(
+                        F_asset_tokens=bundle.F_asset_tokens,
+                        asset_mask=bundle.encoder_attention_mask,
+                        asset_kind=full_asset_kind,
+                        branch_text_tokens=text_tokens,
+                        branch_text_mask=text_mask,
+                        camera_kind=camera_null_kind,
+                    )
 
                 def _combine_cfg(key: str) -> torch.Tensor | None:
                     full = out_full.get(key)
                     if full is None:
                         return None
-                    text = out_text.get(key)
-                    text_asset = out_text_asset.get(key)
-                    uncond = out_uncond.get(key)
-                    if text is None or text_asset is None or uncond is None:
-                        raise RuntimeError(f"CFG branch is missing `{key}` predictions.")
-                    return (
-                        uncond
-                        + scale * (text - uncond)
-                        + asset_control_scale * (text_asset - text)
-                        + camera_scale * (full - text_asset)
-                    )
+                    guided = full
+                    if out_no_text_full is not None:
+                        no_text_full = out_no_text_full.get(key)
+                        if no_text_full is None:
+                            raise RuntimeError(f"Text-CFG branch is missing `{key}` predictions.")
+                        guided = guided + (scale - 1.0) * (full - no_text_full)
+                    if abs(asset_control_scale - 1.0) > 1e-6:
+                        assert out_text is not None and out_text_asset is not None
+                        text = out_text.get(key)
+                        text_asset = out_text_asset.get(key)
+                        if text is None or text_asset is None:
+                            raise RuntimeError(f"Asset-CFG branch is missing `{key}` predictions.")
+                        guided = guided + (asset_control_scale - 1.0) * (text_asset - text)
+                    if abs(camera_scale - 1.0) > 1e-6:
+                        assert out_text_asset is not None
+                        text_asset = out_text_asset.get(key)
+                        if text_asset is None:
+                            raise RuntimeError(f"Camera-CFG branch is missing `{key}` predictions.")
+                        guided = guided + (camera_scale - 1.0) * (full - text_asset)
+                    return guided
 
                 v = _combine_cfg("video")
                 if v is None:
                     raise RuntimeError("CFG branch is missing `video` predictions.")
                 v_camera = _combine_cfg("camera") if camera_z is not None and v_camera_full is not None else None
                 v_sky = _combine_cfg("sky") if sky_z is not None and v_sky_full is not None else None
+                mask_logits_w = _combine_cfg("sky_mask_logits") if read_final_sky_mask else None
+                mask_refined_w = _combine_cfg("sky_mask_refined_logits") if read_final_sky_mask else None
             else:
                 v = v_full
                 v_camera = v_camera_full
                 v_sky = v_sky_full
+                mask_logits_w = out_full.get("sky_mask_logits") if read_final_sky_mask else None
+                mask_refined_w = out_full.get("sky_mask_refined_logits") if read_final_sky_mask else None
 
             v = sampler_prediction_to_velocity(sf, v, z_w, sigma)
             v_acc[:, start:end] += v * w_video
@@ -2944,9 +2880,37 @@ def _cfg_sample_pretrain_latents_sliding(
                 camera_acc[:, start:end] += v_camera * w_camera
                 camera_weight[:, start:end] += w_camera
             if sky_acc is not None and v_sky is not None and sky_z is not None:
-                v_sky = sampler_prediction_to_velocity(sf, v_sky, sky_z, sigma)
-                sky_acc += v_sky
-                sky_weight += 1.0
+                v_sky = sampler_prediction_to_velocity(
+                    sf,
+                    v_sky,
+                    sky_z,
+                    sigma,
+                    t_eps=SKY_FLOW_T_EPS,
+                )
+                global_weight = scene_global_window_weight(start, end, coverage).to(dtype=v_sky.dtype)
+                sky_acc += v_sky * global_weight
+                sky_weight += float(global_weight.item())
+            if read_final_sky_mask:
+                if mask_logits_w is None or mask_refined_w is None:
+                    raise RuntimeError("Final denoising branch did not return sky-mask logits.")
+                assert mask_logit_acc is not None and mask_logit_weight is not None
+                mask_logit_acc[:, start:end] += mask_logits_w.to(dtype=mask_logit_acc.dtype) * w_video
+                mask_logit_weight[:, start:end] += w_video
+                if mask_refined_acc is None:
+                    mask_refined_acc = torch.zeros(
+                        (batch_size, seq_len) + tuple(mask_refined_w.shape[2:]),
+                        device=device,
+                        dtype=mask_refined_w.dtype,
+                    )
+                    mask_refined_weight = torch.zeros(
+                        (1, seq_len, 1, 1, 1),
+                        device=device,
+                        dtype=mask_refined_w.dtype,
+                    )
+                refined_weight_w = w_video.view(1, actual, 1, 1, 1).to(dtype=mask_refined_w.dtype)
+                mask_refined_acc[:, start:end] += mask_refined_w * refined_weight_w
+                assert mask_refined_weight is not None
+                mask_refined_weight[:, start:end] += refined_weight_w
 
         v = v_acc / v_weight.clamp_min(1e-6)
         z = z - step_h.to(dtype=z.dtype) * v
@@ -2957,24 +2921,28 @@ def _cfg_sample_pretrain_latents_sliding(
         if sky_z is not None and sky_acc is not None and sky_weight > 0.0:
             v_sky = sky_acc / float(sky_weight)
             sky_z = sky_z - step_h.to(dtype=sky_z.dtype) * v_sky
+        if read_final_sky_mask:
+            if (
+                mask_logit_acc is None
+                or mask_logit_weight is None
+                or mask_refined_acc is None
+                or mask_refined_weight is None
+            ):
+                raise RuntimeError("Sliding sampling did not accumulate final sky-mask logits.")
+            final_sky_mask_logits = mask_logit_acc / mask_logit_weight.clamp_min(1e-6)
+            final_sky_mask_refined_logits = mask_refined_acc / mask_refined_weight.clamp_min(1e-6)
 
     z = M_keep * z_splat + M_edit * z
-    sky_mask_logits = None
-    sky_mask_patch = None
-    sky_mask_refined_logits = None
-    sky_mask_refined = None
-    if return_sky_mask:
-        sky_mask_logits, sky_mask_patch, sky_mask_refined_logits, sky_mask_refined = _predict_generated_sky_mask_patch(
-            scene_flow,
-            bundle,
-            args,
-            device,
-            z=z,
-            camera_z=camera_z,
-            sky_z=sky_z,
-            text_encoder=text_encoder,
-            sliding=(window, stride),
-        )
+    sky_mask_logits = final_sky_mask_logits
+    sky_mask_refined_logits = final_sky_mask_refined_logits
+    sky_mask_patch = None if sky_mask_logits is None else torch.sigmoid(sky_mask_logits.float()).to(sky_mask_logits.dtype)
+    sky_mask_refined = (
+        None
+        if sky_mask_refined_logits is None
+        else torch.sigmoid(sky_mask_refined_logits.float()).to(sky_mask_refined_logits.dtype)
+    )
+    if return_sky_mask and (sky_mask_patch is None or sky_mask_refined is None):
+        raise RuntimeError("Sampling requested a sky mask but the final denoising step did not produce one.")
     if return_camera or return_sky or return_sky_mask:
         return SimpleNamespace(
             video=z,
@@ -3090,8 +3058,11 @@ def cfg_sample_pretrain_latents(
     full_camera_kind = optional_cfg.full_camera_kind
     full_camera_tokens = optional_cfg.full_camera_tokens
     full_camera_mask = optional_cfg.full_camera_mask
+    final_sky_mask_logits = None
+    final_sky_mask_refined_logits = None
 
     for i in range(int(args.val_sample_steps)):
+        read_final_sky_mask = bool(return_sky_mask) and i == int(args.val_sample_steps) - 1
         step_h = t_steps[i] - t_steps[i + 1]
         sigma = torch.full((batch_size,), float(t_steps[i].item()), device=device)
 
@@ -3125,6 +3096,7 @@ def cfg_sample_pretrain_latents(
                 sky_gen_attention_mask=None,
                 return_mid=False,
                 return_dict=True,
+                return_sky_mask=read_final_sky_mask,
                 asset_condition_kind=asset_kind,
                 control_drop_mask=control_drop_mask,
                 frame_ids=frame_ids,
@@ -3148,58 +3120,87 @@ def cfg_sample_pretrain_latents(
         v_camera_full = out_full.get("camera")
         v_sky_full = out_full.get("sky")
         if do_cfg:
-            out_text = _run_branch(
-                F_asset_tokens=F_uncond,
-                asset_mask=uncond_asset_mask,
-                asset_kind=asset_null_kind,
-                branch_text_tokens=text_tokens,
-                branch_text_mask=text_mask,
-                camera_kind=camera_null_kind,
-                control_drop_mask=drop_all_control,
-            )
-            out_text_asset = _run_branch(
-                F_asset_tokens=bundle.F_asset_tokens,
-                asset_mask=bundle.encoder_attention_mask,
-                asset_kind=full_asset_kind,
-                branch_text_tokens=text_tokens,
-                branch_text_mask=text_mask,
-                camera_kind=camera_null_kind,
-            )
-            out_uncond = _run_branch(
-                F_asset_tokens=F_uncond,
-                asset_mask=uncond_asset_mask,
-                asset_kind=asset_null_kind,
-                branch_text_tokens=text_null,
-                branch_text_mask=text_null_mask,
-                camera_kind=camera_null_kind,
-                control_drop_mask=drop_all_control,
-            )
+            out_no_text_full = None
+            out_text = None
+            out_text_asset = None
+            if abs(scale - 1.0) > 1e-6:
+                out_no_text_full = _run_branch(
+                    F_asset_tokens=bundle.F_asset_tokens,
+                    asset_mask=bundle.encoder_attention_mask,
+                    asset_kind=full_asset_kind,
+                    branch_text_tokens=text_null,
+                    branch_text_mask=text_null_mask,
+                    camera_kind=full_camera_kind,
+                )
+            if abs(asset_control_scale - 1.0) > 1e-6:
+                out_text = _run_branch(
+                    F_asset_tokens=F_uncond,
+                    asset_mask=uncond_asset_mask,
+                    asset_kind=asset_null_kind,
+                    branch_text_tokens=text_tokens,
+                    branch_text_mask=text_mask,
+                    camera_kind=camera_null_kind,
+                    control_drop_mask=drop_all_control,
+                )
+                out_text_asset = _run_branch(
+                    F_asset_tokens=bundle.F_asset_tokens,
+                    asset_mask=bundle.encoder_attention_mask,
+                    asset_kind=full_asset_kind,
+                    branch_text_tokens=text_tokens,
+                    branch_text_mask=text_mask,
+                    camera_kind=camera_null_kind,
+                )
+            elif abs(camera_scale - 1.0) > 1e-6:
+                out_text_asset = _run_branch(
+                    F_asset_tokens=bundle.F_asset_tokens,
+                    asset_mask=bundle.encoder_attention_mask,
+                    asset_kind=full_asset_kind,
+                    branch_text_tokens=text_tokens,
+                    branch_text_mask=text_mask,
+                    camera_kind=camera_null_kind,
+                )
 
             def _combine_cfg(key: str) -> torch.Tensor | None:
                 full = out_full.get(key)
                 if full is None:
                     return None
-                text = out_text.get(key)
-                text_asset = out_text_asset.get(key)
-                uncond = out_uncond.get(key)
-                if text is None or text_asset is None or uncond is None:
-                    raise RuntimeError(f"CFG branch is missing `{key}` predictions.")
-                return (
-                    uncond
-                    + scale * (text - uncond)
-                    + asset_control_scale * (text_asset - text)
-                    + camera_scale * (full - text_asset)
-                )
+                guided = full
+                if out_no_text_full is not None:
+                    no_text_full = out_no_text_full.get(key)
+                    if no_text_full is None:
+                        raise RuntimeError(f"Text-CFG branch is missing `{key}` predictions.")
+                    guided = guided + (scale - 1.0) * (full - no_text_full)
+                if abs(asset_control_scale - 1.0) > 1e-6:
+                    assert out_text is not None and out_text_asset is not None
+                    text = out_text.get(key)
+                    text_asset = out_text_asset.get(key)
+                    if text is None or text_asset is None:
+                        raise RuntimeError(f"Asset-CFG branch is missing `{key}` predictions.")
+                    guided = guided + (asset_control_scale - 1.0) * (text_asset - text)
+                if abs(camera_scale - 1.0) > 1e-6:
+                    assert out_text_asset is not None
+                    text_asset = out_text_asset.get(key)
+                    if text_asset is None:
+                        raise RuntimeError(f"Camera-CFG branch is missing `{key}` predictions.")
+                    guided = guided + (camera_scale - 1.0) * (full - text_asset)
+                return guided
 
             v = _combine_cfg("video")
             if v is None:
                 raise RuntimeError("CFG branch is missing `video` predictions.")
             v_camera = _combine_cfg("camera") if camera_z is not None and v_camera_full is not None else None
             v_sky = _combine_cfg("sky") if sky_z is not None and v_sky_full is not None else None
+            final_sky_mask_logits = _combine_cfg("sky_mask_logits") if read_final_sky_mask else None
+            final_sky_mask_refined_logits = (
+                _combine_cfg("sky_mask_refined_logits") if read_final_sky_mask else None
+            )
         else:
             v = v_full
             v_camera = v_camera_full
             v_sky = v_sky_full
+            if read_final_sky_mask:
+                final_sky_mask_logits = out_full.get("sky_mask_logits")
+                final_sky_mask_refined_logits = out_full.get("sky_mask_refined_logits")
         v = sampler_prediction_to_velocity(sf, v, z, sigma)
         z = z - step_h.to(dtype=z.dtype) * v
         z = M_keep * z_splat + M_edit * z
@@ -3207,26 +3208,26 @@ def cfg_sample_pretrain_latents(
             v_camera = sampler_prediction_to_velocity(sf, v_camera, camera_z, sigma)
             camera_z = camera_z - step_h.to(dtype=camera_z.dtype) * v_camera
         if sky_z is not None and v_sky is not None:
-            v_sky = sampler_prediction_to_velocity(sf, v_sky, sky_z, sigma)
+            v_sky = sampler_prediction_to_velocity(
+                sf,
+                v_sky,
+                sky_z,
+                sigma,
+                t_eps=SKY_FLOW_T_EPS,
+            )
             sky_z = sky_z - step_h.to(dtype=sky_z.dtype) * v_sky
 
     z = M_keep * z_splat + M_edit * z
-    sky_mask_logits = None
-    sky_mask_patch = None
-    sky_mask_refined_logits = None
-    sky_mask_refined = None
-    if return_sky_mask:
-        sky_mask_logits, sky_mask_patch, sky_mask_refined_logits, sky_mask_refined = _predict_generated_sky_mask_patch(
-            scene_flow,
-            bundle,
-            args,
-            device,
-            z=z,
-            camera_z=camera_z,
-            sky_z=sky_z,
-            text_encoder=text_encoder,
-            sliding=None,
-        )
+    sky_mask_logits = final_sky_mask_logits
+    sky_mask_refined_logits = final_sky_mask_refined_logits
+    sky_mask_patch = None if sky_mask_logits is None else torch.sigmoid(sky_mask_logits.float()).to(sky_mask_logits.dtype)
+    sky_mask_refined = (
+        None
+        if sky_mask_refined_logits is None
+        else torch.sigmoid(sky_mask_refined_logits.float()).to(sky_mask_refined_logits.dtype)
+    )
+    if return_sky_mask and (sky_mask_patch is None or sky_mask_refined is None):
+        raise RuntimeError("Sampling requested a sky mask but the final denoising step did not produce one.")
     if return_camera or return_sky or return_sky_mask:
         return SimpleNamespace(
             video=z,
@@ -4203,14 +4204,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--val_sliding_window",
         type=int,
-        default=0,
+        default=8,
         help="Validation CFG sampling window. 0 disables sliding; use sequence_length/training S for long clips.",
     )
     parser.add_argument(
         "--val_sliding_stride",
         type=int,
-        default=0,
-        help="Validation CFG sampling stride. 0 defaults to --val_sliding_window.",
+        default=4,
+        help="Validation CFG sampling stride. 0 defaults to half the window; overlap is mandatory for long clips.",
     )
     parser.add_argument("--no_val_render_rgb", action="store_true")
     parser.add_argument(

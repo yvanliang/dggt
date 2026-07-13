@@ -625,6 +625,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scene_flow_pretrain_path", type=str, default=None,
                         help="Optional SceneFlow pretrain checkpoint for warm-start.")
+    parser.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
     parser.add_argument("--scene_flow_pretrain_ema", dest="scene_flow_pretrain_ema",
                         action="store_true", default=True,
                         help="Load EMA weights from --scene_flow_pretrain_path. Enabled by default.")
@@ -702,14 +703,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--val_sliding_window",
         type=int,
-        default=0,
+        default=8,
         help="Validation CFG sampling window. 0 disables sliding; use the training sequence length for long clips.",
     )
     parser.add_argument(
         "--val_sliding_stride",
         type=int,
-        default=0,
-        help="Validation CFG sampling stride. 0 defaults to --val_sliding_window.",
+        default=4,
+        help="Validation CFG sampling stride. 0 defaults to half the window; overlap is mandatory.",
     )
     parser.add_argument("--no_val_render_rgb", action="store_true",
                         help="Skip validation 3DGS RGB renders and log latent/mask diagnostics only.")
@@ -956,9 +957,14 @@ def _flatten_fast_asset_kv(asset_pass_result, flow_inputs: dict[str, Any], devic
             continue
         lvl = levels[-1].to(device)
         if torch.is_tensor(coverage) and obj_key < int(coverage.shape[0]):
-            cov = coverage[obj_key].to(device=device, dtype=lvl.dtype).reshape(1, 1, -1, 1)
-            if cov.shape[2] == lvl.shape[2]:
-                lvl = lvl * cov
+            cov = coverage[obj_key].to(device=device, dtype=lvl.dtype)
+            if cov.ndim != 1 or int(cov.numel()) != int(lvl.shape[1]):
+                raise ValueError(
+                    f"Asset {obj_key} coverage must be [S]={int(lvl.shape[1])}, "
+                    f"got {tuple(cov.shape)} for LUT {tuple(lvl.shape)}."
+                )
+            # lvl is [B,S,P,C]: coverage gates frames, not patch tokens.
+            lvl = lvl * cov.reshape(1, -1, 1, 1)
         elif phase4_slots and obj_key not in phase4_slots:
             lvl = torch.zeros_like(lvl)
         B, S, P, C = lvl.shape
@@ -1028,8 +1034,13 @@ def _encode_fast_asset_conditions(
         valid = torch.ones(z_asset.shape[:-1], device=device, dtype=torch.bool)
         if torch.is_tensor(coverage) and obj_key < int(coverage.shape[0]):
             cov = coverage[obj_key].to(device=device, dtype=torch.bool)
-            if int(cov.numel()) == int(z_asset.shape[2]):
-                valid = valid & cov.reshape(1, 1, -1)
+            if cov.ndim != 1 or int(cov.numel()) != int(z_asset.shape[1]):
+                raise ValueError(
+                    f"Asset {obj_key} coverage must be [S]={int(z_asset.shape[1])}, "
+                    f"got {tuple(cov.shape)} for latent {tuple(z_asset.shape)}."
+                )
+            # valid is [B,S,P]: broadcast one frame flag over all P patches.
+            valid = valid & cov.reshape(1, -1, 1)
         elif phase4_slots and obj_key not in phase4_slots:
             valid = torch.zeros_like(valid)
         asset_latents.append(z_asset)
@@ -2029,7 +2040,7 @@ def _validation_sliding_params(args: argparse.Namespace, seq_len: int) -> tuple[
         return None
     stride = int(getattr(args, "val_sliding_stride", 0) or 0)
     if stride <= 0:
-        stride = window
+        stride = max(1, window // 2)
     return min(window, int(seq_len)), max(1, stride)
 
 

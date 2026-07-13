@@ -61,7 +61,13 @@ def preserve_loss(
     z_pred: torch.Tensor | None = None,
     z_preserve_target: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    z_hat = z_pred if z_pred is not None else eps + v_pred
+    # The rectified-flow convention in this module is
+    #   z_t = (1 - sigma) * z_clean + sigma * eps
+    #   v = eps - z_clean
+    # so the clean prediction recovered from a velocity is eps - v.  Main
+    # training callers currently pass z_pred explicitly, but keep the fallback
+    # correct for auxiliary/legacy callers as well.
+    z_hat = z_pred if z_pred is not None else eps - v_pred
     target = z_clean if z_preserve_target is None else z_preserve_target
     diff = (z_hat - target).square().mean(dim=-1, keepdim=True)
     return masked_mean(diff, M_preserve)
