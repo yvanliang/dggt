@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # ============================================================
 # 使用方式
 #   在主节点 A 上执行：
-#     bash pretrain_two_nodes_fixed.sh
+#     bash pretrain_two_nodes.sh
 #
 # 脚本会：
 #   1. 检查主节点 A 的文件、Python、PyTorch、GPU、网卡和 IB；
@@ -61,7 +61,8 @@ SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
 QWEN_TEXT_ENCODER="/mnt/vol1/liangyy_workspace/model/Qwen/Qwen3-0.6B"
 
-LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024"
+# 双机训练使用独立目录，避免覆盖单机训练的 checkpoint、验证结果和状态文件。
+LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_two_nodes"
 LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/distributed_launch"
 
 # 以下变量在原脚本中定义，但当前训练命令没有使用。
@@ -72,6 +73,10 @@ SCENE_FLOW_VAL_MANIFEST="${DATASET_ROOT}/waymo_edit_cache/manifests/validation/v
 
 # ============================================================
 # 训练配置
+# 除每卡 batch size 外，下面的配置与 pretrain_single_node.sh 保持一致。
+# 单机为 1 node x 8 GPU x 8 samples/GPU = 64；双机为
+# 2 nodes x 8 GPU x 4 samples/GPU = 64。因此优化器每一步看到的全局
+# batch 不变，不需要额外修改学习率、warmup 或 grad accumulation。
 # ============================================================
 BATCH_SIZE_PER_GPU=4
 GRAD_ACCUM_STEPS=1
@@ -91,6 +96,17 @@ VAL_GUIDANCE_SCALES="1.0,2.0,4.0"
 
 WANDB_NAME="scene_flow_pretrain_waymo_2node_16gpu_b4_gb64_lr1e4_optcond"
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
+SINGLE_NODE_GLOBAL_BATCH_SIZE=$((NPROC_PER_NODE * SINGLE_NODE_BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
+
+if (( SINGLE_NODE_BATCH_SIZE_PER_GPU % NNODES != 0 )); then
+    echo "单机每卡 batch size (${SINGLE_NODE_BATCH_SIZE_PER_GPU}) 不能被节点数 (${NNODES}) 整除" >&2
+    exit 1
+fi
+
+if (( GLOBAL_BATCH_SIZE != SINGLE_NODE_GLOBAL_BATCH_SIZE )); then
+    echo "双机全局 batch size (${GLOBAL_BATCH_SIZE}) 与单机 (${SINGLE_NODE_GLOBAL_BATCH_SIZE}) 不一致" >&2
+    exit 1
+fi
 
 # ============================================================
 # NCCL 网络配置

@@ -515,6 +515,7 @@ class WaymoOpenDataset(Dataset):
         waymo_val_list_path=None,
         pretrain_patch_grid=(25, 37),
         pretrain_max_objects=5,
+        pretrain_instance_cache_size=8,
         trunk_major_samples=False,
         trunk_frames=29,
     ):
@@ -551,6 +552,12 @@ class WaymoOpenDataset(Dataset):
         self.caption_root = caption_root
         self.pretrain_patch_grid = (int(pretrain_patch_grid[0]), int(pretrain_patch_grid[1]))
         self.pretrain_max_objects = int(pretrain_max_objects)
+        self.pretrain_instance_cache_size = int(pretrain_instance_cache_size)
+        if self.pretrain_instance_cache_size < 0:
+            raise ValueError(
+                "pretrain_instance_cache_size must be non-negative, got "
+                f"{pretrain_instance_cache_size}"
+            )
         self.trunk_major_samples = bool(trunk_major_samples)
         self.trunk_frames = int(trunk_frames)
         if self.trunk_frames <= 0:
@@ -937,7 +944,11 @@ class WaymoOpenDataset(Dataset):
     def _load_instance_metadata(self, idx):
         scene_name = str(self.scenes[idx])
         if scene_name in self._instance_metadata_cache:
-            return self._instance_metadata_cache[scene_name]
+            # Plain dicts preserve insertion order.  Pop/reinsert makes this a
+            # small per-worker LRU without adding another dependency or lock.
+            payload = self._instance_metadata_cache.pop(scene_name)
+            self._instance_metadata_cache[scene_name] = payload
+            return payload
         scene_root = self.scene_roots[idx] if idx < len(self.scene_roots) else os.path.join(self.image_dir, scene_name)
         instances_root = os.path.join(scene_root, "instances")
         paths = {
@@ -966,7 +977,17 @@ class WaymoOpenDataset(Dataset):
                 }
             except Exception:
                 payload = None
-        self._instance_metadata_cache[scene_name] = payload
+        # Parsed Waymo instance JSON is much larger than the source file.  An
+        # unbounded cache is replicated in every persistent DataLoader worker
+        # and eventually retains nearly every scene after enough shuffled
+        # epochs.  Keep only a small hot set; random scene sampling has little
+        # long-range locality, while a bounded cache prevents per-worker RAM
+        # from growing with the complete dataset.
+        if self.pretrain_instance_cache_size > 0:
+            self._instance_metadata_cache[scene_name] = payload
+            while len(self._instance_metadata_cache) > self.pretrain_instance_cache_size:
+                oldest_scene = next(iter(self._instance_metadata_cache))
+                del self._instance_metadata_cache[oldest_scene]
         return payload
 
     def _candidate_instance_ids_for_clip(self, metadata, indices):

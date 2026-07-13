@@ -4155,6 +4155,16 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--grad_accum_steps", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument(
+        "--pretrain_instance_cache_size",
+        type=int,
+        default=8,
+        help=(
+            "Maximum parsed Waymo instance-metadata scenes retained per DataLoader worker. "
+            "The bounded LRU prevents persistent workers from caching the full dataset; "
+            "8 preserves a small hot set without changing worker count or prefetching."
+        ),
+    )
+    parser.add_argument(
         "--prefetch_factor",
         type=int,
         default=1,
@@ -4468,6 +4478,16 @@ def main() -> None:
         raise ValueError("--sky_mask_refine_channels must be positive.")
     if args.sequence_length < 2:
         raise ValueError("--sequence_length must be >= 2.")
+    if int(args.pretrain_instance_cache_size) < 0:
+        raise ValueError("--pretrain_instance_cache_size must be non-negative.")
+    if float(args.lambda_rgb_render) < 0.0:
+        raise ValueError("--lambda_rgb_render must be non-negative.")
+    if int(args.rgb_render_every) < 0:
+        raise ValueError("--rgb_render_every must be >= 0.")
+    if int(args.rgb_render_max_samples) < 0 or int(args.rgb_render_max_frames) < 0:
+        raise ValueError("--rgb_render_max_samples and --rgb_render_max_frames must be non-negative; 0 means all.")
+    if int(args.rgb_render_stride) <= 0:
+        raise ValueError("--rgb_render_stride must be positive.")
     if args.val_image_dir is None:
         args.val_image_dir = args.image_dir
     if args.val_scene_start is None:
@@ -4556,6 +4576,7 @@ def main() -> None:
         views=1,
         caption_root=args.caption_root,
         pretrain_patch_grid=args.patch_grid,
+        pretrain_instance_cache_size=args.pretrain_instance_cache_size,
     )
     sampler = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
     loader = DataLoader(
@@ -4580,6 +4601,7 @@ def main() -> None:
             views=1,
             caption_root=args.val_caption_root,
             pretrain_patch_grid=args.patch_grid,
+            pretrain_instance_cache_size=args.pretrain_instance_cache_size,
             trunk_major_samples=True,
             trunk_frames=29,
         )
