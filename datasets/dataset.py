@@ -515,6 +515,8 @@ class WaymoOpenDataset(Dataset):
         waymo_val_list_path=None,
         pretrain_patch_grid=(25, 37),
         pretrain_max_objects=5,
+        trunk_major_samples=False,
+        trunk_frames=29,
     ):
         #mode 1 : train
         #mode 2 : pure reconstruction
@@ -549,6 +551,10 @@ class WaymoOpenDataset(Dataset):
         self.caption_root = caption_root
         self.pretrain_patch_grid = (int(pretrain_patch_grid[0]), int(pretrain_patch_grid[1]))
         self.pretrain_max_objects = int(pretrain_max_objects)
+        self.trunk_major_samples = bool(trunk_major_samples)
+        self.trunk_frames = int(trunk_frames)
+        if self.trunk_frames <= 0:
+            raise ValueError(f"trunk_frames must be positive, got {trunk_frames}")
         self.scene_name_to_index_path = scene_name_to_index_path
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.waymo_train_list_path = waymo_train_list_path or os.path.join(repo_root, "data", "waymo_train_list_full.txt")
@@ -712,6 +718,25 @@ class WaymoOpenDataset(Dataset):
                 else:
                     self.semantic_mask_path.append([] if self.views == 1 else [[] for _ in range(3)])
 
+        # Validation/inference order: every scene's trunk 0, then every scene's
+        # trunk 1, etc. Only trunks that can provide a full sequence are used.
+        self.trunk_major_index = []
+        if self.trunk_major_samples:
+            max_trunks = max(
+                (
+                    len(paths[0] if self.views == 3 else paths) // self.trunk_frames
+                    for paths in self.image_paths
+                ),
+                default=0,
+            )
+            for trunk_idx in range(max_trunks):
+                trunk_base = trunk_idx * self.trunk_frames
+                for scene_idx, paths in enumerate(self.image_paths):
+                    total_frames = len(paths[0] if self.views == 3 else paths)
+                    available = min(trunk_base + self.trunk_frames, total_frames) - trunk_base
+                    if available >= int(self.sequence_length):
+                        self.trunk_major_index.append((scene_idx, trunk_idx))
+
 
     def _build_scene_name_to_base(self, scene_name_to_index_path, image_dir):
         mapping = self._load_scene_name_to_base(scene_name_to_index_path)
@@ -747,10 +772,19 @@ class WaymoOpenDataset(Dataset):
                 if self.caption_root:
                     raise RuntimeError(f"Failed to read Waymo list file: {path}") from exc
                 continue
-            for idx, item in enumerate(lines):
+
+            # The processed Waymo folders are indexed by lexicographically
+            # sorted segment name.  The training list already follows that
+            # order, but the validation list contains the same segments in a
+            # shuffled order.  Enumerating the raw validation file therefore
+            # attached every numeric scene folder to the wrong caption.
+            bases = sorted(_normalize_waymo_caption_base(item) for item in lines)
+            if len(bases) != len(set(bases)):
+                raise ValueError(f"Waymo list contains duplicate segment names: {path}")
+            for idx, base in enumerate(bases):
                 key = f"{idx:03d}"
                 if key not in mapping:
-                    mapping[key] = _normalize_waymo_caption_base(item)
+                    mapping[key] = base
         return mapping
 
 
@@ -778,15 +812,21 @@ class WaymoOpenDataset(Dataset):
                 mapping[key_s.zfill(3)] = _normalize_waymo_caption_base(value_s)
         return mapping
 
-    def _load_caption(self, scene_name, start_idx):
+    def _caption_path(self, scene_name, start_idx):
         if not self.caption_root:
             return None
         scene_key = str(scene_name).zfill(3) if str(scene_name).isdigit() else str(scene_name)
         scene_base = self.scene_name_to_base.get(scene_key, str(scene_name))
         scene_base = _normalize_waymo_caption_base(scene_base)
         clip_index = int(start_idx) // 29
-        path = os.path.join(str(self.caption_root), "pinhole_front", f"{scene_base}_{clip_index}.json")
+        return os.path.join(str(self.caption_root), "pinhole_front", f"{scene_base}_{clip_index}.json")
+
+    def _load_caption(self, scene_name, start_idx):
+        path = self._caption_path(scene_name, start_idx)
+        if path is None:
+            return None
         if not os.path.exists(path):
+            clip_index = int(start_idx) // 29
             raise FileNotFoundError(
                 f"Caption file not found for scene={scene_name!r}, clip_index={clip_index}: {path}"
             )
@@ -804,7 +844,20 @@ class WaymoOpenDataset(Dataset):
 
 
     def __len__(self):
+        if self.trunk_major_samples:
+            return len(self.trunk_major_index)
         return len(self.scenes)
+
+    def _sample_start_in_trunk(self, total_frames, trunk_idx):
+        """Sample a contiguous sequence inside one explicitly selected trunk."""
+        base = int(trunk_idx) * self.trunk_frames
+        end = min(base + self.trunk_frames, int(total_frames))
+        if end - base < int(self.sequence_length):
+            raise IndexError(
+                f"trunk {trunk_idx} has only {end - base} frames, "
+                f"fewer than {self.sequence_length}"
+            )
+        return random.randint(base, end - int(self.sequence_length))
 
     def _sample_start_within_caption_trunk(self, total_frames, trunk_frames=29):
         """Sample a contiguous raw-pretrain window without crossing caption trunks."""
@@ -1152,6 +1205,9 @@ class WaymoOpenDataset(Dataset):
         }
 
     def __getitem__(self, idx):
+        trunk_idx = None
+        if self.trunk_major_samples:
+            idx, trunk_idx = self.trunk_major_index[idx]
         image_paths = self.image_paths[idx]
         sky_mask_paths = self.sky_mask_paths[idx]
         dynamic_mask_paths = self.dynamic_mask_path[idx]
@@ -1159,6 +1215,9 @@ class WaymoOpenDataset(Dataset):
 
         total_frames = len(image_paths[0] if self.views == 3 else image_paths)
         start_idx = (
+            self._sample_start_in_trunk(total_frames, trunk_idx)
+            if trunk_idx is not None
+            else
             self._fixed_start_within_caption_trunk(total_frames)
             if self.mode == 1 and int(self.start_idx) >= 0
             else self._sample_start_within_caption_trunk(total_frames)
@@ -1214,6 +1273,7 @@ class WaymoOpenDataset(Dataset):
                 if self.views == 1:
                     caption = caption.replace("multi-camera", "front-camera")
                 input_dict["caption"] = caption
+                input_dict["caption_path"] = self._caption_path(self.scenes[idx], start_idx)
 
             if self.views == 1:
                 camera_to_world, intrinsics, raw_image_size_hw = self._load_front_waymo_camera_gt(idx, indices, seq)
@@ -1304,6 +1364,7 @@ class WaymoOpenDataset(Dataset):
             caption = self._load_caption(self.scenes[idx], start_idx)
             if caption is not None:
                 input_dict["caption"] = caption
+                input_dict["caption_path"] = self._caption_path(self.scenes[idx], start_idx)
             if len(dynamic_mask_paths) > 0:
                 if self.views == 1:
                     dy_mask_seq = [dynamic_mask_paths[i] for i in indices]

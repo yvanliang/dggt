@@ -33,7 +33,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Sampler
 from tqdm.auto import tqdm
 
 from datasets.dataset import WaymoOpenDataset
@@ -47,6 +47,7 @@ from dggt.models.scene_flow import WanSceneFlow
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.vggt import VGGT
 from dggt.utils.feature_stats import load_into_buffers
+from dggt.utils.gaussian_render import composite_gsplat_rgb
 from dggt.utils.camera_condition import camera_summary_from_waymo_gt
 from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.geometry import unproject_depth_map_to_point_map
@@ -264,6 +265,25 @@ def discover_scene_names(image_dir: str, scene_start: int, scene_end: int) -> li
             f"[{scene_start}, {scene_end})."
         )
     return scene_names
+
+
+class CyclicSequentialSampler(Sampler[int]):
+    """Sequential sampler whose starting point advances between validations."""
+
+    def __init__(self, data_source) -> None:
+        self.data_source = data_source
+        self.offset = 0
+
+    def set_offset(self, offset: int) -> None:
+        length = len(self.data_source)
+        self.offset = int(offset) % length if length else 0
+
+    def __iter__(self):
+        length = len(self.data_source)
+        return iter((self.offset + i) % length for i in range(length))
+
+    def __len__(self) -> int:
+        return len(self.data_source)
 
 
 def split_param_groups(model: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
@@ -1945,13 +1965,14 @@ def _render_gs_map_rgb(
     background_override: torch.Tensor | None = None,
     image_hw: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """Render 3DGS exactly matching `inference.py` mode=2.
+    """Render 3DGS with DGGT mode-2 scene assembly and correct compositing.
 
     Static branch: rasterized once with `bg_mask & (dy_map < 0.5)` (no extra
     valid_depth filter, no sigmoid on the threshold).
     Dynamic branch: per-frame, gated by `bg_mask` only.
-    Background: either GT-image sky model (with min-max norm — matches official),
-    or pure black when `background_mode != "sky"`.
+    Background: either GT-image sky model (with min-max norm), or pure black
+    when ``background_mode != "sky"``. Unlike the legacy ``inference.py``
+    renderer, gsplat's premultiplied RGB is not multiplied by alpha twice.
 
     When `use_sky_mask=False` (used for the fully generated path the user
     requires), `bg_mask` is replaced with an all-True tensor — no GT sky
@@ -2084,8 +2105,15 @@ def _render_gs_map_rgb(
             height=height,
             width=width,
         )
-        foreground = rendered_raw[..., :3]
-        composed = alpha * foreground + (1.0 - alpha) * bg_render[frame_idx : frame_idx + 1]
+        # gsplat returns premultiplied RGB when rasterized without a
+        # background: sum_i(T_i * alpha_i * color_i).  Only the residual
+        # transmittance belongs to the spatial sky/background image.
+        premultiplied_rgb = rendered_raw[..., :3]
+        composed = composite_gsplat_rgb(
+            premultiplied_rgb,
+            alpha,
+            bg_render[frame_idx : frame_idx + 1],
+        )
         renders.append(composed[0].permute(2, 0, 1).detach().cpu().float().clamp(0.0, 1.0))
     return torch.stack(renders, dim=0)
 
@@ -4552,11 +4580,14 @@ def main() -> None:
             views=1,
             caption_root=args.val_caption_root,
             pretrain_patch_grid=args.patch_grid,
+            trunk_major_samples=True,
+            trunk_frames=29,
         )
+        val_sampler = CyclicSequentialSampler(val_dataset)
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
-            shuffle=False,
+            sampler=val_sampler,
             num_workers=args.num_workers,
             pin_memory=bool(args.pin_memory) and device.type == "cuda",
             drop_last=False,
@@ -4738,6 +4769,12 @@ def main() -> None:
                     and global_step > 0
                     and global_step % args.val_every == 0
                 ):
+                    # Continue through trunk-major validation samples instead
+                    # of restarting from scene 000 at every validation call.
+                    validation_index = global_step // args.val_every - 1
+                    val_loader.sampler.set_offset(
+                        validation_index * args.val_batches * args.batch_size
+                    )
                     run_validation(
                         val_loader,
                         vggt_model,
