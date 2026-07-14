@@ -5,6 +5,35 @@ from typing import Iterable, Sequence
 import torch
 
 
+def batched_gather_frames(
+    values: torch.Tensor,
+    frame_indices: torch.Tensor,
+    *,
+    name: str = "values",
+) -> torch.Tensor:
+    """Gather per-row frame indices from a ``[B,T,...]`` tensor."""
+    if values.ndim < 2:
+        raise ValueError(f"{name} must be [B,T,...], got {tuple(values.shape)}")
+    indices = torch.as_tensor(frame_indices, device=values.device, dtype=torch.long)
+    if indices.ndim == 1:
+        indices = indices.view(1, -1).expand(int(values.shape[0]), -1)
+    if indices.ndim != 2 or int(indices.shape[0]) != int(values.shape[0]):
+        raise ValueError(
+            f"frame_indices must be [S] or [B,S] for {name}, got {tuple(indices.shape)}"
+        )
+    if indices.numel() and (
+        int(indices.min().item()) < 0 or int(indices.max().item()) >= int(values.shape[1])
+    ):
+        raise IndexError(
+            f"frame_indices for {name} must be in [0, {int(values.shape[1]) - 1}]"
+        )
+    gather_shape = tuple(indices.shape) + (1,) * (values.ndim - 2)
+    gather_indices = indices.view(gather_shape).expand(
+        tuple(indices.shape) + tuple(values.shape[2:])
+    )
+    return torch.gather(values, dim=1, index=gather_indices)
+
+
 def split_special_and_patch(tokens: torch.Tensor, patch_start_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Split a token tensor into special tokens and patch tokens."""
     if tokens.ndim < 2:

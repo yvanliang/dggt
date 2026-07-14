@@ -18,6 +18,14 @@ from dggt.utils.camera_generation import (
 )
 
 
+DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "logs"
+    / "scene_flow_pretrain_1024"
+    / "feature_stats_pretrain_v2.pt"
+)
+
+
 def checkpoint_sha256(path: str | Path) -> str:
     """Hash a checkpoint once on rank 0 and broadcast under DDP."""
     value: str | None = None
@@ -123,6 +131,21 @@ def validate_camera_stats_provenance(payload: dict, expected_dggt_sha256: str) -
             raise ValueError(f"Camera stats require a positive camera_{role}_count, got {count}")
 
 
+def validate_stats_sequence_length(payload: dict, expected_sequence_length: int) -> None:
+    source = payload.get("source")
+    actual = source.get("sequence_length") if isinstance(source, dict) else None
+    if actual is None:
+        raise ValueError(
+            "Feature stats are missing source.sequence_length; regenerate them with "
+            "tools/compute_pretrain_feature_stats.py."
+        )
+    if int(actual) != int(expected_sequence_length):
+        raise ValueError(
+            "Feature stats sequence-length mismatch: expected "
+            f"{int(expected_sequence_length)} frames, got {int(actual)}."
+        )
+
+
 def _camera_stats_from_payload(
     payload: dict,
     *,
@@ -162,11 +185,21 @@ def load_all_stats_into_buffers(
     *,
     dggt_ckpt_path: str | Path | None = None,
     expected_dggt_sha256: str | None = None,
+    expected_sequence_length: int | None = None,
+    require_existing_match: bool = False,
 ) -> str:
-    """Load latent plus mandatory DGGT-v3 camera stats and verify provenance."""
+    """Load latent plus mandatory DGGT-v3 camera stats and verify provenance.
+
+    ``require_existing_match`` is intended for checkpoint warm-start/resume.  A
+    SceneFlow checkpoint was trained in the coordinate system defined by these
+    buffers, so replacing them with different values would invalidate the
+    checkpoint even when all tensor shapes still match.
+    """
     payload = torch.load(Path(path), map_location="cpu")
     if not isinstance(payload, dict):
         raise TypeError(f"Feature stats at {path} must be a dict, got {type(payload).__name__}")
+    if expected_sequence_length is not None:
+        validate_stats_sequence_length(payload, expected_sequence_length)
     mu, sigma = _extract_stats(payload, token_dim=token_dim)
     if expected_dggt_sha256 is None:
         if dggt_ckpt_path is None:
@@ -175,6 +208,44 @@ def load_all_stats_into_buffers(
     camera = _camera_stats_from_payload(payload, expected_dggt_sha256=expected_dggt_sha256)
     if not hasattr(module, "set_latent_stats") or not hasattr(module, "set_camera_stats"):
         raise AttributeError("SceneFlow module must expose set_latent_stats() and set_camera_stats()")
+    values = {
+        "mu_z": mu,
+        "sigma_z": sigma,
+        "camera_anchor_mean": camera[0],
+        "camera_anchor_std": camera[1],
+        "camera_delta_mean": camera[2],
+        "camera_delta_std": camera[3],
+    }
+    if require_existing_match:
+        mismatches: list[str] = []
+        for name, expected in values.items():
+            if not hasattr(module, name):
+                mismatches.append(f"{name}: checkpoint model has no such buffer")
+                continue
+            actual = torch.as_tensor(getattr(module, name)).detach().cpu().float().reshape(-1)
+            expected = expected.detach().cpu().float().reshape(-1)
+            if tuple(actual.shape) != tuple(expected.shape):
+                mismatches.append(
+                    f"{name}: checkpoint shape={tuple(actual.shape)} stats shape={tuple(expected.shape)}"
+                )
+                continue
+            if not torch.equal(actual, expected):
+                difference = (actual - expected).abs()
+                mismatches.append(
+                    f"{name}: max_abs_diff={float(difference.max().item()):.9g}, "
+                    f"mean_abs_diff={float(difference.mean().item()):.9g}"
+                )
+        if hasattr(module, "camera_stats_valid") and not bool(
+            torch.as_tensor(module.camera_stats_valid).item()
+        ):
+            mismatches.append("camera_stats_valid: checkpoint does not contain valid camera statistics")
+        if mismatches:
+            details = "; ".join(mismatches)
+            raise ValueError(
+                f"Feature statistics at {path} do not match the statistics stored in the loaded "
+                f"SceneFlow checkpoint: {details}. Refusing to replace the checkpoint's latent/camera "
+                "coordinate system. Use the exact feature-stats file used to train that checkpoint."
+            )
     module.set_latent_stats(mu, sigma)
     module.set_camera_stats(*camera)
     return expected_dggt_sha256

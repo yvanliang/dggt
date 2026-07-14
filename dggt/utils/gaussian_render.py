@@ -25,3 +25,33 @@ def composite_gsplat_rgb(
     if alpha.ndim == 0 or alpha.shape[-1] != 1:
         raise ValueError(f"alpha must end in one channel, got {tuple(alpha.shape)}")
     return rendered_rgb + (1.0 - alpha) * background
+
+
+def composite_original_sky(
+    rendered_rgb: torch.Tensor,
+    gt_rgb: torch.Tensor,
+    sky_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Keep input-sky RGB exactly while leaving the edited render elsewhere.
+
+    Using the complete GT image as a rasterizer background would also leak
+    original non-sky content through transparent or uncovered edited
+    Gaussians.  Formal editing instead uses the explicit image-space blend
+    ``sky_mask * gt_rgb + (1 - sky_mask) * rendered_rgb``.
+    """
+    if rendered_rgb.ndim == 0 or rendered_rgb.shape[-1] != 3:
+        raise ValueError(f"rendered_rgb must end in 3 channels, got {tuple(rendered_rgb.shape)}")
+    if gt_rgb.shape != rendered_rgb.shape:
+        raise ValueError(
+            f"gt_rgb shape {tuple(gt_rgb.shape)} must match rendered_rgb {tuple(rendered_rgb.shape)}"
+        )
+    if sky_mask.ndim == 0 or sky_mask.shape[-1] != 1:
+        raise ValueError(f"sky_mask must end in one channel, got {tuple(sky_mask.shape)}")
+    if sky_mask.shape[:-1] != rendered_rgb.shape[:-1]:
+        raise ValueError(
+            f"sky_mask spatial shape {tuple(sky_mask.shape[:-1])} must match "
+            f"rendered_rgb {tuple(rendered_rgb.shape[:-1])}"
+        )
+    weight = sky_mask.to(device=rendered_rgb.device, dtype=rendered_rgb.dtype).clamp(0.0, 1.0)
+    target = gt_rgb.to(device=rendered_rgb.device, dtype=rendered_rgb.dtype)
+    return weight * target + (1.0 - weight) * rendered_rgb

@@ -14,22 +14,230 @@ sequence-facing outputs follow that same order.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
 from dggt.utils.gaussian_edit import (
     Sim3Transform,
     empty_gaussian_dict,
+    load_asset_gaussians,
 )
 from dggt.utils.tokens import select_patch_pyramid
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
+ASSET_PATCH_ALPHA_THRESHOLD = 0.05
+ASSET_PATCH_MASK_VERSION = "alpha_max_t005_v1"
+
+
+def build_asset_patch_valid_mask(
+    alpha: torch.Tensor,
+    patch_grid: tuple[int, int],
+    *,
+    alpha_threshold: float = ASSET_PATCH_ALPHA_THRESHOLD,
+) -> torch.Tensor:
+    """Convert isolated-render alpha to the formal asset patch support mask.
+
+    ``alpha`` must be ``[B,S,1,H,W]`` or ``[S,1,H,W]``.  A patch is valid
+    when at least one pixel has meaningful asset coverage.  Exact, non-
+    overlapping pooling is intentional: asset RoPE positions must use the
+    same patch cells as the DGGT/tokenizer tokens, with no bbox expansion or
+    dilation.
+    """
+    squeeze_batch = alpha.ndim == 4
+    if squeeze_batch:
+        alpha = alpha.unsqueeze(0)
+    if alpha.ndim != 5 or int(alpha.shape[2]) != 1:
+        raise ValueError(
+            "asset alpha must be [B,S,1,H,W] or [S,1,H,W], "
+            f"got {tuple(alpha.shape)}"
+        )
+    batch_size, seq_len, _, height, width = alpha.shape
+    grid_h, grid_w = int(patch_grid[0]), int(patch_grid[1])
+    if grid_h <= 0 or grid_w <= 0 or height % grid_h != 0 or width % grid_w != 0:
+        raise ValueError(
+            f"asset alpha size {(height, width)} is not exactly divisible by patch_grid={patch_grid}"
+        )
+    patch_h, patch_w = height // grid_h, width // grid_w
+    foreground = alpha.to(dtype=torch.float32).ge(float(alpha_threshold))
+    pooled = F.max_pool2d(
+        foreground.reshape(batch_size * seq_len, 1, height, width).to(dtype=torch.float32),
+        kernel_size=(patch_h, patch_w),
+        stride=(patch_h, patch_w),
+    )
+    mask = pooled.reshape(batch_size, seq_len, grid_h * grid_w).to(dtype=torch.bool)
+    return mask[0] if squeeze_batch else mask
+
+
+def require_asset_patch_valid_mask(
+    asset_pass_result: "AssetPassResult",
+    object_key: int,
+    *,
+    expected_shape: tuple[int, int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a schema-v9 Mode-A patch mask, rejecting legacy frame masks."""
+    mask = asset_pass_result.asset_patch_valid_mask.get(int(object_key))
+    if not torch.is_tensor(mask):
+        raise RuntimeError(
+            f"Mode-A asset {int(object_key)} is missing asset_patch_valid_mask "
+            f"({ASSET_PATCH_MASK_VERSION}); regenerate the Mode-A cache."
+        )
+    if tuple(mask.shape) != tuple(int(v) for v in expected_shape):
+        raise ValueError(
+            f"Mode-A asset {int(object_key)} patch mask shape {tuple(mask.shape)} "
+            f"!= expected {tuple(expected_shape)}"
+        )
+    return mask.to(device=device, dtype=torch.bool)
+
+
+def build_asset_condition_slots(
+    asset_pass_result: "AssetPassResult",
+    *,
+    phase1_coverage: torch.Tensor | None,
+    phase4_slots: Sequence[int] | None,
+    scene_tokenizer: nn.Module,
+    patch_grid: tuple[int, int],
+    reference: torch.Tensor,
+    max_assets: int = 5,
+    expected_num_levels: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the canonical formal-training asset-condition slots.
+
+    Selection order is deliberately shared by the cache fast path and the
+    live/offline assembler:
+
+    1. sort by stable object key;
+    2. reject objects outside ``phase4_slots``;
+    3. intersect spatial patch validity with temporal Phase-1 coverage;
+    4. reject objects with no valid token;
+    5. only then apply the ``max_assets`` cap.
+
+    An explicitly empty ``phase4_slots`` means that no asset was selected.
+    ``None`` is reserved for legacy callers that do not provide that metadata.
+    """
+    if reference.ndim != 4:
+        raise ValueError(
+            "asset condition reference must be [B,S,P,C], "
+            f"got {tuple(reference.shape)}"
+        )
+    max_assets = int(max_assets)
+    expected_num_levels = int(expected_num_levels)
+    if max_assets < 0:
+        raise ValueError(f"max_assets must be non-negative, got {max_assets}")
+    if expected_num_levels <= 0:
+        raise ValueError(
+            f"expected_num_levels must be positive, got {expected_num_levels}"
+        )
+
+    batch_size, seq_len, num_patches, channels = (int(v) for v in reference.shape)
+    out = reference.new_zeros(
+        (batch_size, max_assets, seq_len, num_patches, channels)
+    )
+    out_mask = torch.zeros(
+        (batch_size, max_assets, seq_len, num_patches),
+        device=reference.device,
+        dtype=torch.bool,
+    )
+    if max_assets == 0:
+        return out, out_mask
+
+    allowed = (
+        None
+        if phase4_slots is None
+        else {int(object_key) for object_key in phase4_slots}
+    )
+    coverage = None
+    if torch.is_tensor(phase1_coverage):
+        coverage = phase1_coverage.to(device=reference.device, dtype=torch.bool)
+        if coverage.ndim != 2:
+            raise ValueError(
+                "phase1_coverage must be [num_objects,S], "
+                f"got {tuple(coverage.shape)}"
+            )
+
+    selected: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+    for object_key in sorted(
+        int(key) for key in asset_pass_result.F_g_lut_asset.keys()
+    ):
+        if allowed is not None and object_key not in allowed:
+            continue
+
+        levels = asset_pass_result.F_g_lut_asset[object_key]
+        if len(levels) != expected_num_levels:
+            raise RuntimeError(
+                f"Asset {object_key} must provide the complete "
+                f"{expected_num_levels}-level tokenizer LUT, got {len(levels)} levels."
+            )
+        expected_level_shape = (batch_size, seq_len, num_patches)
+        for level_index, level in enumerate(levels):
+            if not torch.is_tensor(level) or level.ndim != 4:
+                shape = (
+                    tuple(level.shape)
+                    if torch.is_tensor(level)
+                    else type(level).__name__
+                )
+                raise RuntimeError(
+                    f"Asset {object_key} level {level_index} must be [B,S,P,C], got {shape}."
+                )
+            if tuple(int(v) for v in level.shape[:-1]) != expected_level_shape:
+                raise ValueError(
+                    f"Asset {object_key} level {level_index} leading shape "
+                    f"{tuple(level.shape[:-1])} != reference {expected_level_shape}."
+                )
+
+        valid = require_asset_patch_valid_mask(
+            asset_pass_result,
+            object_key,
+            expected_shape=expected_level_shape,
+            device=reference.device,
+        )
+        if coverage is not None:
+            if object_key >= int(coverage.shape[0]):
+                raise ValueError(
+                    f"Asset {object_key} has no row in phase1_coverage "
+                    f"with shape {tuple(coverage.shape)}."
+                )
+            object_coverage = coverage[object_key]
+            if tuple(object_coverage.shape) != (seq_len,):
+                raise ValueError(
+                    f"Asset {object_key} coverage must be [S]={seq_len}, "
+                    f"got {tuple(object_coverage.shape)}."
+                )
+            valid = valid & object_coverage.reshape(1, seq_len, 1)
+        if not bool(valid.any().item()):
+            continue
+
+        encoded = scene_tokenizer.encode(
+            [
+                level.to(device=reference.device, dtype=reference.dtype)
+                for level in levels
+            ],
+            patch_grid=patch_grid,
+        )
+        if tuple(encoded.shape) != tuple(reference.shape):
+            raise ValueError(
+                f"Asset {object_key} encoded latent shape {tuple(encoded.shape)} "
+                f"!= reference {tuple(reference.shape)}."
+            )
+        selected.append((object_key, encoded, valid))
+        if len(selected) == max_assets:
+            break
+
+    for slot_index, (_, encoded, valid) in enumerate(selected):
+        out[:, slot_index] = encoded.to(
+            device=reference.device, dtype=reference.dtype
+        )
+        out_mask[:, slot_index] = valid.to(
+            device=reference.device, dtype=torch.bool
+        )
+    return out, out_mask
 
 
 @dataclass
@@ -43,6 +251,9 @@ class AssetPassResult:
     G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] | None
     I_asset: dict[int, torch.Tensor]
     A_asset: dict[int, torch.Tensor]
+    # Per-object true spatial support, shape [B,S,P].  This is distinct from
+    # Phase-1's frame-level coverage mask.
+    asset_patch_valid_mask: dict[int, torch.Tensor] = field(default_factory=dict)
     G_asset_waymo: dict[int, list[dict[str, torch.Tensor]]] | None = None
     asset_pass_space: str = ""
     fit_metrics: dict[int, list[dict[str, Any]]] | None = None
@@ -231,7 +442,17 @@ class AssetAggregatorPass(nn.Module):
         patch_grid = compute_runtime_patch_grid(model_hw, patch_size=self.patch_size)
 
         if localized_objects is None:
-            raise ValueError("AssetAggregatorPass requires localized_objects")
+            return self._forward_legacy_asset_sequence(
+                sample=sample,
+                selected_object_slots=selected_object_slots,
+                asset_cache=asset_cache,
+                occlusion_test=occlusion_test,
+                aggregator_batch_size=aggregator_batch_size,
+                render_space=render_space,
+                device=device,
+                model_hw=model_hw,
+                patch_grid=patch_grid,
+            )
         if cameras_dggt is None:
             raise ValueError("AssetAggregatorPass requires cameras_dggt")
             
@@ -365,9 +586,146 @@ class AssetAggregatorPass(nn.Module):
             G_asset_dggt=G_asset_dggt,
             I_asset=I_asset,
             A_asset=A_asset,
+            asset_patch_valid_mask={
+                int(k): build_asset_patch_valid_mask(A_asset[int(k)], patch_grid)
+                for k in object_keys
+            },
             G_asset_waymo={},
             asset_pass_space=str(render_space),
             fit_metrics=fit_metrics,
+        )
+
+    def _forward_legacy_asset_sequence(
+        self,
+        *,
+        sample: dict[str, Any],
+        selected_object_slots: Sequence[int] | None,
+        asset_cache: dict[str, dict[str, torch.Tensor]] | None,
+        occlusion_test: bool,
+        aggregator_batch_size: int,
+        render_space: str,
+        device: torch.device,
+        model_hw: tuple[int, int],
+        patch_grid: tuple[int, int],
+    ) -> AssetPassResult:
+        """Compatibility path for older callers that render from sample asset poses.
+
+        Current Mode-A/validation precompute passes already-localized DGGT
+        assets through ``localized_objects``.  Some tests and older debugging
+        scripts still monkeypatch ``_render_object_sequence`` directly; keep
+        that interface available without weakening the main dggt_fitted path.
+        """
+        asset_cache = {} if asset_cache is None else asset_cache
+        render_cameras = self._build_legacy_sample_cameras(sample, device=device)
+        candidate_slots = self._resolve_object_slots(sample, selected_object_slots)
+
+        object_keys: list[int] = []
+        patch_start_idx = int(getattr(self.aggregator, "patch_start_idx", 0))
+        patch_start_idx_out = int(patch_start_idx)
+        F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
+        I_asset: dict[int, torch.Tensor] = {}
+        A_asset: dict[int, torch.Tensor] = {}
+        ptr_asset: dict[int, list[GaussianPointers]] = {}
+
+        batch_size = int(aggregator_batch_size)
+        if batch_size <= 0:
+            batch_size = max(1, len(candidate_slots))
+
+        pending_keys: list[int] = []
+        pending_renders: list[torch.Tensor] = []
+        pending_alpha_renders: list[torch.Tensor] = []
+        pending_depth_renders: list[torch.Tensor] = []
+        pending_gaussians: list[list[dict[str, torch.Tensor]]] = []
+
+        def _flush_pending() -> None:
+            nonlocal patch_start_idx_out
+            if not pending_keys:
+                return
+            render_batch = torch.stack(pending_renders, dim=0)
+            _, image_tokens_all, _, _, patch_start_idx = self.aggregator(render_batch)
+            patch_tokens = select_patch_pyramid(image_tokens_all, self.levels, patch_start_idx)
+            patch_start_idx_out = int(patch_start_idx)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+            for object_batch_idx, slot_idx in enumerate(pending_keys):
+                F_g_lut_asset[int(slot_idx)] = [
+                    level_tokens[object_batch_idx : object_batch_idx + 1].detach().cpu().contiguous()
+                    for level_tokens in patch_tokens
+                ]
+
+            for object_batch_idx, slot_idx in enumerate(pending_keys):
+                alpha_seq = pending_alpha_renders[object_batch_idx]
+                depth_seq = pending_depth_renders[object_batch_idx]
+                gauss_seq = pending_gaussians[object_batch_idx]
+                ptr_asset[int(slot_idx)] = self._annotate_object_pointers(
+                    int(slot_idx),
+                    gauss_seq,
+                    render_cameras,
+                    patch_grid,
+                    alpha_seq,
+                    depth_seq,
+                    occlusion_test,
+                )
+                I_asset[int(slot_idx)] = (
+                    pending_renders[object_batch_idx].detach().cpu().unsqueeze(0).contiguous()
+                )
+                A_asset[int(slot_idx)] = (
+                    alpha_seq.detach().cpu().unsqueeze(0).contiguous()
+                )
+
+            del image_tokens_all, patch_tokens, render_batch
+            pending_keys.clear()
+            pending_renders.clear()
+            pending_alpha_renders.clear()
+            pending_depth_renders.clear()
+            pending_gaussians.clear()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+
+        for slot_idx in candidate_slots:
+            if not self._is_valid_asset_slot(sample, slot_idx):
+                continue
+            gauss_seq, rgb_seq, alpha_seq, depth_seq = self._render_object_sequence(
+                sample,
+                int(slot_idx),
+                render_cameras,
+                model_hw,
+                device,
+                asset_cache,
+            )
+            if len(gauss_seq) == 0:
+                continue
+            if not any(gauss["means"].numel() > 0 for gauss in gauss_seq):
+                continue
+            object_keys.append(int(slot_idx))
+            pending_keys.append(int(slot_idx))
+            pending_gaussians.append(gauss_seq)
+            pending_renders.append(torch.stack(rgb_seq, dim=0))
+            pending_alpha_renders.append(torch.stack(alpha_seq, dim=0))
+            pending_depth_renders.append(torch.stack(depth_seq, dim=0))
+            if len(pending_keys) >= batch_size:
+                _flush_pending()
+
+        _flush_pending()
+
+        return AssetPassResult(
+            patch_grid=patch_grid,
+            patch_start_idx=patch_start_idx_out,
+            object_keys=object_keys,
+            cameras_waymo={k: v.detach().cpu() for k, v in render_cameras.items()},
+            F_g_lut_asset=F_g_lut_asset,
+            ptr_asset=ptr_asset,
+            G_asset_dggt=None,
+            I_asset=I_asset,
+            A_asset=A_asset,
+            asset_patch_valid_mask={
+                int(k): build_asset_patch_valid_mask(A_asset[int(k)], patch_grid)
+                for k in object_keys
+            },
+            G_asset_waymo={},
+            asset_pass_space=str(render_space),
+            fit_metrics=None,
         )
 
     def _infer_device(self, images_clean: torch.Tensor) -> torch.device:
@@ -389,6 +747,38 @@ class AssetAggregatorPass(nn.Module):
         return [int(slot) for slot in editable_indices if int(slot) >= 0]
 
     @staticmethod
+    def _resolve_asset_path_for_image(
+        sample: dict[str, Any],
+        slot_idx: int,
+        image_idx: int,
+    ) -> str:
+        slot_idx = int(slot_idx)
+        image_idx = int(image_idx)
+        image_valid = sample.get("object_asset_image_valid_mask_selected")
+        if isinstance(image_valid, torch.Tensor):
+            if slot_idx < 0 or slot_idx >= int(image_valid.shape[0]):
+                return ""
+            if image_idx < 0 or image_idx >= int(image_valid.shape[1]):
+                return ""
+            if not bool(image_valid[slot_idx, image_idx].item()):
+                return ""
+
+        image_paths = sample.get("object_asset_image_paths_selected")
+        if image_paths is not None:
+            try:
+                return str(image_paths[slot_idx][image_idx])
+            except (IndexError, TypeError):
+                return ""
+
+        asset_paths = sample.get("object_asset_paths")
+        if asset_paths is None:
+            return ""
+        try:
+            return str(asset_paths[slot_idx])
+        except (IndexError, TypeError):
+            return ""
+
+    @staticmethod
     def _is_valid_asset_slot(sample: dict[str, Any], slot_idx: int) -> bool:
         image_valid = sample.get("object_asset_image_valid_mask_selected")
         if isinstance(image_valid, torch.Tensor):
@@ -405,6 +795,72 @@ class AssetAggregatorPass(nn.Module):
         if asset_paths is None or slot_idx < 0 or slot_idx >= len(asset_paths):
             return False
         return Path(str(asset_paths[slot_idx])).is_file()
+
+    def _build_legacy_sample_cameras(
+        self,
+        sample: dict[str, Any],
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        num_frames = int(sample["frame_indices"].numel())
+        num_views = int(sample["cam_ids"].numel())
+        num_images = num_frames * num_views
+
+        if "camera_to_world_corrected" in sample:
+            c2w = sample["camera_to_world_corrected"].detach().to(device).float()
+        elif "camera_to_world" in sample:
+            c2w = sample["camera_to_world"].detach().to(device).float()
+        else:
+            c2w = torch.eye(4, dtype=torch.float32, device=device).view(1, 1, 4, 4)
+            c2w = c2w.expand(num_frames, num_views, 4, 4).contiguous()
+        if c2w.dim() == 3:
+            c2w = c2w.view(num_frames, num_views, 4, 4)
+        c2w = c2w.reshape(num_images, 4, 4)
+
+        intrinsics = sample.get("intrinsics")
+        if torch.is_tensor(intrinsics):
+            Ks = intrinsics.detach().to(device).float()
+            if Ks.dim() == 3 and Ks.shape[0] == num_views:
+                Ks = Ks.unsqueeze(0).expand(num_frames, -1, -1, -1)
+            elif Ks.dim() == 3 and Ks.shape[0] == num_images:
+                Ks = Ks.view(num_frames, num_views, 3, 3)
+            elif Ks.dim() != 4:
+                raise ValueError(f"Unsupported sample['intrinsics'] shape {tuple(Ks.shape)}")
+            Ks = Ks.reshape(num_images, 3, 3)
+        else:
+            Ks = torch.eye(3, dtype=torch.float32, device=device).view(1, 3, 3)
+            Ks = Ks.expand(num_images, 3, 3).contiguous()
+
+        image_to_frame = torch.arange(num_frames, dtype=torch.long, device=device).repeat_interleave(num_views)
+        image_to_view = torch.arange(num_views, dtype=torch.long, device=device).repeat(num_frames)
+        cam_ids = sample["cam_ids"].detach().to(device).long()[image_to_view]
+        return {
+            "camera_to_world": c2w,
+            "world_to_camera": torch.linalg.inv(c2w),
+            "K_model": Ks,
+            "image_to_frame": image_to_frame,
+            "image_to_view": image_to_view,
+            "cam_ids": cam_ids,
+        }
+
+    def _render_object_sequence(
+        self,
+        sample: dict[str, Any],
+        slot_idx: int,
+        cameras_waymo: dict[str, torch.Tensor],
+        model_hw: tuple[int, int],
+        device: torch.device,
+        asset_cache: dict[str, dict[str, torch.Tensor]],
+    ) -> tuple[
+        list[dict[str, torch.Tensor]],
+        list[torch.Tensor],
+        list[torch.Tensor],
+        list[torch.Tensor],
+    ]:
+        raise RuntimeError(
+            "Legacy AssetAggregatorPass rendering requires a caller-provided "
+            "_render_object_sequence implementation. Current precompute should "
+            "pass localized_objects and cameras_dggt instead."
+        )
 
     def _build_dggt_cameras(
         self,

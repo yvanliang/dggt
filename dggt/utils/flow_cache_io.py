@@ -29,14 +29,15 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SQLITE_MAGIC = b"SQLite format 3\x00"
 CHUNKED_FLOW_CACHE_FORMAT = "flow_cache_chunked_zstd_sqlite"
 CHUNKED_FLOW_CACHE_FORMAT_VERSION = 2
-CURRENT_FLOW_CACHE_SCHEMA_VERSION = 8
+CURRENT_FLOW_CACHE_SCHEMA_VERSION = 9
 
 
 def is_current_flow_cache_summary(summary: dict[str, Any]) -> bool:
+    schema_version = int(summary.get("schema_version", 0))
     return (
         str(summary.get("format", "")) == CHUNKED_FLOW_CACHE_FORMAT
         and int(summary.get("format_version", 0)) == CHUNKED_FLOW_CACHE_FORMAT_VERSION
-        and int(summary.get("schema_version", 0)) == CURRENT_FLOW_CACHE_SCHEMA_VERSION
+        and schema_version == CURRENT_FLOW_CACHE_SCHEMA_VERSION
         and str(summary.get("gaussian_time_representation", ""))
         == GAUSSIAN_TIME_REPRESENTATION
     )
@@ -245,7 +246,12 @@ def _slice_object_meta_for_frames(obj: dict[str, Any], subset: torch.Tensor) -> 
     """Slice object metadata to the requested original frames.
 
     The dataset reader will apply a local ``0..S-1`` subset afterwards, so every
-    frame-dependent tensor/list here is rewritten to length ``S``.
+    frame-dependent tensor/list here is rewritten to length ``S``.  Camera
+    conditioning is the exception to the purely local view: in addition to the
+    selected poses, keep the clip-global trajectory anchor and the true pose
+    immediately preceding every selected frame.  Without this context a
+    non-zero chunk would silently make its first frame the new origin and give
+    it a zero frame-to-frame delta.
     """
     out: dict[str, Any] = {}
     frame_dim1 = {
@@ -275,6 +281,23 @@ def _slice_object_meta_for_frames(obj: dict[str, Any], subset: torch.Tensor) -> 
             out[key] = [value[n] for n in subset_list]
         else:
             out[key] = value
+
+    camera_full = obj.get("camera_to_world_corrected")
+    if torch.is_tensor(camera_full):
+        if camera_full.ndim == 4 and camera_full.shape[-2:] == (4, 4):
+            camera_front = camera_full[:, 0]
+        elif camera_full.ndim == 3 and camera_full.shape[-2:] == (4, 4):
+            camera_front = camera_full
+        else:
+            raise ValueError(
+                "camera_to_world_corrected must be [S,V,4,4] or [S,4,4], "
+                f"got {tuple(camera_full.shape)}"
+            )
+        previous_indices = (subset.to(dtype=torch.long) - 1).clamp_min(0)
+        out["camera_trajectory_anchor_to_world_corrected"] = camera_front[:1].contiguous()
+        out["camera_previous_to_world_corrected"] = camera_front.index_select(
+            0, previous_indices
+        ).contiguous()
     return out
 
 
@@ -417,6 +440,17 @@ def save_flow_cache_chunked(
         flow_inputs = pass2.get("flow_inputs") if isinstance(pass2, dict) else None
         if isinstance(flow_inputs, dict):
             summary["has_flow_inputs"] = True
+            source = flow_inputs.get("M_source")
+            dest = flow_inputs.get("M_dest")
+            if torch.is_tensor(source) and torch.is_tensor(dest) and source.shape == dest.shape:
+                summary["flow_edit_max_per_frame"] = (
+                    (source.float() + dest.float())
+                    .clamp(0.0, 1.0)
+                    .reshape(int(source.shape[0]), -1)
+                    .amax(dim=1)
+                    .cpu()
+                    .tolist()
+                )
             if torch.is_tensor(flow_inputs.get("phase1_coverage")):
                 summary["flow_inputs_phase1_coverage_shape"] = list(flow_inputs["phase1_coverage"].shape)
         if mode_kind == "mode_a" and payload.get("phase1_localized") is not None:
@@ -544,6 +578,18 @@ def save_flow_cache_chunked(
                     raise RuntimeError(
                         f"Mode-A chunked cache asset {obj_key} has no LUT levels"
                     )
+                patch_valid = entry.get("asset_patch_valid_mask")
+                expected_patches = int(meta["patch_grid"][0]) * int(meta["patch_grid"][1])
+                if (
+                    not torch.is_tensor(patch_valid)
+                    or tuple(patch_valid.shape) != (num_frames, expected_patches)
+                    or patch_valid.dtype != torch.bool
+                ):
+                    raise ValueError(
+                        f"Mode-A asset {obj_key} asset_patch_valid_mask must be bool "
+                        f"[{num_frames},{expected_patches}], got "
+                        f"{None if not torch.is_tensor(patch_valid) else (patch_valid.dtype, tuple(patch_valid.shape))}"
+                    )
                 zbytes, raw_bytes = _put_chunk(
                     conn,
                     cctx,
@@ -554,6 +600,11 @@ def save_flow_cache_chunked(
                         "source_num_levels": num_levels,
                         "source_level_index": None,
                         "has_fit_metrics": entry.get("fit_metrics") is not None,
+                        # Lightweight formal-training metadata.  Keeping the
+                        # full [S,P] bool tensor here lets the fast loader slice
+                        # it without decompressing per-frame RGB/alpha/Gaussian
+                        # payloads.
+                        "asset_patch_valid_mask": patch_valid,
                     },
                 )
                 total_zbytes += zbytes
@@ -732,6 +783,16 @@ def append_flow_inputs_to_chunked_flow_cache(
                 written_keys.append(key)
 
         summary["has_flow_inputs"] = True
+        source = flow_inputs["M_source"]
+        dest = flow_inputs["M_dest"]
+        summary["flow_edit_max_per_frame"] = (
+            (source.float() + dest.float())
+            .clamp(0.0, 1.0)
+            .reshape(num_frames, -1)
+            .amax(dim=1)
+            .cpu()
+            .tolist()
+        )
         if torch.is_tensor(flow_inputs.get("phase1_coverage")):
             summary["flow_inputs_phase1_coverage_shape"] = list(flow_inputs["phase1_coverage"].shape)
         _put_info(conn, "summary", summary)
@@ -779,6 +840,18 @@ def load_chunked_flow_cache_probe(path: str | os.PathLike[str]) -> dict[str, Any
             "mode_b": None,
             "_chunked_summary": summary,
         }
+        edit_max = summary.get("flow_edit_max_per_frame")
+        if edit_max is None and bool(summary.get("has_flow_inputs", False)):
+            # Compatibility for existing chunked caches: read only once per
+            # sampled item, then use the exact final masks to choose a window.
+            edit_max = []
+            for frame in range(int(summary["num_frames"])):
+                chunk = _get_chunk(conn, dctx, f"frame/{frame:02d}/flow_inputs")
+                source = chunk["M_source"].float()
+                dest = chunk["M_dest"].float()
+                edit_max.append(float((source + dest).clamp(0.0, 1.0).amax().item()))
+        if edit_max is not None:
+            probe["flow_edit_max_per_frame"] = torch.as_tensor(edit_max, dtype=torch.float32)
         if probe["mode_kind"] == "mode_a":
             phase1 = _get_chunk(conn, dctx, "mode_a/phase1_meta")
             probe["phase1_localized"] = phase1
@@ -1016,6 +1089,23 @@ def load_chunked_flow_cache_subset(
             for obj_key in [int(k) for k in summary.get("asset_object_keys", [])]:
                 asset_meta = _get_chunk(conn, dctx, f"mode_a/asset/{obj_key}/meta")
                 num_levels = int(asset_meta["num_levels"])
+                patch_valid_full = asset_meta.get("asset_patch_valid_mask")
+                if not torch.is_tensor(patch_valid_full):
+                    raise RuntimeError(
+                        f"Mode-A cache asset {obj_key} is missing asset_patch_valid_mask; "
+                        "regenerate the Mode-A cache with schema v9."
+                    )
+                if patch_valid_full.ndim != 2 or int(patch_valid_full.shape[0]) != int(summary["num_frames"]):
+                    raise ValueError(
+                        f"Mode-A asset {obj_key} patch mask must be [S,P], got "
+                        f"{tuple(patch_valid_full.shape)}"
+                    )
+                expected_patches = int(summary["patch_grid"][0]) * int(summary["patch_grid"][1])
+                if int(patch_valid_full.shape[1]) != expected_patches:
+                    raise ValueError(
+                        f"Mode-A asset {obj_key} patch mask has P={int(patch_valid_full.shape[1])}; "
+                        f"expected {expected_patches} from patch_grid={summary['patch_grid']}"
+                    )
                 levels = _normalize_level_indices(asset_lut_level_indices, num_levels)
                 frame_entries = []
                 if not fast_scene_flow:
@@ -1048,6 +1138,7 @@ def load_chunked_flow_cache_subset(
                 entry = {
                     "F_g_lut_asset_int8": torch.stack(lut_frames, dim=0).contiguous(),
                     "F_g_lut_asset_scale": torch.stack(scale_frames, dim=0).contiguous(),
+                    "asset_patch_valid_mask": patch_valid_full.index_select(0, subset).to(torch.bool).contiguous(),
                 }
                 if not fast_scene_flow:
                     entry.update({

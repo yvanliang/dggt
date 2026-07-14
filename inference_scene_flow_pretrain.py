@@ -90,6 +90,7 @@ from dggt.losses.rgb_render_loss import decode_generated_dggt_geometry
 from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers, load_into_buffers
 from dggt.utils.camera_generation import CAMERA_GENERATION_DIM, CAMERA_GENERATION_REPRESENTATION
 from dggt.utils.flow_viz import save_image_grid
+from dggt.utils.flow_schedule import resolve_inference_flow_schedule
 from dggt.utils.gaussian_edit import CleanSceneState, build_clean_scene_state
 from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
 from dggt.utils.sliding_window import resolve_offline_window
@@ -250,6 +251,7 @@ def build_scene_flow_from_checkpoint(
             "to be absent until training writes it; pass --weights when it becomes available."
         )
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    flow_schedule = resolve_inference_flow_schedule(payload, fallback_args, path)
     config = _checkpoint_config(payload)
     if config is not None:
         camera_dim = int(config.get("camera_gen_dim", 2048))
@@ -325,6 +327,7 @@ def build_scene_flow_from_checkpoint(
         "step": int(payload.get("step", 0)) if isinstance(payload, dict) else 0,
         "scene_flow_config": config,
         "camera_dggt_provenance": payload.get("camera_dggt_provenance") if isinstance(payload, dict) else None,
+        "flow_schedule_config": flow_schedule,
     }
     del payload
     return scene_flow, info
@@ -511,6 +514,8 @@ def render_and_export_generated(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     z_generated = generated_sample.video
     camera_generated = generated_sample.camera_state_dggt
+    camera_anchor_mask = generated_sample.camera_anchor_mask
+    camera_initial_c2w = generated_sample.camera_initial_c2w_dggt
     sky_generated = generated_sample.sky
     sky_mask_patch = generated_sample.sky_mask_patch
     sky_mask_refined = generated_sample.sky_mask_refined
@@ -534,7 +539,12 @@ def render_and_export_generated(
             patch_start_idx=patch_start_idx,
             image_hw=(height, width),
         )
-        generated_pose = decode_pose_from_camera_features(vggt_model, camera_generated.to(device))
+        generated_pose = decode_pose_from_camera_features(
+            vggt_model,
+            camera_generated.to(device),
+            camera_anchor_mask=camera_anchor_mask,
+            initial_camera_to_world=camera_initial_c2w,
+        )
         generated_sky_mask = _sky_mask_patch_to_image(
             sky_mask_refined if sky_mask_refined is not None else sky_mask_patch,
             patch_grid=args.patch_grid,
@@ -744,7 +754,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Independent text-CFG scale for generated camera state.",
     )
     parser.add_argument("--sample_steps", "--val_sample_steps", dest="val_sample_steps", type=int, default=35)
-    parser.add_argument("--shift", type=float, default=10.0)
+    parser.add_argument(
+        "--shift",
+        type=float,
+        default=None,
+        help="Optional assertion for the flow shift stored in the checkpoint.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--precision", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -858,6 +873,7 @@ def main() -> None:
                 args.feature_stats_path,
                 token_dim=int(args.latent_dim),
                 dggt_ckpt_path=args.dggt_ckpt_path,
+                require_existing_match=True,
             )
         else:
             load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
@@ -893,6 +909,7 @@ def main() -> None:
         pretrain_patch_grid=args.patch_grid,
         trunk_major_samples=True,
         trunk_frames=29,
+        return_full_dggt_context=True,
     )
     if len(dataset) == 0:
         raise RuntimeError("The selected validation dataset has no full caption-trunk samples.")

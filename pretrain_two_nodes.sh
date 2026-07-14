@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+trap 'rc=$?; echo "[错误] 命令失败：line ${LINENO}: ${BASH_COMMAND}，exit_code=${rc}" >&2' ERR
+
 # ============================================================
 # 使用方式
 #   在主节点 A 上执行：
@@ -13,13 +15,11 @@ set -Eeuo pipefail
 #   4. 再在 A 上启动 node_rank=0。
 #
 # 注意：
-#   - 本脚本和项目目录位于两台机器共享的 /mnt/vol1；
+#   - 两台机器上的项目、数据、环境和模型路径统一通过 /home/wuzn/liangyy 访问；
 #   - 不执行 conda activate；
 #   - 始终使用 CONDA_ENV/bin/python，避免激活到其他同名环境。
 # ============================================================
 
-# 当前脚本的绝对路径。由于 /mnt/vol1 为共享空间，副节点也可读取它。
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 MODE="${1:---launch}"
 
 # ============================================================
@@ -41,12 +41,17 @@ SSH_PORT=2288
 # ============================================================
 # 项目与 Python 环境
 # ============================================================
-PROJECT_ROOT="/mnt/vol1/liangyy_workspace/dggt"
-DATASET_ROOT="/mnt/vol1/liangyy_workspace/waymo_processed_dggt"
+LIANGYY_ROOT="${LIANGYY_ROOT:-/home/wuzn/liangyy}"
+PROJECT_ROOT="${PROJECT_ROOT:-${LIANGYY_ROOT}/dggt}"
+DATASET_ROOT="${DATASET_ROOT:-${LIANGYY_ROOT}/waymo_processed_dggt}"
 
-CONDA_ROOT="/mnt/vol1/liangyy_workspace/miniconda3"
-CONDA_ENV="${CONDA_ROOT}/envs/dggt"
-PYTHON_BIN="${CONDA_ENV}/bin/python"
+CONDA_ROOT="${CONDA_ROOT:-/home/wuzn/miniconda3}"
+CONDA_ENV="${CONDA_ENV:-${CONDA_ROOT}/envs/dggt}"
+PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV}/bin/python}"
+
+# 远端 SSH 始终执行 canonical 项目路径下的脚本。这样即使主节点从
+# /mnt/vol1/liangyy_workspace/... 启动，也不会把 /mnt/vol1 前缀传给副节点。
+SCRIPT_PATH="${SCRIPT_PATH:-${PROJECT_ROOT}/pretrain_two_nodes.sh}"
 
 # ============================================================
 # 数据与模型路径
@@ -56,10 +61,10 @@ WAYMO_DGGT_ROOT="${DATASET_ROOT}/training"
 WAYMO_DGGT_VAL_ROOT="${DATASET_ROOT}/validation"
 DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
 TOKENIZER_CKPT="${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
-FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v3_798.pt"
+FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v2.pt"
 SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
-QWEN_TEXT_ENCODER="/mnt/vol1/liangyy_workspace/model/Qwen/Qwen3-0.6B"
+QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${LIANGYY_ROOT}/model/Qwen/Qwen3-0.6B}"
 
 # 双机训练使用独立目录，避免覆盖单机训练的 checkpoint、验证结果和状态文件。
 LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_two_nodes"
@@ -73,13 +78,11 @@ SCENE_FLOW_VAL_MANIFEST="${DATASET_ROOT}/waymo_edit_cache/manifests/validation/v
 
 # ============================================================
 # 训练配置
-# 除每卡 batch size 外，下面的配置与 pretrain_single_node.sh 保持一致。
-# 单机为 1 node x 8 GPU x 8 samples/GPU = 64；双机为
-# 2 nodes x 8 GPU x 4 samples/GPU = 64。因此优化器每一步看到的全局
-# batch 不变，不需要额外修改学习率、warmup 或 grad accumulation。
+# 当前全局 batch = NNODES x NPROC_PER_NODE x BATCH_SIZE_PER_GPU x GRAD_ACCUM_STEPS。
+# 修改 BATCH_SIZE_PER_GPU 或 GRAD_ACCUM_STEPS 后，以启动时打印的 GLOBAL_BATCH_SIZE 为准。
 # ============================================================
-BATCH_SIZE_PER_GPU=4
-GRAD_ACCUM_STEPS=1
+BATCH_SIZE_PER_GPU=1
+GRAD_ACCUM_STEPS=4
 NUM_WORKERS=4
 PREFETCH_FACTOR=2
 
@@ -96,24 +99,14 @@ VAL_GUIDANCE_SCALES="1.0,2.0,4.0"
 
 WANDB_NAME="scene_flow_pretrain_waymo_2node_16gpu_b4_gb64_lr1e4_optcond"
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
-SINGLE_NODE_GLOBAL_BATCH_SIZE=$((NPROC_PER_NODE * SINGLE_NODE_BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
-
-if (( SINGLE_NODE_BATCH_SIZE_PER_GPU % NNODES != 0 )); then
-    echo "单机每卡 batch size (${SINGLE_NODE_BATCH_SIZE_PER_GPU}) 不能被节点数 (${NNODES}) 整除" >&2
-    exit 1
-fi
-
-if (( GLOBAL_BATCH_SIZE != SINGLE_NODE_GLOBAL_BATCH_SIZE )); then
-    echo "双机全局 batch size (${GLOBAL_BATCH_SIZE}) 与单机 (${SINGLE_NODE_GLOBAL_BATCH_SIZE}) 不一致" >&2
-    exit 1
-fi
 
 # ============================================================
 # NCCL 网络配置
 # ============================================================
 
-# bond4 用于 torchrun rendezvous、Gloo 和 NCCL bootstrap。
-SOCKET_IFNAME="bond4"
+# 用于 torchrun rendezvous、Gloo 和 NCCL bootstrap。
+# 默认优先 bond4；如果当前节点没有该网卡，启动时会按到对端 IP 的路由自动选择。
+SOCKET_IFNAME="${SOCKET_IFNAME:-bond4}"
 
 # 大数据通信使用两条 200G HDR InfiniBand。
 # 两台机器上的 HCA 名称都必须为 mlx5_4、mlx5_5。
@@ -134,6 +127,45 @@ SSH_OPTS=(
 # ============================================================
 # 清理旧 Conda 状态并构造确定的运行环境
 # ============================================================
+detect_socket_ifname() {
+    local requested="$1"
+    local target
+    local dev
+    local candidate
+
+    if [[ -n "${requested}" && -d "/sys/class/net/${requested}" ]]; then
+        echo "${requested}"
+        return 0
+    fi
+
+    if [[ -n "${requested}" ]]; then
+        echo "[警告] 当前节点不存在网卡 ${requested}，改为自动检测 socket 网卡。" >&2
+    fi
+
+    # 优先使用系统路由表选择到对端 IP 的网卡。主节点到 WORKER_HOST，
+    # 副节点到 MASTER_ADDR；如果某个目标是本机导致 dev=lo，则跳过。
+    for target in "${MASTER_ADDR}" "${WORKER_HOST}"; do
+        dev="$(ip -o -4 route get "${target}" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
+        if [[ -n "${dev}" && "${dev}" != "lo" && -d "/sys/class/net/${dev}" ]]; then
+            echo "${dev}"
+            return 0
+        fi
+    done
+
+    # 路由检测失败时，按常见物理/聚合网卡名兜底；不选 lo/docker/veth。
+    for candidate in bond4 bond0 bond1 ib0 eth0 eno1 eno2 ens1 ens2 ens3 ens4 enp1s0 enp2s0 enp3s0 enp4s0; do
+        if [[ -d "/sys/class/net/${candidate}" ]]; then
+            echo "${candidate}"
+            return 0
+        fi
+    done
+
+    echo "[错误] 无法自动检测可用于 NCCL/Gloo bootstrap 的 socket 网卡。" >&2
+    echo "       当前网卡列表：" >&2
+    ip -br link >&2 || true
+    return 1
+}
+
 setup_common_env() {
     # 清除调用脚本的 Shell 中残留的另一套 Conda 状态。
     unset CONDARC || true
@@ -173,9 +205,11 @@ setup_common_env() {
     export HF_HUB_OFFLINE=1
     export TRANSFORMERS_OFFLINE=1
 
-    # torchrun/Gloo/NCCL bootstrap 使用 bond4。
-    export GLOO_SOCKET_IFNAME="${SOCKET_IFNAME}"
-    export NCCL_SOCKET_IFNAME="=${SOCKET_IFNAME}"
+    # torchrun/Gloo/NCCL bootstrap 使用当前节点实际存在的 socket 网卡。
+    RUNTIME_SOCKET_IFNAME="$(detect_socket_ifname "${SOCKET_IFNAME}")"
+    export RUNTIME_SOCKET_IFNAME
+    export GLOO_SOCKET_IFNAME="${RUNTIME_SOCKET_IFNAME}"
+    export NCCL_SOCKET_IFNAME="=${RUNTIME_SOCKET_IFNAME}"
     export NCCL_SOCKET_FAMILY="AF_INET"
 
     # 跨节点张量通信使用双 HDR IB。
@@ -183,8 +217,8 @@ setup_common_env() {
     export NCCL_IB_HCA="${NCCL_IB_HCA_VALUE}"
 
     # 首次启动用于确认 NCCL 是否走 IB；稳定后可改为 WARN。
-    export NCCL_DEBUG=INFO
-    export NCCL_DEBUG_SUBSYS="INIT,NET"
+    export NCCL_DEBUG=WARN  # export NCCL_DEBUG=INFO
+    unset NCCL_DEBUG_SUBSYS || true  # export NCCL_DEBUG_SUBSYS="INIT,NET"
 
     # 异步 NCCL 错误尽快终止，而不是无限挂住。
     export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
@@ -193,29 +227,72 @@ setup_common_env() {
 # ============================================================
 # 文件与设备检查
 # ============================================================
+check_dir() {
+    local label="$1"
+    local path="$2"
+
+    if [[ ! -d "${path}" ]]; then
+        echo "[错误] 目录不存在：${label}" >&2
+        echo "       ${path}" >&2
+        return 1
+    fi
+    echo "[OK] ${label}: ${path}"
+}
+
+check_file() {
+    local label="$1"
+    local path="$2"
+
+    if [[ ! -f "${path}" ]]; then
+        echo "[错误] 文件不存在：${label}" >&2
+        echo "       ${path}" >&2
+        return 1
+    fi
+    echo "[OK] ${label}: ${path}"
+}
+
+check_executable() {
+    local label="$1"
+    local path="$2"
+
+    if [[ ! -x "${path}" ]]; then
+        echo "[错误] 文件不存在或不可执行：${label}" >&2
+        echo "       ${path}" >&2
+        return 1
+    fi
+    echo "[OK] ${label}: ${path}"
+}
+
 check_required_paths() {
     local node_name="$1"
 
     echo "[${node_name}] 检查共享文件和目录……"
 
-    test -d "${PROJECT_ROOT}"
-    test -f "${PROJECT_ROOT}/train_scene_flow_pretrain.py"
-    test -x "${PYTHON_BIN}"
+    check_dir "PROJECT_ROOT" "${PROJECT_ROOT}"
+    check_file "train_scene_flow_pretrain.py" "${PROJECT_ROOT}/train_scene_flow_pretrain.py"
+    check_executable "PYTHON_BIN" "${PYTHON_BIN}"
 
-    test -d "${WAYMO_DGGT_ROOT}"
-    test -d "${WAYMO_DGGT_VAL_ROOT}"
-    test -f "${DGGT_CKPT}"
-    test -f "${TOKENIZER_CKPT}"
-    test -f "${FEATURE_STATS}"
-    test -d "${SCENE_CAPTION_ROOT}"
-    test -d "${SCENE_CAPTION_VAL_ROOT}"
-    test -d "${QWEN_TEXT_ENCODER}"
+    check_dir "WAYMO_DGGT_ROOT" "${WAYMO_DGGT_ROOT}"
+    check_dir "WAYMO_DGGT_VAL_ROOT" "${WAYMO_DGGT_VAL_ROOT}"
+    check_file "DGGT_CKPT" "${DGGT_CKPT}"
+    check_file "TOKENIZER_CKPT" "${TOKENIZER_CKPT}"
+    check_file "FEATURE_STATS" "${FEATURE_STATS}"
+    check_dir "SCENE_CAPTION_ROOT" "${SCENE_CAPTION_ROOT}"
+    check_dir "SCENE_CAPTION_VAL_ROOT" "${SCENE_CAPTION_VAL_ROOT}"
+    check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
 
-    test -d "/sys/class/net/${SOCKET_IFNAME}"
-    test -d /sys/class/infiniband/mlx5_4
-    test -d /sys/class/infiniband/mlx5_5
+    echo "[OK] RUNTIME_SOCKET_IFNAME: ${RUNTIME_SOCKET_IFNAME:-未设置}"
+    check_dir "IB HCA mlx5_4" /sys/class/infiniband/mlx5_4
+    check_dir "IB HCA mlx5_5" /sys/class/infiniband/mlx5_5
 
-    mkdir -p "${LOG_DIR}" "${LAUNCH_LOG_DIR}"
+    if ! mkdir -p "${LOG_DIR}" "${LAUNCH_LOG_DIR}"; then
+        echo "[错误] 创建日志目录失败：" >&2
+        echo "       LOG_DIR=${LOG_DIR}" >&2
+        echo "       LAUNCH_LOG_DIR=${LAUNCH_LOG_DIR}" >&2
+        return 1
+    fi
+    echo "[OK] LOG_DIR: ${LOG_DIR}"
+    echo "[OK] LAUNCH_LOG_DIR: ${LAUNCH_LOG_DIR}"
 }
 
 check_python_and_gpu() {

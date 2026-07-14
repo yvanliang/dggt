@@ -24,7 +24,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from dggt.utils.gaussian_render import composite_gsplat_rgb
+from dggt.utils.gaussian_render import composite_gsplat_rgb, composite_original_sky
 from dggt.utils.gs import get_split_gs
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 
@@ -418,6 +418,21 @@ def _render_one_sample(
         ).squeeze(1)
     non_sky_probability = (1.0 - sky_low.clamp(0.0, 1.0)).unsqueeze(0)
 
+    gt_rgb_low = None
+    gt_sky_low = None
+    if background_mode == "gt_sky":
+        # Formal editing keeps the original sky in image space.  The
+        # rasterizer itself stays on a black background so original non-sky
+        # pixels cannot leak through gaps in the edited Gaussians.
+        gt_rgb_low = F.interpolate(
+            images.float(), size=(render_h, render_w), mode="area"
+        ).permute(0, 2, 3, 1).contiguous()
+        gt_sky_low = F.interpolate(
+            render_sky_probability.unsqueeze(1).float(),
+            size=(render_h, render_w),
+            mode="area",
+        ).squeeze(1).clamp(0.0, 1.0)
+
     if background_mode == "sky_tokens" and sky_tokens is not None:
         background = sky_tokens_to_background(
             sky_tokens,
@@ -430,7 +445,7 @@ def _render_one_sample(
             intrinsics=intrinsics.unsqueeze(0),
         )
     elif background_mode == "sky_model":
-        # Formal editing intentionally retains the frozen input-image sky.
+        # Legacy/frozen sky-model background retained for non-formal callers.
         with torch.no_grad():
             full_nhwc = vggt_model.sky_model(
                 images.unsqueeze(0), world_to_camera, intrinsics_b[0]
@@ -503,6 +518,12 @@ def _render_one_sample(
         composed = composite_gsplat_rgb(
             premultiplied[..., :3], alpha, background[frame_index : frame_index + 1]
         )
+        if gt_rgb_low is not None and gt_sky_low is not None:
+            composed = composite_original_sky(
+                composed,
+                gt_rgb_low[frame_index : frame_index + 1],
+                gt_sky_low[frame_index : frame_index + 1].unsqueeze(-1),
+            )
         rendered_frames.append(composed[0].permute(2, 0, 1))
         alpha_frames.append(alpha[0].permute(2, 0, 1))
     return torch.stack(rendered_frames), torch.stack(alpha_frames)
@@ -555,6 +576,8 @@ def compute_rgb_render_loss(
 ) -> RGBRenderLossResult:
     if images.ndim != 5 or int(images.shape[2]) != 3:
         raise ValueError(f"images must be [B,S,3,H,W], got {tuple(images.shape)}")
+    if str(background_mode) == "gt_sky" and render_sky_probability is None:
+        raise ValueError("background_mode='gt_sky' requires a GT sky mask")
     if render_pose_enc_dggt.ndim != 3 or int(render_pose_enc_dggt.shape[-1]) != 9:
         raise ValueError(
             f"render_pose_enc_dggt must be DGGT [B,S,9], got {render_pose_enc_dggt.shape}"

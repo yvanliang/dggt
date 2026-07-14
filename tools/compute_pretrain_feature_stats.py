@@ -30,11 +30,12 @@ from dggt.utils.camera_generation import (
     camera_state_from_dggt_pose_enc,
 )
 from dggt.utils.feature_stats import (
+    DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
     checkpoint_sha256,
     load_feature_stats,
     save_feature_stats,
 )
-from dggt.utils.tokens import select_patch_pyramid
+from dggt.utils.tokens import batched_gather_frames, select_patch_pyramid
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
@@ -238,8 +239,23 @@ def compute_dggt_stats_single_pass(
                 "Batch is missing dynamic_mask. Check fine_dynamic_masks/all coverage for selected scenes."
             )
         images = batch["images"].to(device, non_blocking=True)
+        context_raw = batch.get("dggt_context_images")
+        if not torch.is_tensor(context_raw):
+            raise RuntimeError(
+                "Camera v4 stats require dggt_context_images from the complete 29-frame clip."
+            )
+        context_images = context_raw.to(device, non_blocking=True)
+        if context_images.ndim != 5 or int(context_images.shape[1]) != 29:
+            raise ValueError(
+                "Camera v4 stats require dggt_context_images [B,29,3,H,W], got "
+                f"{tuple(context_images.shape)}"
+            )
+        window_indices_raw = batch.get("dggt_window_indices")
+        if not torch.is_tensor(window_indices_raw):
+            raise RuntimeError("Camera v4 stats require dggt_window_indices [B,S].")
+        window_indices = window_indices_raw.to(device=device, dtype=torch.long, non_blocking=True)
         with autocast_context(args, device):
-            outputs = model.get_aggregator_token_outputs(images)
+            outputs = model.get_aggregator_token_outputs(context_images)
             pose_enc_dggt = model.camera_head(outputs["aggregated_tokens_list"])[-1]
             camera_state_dggt, anchor_mask = camera_state_from_dggt_pose_enc(pose_enc_dggt)
             flat_camera = camera_state_dggt.detach().cpu().double().reshape(-1, CAMERA_GENERATION_DIM)
@@ -253,7 +269,10 @@ def compute_dggt_stats_single_pass(
             if not compute_latents:
                 z = None
             else:
-                image_tokens_all = outputs["image_tokens_list"]
+                image_tokens_all = [
+                    batched_gather_frames(tokens, window_indices, name=f"image_tokens_list[{level}]")
+                    for level, tokens in enumerate(outputs["image_tokens_list"])
+                ]
                 patch_start_idx = int(outputs["patch_start_idx"])
                 image_patch = select_patch_pyramid(image_tokens_all, DEFAULT_LEVELS, patch_start_idx)
                 patch_count = int(image_patch[-1].shape[-2])
@@ -314,12 +333,23 @@ def build_argparser() -> argparse.ArgumentParser:
             "Reuse validated mu_z/sigma_z while still running frozen DGGT CameraHead for v3 camera stats."
         ),
     )
-    parser.add_argument("--output_path", type=str, required=True)
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default=str(DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH),
+        help="Output path shared by SceneFlow pretrain and formal training.",
+    )
     parser.add_argument("--scene_list", type=str, default=None)
     parser.add_argument("--scene_names", type=str, default=None)
     parser.add_argument("--scene_start", type=int, default=0)
     parser.add_argument("--scene_end", type=int, default=600)
-    parser.add_argument("--sequence_length", type=int, default=4)
+    parser.add_argument("--sequence_length", type=int, default=10)
+    parser.add_argument(
+        "--camera_anchor_window_probability",
+        type=float,
+        default=0.5,
+        help="Balance frame-0 and non-zero latent windows; camera stats always use the full 29-frame context.",
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--max_batches", type=int, default=None)
@@ -355,6 +385,9 @@ def main() -> None:
         sequence_length=args.sequence_length,
         mode=1,
         views=1,
+        trunk_frames=29,
+        camera_anchor_window_probability=float(args.camera_anchor_window_probability),
+        return_full_dggt_context=True,
     )
     if args.require_dynamic_mask:
         validate_dynamic_masks(dataset)
@@ -397,6 +430,8 @@ def main() -> None:
         "image_dir": args.image_dir,
         "scene_names": parse_scene_names(args),
         "sequence_length": int(args.sequence_length),
+        "dggt_context_length": 29,
+        "camera_anchor_window_probability": float(args.camera_anchor_window_probability),
         "max_batches": args.max_batches,
         "levels": list(DEFAULT_LEVELS),
         "latent_stats_path": args.latent_stats_path,

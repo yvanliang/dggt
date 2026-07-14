@@ -2,17 +2,17 @@
 validation flow-cache and dump the same visualization set the training code
 produces.
 
-This script combines two documented pipelines:
+This script combines two documented formal-editing pipelines:
 
 * The **formal-training data path** of ``train_scene_flow.py`` (see
-  ``docs/scene_flow_cmd.md`` §3): read the offline v6 flow cache through
+  ``docs/scene_flow_cmd.md`` §3): read the current schema-v9 flow cache through
   ``WaymoFlowCacheDataset`` and drive ``FlowFeatureAssembler`` per clip to
   build the exact ``FlowFeatureBundle`` the trainer consumes. Its training-time
   visualization op (``train_scene_flow.py:_dump_vis`` ->
   ``dggt.utils.flow_viz.dump_flow_features``) is reproduced verbatim.
 
 * The **validation flow cache** of ``tools/precompute_flow_features_validation.py``
-  (see ``docs/flow_cache_validation_cmd.md``): Mode-A-schema v8 chunked-zstd
+  (see ``docs/flow_cache_validation_cmd.md``): Mode-A schema-v9 chunked-zstd
   SQLite ``.pt`` files,
   canonical layout
   ``{cache_root}/validation/{entry_index:06d}_{edit_name}.pt``,
@@ -23,8 +23,8 @@ guidance (mirroring ``train_scene_flow.py:cfg_sample_edit_latents``: factored
 text CFG plus asset/control CFG, with non-edit tokens pinned to ``z_splat`` at
 every ODE step), then decodes the edited latent and renders 3DGS with
 ``train_scene_flow.py:render_validation_rgb_gt_sky`` so formal offline
-validation matches training-time T1 validation: generated outputs are
-composited with GT sky mask / sky background.
+validation matches training-time T1 validation: generated outputs preserve
+the original input RGB exactly inside the GT sky mask.
 
 ================================ COMMANDS ================================
 
@@ -39,14 +39,15 @@ Environment (see docs/scene_flow_cmd.md §0 and docs/flow_cache_validation_cmd.m
 
 Sliding window: the validation clips are 29 frames but WanSceneFlow is trained
 on 10-frame windows in both stages. Requests longer than 10 frames are
-automatically tiled into at most 8-frame windows with ``--window_stride``;
-``--window <= 0`` selects this automatic policy and values above 8 are capped.
+automatically tiled into at most 10-frame windows with ``--window_stride``;
+``--window <= 0`` selects this automatic policy and values above 10 are capped.
 Every full window has exactly the resolved effective-window number of frames
 (the last start is clamped so the clip tail is
 covered). Sampling keeps one full-clip latent state; at each denoising step the
 model is run on window slices, window velocities are blended in overlap regions,
 and the full latent is updated once. Per-window bundles are still dumped for
-diagnostics, while the final 3DGS render uses the full-clip latent.
+diagnostics. The final 3DGS render uses the full-clip latent but exports at most
+``--val_log_images`` frames (default 10; pass 29 to export a full Waymo clip).
 
 A) Validation manifest, formal-training (T1) checkpoint, all entries:
 
@@ -59,31 +60,17 @@ A) Validation manifest, formal-training (T1) checkpoint, all entries:
         --split validation \
         --output_dir runs/scene_flow_val_t1 \
         --window 0 --window_stride 7 \
-        --sample_steps 30 --shift 10.0 \
+        --sample_steps 50 --shift 10.0 \
         --guidance_scales 1.0,2.0,4.0 \
         --asset_control_guidance_scale 1.0 \
         --val_log_images 10 \
         --seed 0 --precision bf16
 
-B) Pretrain checkpoint, cache_root scan (no manifest), EMA weights (default):
-
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
-        --ckpt_path $DGGT_CKPT \
-        --tokenizer_ckpt_path $TOKENIZER_CKPT \
-        --scene_flow_ckpt_path logs/scene_flow_pretrain/ckpt/pretrain_step100000.pt \
-        --feature_stats_path $FEATURE_STATS \
-        --cache_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_validation \
-        --split validation \
-        --output_dir runs/scene_flow_val_pretrain \
-        --start 0 --end 5 \
-        --sample_steps 30 --shift 10.0 --guidance_scales 2.0 \
-        --window 0 --render_per_window
-
-C) Single entry smoke (entry 0 -> manifest index 0, combined variant):
+Single-entry smoke (entry 0 -> manifest index 0, combined variant):
 
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
         --ckpt_path $DGGT_CKPT --tokenizer_ckpt_path $TOKENIZER_CKPT \
-        --scene_flow_ckpt_path logs/scene_flow_pretrain/ckpt/pretrain_step100000.pt \
+        --scene_flow_ckpt_path logs/scene_flow_t1/ckpt/flow_step040000_ema_weights_only.pt \
         --feature_stats_path $FEATURE_STATS \
         --manifest_path $VAL_MANIFEST --split validation \
         --output_dir /tmp/scene_flow_val_smoke \
@@ -91,33 +78,27 @@ C) Single entry smoke (entry 0 -> manifest index 0, combined variant):
         --window 0 --no_render_rgb --splat_pca
 
 Notes:
-  * ``--scene_flow_ckpt_path`` accepts the formal-training checkpoint
-    (``{step, scene_flow, scaffold_packer, ...}`` from ``train_scene_flow.py``)
-    or the pretrain full / EMA-only / weights-only checkpoint
-    (``{scene_flow[, ema_scene_flow], ...}``,
-    ``{scene_flow, ema_scene_flow_state_dict, ...}``, or
-    ``{scene_flow, is_ema_weights=True}`` from ``train_scene_flow_pretrain.py``).
+  * ``--scene_flow_ckpt_path`` accepts only a formal-training full / raw-only /
+    EMA-only checkpoint carrying ``formal_flow_domain_version`` and the trained
+    ``scaffold_packer``. Pretrain checkpoints use
+    ``inference_scene_flow_pretrain.py``.
   * EMA weights are used BY DEFAULT (pass ``--no_ema`` to use raw weights).
-    Per ``docs/scene_flow_cmd.md`` §1.5 / commit 6e2c039f, raw mid-training
-    weights produce drastically worse diffusion samples; DiT/SD3/Wan/RAE all
-    sample from EMA. IMPORTANT: ``pretrain_step{N}_weights_only.pt`` stores
-    ONLY the raw ``scene_flow`` (no EMA) — point at the FULL
-    ``pretrain_step{N}.pt`` or ``pretrain_step{N}_ema_weights_only.pt`` to get
-    EMA. The script warns if EMA is requested but absent.
-  * ``--shift`` defaults to 10.0 to match ``docs/scene_flow_cmd.md`` and the
-    current pretrain / T1 training defaults. Flow-matching inference should use
-    the same schedule the model was trained on.
+    Raw mid-training weights generally produce worse samples; prefer a formal
+    ``flow_step{N}_ema_weights_only.pt`` export or the EMA in a formal full
+    checkpoint.
+  * The flow schedule is loaded from the SceneFlow checkpoint. ``--shift`` is
+    only an optional assertion; a conflicting value is rejected.
   * ``--prediction_type`` defaults to ``x`` to match RAEv2-style SceneFlow
     training. Checkpoints that record a different prediction type are rejected
     before weights are loaded; pass ``--prediction_type v`` only for explicit
     velocity-prediction checkpoints.
-  * ``--feature_stats_path`` is optional: the checkpoint already carries
-    ``mu_z``/``sigma_z`` buffers. Pass it only to override (same dim as
-    ``--latent_dim``; e.g. ``feature_stats_pretrain.pt``).
+  * ``--feature_stats_path`` is optional because the checkpoint already carries
+    its stats buffers. When supplied it is an exact consistency check; it cannot
+    override or change the checkpoint coordinate system.
   * Memory: the default single 29-frame render does one VGGT-L pass on the
     full clip (~25GB free, same as the validation-cache precompute). Use
-    ``--render_per_window`` (per-window 10-frame renders) or ``--no_render_rgb``
-    if tight.
+    ``--render_per_window`` (per-window 10-frame geometry passes that slice the
+    same cached full-context DGGT pose trajectory) or ``--no_render_rgb`` if tight.
 
 Output (per entry, under ``{output_dir}/{tag}/``):
 
@@ -153,9 +134,16 @@ from dggt.losses.flow_losses import (
 )
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
-from dggt.utils.feature_stats import checkpoint_sha256, load_into_buffers, validate_camera_stats_provenance
-from dggt.utils.flow_cache_io import load_flow_cache
+from dggt.utils.camera_generation import CAMERA_STATS_VERSION
+from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers
+from dggt.utils.flow_cache_io import (
+    is_chunked_flow_cache,
+    load_chunked_flow_cache_probe,
+    load_chunked_flow_cache_subset,
+    load_flow_cache,
+)
 from dggt.utils.flow_viz import dump_flow_features, save_image_grid
+from dggt.utils.flow_schedule import resolve_inference_flow_schedule
 from dggt.utils.sliding_window import (
     OFFLINE_MAX_SINGLE_WINDOW,
     cosine_window,
@@ -174,11 +162,13 @@ from train_scene_flow import (
     _slice_time,
     build_formal_edit_domains,
     build_flow_bundle as build_train_flow_bundle,
+    cached_render_pose_from_item,
     encode_text_condition,
     freeze_module,
     normalize_asset_latents,
     render_validation_rgb_gt_sky,
     sampler_prediction_to_velocity,
+    scene_flow_t_eps,
     setup_text_encoder,
     validate_formal_flow_domain_config,
 )
@@ -208,15 +198,23 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     # Models
     p.add_argument("--ckpt_path", type=str, required=True,
-                   help="DGGT checkpoint (aggregator + dense heads + sky_model).")
-    p.add_argument("--tokenizer_ckpt_path", type=str, default=None,
-                   help="JointSceneTokenizer checkpoint matching scene_flow training "
-                        "(omit to use tokenizer weights inside --ckpt_path).")
+                   help="DGGT checkpoint (aggregator + dense heads + scene tokenizer).")
+    p.add_argument(
+        "--tokenizer_ckpt_path",
+        type=str,
+        default=None,
+        help=(
+            "JointSceneTokenizer checkpoint matching SceneFlow training. It may be omitted "
+            "only if --ckpt_path embeds a complete tokenizer state; no random fallback is allowed."
+        ),
+    )
     p.add_argument("--scene_flow_ckpt_path", type=str, required=True,
-                   help="Trained WanSceneFlow checkpoint (T1 or pretrain).")
+                   help="Formal T1 WanSceneFlow checkpoint with trained scaffold_packer.")
     p.add_argument("--feature_stats_path", type=str, default=None,
-                   help="Optional latent stats override (mu_z/sigma_z). Default: "
-                        "use the buffers stored inside --scene_flow_ckpt_path.")
+                   help=(
+                       "Optional latent+camera stats contract. It must exactly match the buffers "
+                       "stored inside --scene_flow_ckpt_path; the checkpoint remains authoritative."
+                   ))
     p.add_argument("--no_ema", action="store_true",
                    help="Use raw weights. By DEFAULT the EMA shadow weights are "
                         "used when the checkpoint carries them (mandatory for "
@@ -282,10 +280,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--end", type=int, default=None)
 
     # Sampling
-    p.add_argument("--sample_steps", type=int, default=30,
-                   help="FlowMatch inference steps (15 smoke / 30 normal / 50 stable).")
-    p.add_argument("--shift", type=float, default=10.0,
-                   help="FlowMatch / RAE time distribution shift used for sampling.")
+    p.add_argument("--sample_steps", type=int, default=50,
+                   help="FlowMatch inference steps (15 smoke / 35 fast / 50 formal, matching formal validation).")
+    p.add_argument("--shift", type=float, default=None,
+                   help="Optional assertion for the checkpoint's FlowMatch / RAE shift.")
     p.add_argument("--edit_domain_threshold", type=float, default=1e-4,
                    help="Threshold soft source+destination coverage into the binary flow domain.")
     p.add_argument("--edit_domain_dilation", type=int, default=1,
@@ -301,8 +299,15 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Deprecated compatibility flag; non-edit tokens are pinned to z_splat each ODE step.")
 
     # Visualization (consumed by reused pretrain render helpers)
-    p.add_argument("--val_log_images", type=int, default=10,
-                   help="Number of frames rendered/tiled per grid.")
+    p.add_argument(
+        "--val_log_images",
+        type=int,
+        default=10,
+        help=(
+            "Number of frames rendered/tiled per grid; pass the full clip length "
+            "(for example 29) to export all frames."
+        ),
+    )
     p.add_argument("--splat_pca", action="store_true",
                    help="Also dump splat_pca grids in flow_features/.")
     p.add_argument("--no_flow_tensors", action="store_true",
@@ -324,21 +329,7 @@ def build_argparser() -> argparse.ArgumentParser:
 @torch.no_grad()
 def build_bundle(item: dict[str, Any], assembler: FlowFeatureAssembler, device: torch.device):
     bundle = build_train_flow_bundle(item, assembler, device)
-    variant = str(item.get("validation_variant", ""))
-    if variant:
-        bundle.asset_condition_kind = validation_asset_condition_kind(variant)
     return bundle, item["sample"]
-
-
-def validation_asset_condition_kind(variant: str) -> str:
-    variant = str(variant)
-    has_asset = variant in {"combined", "insertion", "replacement", "repositioning"}
-    has_delete = variant in {"combined", "deletion", "replacement", "repositioning"}
-    if has_asset and has_delete:
-        return "mode_a_with_empty"
-    if has_delete:
-        return "mode_b_empty"
-    return "mode_a"
 
 
 # ---------------------------------------------------------------------- #
@@ -364,6 +355,7 @@ def _cfg_sample_edit_latents_sliding(
         time_shift=float(args.shift),
         device=device,
         dtype=torch.float32,
+        t_eps=scene_flow_t_eps(scene_flow),
     )
     z_splat_n = sf.normalize(bundle.z_splat.float())
     generator = torch.Generator(device=device)
@@ -533,6 +525,7 @@ def cfg_sample_edit_latents(
         time_shift=float(args.shift),
         device=device,
         dtype=torch.float32,
+        t_eps=scene_flow_t_eps(scene_flow),
     )
     z_splat_n = sf.normalize(bundle.z_splat.float())
     generator = torch.Generator(device=device)
@@ -830,8 +823,8 @@ def _validate_scene_flow_checkpoint_config(scene_flow: nn.Module, payload: Any, 
     if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
         raise ValueError(
             f"{path} was saved with the legacy global mrope_temporal_margin RoPE layout. "
-            "The current SceneFlow model uses the fixed A2 layout "
-            "(video/asset/camera shared video time, camera center, sky temporal offset 15000); "
+            "The current SceneFlow model uses the fixed A3 layout "
+            "(video/asset/camera shared video time, camera center, spherical sky coordinates near 15000); "
             "do not run inference across these incompatible position semantics."
         )
     current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)
@@ -875,8 +868,10 @@ def load_scene_flow_ckpt(
     ckpt_path: str,
     disable_ema: bool,
     device: torch.device,
+    args: argparse.Namespace,
 ) -> dict[str, Any]:
     payload = torch.load(ckpt_path, map_location="cpu")
+    flow_schedule = resolve_inference_flow_schedule(payload, args, ckpt_path)
     saved_flow_domain = payload.get("formal_flow_domain_version") if isinstance(payload, dict) else None
     if saved_flow_domain != FORMAL_FLOW_DOMAIN_VERSION:
         raise ValueError(
@@ -890,6 +885,7 @@ def load_scene_flow_ckpt(
         "ema_used": False,
         "prediction_type": _scene_flow_prediction_type(scene_flow),
         "checkpoint_prediction_type": _checkpoint_prediction_type(payload),
+        "flow_schedule_config": flow_schedule,
     }
 
     if not disable_ema and isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
@@ -924,10 +920,9 @@ def load_scene_flow_ckpt(
     info["missing"] = len(missing)
     info["unexpected"] = len(unexpected)
 
-    # EMA shadow weights are used BY DEFAULT (pretrain full checkpoints store an
-    # EMAModel dict under "ema_scene_flow"). Per docs/scene_flow_cmd.md §1.5 /
-    # commit 6e2c039f, raw mid-training weights give drastically worse diffusion
-    # samples; validation/inference must run under EMA.
+    # EMA shadow weights are used by default when carried by the formal full
+    # checkpoint. Raw mid-training weights generally give worse diffusion
+    # samples, so validation/inference should normally use the formal EMA export.
     has_ema = isinstance(payload, dict) and "ema_scene_flow" in payload
     info["ema_in_ckpt"] = bool(has_ema)
     if disable_ema:
@@ -958,14 +953,15 @@ def load_scene_flow_ckpt(
             "[warn] checkpoint has NO ema_scene_flow"
             + (" (this is a *_weights_only.pt which stores ONLY raw weights)"
                if is_weights_only else "")
-            + ". Per docs/scene_flow_cmd.md §1.5 / 6e2c039f, raw mid-training "
-            "weights produce drastically worse samples. Point "
-            "--scene_flow_ckpt_path at the FULL pretrain_step{N}.pt (it carries "
-            "ema_scene_flow) for meaningful results.",
+            + ". Raw mid-training weights generally produce worse samples; prefer "
+            "a formal flow_step{N}_ema_weights_only.pt export or a formal full "
+            "checkpoint carrying EMA weights.",
             flush=True,
         )
 
-    # The formal trainer also trains assembler.scaffold_packer; load it if present.
+    # The formal trainer also trains assembler.scaffold_packer.  Formal
+    # inference is invalid without it: using the constructor initialization
+    # would change edit-control conditioning while appearing to load cleanly.
     if isinstance(payload, dict) and "scaffold_packer" in payload:
         sp_missing, sp_unexpected = assembler.scaffold_packer.load_state_dict(
             _strip_module(payload["scaffold_packer"]), strict=False
@@ -980,7 +976,12 @@ def load_scene_flow_ckpt(
         info["scaffold_packer_missing"] = len(sp_missing)
         info["scaffold_packer_unexpected"] = len(sp_unexpected)
     else:
-        info["scaffold_packer_missing"] = "not_in_ckpt"
+        raise ValueError(
+            f"{ckpt_path} does not contain the trained scaffold_packer. "
+            "Legacy formal *_weights_only.pt exports omitted it and cannot "
+            "reproduce the trained model; use a full checkpoint or a newly "
+            "exported *_ema_weights_only.pt checkpoint."
+        )
 
     scene_flow.to(device).eval()
     return info
@@ -1036,12 +1037,60 @@ def _item_for_subset(
     return item
 
 
-def _make_batch(sample: dict[str, Any], device: torch.device) -> dict[str, torch.Tensor]:
-    """render_validation_rgb_gt_sky expects a raw-batch dict (B,S,...) of cached frames."""
+def _load_formal_offline_payload(
+    dataset: WaymoFlowCacheDataset,
+    entry: dict[str, Any],
+    cache_path: Path,
+) -> dict[str, Any]:
+    """Load a full clip in the same cached representation formal training uses.
+
+    Chunked formal training consumes the precomputed ``flow_inputs`` fast path.
+    Offline inference additionally needs RGB and DGGT pose data for rendering,
+    so use the corresponding fast-RGB consumer rather than reconstructing the
+    legacy cache and recomputing the flow conditions online.
+    """
+    if is_chunked_flow_cache(cache_path):
+        probe = load_chunked_flow_cache_probe(cache_path)
+        WaymoFlowCacheDataset._validate_v6_payload(
+            probe,
+            cache_path=cache_path,
+            entry=entry,
+        )
+        all_frames = torch.arange(int(probe["meta"]["num_frames"]), dtype=torch.long)
+        payload = load_chunked_flow_cache_subset(
+            cache_path,
+            all_frames,
+            consumer="scene_flow_fast_rgb",
+            asset_lut_level_indices=dataset.asset_lut_level_indices,
+        )
+    else:
+        # Plain caches follow the same legacy fallback in the training dataset.
+        payload = load_flow_cache(
+            cache_path,
+            map_location="cpu",
+            weights_only=False,
+            mmap=bool(getattr(dataset, "mmap_plain_cache", True)),
+        )
+    WaymoFlowCacheDataset._validate_v6_payload(
+        payload,
+        cache_path=cache_path,
+        entry=entry,
+    )
+    return payload
+
+
+def _make_batch(
+    sample: dict[str, Any],
+    device: torch.device,
+    *,
+    render_pose_enc_dggt: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build a renderer batch with the cached full-context DGGT pose slice."""
     return {
         "images": sample["images"].unsqueeze(0).to(device),
         "masks": sample["masks"].unsqueeze(0).to(device),
         "timestamps": sample["timestamps"].unsqueeze(0),
+        "render_pose_enc_dggt": render_pose_enc_dggt,
     }
 
 
@@ -1130,7 +1179,8 @@ def main() -> None:
             f"!= --asset_position_mode={args.asset_position_mode!r}"
         )
 
-    # Full VGGT (aggregator + dense heads + sky_model + scene_tokenizer).
+    # Full VGGT (aggregator + dense heads + scene_tokenizer). Formal rendering
+    # preserves GT sky RGB directly and does not call the frozen sky_model.
     vggt_model = load_dggt_aggregator_and_tokenizer(
         args.ckpt_path, args.tokenizer_ckpt_path, device
     )
@@ -1150,7 +1200,7 @@ def main() -> None:
     assembler.eval()
 
     ckpt_info = load_scene_flow_ckpt(
-        scene_flow, assembler, args.scene_flow_ckpt_path, args.no_ema, device
+        scene_flow, assembler, args.scene_flow_ckpt_path, args.no_ema, device, args
     )
     print(f"[ckpt:scene_flow] {ckpt_info}", flush=True)
     dggt_sha256 = checkpoint_sha256(args.ckpt_path)
@@ -1163,13 +1213,30 @@ def main() -> None:
             "Formal offline inference DGGT checkpoint does not match SceneFlow provenance: "
             f"checkpoint={recorded_hash!r}, current={dggt_sha256!r}."
         )
+    recorded_stats_version = provenance.get("camera_stats_version") if isinstance(provenance, dict) else None
+    if recorded_stats_version != CAMERA_STATS_VERSION:
+        raise ValueError(
+            "Formal offline inference requires global-context camera stats provenance: "
+            f"checkpoint={recorded_stats_version!r}, required={CAMERA_STATS_VERSION!r}."
+        )
+    if int(provenance.get("dggt_context_length", 0)) != 29:
+        raise ValueError(
+            "Formal offline inference requires a checkpoint built from complete 29-frame DGGT context."
+        )
     if args.feature_stats_path:
-        load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
-        stats_payload = torch.load(args.feature_stats_path, map_location="cpu")
-        if not isinstance(stats_payload, dict):
-            raise TypeError("feature stats payload must be a dict")
-        validate_camera_stats_provenance(stats_payload, dggt_sha256)
-        print(f"[stats] overrode mu_z/sigma_z from {args.feature_stats_path}", flush=True)
+        load_all_stats_into_buffers(
+            scene_flow,
+            args.feature_stats_path,
+            token_dim=int(args.latent_dim),
+            expected_dggt_sha256=dggt_sha256,
+            require_existing_match=True,
+        )
+        stats_sha256 = checkpoint_sha256(args.feature_stats_path)
+        print(
+            f"[stats] verified latent+camera stats against the inference checkpoint and loaded "
+            f"{args.feature_stats_path} (sha256={stats_sha256})",
+            flush=True,
+        )
     elif float(scene_flow.sigma_z.std().item()) < 1e-8 and float(scene_flow.mu_z.abs().max().item()) < 1e-8:
         print("[warn] checkpoint latent stats look like defaults (mu=0, sigma=1); "
               "pass --feature_stats_path if normalization was used in training.",
@@ -1197,10 +1264,7 @@ def main() -> None:
     for pos, idx in enumerate(indices, start=1):
         entry = dataset.entries[idx]
         cache_path = Path(entry["cache_path"])
-        payload = load_flow_cache(cache_path, map_location="cpu", weights_only=False)
-        WaymoFlowCacheDataset._validate_v6_payload(
-            payload, cache_path=cache_path, entry=entry
-        )
+        payload = _load_formal_offline_payload(dataset, entry, cache_path)
         num_frames = int(payload["meta"]["num_frames"])
         effective_window, effective_stride, offline_sliding = resolve_offline_window(
             num_frames,
@@ -1219,6 +1283,7 @@ def main() -> None:
         item_full = _item_for_subset(
             dataset, payload, entry, cache_path, idx, all_frames_t
         )
+        render_pose_full = cached_render_pose_from_item(item_full)
         bundle_full, sample_full = build_bundle(item_full, assembler, device)
         ldim_full = int(bundle_full.z_clean.shape[-1])
         if ldim_full != int(args.latent_dim):
@@ -1328,7 +1393,11 @@ def main() -> None:
                     if cuda:
                         torch.cuda.empty_cache()
                     rgb = render_validation_rgb_gt_sky(
-                        _make_batch(record["sample"], device),
+                        _make_batch(
+                            record["sample"],
+                            device,
+                            render_pose_enc_dggt=render_pose_full[:, a:b],
+                        ),
                         vggt_model,
                         scene_flow,
                         z_edit_w,
@@ -1350,7 +1419,11 @@ def main() -> None:
                 if cuda:
                     torch.cuda.empty_cache()
                 rgb = render_validation_rgb_gt_sky(
-                    _make_batch(sample_full, device),
+                    _make_batch(
+                        sample_full,
+                        device,
+                        render_pose_enc_dggt=render_pose_full,
+                    ),
                     vggt_model, scene_flow, z_edit_full[scale], args, device,
                 )
                 _save_rgb_grids(
@@ -1399,7 +1472,7 @@ def main() -> None:
         }
         (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
         all_summaries.append({"row_index": idx, "tag": tag, "output_dir": str(out_dir)})
-        del z_clean_full, z_edit_full, Mp_full, Ms_full, Md_full, payload, bundle_full, item_full, window_records
+        del z_clean_full, z_edit_full, Mp_full, Ms_full, Md_full, payload, bundle_full, item_full, render_pose_full, window_records
         if cuda:
             torch.cuda.empty_cache()
 

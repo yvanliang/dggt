@@ -56,7 +56,11 @@ from datasets.waymo_edit_dataset import (
     DEFAULT_TRANSFER_ROOT,
     WaymoEditDataset,
 )
-from dggt.models.asset_pass import AssetAggregatorPass
+from dggt.models.asset_pass import (
+    ASSET_PATCH_MASK_VERSION,
+    AssetAggregatorPass,
+    require_asset_patch_valid_mask,
+)
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens, quantize_tokens
 from dggt.utils.flow_cache_io import (
@@ -233,14 +237,14 @@ def _should_skip_existing_cache(path: Path, args: argparse.Namespace) -> tuple[b
             if str(getattr(args, "save_compression", "")) == "chunked_zstd":
                 try:
                     if not is_chunked_flow_cache(path):
-                        return False, f"schema_v{CACHE_SCHEMA_VERSION}_non_chunked"
+                        return False, f"schema_v{version}_non_chunked"
                     summary = load_chunked_flow_cache_summary(path)
                 except Exception:
-                    return False, f"schema_v{CACHE_SCHEMA_VERSION}_unreadable_chunked"
+                    return False, f"schema_v{version}_unreadable_chunked"
                 if not is_current_flow_cache_summary(summary):
                     fmt = summary.get("format_version", "unknown")
-                    return False, f"schema_v{CACHE_SCHEMA_VERSION}_chunked_format_v{fmt}"
-            return True, f"schema_v{CACHE_SCHEMA_VERSION}"
+                    return False, f"schema_v{version}_chunked_format_v{fmt}"
+            return True, f"schema_v{version}"
         return False, f"schema_v{version if version is not None else 'unreadable'}"
     return True, "exists"
 
@@ -676,11 +680,18 @@ def _pack_mode_a_asset_pass_result(
             raise RuntimeError(
                 f"Mode-A DGGT-fitted asset result missing G_asset_dggt for object {k}"
             )
+        patch_mask = require_asset_patch_valid_mask(
+            asset_result,
+            k,
+            expected_shape=(1, int(F_k_q["data"].shape[0]), int(F_k_q["data"].shape[1])),
+            device=torch.device("cpu"),
+        )[0].cpu().contiguous()
         entry = {
             "I_asset": I_k,
             "A_asset": A_k,
             "F_g_lut_asset_int8": F_k_q["data"].cpu(),
             "F_g_lut_asset_scale": F_k_q["scale"].cpu(),
+            "asset_patch_valid_mask": patch_mask,
             "G_asset_dggt_per_frame": [
                 {kk: vv.cpu() for kk, vv in g.items()}
                 for g in asset_result.G_asset_dggt[k]
@@ -1506,6 +1517,9 @@ def precompute_one_clip(
                 "skipped"
                 if asset_pass_result is None
                 else str(asset_pass_result.asset_pass_space)
+            ),
+            "asset_patch_mask_version": (
+                ASSET_PATCH_MASK_VERSION if args.edit_mode == "mode_a" else "none"
             ),
             "editor_config": {
                 "use_pose_refine": True,

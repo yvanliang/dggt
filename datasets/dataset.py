@@ -520,6 +520,9 @@ class WaymoOpenDataset(Dataset):
         pretrain_instance_cache_size=8,
         trunk_major_samples=False,
         trunk_frames=29,
+        camera_anchor_window_probability=0.0,
+        return_full_dggt_context=False,
+        trunk_major_window_offsets=None,
     ):
         #mode 1 : train
         #mode 2 : pure reconstruction
@@ -564,6 +567,25 @@ class WaymoOpenDataset(Dataset):
         self.trunk_frames = int(trunk_frames)
         if self.trunk_frames <= 0:
             raise ValueError(f"trunk_frames must be positive, got {trunk_frames}")
+        self.camera_anchor_window_probability = float(camera_anchor_window_probability)
+        if not 0.0 <= self.camera_anchor_window_probability <= 1.0:
+            raise ValueError(
+                "camera_anchor_window_probability must be in [0, 1], got "
+                f"{camera_anchor_window_probability}"
+            )
+        self.return_full_dggt_context = bool(return_full_dggt_context)
+        if self.return_full_dggt_context and self.views != 1:
+            raise ValueError("Full DGGT context is currently supported only for views=1.")
+        if trunk_major_window_offsets is None:
+            self.trunk_major_window_offsets = None
+        else:
+            offsets = tuple(int(offset) for offset in trunk_major_window_offsets)
+            if not offsets or any(offset < 0 for offset in offsets):
+                raise ValueError(
+                    "trunk_major_window_offsets must contain non-negative offsets, got "
+                    f"{trunk_major_window_offsets}"
+                )
+            self.trunk_major_window_offsets = tuple(dict.fromkeys(offsets))
         self.scene_name_to_index_path = scene_name_to_index_path
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.waymo_train_list_path = waymo_train_list_path or os.path.join(repo_root, "data", "waymo_train_list_full.txt")
@@ -744,7 +766,13 @@ class WaymoOpenDataset(Dataset):
                     total_frames = len(paths[0] if self.views == 3 else paths)
                     available = min(trunk_base + self.trunk_frames, total_frames) - trunk_base
                     if available >= int(self.sequence_length):
-                        self.trunk_major_index.append((scene_idx, trunk_idx))
+                        if self.trunk_major_window_offsets is None:
+                            self.trunk_major_index.append((scene_idx, trunk_idx))
+                        else:
+                            max_offset = available - int(self.sequence_length)
+                            for offset in self.trunk_major_window_offsets:
+                                if offset <= max_offset:
+                                    self.trunk_major_index.append((scene_idx, trunk_idx, offset))
 
 
     def _build_scene_name_to_base(self, scene_name_to_index_path, image_dir):
@@ -866,7 +894,38 @@ class WaymoOpenDataset(Dataset):
                 f"trunk {trunk_idx} has only {end - base} frames, "
                 f"fewer than {self.sequence_length}"
             )
-        return random.randint(base, end - int(self.sequence_length))
+        return self._sample_balanced_camera_start(base, end)
+
+    def _fixed_start_in_trunk(self, total_frames, trunk_idx, window_offset=None):
+        """Select the deterministic offset requested by ``start_idx`` in a trunk."""
+        base = int(trunk_idx) * self.trunk_frames
+        end = min(base + self.trunk_frames, int(total_frames))
+        if end - base < int(self.sequence_length):
+            raise IndexError(
+                f"trunk {trunk_idx} has only {end - base} frames, "
+                f"fewer than {self.sequence_length}"
+            )
+        requested_offset = int(self.start_idx) if window_offset is None else int(window_offset)
+        offset = min(max(0, requested_offset), end - base - int(self.sequence_length))
+        return base + offset
+
+    def _sample_balanced_camera_start(self, base, end):
+        """Balance clip-anchor and delta-only windows without changing token roles.
+
+        Natural uniform sampling sees the clip anchor with probability
+        ``1 / (trunk_frames - sequence_length + 1)``.  Instead, first choose
+        whether this sample contains the one global camera anchor, then sample
+        uniformly among the non-anchor starts.  This avoids both anchor
+        starvation and accidentally promoting a local window start to anchor.
+        """
+        base = int(base)
+        end = int(end)
+        last_start = end - int(self.sequence_length)
+        if last_start <= base:
+            return base
+        if random.random() < self.camera_anchor_window_probability:
+            return base
+        return random.randint(base + 1, last_start)
 
     def _sample_start_within_caption_trunk(self, total_frames, trunk_frames=29):
         """Sample a contiguous raw-pretrain window without crossing caption trunks."""
@@ -885,7 +944,7 @@ class WaymoOpenDataset(Dataset):
         if not valid_trunks:
             return random.randint(0, max(0, total_frames - sequence_length))
         base, end = random.choice(valid_trunks)
-        return random.randint(base, end - sequence_length)
+        return self._sample_balanced_camera_start(base, end)
 
     def _fixed_start_within_caption_trunk(self, total_frames, trunk_frames=29):
         """Return a deterministic start index without crossing caption trunks."""
@@ -1242,24 +1301,34 @@ class WaymoOpenDataset(Dataset):
 
     def __getitem__(self, idx):
         trunk_idx = None
+        trunk_window_offset = None
         if self.trunk_major_samples:
-            idx, trunk_idx = self.trunk_major_index[idx]
+            trunk_entry = self.trunk_major_index[idx]
+            if len(trunk_entry) == 3:
+                idx, trunk_idx, trunk_window_offset = trunk_entry
+            else:
+                idx, trunk_idx = trunk_entry
         image_paths = self.image_paths[idx]
         sky_mask_paths = self.sky_mask_paths[idx]
         dynamic_mask_paths = self.dynamic_mask_path[idx]
         semantic_mask_paths = self.semantic_mask_path[idx]
 
         total_frames = len(image_paths[0] if self.views == 3 else image_paths)
-        start_idx = (
-            self._sample_start_in_trunk(total_frames, trunk_idx)
-            if trunk_idx is not None
-            else
-            self._fixed_start_within_caption_trunk(total_frames)
-            if self.mode == 1 and int(self.start_idx) >= 0
-            else self._sample_start_within_caption_trunk(total_frames)
-            if self.mode == 1
-            else 0
-        )
+        if trunk_idx is not None:
+            if trunk_window_offset is not None:
+                start_idx = self._fixed_start_in_trunk(
+                    total_frames, trunk_idx, window_offset=trunk_window_offset
+                )
+            elif self.mode == 1 and int(self.start_idx) >= 0:
+                start_idx = self._fixed_start_in_trunk(total_frames, trunk_idx)
+            else:
+                start_idx = self._sample_start_in_trunk(total_frames, trunk_idx)
+        elif self.mode == 1 and int(self.start_idx) >= 0:
+            start_idx = self._fixed_start_within_caption_trunk(total_frames)
+        elif self.mode == 1:
+            start_idx = self._sample_start_within_caption_trunk(total_frames)
+        else:
+            start_idx = 0
 
         if self.mode == 1:
             indices = list(range(start_idx, start_idx + self.sequence_length))
@@ -1267,7 +1336,26 @@ class WaymoOpenDataset(Dataset):
             #images
             if self.views == 1:
                 seq = [image_paths[i] for i in indices]
-                images = load_and_preprocess_images(seq)  # [S, C, H, W]
+                if self.return_full_dggt_context:
+                    context_base = (int(start_idx) // self.trunk_frames) * self.trunk_frames
+                    context_end = context_base + self.trunk_frames
+                    if context_end > total_frames:
+                        raise RuntimeError(
+                            "Full DGGT context requires a complete caption trunk: "
+                            f"scene={self.scenes[idx]} base={context_base} end={context_end} "
+                            f"total_frames={total_frames}"
+                        )
+                    context_indices = list(range(context_base, context_end))
+                    context_seq = [image_paths[i] for i in context_indices]
+                    dggt_context_images = load_and_preprocess_images(context_seq)
+                    window_context_indices = torch.tensor(
+                        [i - context_base for i in indices], dtype=torch.long
+                    )
+                    images = dggt_context_images.index_select(0, window_context_indices)
+                else:
+                    dggt_context_images = None
+                    window_context_indices = None
+                    images = load_and_preprocess_images(seq)  # [S, C, H, W]
             elif self.views == 3:
                 seq = []
                 for i in indices:
@@ -1303,6 +1391,13 @@ class WaymoOpenDataset(Dataset):
                 "start_idx": start_idx,
                 "clip_index": start_idx // 29,
             }
+            if self.return_full_dggt_context:
+                input_dict["dggt_context_images"] = dggt_context_images
+                input_dict["dggt_window_indices"] = window_context_indices
+                input_dict["dggt_context_frame_ids"] = torch.arange(
+                    self.trunk_frames, dtype=torch.long
+                )
+                input_dict["window_contains_camera_anchor"] = bool(frame_ids[0] == 0)
             caption = self._load_caption(self.scenes[idx], start_idx)
             if caption is not None:
                 if self.views == 1:

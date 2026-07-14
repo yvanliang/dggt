@@ -132,14 +132,16 @@ def test_sparse_asset_tokens_are_identical_across_overlapping_global_windows():
     assert pos_b[0, 15 * tokens_per_frame, 0].item() == 23
 
 
-def test_preserve_loss_velocity_fallback_recovers_clean_as_noise_minus_velocity():
+def test_preserve_loss_requires_explicit_clean_prediction_for_rae_velocity():
     z_clean = torch.randn(2, 3, 4, 8)
     eps = torch.randn_like(z_clean)
     v_pred = eps - z_clean
     preserve = torch.ones(2, 3, 4, 1)
 
-    loss = preserve_loss(v_pred, eps, z_clean, preserve)
+    with pytest.raises(ValueError, match="requires an explicit clean prediction"):
+        preserve_loss(v_pred, eps, z_clean, preserve)
 
+    loss = preserve_loss(v_pred, eps, z_clean, preserve, z_pred=z_clean)
     assert float(loss.item()) < 1e-12
 
 
@@ -162,7 +164,7 @@ def test_scene_flow_defaults_to_clean_prediction():
     assert model.config.prediction_type == "x"
 
 
-def test_a1_rope_layout_is_versioned_in_config():
+def test_rope_layout_is_versioned_in_config():
     model = _tiny_model()
     assert model.config.rope_layout_version == ROPE_LAYOUT_VERSION
 
@@ -231,7 +233,7 @@ def test_qwen_text_condition_uses_zero_rope_positions():
     assert not pos.any()
 
 
-def test_a1_rope_positions_use_video_camera_shared_grid_and_sky_offset():
+def test_rope_positions_use_video_camera_shared_grid_and_spherical_sky():
     model = _tiny_model()
     video_pos = model._target_position_ids(
         batch_size=1,
@@ -241,12 +243,22 @@ def test_a1_rope_positions_use_video_camera_shared_grid_and_sky_offset():
         device=torch.device("cpu"),
     )
     camera_pos = model._camera_position_ids(batch_size=1, seq_len=2, device=torch.device("cpu"))
-    sky_pos = model._sky_position_ids(batch_size=1, num_tokens=4, device=torch.device("cpu"))
+    sky_model = _tiny_model(sky_grid=(2, 4), max_sky_tokens=8)
+    sky_pos = sky_model._sky_position_ids(batch_size=1, num_tokens=8, device=torch.device("cpu"))
 
     assert video_pos[0, [0, 4], 0].tolist() == [0, 1]
     assert camera_pos[0, :, 0].tolist() == [0, 1]
     assert camera_pos[0, :, 1:].tolist() == [[1, 1], [1, 1]]
-    assert sky_pos[0, :, 0].tolist() == [SKY_MROPE_TEMPORAL_OFFSET] * 4
+    assert sky_pos.dtype == torch.float32
+    assert torch.all((sky_pos - SKY_MROPE_TEMPORAL_OFFSET).norm(dim=-1).sub(8.0).abs() < 1e-3)
+
+    # On the lower atlas row, longitude columns 3 and 0 straddle the atlas
+    # boundary and must be as close as the ordinary neighboring pair 0 and 1.
+    seam_distance = (sky_pos[0, 4] - sky_pos[0, 7]).norm()
+    neighbor_distance = (sky_pos[0, 4] - sky_pos[0, 5]).norm()
+    opposite_distance = (sky_pos[0, 4] - sky_pos[0, 6]).norm()
+    assert torch.allclose(seam_distance, neighbor_distance, atol=1e-4)
+    assert seam_distance < opposite_distance
 
 
 def test_global_mrope_temporal_margin_is_removed():
@@ -335,6 +347,52 @@ def test_sparse_asset_uncond_uses_single_learned_null_token():
     assert torch.allclose(tokens[0, 0], model.asset_null_condition_embed.detach().reshape(-1))
     assert pos[0, 0].tolist() == [0, 0, 0]
     assert int(out_mask[1].sum().item()) > 1
+
+
+def test_sparse_mode_a_with_empty_reserves_token_budget_for_empty_condition():
+    model = _tiny_model(
+        max_asset_tokens=2,
+        max_asset_patch_tokens_per_asset_frame=1,
+    )
+    assets = torch.randn(1, 5, 1, 4, 8)
+    mask = torch.zeros(1, 5, 1, 4, dtype=torch.bool)
+    mask[0, 0, 0, 0] = True
+
+    tokens, out_mask, pos = model._build_sparse_asset_condition(
+        assets,
+        mask,
+        seq_len=1,
+        num_patches=4,
+        patch_grid=(2, 2),
+        asset_condition_kind=["mode_a_with_empty"],
+    )
+
+    empty = model.empty_asset_embed.detach().reshape(-1)
+    assert tokens.shape == (1, 2, 16)
+    assert out_mask is not None and out_mask.all()
+    assert not torch.allclose(tokens[0, 0], empty)
+    assert torch.allclose(tokens[0, 1], empty)
+    assert pos[0, 1].tolist() == [0, 0, 0]
+
+
+def test_sparse_mode_a_with_empty_rejects_impossible_single_token_budget():
+    model = _tiny_model(
+        max_asset_tokens=1,
+        max_asset_patch_tokens_per_asset_frame=1,
+    )
+    assets = torch.randn(1, 5, 1, 4, 8)
+    mask = torch.zeros(1, 5, 1, 4, dtype=torch.bool)
+    mask[0, 0, 0, 0] = True
+
+    with pytest.raises(ValueError, match="max_asset_tokens >= 2"):
+        model._build_sparse_asset_condition(
+            assets,
+            mask,
+            seq_len=1,
+            num_patches=4,
+            patch_grid=(2, 2),
+            asset_condition_kind=["mode_a_with_empty"],
+        )
 
 
 def test_camera_uncond_uses_per_frame_learned_null_tokens():

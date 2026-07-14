@@ -1,9 +1,41 @@
 """Smoke tests for `dggt.models.scaffold.ScaffoldPacker`."""
 from __future__ import annotations
 
+import os
+
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel
 
 from dggt.models.scaffold import ScaffoldPacker
+
+
+def _run_pooled_scaffold_ddp_step(
+    rank: int,
+    world_size: int,
+    rendezvous_path: str,
+    output_dir: str,
+) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{rendezvous_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(0)
+        packer = DistributedDataParallel(
+            ScaffoldPacker(in_channels=7, out_dim=4, hidden_dim=8)
+        )
+        optimizer = torch.optim.SGD(packer.parameters(), lr=0.1)
+        pooled = torch.full((1, 2, 3, 7), float(rank + 1))
+        loss = packer(pooled, already_pooled=True).square().mean()
+        loss.backward()
+        optimizer.step()
+        torch.save(packer.module.state_dict(), os.path.join(output_dir, f"rank{rank}.pt"))
+    finally:
+        dist.destroy_process_group()
 
 
 def test_forward_shape():
@@ -19,6 +51,48 @@ def test_gradient_flows():
     out = packer(x, target_grid=37)
     out.sum().backward()
     assert x.grad is not None and x.grad.abs().sum() > 0
+
+
+def test_already_pooled_forward_matches_mlp_and_keeps_gradients():
+    packer = ScaffoldPacker(in_channels=7, out_dim=16, hidden_dim=8)
+    pooled = torch.randn(2, 3, 5, 7, requires_grad=True)
+
+    expected = packer.mlp(pooled)
+    actual = packer(pooled, already_pooled=True)
+
+    assert torch.allclose(actual, expected)
+    actual.sum().backward()
+    assert pooled.grad is not None and pooled.grad.abs().sum() > 0
+
+
+def test_already_pooled_forward_rejects_hires_or_wrong_channels():
+    packer = ScaffoldPacker(in_channels=7, out_dim=16, hidden_dim=8)
+
+    for invalid in (torch.randn(1, 2, 4, 4, 7), torch.randn(1, 2, 4, 6)):
+        try:
+            packer(invalid, already_pooled=True)
+        except ValueError:
+            continue
+        raise AssertionError("expected ValueError for invalid already-pooled scaffold")
+
+
+def test_already_pooled_forward_synchronizes_two_ddp_ranks(tmp_path):
+    if not dist.is_available():
+        return
+    rendezvous = tmp_path / "ddp_init"
+    mp.start_processes(
+        _run_pooled_scaffold_ddp_step,
+        args=(2, str(rendezvous), str(tmp_path)),
+        nprocs=2,
+        join=True,
+        start_method="spawn",
+    )
+
+    rank0 = torch.load(tmp_path / "rank0.pt", map_location="cpu")
+    rank1 = torch.load(tmp_path / "rank1.pt", map_location="cpu")
+    assert rank0.keys() == rank1.keys()
+    for key in rank0:
+        assert torch.equal(rank0[key], rank1[key]), key
 
 
 def test_rejects_wrong_channels():

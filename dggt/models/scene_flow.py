@@ -68,8 +68,9 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
 
 COSMOS_MROPE_SECTION = (24, 20, 20)
 VIDEO_STATE_DIM = 6
-ROPE_LAYOUT_VERSION = "a2_camera_center_sky15000"
+ROPE_LAYOUT_VERSION = "a3_camera_center_spherical_sky15000"
 SKY_MROPE_TEMPORAL_OFFSET = 15000
+SKY_MROPE_SPHERE_RADIUS = 8.0
 VIDEO_MROPE_TEMPORAL_LIMIT = SKY_MROPE_TEMPORAL_OFFSET
 DEFAULT_ROPE_MAX_POSITION = 16384
 CAMERA_ROPE_SPATIAL_MODE = "center"
@@ -836,6 +837,8 @@ class RAEVideoSceneFlow(nn.Module):
             raise ValueError(f"unsupported camera generation representation {camera_generation_representation!r}")
         if str(asset_position_mode) not in ("localized", "canonical"):
             raise ValueError("asset_position_mode must be 'localized' or 'canonical'")
+        if int(max_asset_tokens) <= 0:
+            raise ValueError(f"max_asset_tokens must be positive, got {max_asset_tokens}")
         sky_grid_t = None
         if sky_grid is not None:
             if len(sky_grid) != 2:
@@ -861,10 +864,10 @@ class RAEVideoSceneFlow(nn.Module):
             )
         if sky_mask_refine_channels <= 0:
             raise ValueError(f"sky_mask_refine_channels must be positive, got {sky_mask_refine_channels}")
-        if int(rope_max_position) <= SKY_MROPE_TEMPORAL_OFFSET:
+        if float(rope_max_position) <= SKY_MROPE_TEMPORAL_OFFSET + SKY_MROPE_SPHERE_RADIUS:
             raise ValueError(
-                f"rope_max_position={rope_max_position} must exceed the sky modality position "
-                f"{SKY_MROPE_TEMPORAL_OFFSET}"
+                f"rope_max_position={rope_max_position} must exceed the spherical sky RoPE range ending at "
+                f"{SKY_MROPE_TEMPORAL_OFFSET + SKY_MROPE_SPHERE_RADIUS}"
             )
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
@@ -884,8 +887,8 @@ class RAEVideoSceneFlow(nn.Module):
         del timestep_scale
         if "mrope_temporal_margin" in unused:
             raise TypeError(
-                "mrope_temporal_margin has been removed. SceneFlow now uses fixed A2 RoPE positions: "
-                "video/asset/control temporal offset 0, camera on the video frame center, and sky temporal offset 15000."
+                "mrope_temporal_margin has been removed. SceneFlow now uses fixed A3 RoPE positions: "
+                "video/asset/control temporal offset 0, camera on the video frame center, and spherical sky coordinates near 15000."
             )
         # Accepted only so tiny downstream constructors using the former inert
         # field keep working. It is deliberately not serialized or used.
@@ -1242,8 +1245,8 @@ class RAEVideoSceneFlow(nn.Module):
     ) -> "RAEVideoSceneFlow":
         if "mrope_temporal_margin" in kwargs:
             raise TypeError(
-                "mrope_temporal_margin has been removed. Use the fixed A2 RoPE layout "
-                "(video/asset/camera shared grid, sky offset 15000)."
+                "mrope_temporal_margin has been removed. Use the fixed A3 RoPE layout "
+                "(video/asset/camera shared grid, spherical sky coordinates near 15000)."
             )
         if bring_up:
             defaults = {
@@ -1627,6 +1630,110 @@ class RAEVideoSceneFlow(nn.Module):
         sampled = sorted_idx.gather(1, ranks).clamp_max(max(p - 1, 0))
         return sampled, slots.lt(sample_count.view(n, 1))
 
+    @staticmethod
+    def _balanced_frame_token_counts(
+        valid_counts: torch.Tensor,
+        *,
+        max_per_frame: int,
+        max_total: int,
+    ) -> torch.Tensor:
+        """Allocate a clip-level sparse-token budget without temporal prefix bias.
+
+        The allocation is integer max-min fair across active frames. Frames whose
+        support contains fewer tokens keep only their available tokens; the freed
+        budget is redistributed to frames with remaining capacity. Any final
+        sub-round remainder is spread uniformly over the eligible frame indices
+        instead of being assigned to the earliest frames.
+        """
+        if valid_counts.ndim != 2:
+            raise ValueError(f"valid_counts must be [B,S], got {tuple(valid_counts.shape)}")
+        max_per_frame = int(max_per_frame)
+        max_total = int(max_total)
+        counts = valid_counts.to(dtype=torch.long).clamp_min(0)
+        if max_per_frame <= 0 or max_total <= 0 or counts.shape[1] == 0:
+            return torch.zeros_like(counts)
+
+        capacity = counts.clamp_max(max_per_frame)
+        target_total = capacity.sum(dim=1).clamp_max(max_total)
+
+        # Find the largest common integer water level whose capped allocation
+        # fits in the clip-level budget. The loop count depends only on the
+        # static per-frame ceiling and does not synchronize device tensors.
+        low = torch.zeros_like(target_total)
+        high = torch.full_like(target_total, max_per_frame + 1)
+        for _ in range((max_per_frame + 1).bit_length()):
+            mid = torch.div(low + high, 2, rounding_mode="floor")
+            used = torch.minimum(capacity, mid.unsqueeze(1)).sum(dim=1)
+            fits = used <= target_total
+            low = torch.where(fits, mid, low)
+            high = torch.where(fits, high, mid)
+
+        allocation = torch.minimum(capacity, low.unsqueeze(1))
+        remaining = target_total - allocation.sum(dim=1)
+        eligible = capacity > allocation
+        eligible_count = eligible.sum(dim=1)
+
+        # At the maximal water level, `remaining` is strictly smaller than the
+        # number of eligible frames. Select exactly that many frames at evenly
+        # spaced eligible ranks so the one-token remainder has no prefix bias.
+        seq_len = int(counts.shape[1])
+        remainder_slots = torch.arange(seq_len, device=counts.device, dtype=torch.long).view(1, seq_len)
+        valid_remainder_slot = remainder_slots < remaining.unsqueeze(1)
+        remaining_safe = remaining.clamp_min(1).unsqueeze(1)
+        eligible_count_safe = eligible_count.clamp_min(1).unsqueeze(1)
+        target_ranks = torch.div(
+            (2 * remainder_slots + 1) * eligible_count_safe,
+            2 * remaining_safe,
+            rounding_mode="floor",
+        ).clamp_max(eligible_count_safe - 1)
+        eligible_ranks = eligible.to(dtype=torch.long).cumsum(dim=1) - 1
+        receive_extra = (
+            eligible_ranks.unsqueeze(2).eq(target_ranks.unsqueeze(1))
+            & valid_remainder_slot.unsqueeze(1)
+        ).any(dim=2)
+        allocation = allocation + (receive_extra & eligible).to(dtype=allocation.dtype)
+        return allocation
+
+    @staticmethod
+    def _uniform_sample_mask_indices_with_counts(
+        valid_mask: torch.Tensor,
+        sample_counts: torch.Tensor,
+        *,
+        max_count: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Uniformly sample a different deterministic token count for each row."""
+        if valid_mask.ndim != 2:
+            raise ValueError(f"valid_mask must be [N,P], got {tuple(valid_mask.shape)}")
+        if sample_counts.shape != (valid_mask.shape[0],):
+            raise ValueError(
+                f"sample_counts must be [N]={valid_mask.shape[0]}, got {tuple(sample_counts.shape)}"
+            )
+        n, p = valid_mask.shape
+        max_count = int(max_count)
+        if max_count <= 0:
+            idx = torch.zeros((n, 0), device=valid_mask.device, dtype=torch.long)
+            keep = torch.zeros((n, 0), device=valid_mask.device, dtype=torch.bool)
+            return idx, keep
+
+        counts = valid_mask.sum(dim=1).to(dtype=torch.long)
+        requested = sample_counts.to(device=valid_mask.device, dtype=torch.long).clamp_min(0)
+        requested = torch.minimum(requested, counts).clamp_max(max_count)
+        patch_idx = torch.arange(p, device=valid_mask.device, dtype=torch.long).view(1, p)
+        sorted_idx = torch.where(valid_mask, patch_idx, torch.full_like(patch_idx, p)).sort(dim=1).values
+        slots = torch.arange(max_count, device=valid_mask.device, dtype=torch.long).view(1, max_count)
+
+        # For q>1, ranks span the complete valid support from first to last. A
+        # single requested token uses the support midpoint rather than its first
+        # patch. Masked slots may contain arbitrary safe indices and are ignored.
+        denom = requested.sub(1).clamp_min(1).unsqueeze(1)
+        numer = slots * counts.sub(1).clamp_min(0).unsqueeze(1)
+        ranks = torch.div(numer + torch.div(denom, 2, rounding_mode="floor"), denom, rounding_mode="floor")
+        midpoint = torch.div(counts.sub(1).clamp_min(0), 2, rounding_mode="floor").unsqueeze(1)
+        ranks = torch.where(requested.unsqueeze(1).eq(1), midpoint, ranks)
+        ranks = ranks.clamp_min(0).clamp_max(max(p - 1, 0))
+        sampled = sorted_idx.gather(1, ranks).clamp_max(max(p - 1, 0))
+        return sampled, slots < requested.unsqueeze(1)
+
     def _pad_sparse_condition(
         self,
         token_rows: list[torch.Tensor],
@@ -1826,20 +1933,42 @@ class RAEVideoSceneFlow(nn.Module):
             )
             null_token = self.asset_null_condition_embed.to(device=device, dtype=projected.dtype).reshape(1, hidden_size)
             for row in range(b):
-                pieces = [block_tokens[row, block_mask[row]]]
-                positions = [block_pos[row, block_mask[row]]]
+                row_tokens = block_tokens[row, block_mask[row]]
+                row_positions = block_pos[row, block_mask[row]]
                 if null_rows is not None and bool(null_rows[row].item()):
-                    pieces = [null_token]
-                    positions = [torch.tensor([[0, 0, 0]], device=device, dtype=block_pos.dtype)]
+                    row_tokens = null_token
+                    row_positions = torch.tensor([[0, 0, 0]], device=device, dtype=block_pos.dtype)
                 elif replace_rows is not None and bool(replace_rows[row].item()):
-                    pieces = [self.empty_asset_embed.to(device=device, dtype=projected.dtype).reshape(1, hidden_size)]
-                    positions = [torch.tensor([[0, 0, 0]], device=device, dtype=block_pos.dtype)]
+                    row_tokens = self.empty_asset_embed.to(
+                        device=device,
+                        dtype=projected.dtype,
+                    ).reshape(1, hidden_size)
+                    row_positions = torch.tensor([[0, 0, 0]], device=device, dtype=block_pos.dtype)
                 elif append_rows is not None and bool(append_rows[row].item()):
-                    pieces.append(self.empty_asset_embed.to(device=device, dtype=projected.dtype).reshape(1, hidden_size))
-                    positions.append(torch.tensor([[0, 0, 0]], device=device, dtype=block_pos.dtype))
-                if pieces and sum(int(piece.shape[0]) for piece in pieces) > 0:
-                    token_rows.append(torch.cat(pieces, dim=0)[:max_asset_tokens])
-                    pos_rows.append(torch.cat(positions, dim=0)[:max_asset_tokens])
+                    if int(row_tokens.shape[0]) > 0 and max_asset_tokens < 2:
+                        raise ValueError(
+                            "mode_a_with_empty requires max_asset_tokens >= 2 when REAL asset tokens are present"
+                        )
+                    # EMPTY is the deletion control for a combined edit, so it
+                    # must survive any truncation of the preceding REAL tokens.
+                    real_budget = max(0, max_asset_tokens - 1)
+                    row_tokens = torch.cat(
+                        [
+                            row_tokens[:real_budget],
+                            self.empty_asset_embed.to(device=device, dtype=projected.dtype).reshape(1, hidden_size),
+                        ],
+                        dim=0,
+                    )
+                    row_positions = torch.cat(
+                        [
+                            row_positions[:real_budget],
+                            torch.tensor([[0, 0, 0]], device=device, dtype=block_pos.dtype),
+                        ],
+                        dim=0,
+                    )
+                if int(row_tokens.shape[0]) > 0:
+                    token_rows.append(row_tokens[:max_asset_tokens])
+                    pos_rows.append(row_positions[:max_asset_tokens])
                 else:
                     token_rows.append(torch.zeros((0, hidden_size), device=device, dtype=projected.dtype))
                     pos_rows.append(torch.zeros((0, 3), device=device, dtype=block_pos.dtype))
@@ -2231,10 +2360,14 @@ class RAEVideoSceneFlow(nn.Module):
         num_tokens: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Cosmos-style 3D RoPE ids for scene-level sky atlas tokens."""
+        """3D RoPE coordinates on the upper unit hemisphere.
+
+        Encoding Cartesian directions makes the first and last longitude
+        columns adjacent in RoPE space without a separate seam objective.
+        """
         num_tokens = int(num_tokens)
         if num_tokens <= 0:
-            return torch.zeros((batch_size, 0, 3), device=device, dtype=torch.long)
+            return torch.zeros((batch_size, 0, 3), device=device, dtype=torch.float32)
         grid = getattr(self.config, "sky_grid", None)
         if grid is not None and int(grid[0]) * int(grid[1]) >= num_tokens:
             gh, gw = int(grid[0]), int(grid[1])
@@ -2244,11 +2377,20 @@ class RAEVideoSceneFlow(nn.Module):
         idx = torch.arange(num_tokens, device=device, dtype=torch.long)
         y = torch.div(idx, gw, rounding_mode="floor").clamp_max(max(gh - 1, 0))
         x = (idx % gw).clamp_max(max(gw - 1, 0))
-        pos = torch.zeros((batch_size, num_tokens, 3), device=device, dtype=torch.long)
-        pos[..., 0] = int(self.config.sky_rope_temporal_offset)
-        pos[..., 1] = y.view(1, num_tokens)
-        pos[..., 2] = x.view(1, num_tokens)
-        return pos
+        elevation = (1.0 - (y.float() + 0.5) / float(gh)) * (math.pi * 0.5)
+        azimuth = ((x.float() + 0.5) / float(gw)) * (math.pi * 2.0) - math.pi
+        horizontal = torch.cos(elevation)
+        direction = torch.stack(
+            [
+                horizontal * torch.cos(azimuth),
+                -torch.sin(elevation),
+                horizontal * torch.sin(azimuth),
+            ],
+            dim=-1,
+        )
+        center = float(self.config.sky_rope_temporal_offset)
+        pos = center + SKY_MROPE_SPHERE_RADIUS * direction
+        return pos.view(1, num_tokens, 3).expand(batch_size, -1, -1).contiguous()
 
     def _build_camera_condition(
         self,
@@ -2467,7 +2609,18 @@ class RAEVideoSceneFlow(nn.Module):
             frame_ids=frame_ids,
             fps=fps,
         ).reshape(b, s, p, 3)
-        sampled, sample_mask = self._uniform_sample_mask_indices(support[..., 0].reshape(b * s, p), max_per_frame)
+        support_flat = support[..., 0].reshape(b * s, p)
+        valid_counts = support[..., 0].sum(dim=-1)
+        frame_token_counts = self._balanced_frame_token_counts(
+            valid_counts,
+            max_per_frame=max_per_frame,
+            max_total=max_total,
+        )
+        sampled, sample_mask = self._uniform_sample_mask_indices_with_counts(
+            support_flat,
+            frame_token_counts.reshape(b * s),
+            max_count=max_per_frame,
+        )
         control_flat = control_h.reshape(b * s, p, hidden_size)
         pos_flat = target_pos.reshape(b * s, p, 3)
         sampled_tokens = control_flat.gather(1, sampled.unsqueeze(-1).expand(-1, -1, hidden_size))
@@ -2486,8 +2639,10 @@ class RAEVideoSceneFlow(nn.Module):
                 continue
             row_mask = sample_mask[row]
             if bool(row_mask.any().item()):
-                token_rows.append(sampled_tokens[row, row_mask][:max_total])
-                pos_rows.append(sampled_pos[row, row_mask][:max_total])
+                # The balanced allocator already guarantees the clip-level
+                # budget, so concatenation cannot discard later frames.
+                token_rows.append(sampled_tokens[row, row_mask])
+                pos_rows.append(sampled_pos[row, row_mask])
             else:
                 token_rows.append(torch.zeros((0, hidden_size), device=device, dtype=control_h.dtype))
                 pos_rows.append(torch.zeros((0, 3), device=device, dtype=sampled_pos.dtype))

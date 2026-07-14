@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import inspect
+import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
 from dggt.losses.rgb_render_loss import (
     _masked_lpips,
@@ -20,7 +25,26 @@ from dggt.losses.rgb_render_loss import (
 )
 from dggt.utils.gaussian_render import composite_gsplat_rgb
 from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
-from train_scene_flow import _formal_rgb_context
+import train_scene_flow as formal_train
+from train_scene_flow import (
+    _cached_render_pose_from_payload,
+    _formal_rgb_context,
+    _prepare_visualization_batch,
+    cached_render_pose_from_item,
+)
+from train_scene_flow_pretrain import (
+    auxiliary_scene_flow_forward,
+    should_apply_sky_mask_endpoint_supervision,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PRETRAIN_LAUNCH_SCRIPTS = (
+    "pretrain_half_node_p6000.sh",
+    "pretrain_single_node.sh",
+    "pretrain_single_node_test.sh",
+    "pretrain_two_nodes.sh",
+)
 
 
 class _Tokenizer(nn.Module):
@@ -79,6 +103,12 @@ class _SkyModel(nn.Module):
         return torch.zeros((s, h, w, 3), device=images.device, dtype=images.dtype)
 
 
+class _FailIfCalledSkyModel(nn.Module):
+    def forward(self, *args, **kwargs):
+        del args, kwargs
+        raise AssertionError("formal GT-sky rendering must not call sky_model")
+
+
 class _VGGT(nn.Module):
     def __init__(self):
         super().__init__()
@@ -94,9 +124,33 @@ class _SceneFlow(nn.Module):
         return z
 
 
+class _ValidationVGGT(nn.Module):
+    def get_aggregator_token_outputs(self, images):
+        del images
+        return {"patch_start_idx": 5}
+
+    def semantic_head(self, tokens, images, patch_start_idx, image_hw=None):
+        del tokens, images, patch_start_idx
+        h, w = image_hw
+        return torch.zeros((1, 3, h, w, 2)), None
+
+
 class _SpatialLPIPS(nn.Module):
     def forward(self, prediction, target):
         return (prediction - target).abs().mean(dim=1, keepdim=True)
+
+
+class _AuxiliaryDDPModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.trunk = nn.Linear(2, 2, bias=False)
+        self.repa_proj = nn.Linear(2, 2, bias=False)
+
+    def forward(self, inputs: torch.Tensor, *, return_mid: bool) -> torch.Tensor:
+        outputs = self.trunk(inputs)
+        if return_mid:
+            outputs = outputs + self.repa_proj(inputs)
+        return outputs
 
 
 def test_primary_rgb_api_has_no_teacher_depth_argument():
@@ -165,6 +219,84 @@ def test_formal_context_ignores_teacher_depth():
     assert not any("depth" in key for key in context)
 
 
+def test_validation_pose_uses_cached_full_context_then_slices_window():
+    full_pose = torch.arange(29 * 9, dtype=torch.float32).reshape(29, 9)
+    subset = torch.tensor([7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    selected = _cached_render_pose_from_payload(
+        {"pass1": {"pose_enc": full_pose}},
+        subset,
+    )
+    torch.testing.assert_close(selected, full_pose[subset].unsqueeze(0))
+
+    # Dataset items already contain the selected pose; subset_frames are
+    # original clip indices and must not be applied a second time.
+    item = {
+        "cache_path": "validation.pt",
+        "subset_frames": subset,
+        "predictions": {"pose_enc": selected},
+    }
+    torch.testing.assert_close(cached_render_pose_from_item(item), selected)
+
+
+def test_visualization_batch_requires_matching_cached_pose():
+    sample = {
+        "images": torch.zeros((3, 3, 4, 5)),
+        "masks": torch.zeros((3, 3, 4, 5)),
+        "timestamps": torch.arange(3),
+    }
+    pose = torch.zeros((1, 3, 9))
+    batch = _prepare_visualization_batch(sample, render_pose_enc_dggt=pose)
+    assert batch["render_pose_enc_dggt"] is pose
+
+    with pytest.raises(ValueError, match="pose_enc must be"):
+        _prepare_visualization_batch(
+            sample,
+            render_pose_enc_dggt=torch.zeros((1, 2, 9)),
+        )
+
+
+def test_generated_validation_renderer_uses_cached_pose_without_camera_head(monkeypatch):
+    seq_len, height, width = 3, 4, 5
+    cached_pose = torch.arange(seq_len * 9, dtype=torch.float32).reshape(1, seq_len, 9)
+    batch = {
+        "images": torch.zeros((1, seq_len, 3, height, width)),
+        "masks": torch.zeros((1, seq_len, 3, height, width)),
+        "timestamps": torch.arange(seq_len).unsqueeze(0),
+        "render_pose_enc_dggt": cached_pose,
+    }
+    geometry = SimpleNamespace(
+        dino_tokens=None,
+        depth=torch.zeros((1, seq_len, height, width, 1)),
+        dynamic_conf=torch.zeros((1, seq_len, height, width, 1)),
+        gs_map=torch.zeros((1, seq_len, height, width, 11)),
+        gs_conf=torch.ones((1, seq_len, height, width)),
+    )
+    captured: dict[str, torch.Tensor] = {}
+
+    monkeypatch.setattr(formal_train, "decode_generated_dggt_geometry", lambda **kwargs: geometry)
+    monkeypatch.setattr(
+        formal_train,
+        "_semantic_logits_to_sky_mask",
+        lambda logits: torch.zeros((1, seq_len, 1, height, width)),
+    )
+
+    def fake_render(*args, **kwargs):
+        del kwargs
+        captured["pose"] = args[4]
+        return torch.zeros((seq_len, 3, height, width))
+
+    monkeypatch.setattr(formal_train, "_render_gs_map_rgb", fake_render)
+    formal_train.render_validation_generated_rgb_gt_sky(
+        batch,
+        _ValidationVGGT(),  # Intentionally has no CameraHead.
+        _SceneFlow(),
+        torch.zeros((1, seq_len, 1, 4)),
+        SimpleNamespace(precision="fp32", val_log_images=seq_len, patch_grid=(1, 1)),
+        torch.device("cpu"),
+    )
+    torch.testing.assert_close(captured["pose"], cached_pose)
+
+
 def test_fast_flow_inputs_slice_asset_coverage_with_video_frames():
     payload = {
         "M_preserve": torch.zeros((6, 2, 1)),
@@ -202,6 +334,83 @@ def test_rgb_schedule_has_true_delay_and_period():
     assert rgb_render_loss_ramp(args, 10) == 0.0
     assert rgb_render_loss_ramp(args, 20) == 0.5
     assert rgb_render_loss_ramp(args, 30) == 1.0
+
+
+def test_sky_mask_endpoint_supervision_has_independent_delay_and_period():
+    args = SimpleNamespace(
+        sky_mask_endpoint_start_step=5000,
+        sky_mask_endpoint_every=4,
+    )
+    assert not should_apply_sky_mask_endpoint_supervision(args, None, training=True)
+    assert not should_apply_sky_mask_endpoint_supervision(args, 4999, training=True)
+    assert should_apply_sky_mask_endpoint_supervision(args, 5000, training=True)
+    assert not should_apply_sky_mask_endpoint_supervision(args, 5002, training=True)
+    assert should_apply_sky_mask_endpoint_supervision(args, 5004, training=True)
+    assert not should_apply_sky_mask_endpoint_supervision(args, 5004, training=False)
+
+    args.sky_mask_endpoint_every = 0
+    assert not should_apply_sky_mask_endpoint_supervision(args, 5000, training=True)
+
+
+def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
+    from train_scene_flow_pretrain import build_argparser
+
+    args = build_argparser().parse_args(
+        [
+            "--image_dir",
+            "/tmp/images",
+            "--dggt_ckpt_path",
+            "/tmp/dggt.pt",
+            "--feature_stats_path",
+            "/tmp/stats.pt",
+            "--log_dir",
+            "/tmp/logs",
+        ]
+    )
+    assert args.rgb_render_start_step == 5000
+    assert args.rgb_render_every == 2
+    assert args.rgb_render_max_frames == 0  # 0 means every frame in the clip.
+    assert args.rgb_render_stride == 1
+
+
+def test_pretrain_launch_scripts_do_not_override_rgb_coverage_defaults():
+    forbidden_flags = (
+        "--rgb_render_every",
+        "--rgb_render_max_frames",
+        "--rgb_render_stride",
+    )
+    for script_name in PRETRAIN_LAUNCH_SCRIPTS:
+        script = (REPO_ROOT / script_name).read_text()
+        for flag in forbidden_flags:
+            assert flag not in script, f"{script_name} must inherit the pretrain default for {flag}"
+
+
+def test_auxiliary_scene_flow_forward_does_not_prepare_ddp_reducer_twice():
+    if not dist.is_available():
+        pytest.skip("torch.distributed is unavailable")
+    if dist.is_initialized():
+        pytest.skip("test requires ownership of a temporary process group")
+
+    with tempfile.NamedTemporaryFile() as rendezvous:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"file://{os.path.abspath(rendezvous.name)}",
+            rank=0,
+            world_size=1,
+        )
+        try:
+            model = DistributedDataParallel(
+                _AuxiliaryDDPModel(),
+                find_unused_parameters=True,
+            )
+            inputs = torch.randn(3, 2)
+            primary = model(inputs, return_mid=True)
+            endpoint = auxiliary_scene_flow_forward(model, inputs, return_mid=False)
+            (primary + endpoint).square().mean().backward()
+            assert model.module.trunk.weight.grad is not None
+            assert model.module.repa_proj.weight.grad is not None
+        finally:
+            dist.destroy_process_group()
 
 
 def test_directional_sky_projection_matches_validation_path():
@@ -293,6 +502,48 @@ def test_full_rgb_loss_backpropagates_through_generated_depth_and_gs():
     assert z.grad is not None
     assert torch.isfinite(z.grad).all()
     assert float(z.grad.abs().sum()) > 0.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="gsplat CUDA GT-sky integration test")
+def test_formal_rgb_renderer_preserves_original_gt_sky_without_sky_model() -> None:
+    pytest.importorskip("gsplat")
+    device = torch.device("cuda:0")
+    seq_len, height, width = 2, 16, 16
+    z = torch.zeros((1, seq_len, 1, 4), device=device)
+    images = torch.full((1, seq_len, 3, height, width), 0.8, device=device)
+    sky_mask = torch.zeros((1, seq_len, 1, height, width), device=device)
+    sky_mask[..., : height // 2, :] = 1.0
+    pose = torch.tensor(
+        [[[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]],
+        device=device,
+    )
+    vggt = _VGGT().to(device)
+    vggt.sky_model = _FailIfCalledSkyModel().to(device)
+
+    result = compute_rgb_render_loss(
+        vggt_model=vggt,
+        scene_flow_root=_SceneFlow().to(device),
+        z_clean_pred_n=z,
+        images=images,
+        timestamps=torch.tensor([[0.0, 1.0]], device=device),
+        render_pose_enc_dggt=pose,
+        render_sky_probability=sky_mask,
+        loss_sky_mask_gt=sky_mask,
+        patch_grid=(1, 1),
+        patch_start_idx=1,
+        max_samples=1,
+        max_frames=seq_len,
+        render_stride=1,
+        background_mode="gt_sky",
+        patch_weight_mask=torch.ones((1, seq_len, 1, 1), device=device),
+        return_debug_tensors=True,
+    )
+
+    assert result.rendered is not None
+    sky = sky_mask.expand_as(images).bool()
+    torch.testing.assert_close(result.rendered[sky], images[sky], rtol=0.0, atol=0.0)
+    assert float((result.rendered[~sky] - images[~sky]).abs().mean()) > 0.01
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="gsplat CUDA parity test")

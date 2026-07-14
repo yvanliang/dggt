@@ -25,13 +25,21 @@ Forward 中先拼接 generation sequence，再拼接 condition sequence：
 full_seq = [video, camera_gen, sky_gen, timestep, text, camera_cond, asset, edit_control]
 ```
 
-时间和长视频 camera 采用 clip-global 约定：Gaussian timestamp 恒为
+时间和长视频 camera 采用 clip-global 约定：raw pretrain 先对完整 29 帧 caption clip
+运行一次冻结 DGGT，再从其输出切出 10 帧 tokenizer/camera target；Gaussian timestamp 恒为
 `clip_local_frame_id / 4`，不再随训练窗口长度归一化；Waymo camera condition 的
 `rel pose` 始终相对 clip frame 0，`delta pose` 始终相对真实前一帧。训练随机截取
 10 帧时仍携带这两个全局上下文，因此与 offline 先编码完整轨迹再切 10 帧窗口完全
-一致。Pretrain 另外以 `camera_anchor_context_dropout=0.25` 隐藏 global camera-gen
-anchor，仅监督可见 delta token，从而覆盖长视频后续滑窗不包含 anchor 的输入分布。
+一致。窗口采样先以 `camera_anchor_window_probability=0.5` 决定取 frame-0 anchor
+窗口还是非零起点的 delta-only 窗口，再在非零起点中均匀采样，避免自然采样导致
+anchor 稀缺。`camera_anchor_context_dropout` 默认改为 `0`，因为 delta-only 窗口本身
+已经覆盖长视频后续滑窗不包含 anchor 的输入分布；该参数仅保留为额外消融开关，且
+只会作用于确实包含 anchor 的窗口。
 默认长视频窗口为 10 帧、stride 7，即重叠 3 帧。
+训练内 validation 的局部 loss 使用同一窗口表（10 帧时起点为
+`0/7/14/19`），而生成验证在完整 29 帧上按训练 `sequence_length` 做 rollout；sampler
+返回完整的 global anchor mask 和 delta-only 首窗所需的 DGGT previous-C2W。所有 loss、指标、
+RGB/PLY 解码入口都必须显式消费这两个值，禁止根据局部 token 0 猜测 anchor。
 
 所有可见 token 一起做 full self-attention。模型只对 generation spans 解码：video span 走 RAEv2 DDT head；camera/sky spans 分别走独立 decoder head。
 
@@ -62,7 +70,9 @@ mode_scale = 1.29
 shift = 10.0
 ```
 
-`prediction_type=x` 对齐 RAEv2 T2I：DDT head 直接输出 clean latent，再按 `(z_t - x_pred) / sigma` 转换成 velocity 做 flow matching loss 和 ODE 采样。`shift=10.0` 是显式工程取值，不按视频 token 总维度继续放大，避免 `S*P*C` 使 shift 过大。pretrain、正式训练、训练内 validation 和离线 inference 必须保持同一组 flow/timestep 参数。
+`prediction_type=x` 对齐 RAEv2 T2I：DDT head 直接输出 clean latent，再按 `(z_t - x_pred) / max(sigma, t_eps)` 转换成 velocity 做 flow matching loss 和 ODE 采样。`shift=10.0` 是显式工程取值，不按视频 token 总维度继续放大，避免 `S*P*C` 使 shift 过大。pretrain、正式训练、训练内 validation 和离线 inference 必须保持同一组 flow/timestep 参数。
+
+RAEv2 的 clamped pseudo-velocity 不能在 `sigma<t_eps` 的网格点被当作精确 ODE 导数。采样入口因此要求最后一个非零时间点满足 `sigma_last>=t_eps`；对 shifted uniform grid，安全条件为 `sample_steps <= shift/t_eps-shift+1`。默认 `shift=10,t_eps=0.05` 时上限为 191 步，常用的 35/50 步均在安全区间。
 
 pretrain 是 full-scene prior：`M_preserve=0, M_source=0, M_dest=1`，从噪声生成完整 scene latent。正式训练把两类 mask 分开使用：连续的 `M_preserve/M_source/M_dest` 只表达几何覆盖和编辑语义；flow state 使用由 `M_source+M_dest` threshold 后再在 patch grid 上 dilation 得到的二值 `H_edit`。默认 `threshold=1e-4`、`dilation=1`，并由 train、训练内 validation 和 offline inference 共用同一个 helper。
 
@@ -105,6 +115,16 @@ SceneFlow 内部对 text 做 RMSNorm + Linear projection，再加 `text_modality
 
 DDT 的视觉 embedder 只吃当前噪声 latent `z_t`，不再吃旧实验中的 packed `[z_t, z_splat, scaffold, masks]`。局部编辑上下文作为 edit-control condition token 进入 full attention。
 
+Edit-control 使用按 model forward 计的两级稀疏预算：每帧上限
+`max_control_tokens_per_frame=128`，整个窗口上限 `max_control_tokens=1024`。
+预算根据当前样本中具有 edit support 的 active frame 动态做 integer max-min fair
+分配；support 较少的帧释放出的预算会重新分配，最后不足一轮的余量沿时间轴均匀
+散布，不再把 T-major 展平后的前 1024 个 token 直接截断。默认 10 帧窗口在
+所有帧均 active 时每帧得到 102 或 103 个 token；直接 29 帧 forward 时每帧得到
+35 或 36 个。每帧内部仍使用确定性的空间均匀采样，因此同一滑窗在各 ODE step
+使用一致的 control token 与 Cosmos mRoPE 位置。长视频滑窗的 1024 总预算按窗口
+重新计算，不随完整视频长度增长而持续压缩。
+
 每个 video token 额外注入 6 维 per-token state：
 
 ```text
@@ -134,15 +154,15 @@ SceneFlow 使用 Cosmos-style 3D mRoPE。当前正式从头训练配置：
 | camera generation token | 每帧 `(t, H//2, W//2)` |
 | text token | `(0,0,0)` |
 | timestep token | `(0,0,0)` |
-| sky token | `(128, sky_y, sky_x)`，使用 scene-level sky atlas grid |
+| sky token | `15000 + 8 * (dir_x, dir_y, dir_z)`，使用 scene-level 上半球方向 |
 
-SceneFlow 不再暴露全局 `mrope_temporal_margin`。当前写死 A1 坐标设计，并在 checkpoint 的 `scene_flow_config` 中记录 `rope_layout_version=a1_camera_center_sky128`：
+SceneFlow 不再暴露全局 `mrope_temporal_margin`。当前写死 A3 坐标设计，并在 checkpoint 的 `scene_flow_config` 中记录 `rope_layout_version=a3_camera_center_spherical_sky15000`：
 
 - text/timestep 保持 RAEv2-style zero RoPE；文本顺序已经由 Qwen hidden states 表达，不额外注入视频空间坐标。
 - video、asset、edit-control 共享真实视频 `(t,y,x)`，保留局部编辑所需的 patch 对齐归纳偏置。
 - camera 是全局每帧几何条件，temporal 与对应 video frame 对齐，spatial 放在 patch grid 中心，避免把相机条件绑定到左上角 patch。
-- sky 是 scene-level directional atlas，不是 image-plane patch；用独立 temporal offset `128` 与视频帧范围分离，但不采用 Cosmos3 `15000` 的 packed-segment大间隔。
-- 旧 checkpoint 如果仍记录全局 `mrope_temporal_margin`，其 camera/sky 位置语义与 A1 不一致，不应直接续训、warm-start 或推理。
+- sky 是 scene-level directional atlas，不是 image-plane patch；将上半球方向映射为以 `15000` 为中心的三轴 Cartesian RoPE 坐标。经度首尾方向因此在位置空间天然相邻，不使用 seam loss；同时它仍与 video、asset、edit-control、camera 的 `[0,15000)` 时间轴分离。`rope_max_position=16384` 会对越界位置 fail-fast。
+- 旧 A1/A2 checkpoint 或仍记录全局 `mrope_temporal_margin` 的 checkpoint，其 sky 位置语义与 A3 不一致，不应直接续训、warm-start 或推理。
 
 `frame_ids` 和 `fps` 可让 video/asset/camera temporal position 做 Cosmos 风格的时间缩放；默认路径使用固定 sequence order。
 
@@ -150,16 +170,33 @@ SceneFlow 不再暴露全局 `mrope_temporal_margin`。当前写死 A1 坐标设
 
 Pretrain 的 asset 条件来自 clean latent 和 `dynamic_mask` 构造的 pseudo asset slots。每个场景最多保留 5 个 asset slot；每个 asset 每帧最多采样 32 个 patch token，并额外构造 summary token。
 
-asset 有三种不同语义，不能混用：
+正式训练的真实 asset patch mask 固定使用目标位置 isolated render 的 `A_asset`：先以
+`alpha >= 0.05` 二值化，再按与 DGGT patch 完全一致的非重叠 cell 做 max pooling；不使用
+bbox、不使用联合 `M_dest`、不做 dilation。该 mask 与 `phase1_coverage` 和选中 slot 取交集。
+cache 记录 `asset_patch_mask_version=alpha_max_t005_v1`，每个 asset 的轻量 mask 为 `[S,P]`；
+缺失该字段的旧 Mode-A cache 必须拒绝。Scene tokenizer 仍先编码完整 isolated asset LUT，
+随后才用 mask 做 sparse token 选择，这与 pretrain 的“先得到 clean latent、再按 object mask
+选择 token”一致。`asset_position_mode=localized` 时 patch 和 summary 分别使用目标位置
+`(t,y,x)` 与覆盖区域质心，保留用户指定目标位置的控制语义。
 
-| 语义 | 表示 |
-|---|---|
-| 真实 asset 条件 | sparse asset patch/summary tokens，可见 mask=true |
-| 场景没有 dynamic asset | `asset_condition_kind="none"`，asset mask 全 false，不插 learned token |
-| 用户未提供 asset / 训练 dropout asset | `asset_condition_kind="asset_uncond"`，插入 1 个 learned `asset_null_condition_embed` |
-| 显式空目标/删除洞/Mode-B empty | `empty_asset_embed`，表示 conditional empty target |
+asset 使用四种互不等价的原语。统一简称为 `PAD / NULL / EMPTY / REAL`：
 
-`asset_null_condition_embed` 只插入 1 个 visible token。它表示“asset 条件这个模态未提供”，不是 5 个 asset slot 分别为空。padding token mask=false，不参与 attention。
+| 名称 | 含义 | 运行时表示 | attention 可见性 |
+|---|---|---|---|
+| `PAD`（容量空槽） | 固定容量 5 中未被真实 asset 占用的 slot；真实 asset 内未覆盖的帧/patch 也属于局部 padding | token 值补零，mask=false；它不是独立的 `asset_condition_kind` | 不可见 |
+| `NULL`（条件缺席） | 样本本来存在可用 asset 条件，但用户未输入，或训练时对 asset 做 CFG dropout | `asset_condition_kind="asset_uncond"`，使用 1 个 learned `asset_null_condition_embed` | 仅该 learned token 可见 |
+| `EMPTY`（显式空目标） | 用户明确要求删除目标，即 Mode-B deletion/empty；这是一个有效控制条件，不是缺少条件 | `asset_condition_kind="mode_b_empty"`，使用 1 个 learned `empty_asset_embed` | 仅该 learned token 可见 |
+| `REAL`（真实资产） | 用户输入一个或多个 asset | `asset_condition_kind="mode_a"`，使用 sparse asset patch/summary tokens | 仅真实覆盖 token 可见 |
+
+`PAD` 是张量批处理/稀疏化状态，`NULL` 和 `EMPTY` 是两个不同的可学习语义 token，`REAL` 是数据 token，四者不能互换。具体边界如下：
+
+- 样本有 1--4 个真实 asset 时，kind 仍是 `mode_a`；未占用 slot 是 `PAD`，不会为每个空 slot 插入 learned token。
+- 样本自然有 0 个 dynamic asset 时，kind 是 `none`，5 个 slot 全是 `PAD`，不插入 learned token。这是 `PAD` 的零资产边界，不等于 `NULL`。
+- 用户主动省略本来可用的 asset 条件，或者训练 CFG 主动丢弃 asset 时，才使用 `asset_uncond`/`NULL`。
+- pure deletion 使用 `EMPTY`；combined edit 使用 `mode_a_with_empty`，即 `REAL + EMPTY`。它是两种原语的组合，不是第五种原语，并且必须同时保留真实 asset token 和一个可见的 `empty_asset_embed`。
+- real asset 内没有目标覆盖的帧/patch 同样 mask=false；这是 token 级 padding，不改变样本的 `mode_a` 条件语义。
+
+`asset_null_condition_embed` 只插入 1 个 visible token。它表示“asset 条件这个模态未提供”，不是 5 个 asset slot 分别为空。optional-condition resolver 必须保留自然零资产的 `none`，只能把用户省略或 CFG dropout 的行标成 `asset_uncond`；不能仅凭 asset mask 全 false 就把 `none` 重写为 `asset_uncond`。
 
 正式训练不启用 optional asset condition；局部编辑时 asset 条件必须由用户/样本给定。训练 dropout
 和 CFG 的 no-asset 分支仍使用 `asset_uncond` learned null，这是为了给 guidance 一个稳定的
@@ -193,8 +230,15 @@ Waymo camera 不做坐标转换，也不能进入这个入口。解码必须显�
 
 全局 `camera_gen_anchor_mask` 只在 clip 第 0 帧为 true。滑窗只能切片这个 mask，
 不能把窗口首帧提升成 anchor；因此相对轨迹始终在窗口融合结束后一次性积分。
+delta-only 窗口的第一个 camera token 是相对全局前一帧的真实 delta；几何/RGB loss
+只在解码 loss 坐标时使用该前一帧的冻结 DGGT `C2W` 作为积分初值，它不进入模型条件，
+也不会把局部首 token 变成 anchor。训练中若包含 anchor 的窗口通过
+`camera_anchor_context_dropout` 隐藏了 anchor，该行仍监督 camera delta flow，但从依赖
+完整绝对轨迹的 RGB render loss 中排除。`rgb_render_max_samples` 在排除这种行之后才
+生效，若无有效行则仅跳过当次 RGB render loss。
 anchor 与 delta 分别使用 11D per-channel mean/std，stats 版本为
-`dggt_camera_anchor_delta_per_channel_v3`，std 下限 `1e-4`。stats 同时记录 target
+`dggt_camera_anchor_delta_per_channel_v4_global_context`，std 下限 `1e-4`。camera stats
+始终统计完整 29 帧 DGGT 输出，而不是把随机窗口首帧重复计为 anchor。stats 同时记录 target
 space/source、DGGT checkpoint SHA256 与 anchor/delta count；缺失、非有限、旧版本或
 checkpoint hash 不匹配会直接终止。camera condition/generation 在统计归一化后只经过
 保幅值的 `ChannelScale -> Linear`，不会被 per-token RMSNorm 消除尺度。训练包含 normalized-state flow loss，以及完整轨迹上的绝对
@@ -216,15 +260,15 @@ condition residual。因此扫描全局 CFG 1/2/4 不会把 11D camera 状态外
 
 ## 9. Sky Token 设计
 
-sky generation 只属于 full-scene pretrain。sky token 是 scene-level directional atlas token，默认 grid 为 `16x32`，每个 token 3 维：
+sky generation 只属于 full-scene pretrain。sky token 是 scene-level directional atlas token：先构造 `32x64` RGB atlas，再用固定 `2x2` pixel-unshuffle 打包为默认 `16x32` grid，每个 token 12 维：
 
 ```text
-[r, g, b]
+2x2 atlas patch x [r, g, b]
 ```
 
-训练时从输入图像、sky mask 和 DGGT-space camera 构造 sky token target。sky mask 只用于构造 RGB target 和 per-token `sky_gen_loss_weight`，绝不能作为模型输入 attention mask；训练和开放推理都 pack 完整 `16x32` sky atlas。每个 token 对应上半球一个无穷远方向 bin；target 投影只使用 DGGT world-to-camera rotation，不使用 translation，和 renderer 的 camera-ray 环境贴图定义严格互逆。该方向投影到各帧后，在 GT sky mask 内采样 RGB 并跨可见帧平均。低覆盖 atlas cell 保留 fallback RGB，loss weight 使用较小值（默认 `0.05`），避免伪 target 主导训练。
+训练时从输入图像、sky mask 和 DGGT-space camera 构造 sky token target。sky mask 只用于构造 RGB target 和逐输出通道的 `sky_gen_loss_weight [B,512,12]`，绝不能作为模型输入 attention mask；训练和开放推理都 pack 完整 `16x32` sky atlas。每个 atlas cell 对应上半球一个无穷远方向 bin；target 投影只使用 DGGT world-to-camera rotation，不使用 translation，和 renderer 的 camera-ray 环境贴图定义严格互逆。该方向投影到各帧后，在 GT sky mask 内采样 RGB，并选择置信度最高的可见帧，避免跨帧位姿误差模糊纹理。未观测方向使用带经度环绕的球面邻域补全，且只按默认 `0.05` 低权重监督；整段完全没有有效 sky 观测时仍为零权重。visibility 使用和 RGB 完全相同的 pixel-unshuffle 顺序打包，因此一个 token 内未观测的子像素不会因相邻子像素可见而被错误监督；可用 `--sky_unobserved_loss_weight` 调整低权重。
 
-pretrain 采样时，sky token 和 video/camera 一起作为 generation state 更新；RGB validation 使用 generated sky directional atlas，并按 generated DGGT camera 逐帧渲染 sky background。正式训练、训练内采样和离线 inference 都不 pack generated sky token，也不计算 `loss_sky_flow`；正式编辑渲染保持 GT sky mask + sky model 背景。
+pretrain 采样时，sky token 和 video/camera 一起作为 generation state 更新；RGB validation 使用 generated sky directional atlas，并按 generated DGGT camera 逐帧渲染 sky background。正式训练、训练内采样和离线 inference 都不 pack generated sky token，也不计算 `loss_sky_flow`；正式编辑在图像空间执行 `GT_sky_mask * input_GT_RGB + (1-GT_sky_mask) * rendered_edit`，天空像素严格来自原始输入，不再经过 sky model 或窗口级 min-max。
 
 ## 10. Sky Mask 生成与 Refine
 
@@ -318,7 +362,9 @@ sky_mask_refine_boundary_loss_weight = 0.25
 
 `pos_weight` 按当前 batch 的 sky/non-sky 比例动态计算并 clamp，避免天空正类比例低时被 BCE 淹没。Dice 约束区域重叠，boundary BCE 专门提高地平线、树冠、电线杆等边界附近的监督强度。
 
-sky mask head 和 video clean prediction 在同一个随机 `sigma` denoising forward 上训练。采样时从最后一个**非零、训练分布内**的去噪步直接读取 `sky_mask_logits` 和 `sky_mask_refined_logits`；启用 factored CFG 时，对 mask logits 使用同一组分支和 scale，再做 sigmoid。不能在采样结束后对 clean state 额外做 `sigma=0` forward，因为训练 timestep 不覆盖该输入面。RGB render 优先使用 refined mask；如果只有 patch mask，则回退到 patch mask 上采样。render 在 `_render_gs_map_rgb` 内把 sky mask hard-threshold 成 non-sky Gaussian 选择，这与 DGGT 用 GT sky mask 排除 sky Gaussian、再由 rasterizer transmittance 合成背景的定义一致；mask target 不应替换成 renderer alpha。
+sky mask head 首先在和 video clean prediction 相同的随机 `sigma` denoising forward 上接受辅助监督。为了让最终渲染所用的 mask 与生成完成后的 clean scene 对齐，训练从 `sky_mask_endpoint_start_step` 开始，按 `sky_mask_endpoint_every` 周期把当前预测的 clean video、camera 和 sky state `detach` 后再做一次 `sigma=0` mask-only endpoint forward，并对 endpoint mask 施加同一份 GT mask 监督。RGB render 若在非 endpoint-supervision step 激活，也会按依赖关系执行这个 clean endpoint，但不会额外改变 `sky_mask_endpoint_every` 所定义的 BCE/Dice endpoint 监督频率。
+
+采样时完成全部 ODE 更新后，对最终 clean video/camera/sky state 做一次 `sigma=0` mask-only endpoint forward；普通采样和滑动窗采样都只从该 endpoint 读取 `sky_mask_logits` 和 `sky_mask_refined_logits`。启用 factored CFG 时，endpoint 复用与生成完全相同的 text/asset/camera 分支及 scale，再对组合后的 logits 做 sigmoid。不能从最后一个非零去噪步读取最终 mask：在默认 `shift=10` 下，最后一个非零 `sigma` 仍可能较大，并不代表最终 clean scene。RGB render 优先使用 refined mask；如果只有 patch mask，则回退到 patch mask 上采样。render 在 `_render_gs_map_rgb` 内把 sky mask hard-threshold 成 non-sky Gaussian 选择，这与 DGGT 用 GT sky mask 排除 sky Gaussian、再由 rasterizer transmittance 合成背景的定义一致；mask target 不应替换成 renderer alpha。
 
 ## 11. DDT Head 与输出头
 
@@ -350,11 +396,13 @@ sky mask 也不走 DDT head。patch mask 使用 lightweight MLP decoder；refine
 
 | 情况 | token 可见性 |
 |---|---|
-| padding | mask=false |
-| no dynamic asset | 无 visible asset token |
-| asset condition missing | 1 个 visible `asset_null_condition_embed` |
+| `PAD` capacity/patch padding | mask=false |
+| natural zero-asset sample (`none`) | 5 个 slot 全为 `PAD`，无 visible asset token |
+| `NULL` asset condition missing (`asset_uncond`) | 1 个 visible `asset_null_condition_embed` |
 | camera condition missing | 每帧 visible `camera_null_condition_embed` |
-| explicit empty asset | visible `empty_asset_embed` |
+| `EMPTY` explicit deletion/empty target | 1 个 visible `empty_asset_embed` |
+| `REAL` asset condition | sparse patch/summary token mask=true，其余位置为 `PAD` |
+| combined edit (`mode_a_with_empty`) | `REAL` token 与 1 个 `EMPTY` token 同时可见 |
 
 这保证模型能区分“用户没有给条件”和“场景/任务本身为空”。
 
@@ -398,7 +446,7 @@ v += (camera_scale - 1) * (v_full       - v_text_asset)
 --camera_guidance_scale
 ```
 
-三个 scale 默认都是 `1.0`，表示 no-op。pretrain 推理允许用户不输入 asset 或 camera 条件；采样端会逐行检测有效 token，空行改为 `asset_uncond`/`camera_uncond`，整批缺失某类条件时对应 scale 强制退回 `1.0`。`asset_control_guidance_scale` 在正式训练中仍控制 asset + edit-control guidance；pretrain full-scene 没有局部 edit-control token，但保留同名参数以对齐两阶段采样接口。
+三个 scale 默认都是 `1.0`，表示 no-op。pretrain 推理允许用户不输入 asset 或 camera 条件；采样端必须依据显式 condition kind，而不是只依据 valid mask 判断 optional condition：用户省略 asset 时使用 `asset_uncond`/`NULL`，自然零资产样本的 `none` 必须保持为零 visible token 的条件态。只有 `asset_uncond` 才表示 asset 模态缺席并使对应 scale 退回 `1.0`；`none` 与 `mode_b_empty` 都是已提供的有效条件语义。camera 整批缺失时对应 scale 强制退回 `1.0`。`asset_control_guidance_scale` 在正式训练中仍控制 asset + edit-control guidance；pretrain full-scene 没有局部 edit-control token，但保留同名参数以对齐两阶段采样接口。
 
 默认的 CFG sweep 只改变 `text_scale`，asset/camera scale 保持 `1.0`。这与 Cosmos conditional generation 的两分支设计一致：clean visual/structural condition 在 conditional 与 text-unconditional 分支中都保留，CFG 只放大上下文相关的文本残差。同时放大三个 scale 会额外外推目标外观与相机轨迹，不应作为普通 `cfg2/cfg4` 的默认含义；需要研究控制强度时可显式单独设置 asset/camera scale。
 
@@ -426,7 +474,7 @@ gsplat 在无 background 时返回 premultiplied RGB，因此合成公式固定�
 
 pretrain validation/offline 的 generated branch 必须使用 SceneFlow 生成的 DGGT camera；只有 clean/tokenizer-reconstruction 诊断分支可以使用 frozen DGGT teacher pose。任何 render camera 都不应在 optional camera condition 缺失时回灌成模型输入条件。
 
-正式训练 validation 和离线 inference 不使用 generated camera/sky token。生成分支固定复用输入图像经 DGGT 预测出的 DGGT camera，并使用 GT sky mask 和 sky model 背景合成；`generated_pred_sky_mask` 是 edited latent 送入 DGGT `semantic_head` 得到的诊断图，不参与 sky/non-sky 合成，也不是 SceneFlow sky mask 输出。
+正式训练 validation 和离线 inference 不使用 generated camera/sky token。生成分支固定复用输入图像经 DGGT 预测出的 DGGT camera，并在 GT sky mask 内逐像素保留原始输入 RGB；非天空区域只使用 edited 3DGS render，避免把整张 GT 图作为 background 后泄漏原场景。该 DGGT camera 必须来自 cache 中对完整 29 帧输入一次性运行 CameraHead 得到的 `pose_enc`；10 帧训练 validation 或 `--render_per_window` 只按原始帧索引切片，禁止在局部窗口重新运行 CameraHead，否则窗口之间的上下文依赖会导致位姿不连续。`generated_pred_sky_mask` 是 edited latent 送入 DGGT `semantic_head` 得到的诊断图，不参与 sky/non-sky 合成，也不是 SceneFlow sky mask 输出。
 
 ## 15. 与运行参数文档的边界
 

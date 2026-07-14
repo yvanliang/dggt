@@ -3,7 +3,7 @@
 本文档介绍 FlowDGGT **validation** 离线缓存的生成。它与 `docs/flow_cache_cmd.md`
 的当前 training Mode A 共享**完全相同的逻辑与物理格式**：
 
-* 逻辑 schema：`schema_version=8`、`mode_kind="mode_a"`；
+* 逻辑 schema：`schema_version=9`、`mode_kind="mode_a"`；
 * 物理格式：chunked-zstd SQLite container，文件扩展名仍为 `.pt`；
 * chunked format：当前为 `format_version=2`，Mode-A asset LUT 保存完整 4 levels；
 * 读取入口：`dggt.utils.flow_cache_io`，不要直接假定是普通 `torch.save` 文件。
@@ -16,7 +16,7 @@ v8 同时包含旧版本问题的修复：
 * v7 修复：`pass1.gs_conf` 以 finite fp32 保存，避免 v6 的 fp16 `inf` 溢出；
 * v8 修复：pass2 splat 使用与当前 training 一致的动态 Gaussian 生命周期阈值
   `sigmoid(0.5)`，不再使用旧的 `0.5` 概率阈值；
-* validation 生成器只复用已有的当前 v8 chunked cache。已有 v6/v7、旧 chunked
+* validation 生成器只复用已有的当前 v9 chunked cache。已有旧 schema、旧 chunked
   format v1 或 monolithic v8 文件会默认自动重算，避免静默混用旧数据。
 
 与训练 Mode A 的区别：
@@ -83,6 +83,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. conda run -n dggt --no-capture-output \
     --out_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_validation \
     --save_compression chunked_zstd \
     --gzip_level 1 \
+    --overwrite_v7 \
     --max_save_threads 1
 ```
 
@@ -117,7 +118,7 @@ manifest 中仍保留逻辑数字 `index = entry_index*5 + variant_ord`，只用
 
 * `--variants combined,deletion` —— 只生成指定 variant（调试 / 省时）。
 * `--start N --end M` —— 只处理 entry 索引 `[N, M)`（0..32）。
-* `--force_overwrite` —— 无条件覆盖已存在的 `.pt`。默认只跳过合法的当前 v8
+* `--force_overwrite` —— 无条件覆盖已存在的 `.pt`。默认只跳过合法的当前 v9
   chunked-zstd cache；v6/v7、旧 chunked format v1 或非 chunked 文件会自动重算。
 * `--save_compression chunked_zstd` —— 默认值，与 training 一致。`gzip/zstd/none`
   仅保留用于调试，不应作为正式 validation cache 格式。
@@ -167,7 +168,7 @@ a=load_flow_cache('/data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_
 b=load_flow_cache('/tmp/valcache_smoke/validation/000000_combined.pt')
 assert set(a)==set(b), (set(a)^set(b))
 assert is_chunked_flow_cache('/tmp/valcache_smoke/validation/000000_combined.pt')
-assert a['schema_version']==b['schema_version']==8 and b['mode_kind']=='mode_a'
+assert a['schema_version']==b['schema_version']==9 and b['mode_kind']=='mode_a'
 assert b['pass1']['gs_conf'].dtype == __import__('torch').float32
 for k in ('pass1','phase1_localized','pass2_splatted_tok_low'):
     assert set(a[k])==set(b[k]), (k, set(a[k])^set(b[k]))   # binding blocks identical
@@ -254,7 +255,7 @@ RGB 用缓存权威的 `cameras_dggt` + 缓存高斯（保留=clean 去掉
 `phase1_localized.delete_mask`；资产=`asset_pass.G_asset_dggt`/`I_asset`）直接 gsplat 渲染，
 不需要模型；`flow_features/` 由训练同款 `FlowFeatureAssembler` + `dump_flow_features` 产出，
 与 `verify_flow_cache_wysiwyg` / 训练消费的 bundle 逐值对齐。正式 validation
-产物统一为 v8 chunked cache。
+产物统一为 v9 chunked cache，并携带 `alpha_max_t005_v1` asset patch mask。
 
 ## 4. 实现要点（与 Mode A 的复用关系）
 

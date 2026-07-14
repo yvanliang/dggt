@@ -46,14 +46,24 @@ from dggt.losses.rgb_render_loss import (
     should_apply_rgb_render_loss,
 )
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
+from dggt.models.asset_pass import (
+    build_asset_condition_slots,
+    require_asset_patch_valid_mask,
+)
+from dggt.models.joint_scene_tokenizer import JointSceneTokenizer
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
-from dggt.utils.feature_stats import checkpoint_sha256, load_into_buffers, validate_camera_stats_provenance
+from dggt.utils.feature_stats import (
+    DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
+    checkpoint_sha256,
+    load_all_stats_into_buffers,
+)
 from dggt.utils.camera_condition import (
     camera_summary_from_waymo_gt,
     normalize_front_image_hw,
 )
+from dggt.utils.camera_generation import CAMERA_STATS_VERSION
 from dggt.utils.flow_cache_io import (
     is_chunked_flow_cache,
     load_chunked_flow_cache_subset,
@@ -61,9 +71,16 @@ from dggt.utils.flow_cache_io import (
     load_flow_cache,
 )
 from dggt.utils.flow_viz import save_image_grid
+from dggt.utils.flow_schedule import (
+    build_flow_schedule_config,
+    validate_checkpoint_flow_schedule,
+)
 from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
 from dggt.utils.sliding_window import cosine_window, default_window_stride, window_slices
 from dggt.utils.tokens import reattach_special_tokens, replace_selected_levels, select_patch_pyramid
+from dggt.utils.tokenizer_checkpoint import load_scene_tokenizer_checkpoint_strict
+from dggt.utils.validation_cache_naming import validation_asset_condition_kind
+from dggt.utils.validation_rng import make_validation_generator, preserve_validation_rng_state
 from diffusers.training_utils import EMAModel
 from train_scene_flow_pretrain import (
     TOKENIZER_LEVELS,
@@ -84,6 +101,17 @@ from train_scene_flow_pretrain import (
 
 
 FORMAL_FLOW_DOMAIN_VERSION = "hard_binary_edit_domain_v1"
+
+
+def _asset_condition_kind_from_item(item: dict[str, Any], mode_kind: str) -> str:
+    variant = item.get("validation_variant")
+    if variant not in (None, ""):
+        return validation_asset_condition_kind(str(variant))
+    return (
+        "mode_b_empty"
+        if str(mode_kind) in ("mode_b", "mode_b_empty", "empty")
+        else "mode_a"
+    )
 
 
 def formal_flow_domain_config(args) -> dict[str, Any]:
@@ -356,6 +384,17 @@ def materialize_ema_state_dict(scene_flow: nn.Module, ema: EMAModel) -> dict[str
         ema.restore(params)
 
 
+@torch.no_grad()
+def sync_ema_shadow_from_model(scene_flow: nn.Module, ema: EMAModel) -> None:
+    """Initialize EMAModel shadow params from the currently loaded model."""
+    params = list(unwrap_ddp(scene_flow).parameters())
+    if len(params) != len(ema.shadow_params):
+        raise ValueError(
+            f"EMA shadow param count {len(ema.shadow_params)} != model param count {len(params)}"
+        )
+    ema.shadow_params = [p.detach().clone() for p in params]
+
+
 def split_param_groups(model: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
     decay, no_decay = [], []
     for name, param in model.named_parameters():
@@ -506,8 +545,8 @@ def _validate_scene_flow_checkpoint_config(scene_flow: nn.Module, payload: Any, 
     if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
         raise ValueError(
             f"{path} was saved with the legacy global mrope_temporal_margin RoPE layout. "
-            "The current SceneFlow model uses the fixed A2 layout "
-            "(video/asset/camera shared video time, camera center, sky temporal offset 15000); "
+            "The current SceneFlow model uses the fixed A3 layout "
+            "(video/asset/camera shared video time, camera center, spherical sky coordinates near 15000); "
             "do not resume/warm-start across these incompatible position semantics."
         )
     current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)
@@ -550,6 +589,7 @@ def load_scene_flow_warm_start(
     pretrain_path: str | None,
     *,
     use_ema: bool = True,
+    args: argparse.Namespace | None = None,
 ) -> dict[str, Any] | None:
     if not pretrain_path:
         return None
@@ -557,6 +597,15 @@ def load_scene_flow_warm_start(
     sf = unwrap_ddp(scene_flow)
     payload = torch.load(pretrain_path, map_location="cpu")
     _validate_scene_flow_checkpoint_config(scene_flow, payload, pretrain_path)
+    if args is None:
+        raise ValueError("SceneFlow warm-start requires runtime args for flow-schedule validation")
+    validate_checkpoint_flow_schedule(
+        payload,
+        args,
+        pretrain_path,
+        prediction_type=_scene_flow_prediction_type_from_module(scene_flow),
+        t_eps=scene_flow_t_eps(scene_flow),
+    )
     info: dict[str, Any] = {
         "path": pretrain_path,
         "step": int(payload.get("step", -1)) if isinstance(payload, dict) else -1,
@@ -673,10 +722,15 @@ def split_train_val_entries(
     val_entries = [entry for idx, entry in enumerate(entries) if idx in val_indices]
 
     dataset.entries = train_entries
+    dataset._window_seed = int(seed)
     dataset._rng = random.Random(int(seed))
+    dataset._rng_worker_seed = None
     val_dataset = copy.copy(dataset)
     val_dataset.entries = val_entries
+    val_dataset._window_seed = int(seed) + 1
     val_dataset._rng = random.Random(int(seed) + 1)
+    val_dataset._rng_worker_seed = None
+    val_dataset.deterministic_windows = True
     return val_dataset
 
 
@@ -700,10 +754,21 @@ def _validate_item_patch_grid(
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="T1 SceneFlow training (Phase 9).")
     parser.add_argument("--ckpt_path", type=str, required=True, help="Base DGGT checkpoint for tokenizer.")
-    parser.add_argument("--tokenizer_ckpt_path", type=str, default=None,
-                        help="Optional tokenizer checkpoint. Defaults to --ckpt_path.")
-    parser.add_argument("--feature_stats_path", type=str, default=None,
-                        help="Optional latent stats override. Warm-start checkpoints already carry these buffers.")
+    parser.add_argument(
+        "--tokenizer_ckpt_path",
+        type=str,
+        default=None,
+        help=(
+            "Tokenizer checkpoint used for SceneFlow latents. It may be omitted only when "
+            "--ckpt_path embeds a complete scene_tokenizer state; otherwise startup fails."
+        ),
+    )
+    parser.add_argument("--feature_stats_path", type=str, default=str(DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH),
+                        help=(
+                            "Latent+camera stats contract; defaults to feature_stats_pretrain_v2.pt. "
+                            "The file must exactly match the "
+                            "buffers stored in the warm-start/resume checkpoint; mismatches fail fast."
+                        ))
     parser.add_argument(
         "--latent_dim",
         type=int,
@@ -870,8 +935,8 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Deprecated compatibility flag. Formal T1 training no longer packs "
-            "generated-sky tokens or computes sky flow loss; GT sky is used only "
-            "by RGB validation/rendering."
+            "generated-sky tokens or computes sky flow loss; RGB rendering preserves "
+            "the original input RGB exactly inside the GT sky mask."
         ),
     )
     parser.add_argument("--sky_grid_h", type=int, default=DEFAULT_SKY_GRID[0])
@@ -911,16 +976,12 @@ def build_argparser() -> argparse.ArgumentParser:
 # Model setup                                                             #
 # ---------------------------------------------------------------------- #
 def _load_tokenizer(ckpt_path: str, device: torch.device) -> nn.Module:
-    from dggt.models.vggt import VGGT
-
-    model = VGGT().to(device)
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    state = checkpoint.get("state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
-    cleaned = {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
-    model.load_state_dict(cleaned, strict=False)
-    # We only need scene_tokenizer; aggregator/heads stay offline.
-    model.eval()
-    tokenizer = model.scene_tokenizer.float()
+    # Formal cached training only needs the tokenizer.  Loading it directly is
+    # both cheaper than constructing full VGGT and, crucially, lets us require
+    # an exact tokenizer match instead of silently retaining random weights.
+    tokenizer = JointSceneTokenizer().to(device=device, dtype=torch.float32)
+    load_scene_tokenizer_checkpoint_strict(tokenizer, ckpt_path)
+    tokenizer.eval()
     return tokenizer
 
 
@@ -940,7 +1001,7 @@ def model_prediction_to_velocity(scene_flow: nn.Module, prediction: torch.Tensor
         return (target.z_t - prediction) / target.sigmas4.to(
             device=prediction.device,
             dtype=prediction.dtype,
-        ).clamp_min(float(getattr(target, "t_eps", 0.05)))
+        ).clamp_min(float(getattr(target, "t_eps", scene_flow_t_eps(scene_flow))))
     return prediction
 
 
@@ -952,7 +1013,12 @@ def scene_flow_t_eps(scene_flow: nn.Module) -> float:
 def model_prediction_to_clean(scene_flow: nn.Module, prediction: torch.Tensor, target) -> torch.Tensor:
     if scene_flow_prediction_type(scene_flow) == "x":
         return prediction
-    return target.z_t - target.sigmas4.to(device=prediction.device, dtype=prediction.dtype) * prediction
+    # RAEv2 trains velocity against (z_t - z_clean) / max(sigma, t_eps), so
+    # recovering the clean endpoint must invert that same clamped denominator.
+    sigma_safe = target.sigmas4.to(device=prediction.device, dtype=prediction.dtype).clamp_min(
+        float(getattr(target, "t_eps", scene_flow_t_eps(scene_flow)))
+    )
+    return target.z_t - sigma_safe * prediction
 
 
 def sampler_prediction_to_velocity(scene_flow: nn.Module, prediction: torch.Tensor, z: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -1116,6 +1182,12 @@ def _flatten_fast_asset_kv(asset_pass_result, flow_inputs: dict[str, Any], devic
         if not levels:
             continue
         lvl = levels[-1].to(device)
+        patch_valid = require_asset_patch_valid_mask(
+            asset_pass_result,
+            obj_key,
+            expected_shape=(int(lvl.shape[0]), int(lvl.shape[1]), int(lvl.shape[2])),
+            device=device,
+        )
         if torch.is_tensor(coverage) and obj_key < int(coverage.shape[0]):
             cov = coverage[obj_key].to(device=device, dtype=lvl.dtype)
             if cov.ndim != 1 or int(cov.numel()) != int(lvl.shape[1]):
@@ -1123,38 +1195,15 @@ def _flatten_fast_asset_kv(asset_pass_result, flow_inputs: dict[str, Any], devic
                     f"Asset {obj_key} coverage must be [S]={int(lvl.shape[1])}, "
                     f"got {tuple(cov.shape)} for LUT {tuple(lvl.shape)}."
                 )
-            # lvl is [B,S,P,C]: coverage gates frames, not patch tokens.
-            lvl = lvl * cov.reshape(1, -1, 1, 1)
-        elif phase4_slots and obj_key not in phase4_slots:
-            lvl = torch.zeros_like(lvl)
+            patch_valid = patch_valid & cov.to(dtype=torch.bool).reshape(1, -1, 1)
+        if phase4_slots and obj_key not in phase4_slots:
+            patch_valid = torch.zeros_like(patch_valid)
+        lvl = lvl * patch_valid.unsqueeze(-1).to(dtype=lvl.dtype)
         B, S, P, C = lvl.shape
         chunks.append(lvl.reshape(B, S * P, C))
     if not chunks:
         return torch.zeros((1, 0, 3072), dtype=torch.float32, device=device)
     return torch.cat(chunks, dim=1)
-
-
-def _validate_scene_flow_asset_levels(levels: list[torch.Tensor], obj_key: int) -> None:
-    if len(levels) != 4:
-        raise RuntimeError(
-            f"Asset {obj_key} must provide the complete 4-level tokenizer LUT, got {len(levels)} levels."
-        )
-    reference_shape = None
-    for level_idx, level in enumerate(levels):
-        if not torch.is_tensor(level):
-            raise RuntimeError(f"Asset {obj_key} level {level_idx} is not a tensor.")
-        if level.ndim != 4:
-            raise RuntimeError(
-                f"Asset {obj_key} level {level_idx} must be [1,S,P,C], got {tuple(level.shape)}."
-            )
-        shape = tuple(int(v) for v in level.shape)
-        if reference_shape is None:
-            reference_shape = shape
-        elif shape != reference_shape:
-            raise RuntimeError(
-                f"Asset {obj_key} has inconsistent LUT level shapes: "
-                f"{reference_shape} vs {shape} at level {level_idx}."
-            )
 
 
 def _encode_fast_asset_conditions(
@@ -1178,38 +1227,17 @@ def _encode_fast_asset_conditions(
         return out, mask
 
     coverage = flow_inputs.get("phase1_coverage")
-    if torch.is_tensor(coverage):
-        coverage = coverage.to(device=device, dtype=torch.bool)
-    phase4_slots = {int(v) for v in flow_inputs.get("phase4_slots", [])}
-
-    asset_latents: list[torch.Tensor] = []
-    asset_masks: list[torch.Tensor] = []
-    for obj_key in sorted(int(k) for k in asset_pass_result.F_g_lut_asset.keys()):
-        if len(asset_latents) >= 5:
-            break
-        levels = asset_pass_result.F_g_lut_asset[obj_key]
-        _validate_scene_flow_asset_levels(levels, obj_key)
-        levels = [level.to(device=device, dtype=reference.dtype) for level in levels]
-        z_asset = scene_tokenizer.encode(levels, patch_grid=patch_grid)
-        valid = torch.ones(z_asset.shape[:-1], device=device, dtype=torch.bool)
-        if torch.is_tensor(coverage) and obj_key < int(coverage.shape[0]):
-            cov = coverage[obj_key].to(device=device, dtype=torch.bool)
-            if cov.ndim != 1 or int(cov.numel()) != int(z_asset.shape[1]):
-                raise ValueError(
-                    f"Asset {obj_key} coverage must be [S]={int(z_asset.shape[1])}, "
-                    f"got {tuple(cov.shape)} for latent {tuple(z_asset.shape)}."
-                )
-            # valid is [B,S,P]: broadcast one frame flag over all P patches.
-            valid = valid & cov.reshape(1, -1, 1)
-        elif phase4_slots and obj_key not in phase4_slots:
-            valid = torch.zeros_like(valid)
-        asset_latents.append(z_asset)
-        asset_masks.append(valid)
-
-    if asset_latents:
-        n_assets = min(len(asset_latents), 5)
-        out[:, :n_assets] = torch.stack(asset_latents[:n_assets], dim=1).to(device=device, dtype=reference.dtype)
-        mask[:, :n_assets] = torch.stack(asset_masks[:n_assets], dim=1).to(device=device, dtype=torch.bool)
+    phase4_slots = flow_inputs.get("phase4_slots")
+    out, mask = build_asset_condition_slots(
+        asset_pass_result,
+        phase1_coverage=coverage if torch.is_tensor(coverage) else None,
+        phase4_slots=phase4_slots,
+        scene_tokenizer=scene_tokenizer,
+        patch_grid=patch_grid,
+        reference=reference,
+        max_assets=5,
+        expected_num_levels=4,
+    )
     return out, mask
 
 
@@ -1480,7 +1508,9 @@ def build_cached_flow_bundle(
     M_source = flow_inputs["M_source"].to(device=device, dtype=torch.float32)
     M_dest = flow_inputs["M_dest"].to(device=device, dtype=torch.float32)
     scaffold_pooled = flow_inputs["scaffold_pooled"].to(device=device, dtype=torch.float32)
-    scaffold_tok = unwrap_ddp(assembler.scaffold_packer).mlp(scaffold_pooled)
+    # Keep the cached fast path inside ScaffoldPacker.forward so a DDP-wrapped
+    # packer installs and executes its gradient-reduction hooks.
+    scaffold_tok = assembler.scaffold_packer(scaffold_pooled, already_pooled=True)
 
     asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
     mode_kind = str(item.get("mode_kind", flow_inputs.get("mode_kind", "mode_a")))
@@ -1518,7 +1548,7 @@ def build_cached_flow_bundle(
         encoder_attention_mask=asset_mask,
         camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
-        asset_condition_kind="mode_b_empty" if mode_kind == "mode_b" else "mode_a",
+        asset_condition_kind=_asset_condition_kind_from_item(item, mode_kind),
         phase4_slots=list(flow_inputs.get("phase4_slots", [])),
         captions=[str(item.get("caption", ""))],
         patch_grid=assembler.patch_grid,
@@ -1575,8 +1605,11 @@ def build_cached_flow_batch_bundle(
     M_preserve = flow_inputs["M_preserve"].to(device=device, dtype=torch.float32)
     M_source = flow_inputs["M_source"].to(device=device, dtype=torch.float32)
     M_dest = flow_inputs["M_dest"].to(device=device, dtype=torch.float32)
-    scaffold_tok = unwrap_ddp(assembler.scaffold_packer).mlp(
-        flow_inputs["scaffold_pooled"].to(device=device, dtype=torch.float32)
+    # Do not unwrap here: the packer is independently DDP-wrapped in formal
+    # training and its forward must run through that wrapper on every rank.
+    scaffold_tok = assembler.scaffold_packer(
+        flow_inputs["scaffold_pooled"].to(device=device, dtype=torch.float32),
+        already_pooled=True,
     )
 
     asset_bundles: list[Any] = []
@@ -1601,7 +1634,7 @@ def build_cached_flow_batch_bundle(
             SimpleNamespace(
                 F_asset_tokens=F_asset_tokens_i,
                 encoder_attention_mask=asset_mask_i,
-                asset_condition_kind="mode_b_empty" if mode_kind == "mode_b" else "mode_a",
+                asset_condition_kind=_asset_condition_kind_from_item(item, mode_kind),
             )
         )
         num_objects += float(len(item_flow_inputs.get("phase4_slots", [])))
@@ -1667,7 +1700,10 @@ def build_cached_flow_batch_bundle(
         sky_gen_clean=sky_gen_clean,
         sky_gen_attention_mask=sky_gen_attention_mask,
         asset_condition_kind=[
-            "mode_b_empty" if str(item.get("mode_kind", "mode_a")) == "mode_b" else "mode_a"
+            _asset_condition_kind_from_item(
+                item,
+                str(item.get("mode_kind", "mode_a")),
+            )
             for item in items
         ],
         phase4_slots=[],
@@ -1745,7 +1781,7 @@ def build_flow_bundle(
     bundle.captions = [str(item.get("caption", ""))]
     bundle.frame_ids = _frame_ids_from_item(item, seq_len=int(bundle.z_clean.shape[1]), device=device, sample=sample)
     kind = str(getattr(bundle, "extras", {}).get("asset_condition_kind", mode_kind))
-    bundle.asset_condition_kind = "mode_b_empty" if kind in ("mode_b", "mode_b_empty") else "mode_a"
+    bundle.asset_condition_kind = _asset_condition_kind_from_item(item, kind)
     bundle = _attach_sky_tokens_to_bundle(bundle, item, args, device)
     if include_rgb_render_context:
         bundle = _attach_rgb_context(bundle, _formal_rgb_context(item, device=device, strict=True))
@@ -1979,7 +2015,7 @@ def _add_formal_rgb_render_loss(
         max_samples=int(args.rgb_render_max_samples),
         max_frames=int(args.rgb_render_max_frames),
         render_stride=int(args.rgb_render_stride),
-        background_mode="sky_model",
+        background_mode="gt_sky",
         sky_tokens=None,
         sky_grid=tuple(getattr(args, "sky_grid", DEFAULT_SKY_GRID)),
         patch_weight_mask=target.M_edit,
@@ -2010,6 +2046,7 @@ def train_step(
     global_step: int | None = None,
     render_vggt_model: nn.Module | None = None,
     lpips_model: nn.Module | None = None,
+    generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     rgb_render_active = should_apply_rgb_render_loss(
         args,
@@ -2081,6 +2118,8 @@ def train_step(
                 mode_scale=args.mode_scale,
                 loss_weighting_scheme=args.loss_weighting_scheme,
                 time_shift=float(args.shift),
+                t_eps=scene_flow_t_eps(scene_flow),
+                generator=generator,
             )
             use_repa = float(args.lambda_repa) != 0.0
             text_tokens, text_mask = encode_text_condition(
@@ -2149,7 +2188,7 @@ def train_step(
                 lambda_boundary=args.lambda_boundary,
                 lambda_repa=args.lambda_repa,
                 lambda_identity=args.lambda_identity,
-                identity_batch=bool(float(M_edit.mean().detach().item()) < 1e-4),
+                identity_batch=~M_edit.detach().to(torch.bool).flatten(1).any(dim=1),
                 preserve_floor=args.preserve_floor,
             )
             metrics.update({
@@ -2197,6 +2236,7 @@ def train_step(
                 global_step=global_step,
                 render_vggt_model=render_vggt_model,
                 lpips_model=lpips_model,
+                generator=generator,
             )
             losses.append(loss_i)
             for key, value in metrics_i.items():
@@ -2251,6 +2291,8 @@ def train_step(
         mode_scale=args.mode_scale,
         loss_weighting_scheme=args.loss_weighting_scheme,
         time_shift=float(args.shift),
+        t_eps=scene_flow_t_eps(scene_flow),
+        generator=generator,
     )
     use_repa = float(args.lambda_repa) != 0.0
     text_tokens, text_mask = encode_text_condition(
@@ -2319,7 +2361,7 @@ def train_step(
         lambda_boundary=args.lambda_boundary,
         lambda_repa=args.lambda_repa,
         lambda_identity=args.lambda_identity,
-        identity_batch=bool(float(M_edit.mean().detach().item()) < 1e-4),
+        identity_batch=~M_edit.detach().to(torch.bool).flatten(1).any(dim=1),
         preserve_floor=args.preserve_floor,
     )
     metrics.update({
@@ -2403,6 +2445,9 @@ def _move_asset_pass(apr, device: torch.device):
         },
         I_asset={k: v.to(device) for k, v in apr.I_asset.items()},
         A_asset={k: v.to(device) for k, v in apr.A_asset.items()},
+        asset_patch_valid_mask={
+            k: v.to(device) for k, v in apr.asset_patch_valid_mask.items()
+        },
         asset_pass_space=apr.asset_pass_space,
         fit_metrics=apr.fit_metrics,
     )
@@ -2479,6 +2524,7 @@ def _cfg_sample_edit_latents_sliding(
         time_shift=float(args.shift),
         device=device,
         dtype=torch.float32,
+        t_eps=scene_flow_t_eps(scene_flow),
     )
     z_splat_n = sf.normalize(bundle.z_splat.float())
     generator = torch.Generator(device=device)
@@ -2651,6 +2697,7 @@ def cfg_sample_edit_latents(
         time_shift=float(args.shift),
         device=device,
         dtype=torch.float32,
+        t_eps=scene_flow_t_eps(scene_flow),
     )
     z_splat_n = sf.normalize(bundle.z_splat.float())
     generator = torch.Generator(device=device)
@@ -2792,7 +2839,67 @@ def dataloader_runtime_kwargs(args) -> dict[str, Any]:
     }
 
 
-def _prepare_visualization_batch(sample: dict[str, Any]) -> dict[str, torch.Tensor]:
+def _validate_cached_render_pose(
+    pose: torch.Tensor,
+    *,
+    batch_size: int,
+    seq_len: int,
+    where: str,
+) -> torch.Tensor:
+    if pose.ndim == 2:
+        pose = pose.unsqueeze(0)
+    expected = (int(batch_size), int(seq_len), 9)
+    if tuple(pose.shape) != expected:
+        raise ValueError(f"{where} DGGT pose_enc must be {expected}, got {tuple(pose.shape)}")
+    if not bool(torch.isfinite(pose).all()):
+        raise ValueError(f"{where} DGGT pose_enc contains non-finite values")
+    return pose.contiguous()
+
+
+def cached_render_pose_from_item(item: dict[str, Any]) -> torch.Tensor:
+    """Return the cached full-context DGGT pose already sliced to this item."""
+    predictions = item.get("predictions")
+    pose = predictions.get("pose_enc") if isinstance(predictions, dict) else None
+    if not torch.is_tensor(pose):
+        raise RuntimeError(
+            f"{item.get('cache_path', '<unknown>')} is missing cached full-context predictions.pose_enc"
+        )
+    subset = item.get("subset_frames")
+    seq_len = int(torch.as_tensor(subset).numel()) if subset is not None else int(pose.shape[-2])
+    batch_size = int(pose.shape[0]) if pose.ndim == 3 else 1
+    return _validate_cached_render_pose(
+        pose,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        where=str(item.get("cache_path", "validation item")),
+    )
+
+
+def _cached_render_pose_from_payload(payload: dict[str, Any], subset: torch.Tensor) -> torch.Tensor:
+    pass1 = payload.get("pass1")
+    pose = pass1.get("pose_enc") if isinstance(pass1, dict) else None
+    if not torch.is_tensor(pose):
+        raise RuntimeError("Validation cache payload is missing full-context pass1.pose_enc")
+    subset = subset.detach().cpu().to(torch.long).reshape(-1)
+    if pose.ndim == 2:
+        selected = pose.index_select(0, subset).unsqueeze(0)
+    elif pose.ndim == 3 and int(pose.shape[0]) == 1:
+        selected = pose.index_select(1, subset)
+    else:
+        raise ValueError(f"Cached pass1.pose_enc must be [S,9] or [1,S,9], got {tuple(pose.shape)}")
+    return _validate_cached_render_pose(
+        selected,
+        batch_size=1,
+        seq_len=int(subset.numel()),
+        where="validation cache payload",
+    )
+
+
+def _prepare_visualization_batch(
+    sample: dict[str, Any],
+    *,
+    render_pose_enc_dggt: torch.Tensor,
+) -> dict[str, torch.Tensor]:
     images = sample.get("images", sample.get("images_clean"))
     masks = sample.get("masks", sample.get("sky_mask"))
     timestamps = sample.get("timestamps")
@@ -2815,10 +2922,17 @@ def _prepare_visualization_batch(sample: dict[str, Any]) -> dict[str, torch.Tens
         raise ValueError(f"Expected visualization masks [B,S,3,H,W], got {tuple(masks.shape)}")
     if timestamps.ndim != 2:
         raise ValueError(f"Expected visualization timestamps [B,S], got {tuple(timestamps.shape)}")
+    render_pose_enc_dggt = _validate_cached_render_pose(
+        render_pose_enc_dggt,
+        batch_size=int(images.shape[0]),
+        seq_len=int(images.shape[1]),
+        where="validation visualization",
+    )
     return {
         "images": images.contiguous(),
         "masks": masks.contiguous(),
         "timestamps": timestamps.contiguous(),
+        "render_pose_enc_dggt": render_pose_enc_dggt,
     }
 
 
@@ -2828,7 +2942,10 @@ def load_validation_visualization_batch(
 ) -> dict[str, torch.Tensor]:
     """Return the raw batch fields needed by the 3DGS validation renderer."""
     if item.get("sample") is not None:
-        return _prepare_visualization_batch(item["sample"])
+        return _prepare_visualization_batch(
+            item["sample"],
+            render_pose_enc_dggt=cached_render_pose_from_item(item),
+        )
 
     cache_path_raw = item.get("cache_path")
     if cache_path_raw is None:
@@ -2862,7 +2979,10 @@ def load_validation_visualization_batch(
     if not is_chunked_flow_cache(cache_path):
         WaymoFlowCacheDataset._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
     sample = dataset._build_sample(payload, subset_payload)
-    return _prepare_visualization_batch(sample)
+    return _prepare_visualization_batch(
+        sample,
+        render_pose_enc_dggt=_cached_render_pose_from_payload(payload, subset_payload),
+    )
 
 
 def _save_rgb_validation_images(
@@ -2890,6 +3010,26 @@ def _cuda_empty_cache_if_available() -> None:
         torch.cuda.empty_cache()
 
 
+def _cached_render_pose_from_batch(
+    batch: dict[str, torch.Tensor],
+    images: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    pose = batch.get("render_pose_enc_dggt")
+    if not torch.is_tensor(pose):
+        raise RuntimeError(
+            "Formal RGB rendering requires cached full-context render_pose_enc_dggt; "
+            "do not recompute CameraHead on a validation window."
+        )
+    pose = _validate_cached_render_pose(
+        pose,
+        batch_size=int(images.shape[0]),
+        seq_len=int(images.shape[1]),
+        where="formal RGB render batch",
+    )
+    return pose.to(device=device, dtype=torch.float32, non_blocking=True)
+
+
 @torch.no_grad()
 def render_validation_rgb_gt_sky(
     batch: dict[str, torch.Tensor],
@@ -2899,9 +3039,10 @@ def render_validation_rgb_gt_sky(
     args,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Render formal-training validation RGB with generated outputs composited over GT sky."""
+    """Render formal validation with the cached full-context DGGT camera and GT sky."""
     images = batch["images"].to(device, non_blocking=True)
     masks = batch["masks"].to(device, non_blocking=True)
+    render_pose_enc_dggt = _cached_render_pose_from_batch(batch, images, device)
     frames = min(int(args.val_log_images), int(images.shape[1]))
     sf = unwrap_ddp(scene_flow)
     timestamps_raw = batch["timestamps"]
@@ -2938,12 +3079,6 @@ def render_validation_rgb_gt_sky(
 
     with autocast_context(args, device):
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            # T1/formal editing keeps the render camera fixed to the DGGT
-            # camera predicted from the input images.  Generated/recon patch
-            # tokens must not define a new camera trajectory.
-            render_pose_enc_dggt = vggt_model.camera_head(aggregated_tokens_list)[-1]
-            if render_pose_enc_dggt.ndim != 3 or render_pose_enc_dggt.shape[-1] != 9 or not bool(torch.isfinite(render_pose_enc_dggt).all()):
-                raise RuntimeError("render_pose_enc_dggt must be finite [B,S,9] from the input DGGT CameraHead")
             depth, _ = vggt_model.depth_head(aggregated_tokens_list, images, patch_start_idx)
             dynamic_conf, _ = vggt_model.instance_head(dino_token_list, images, patch_start_idx)
             clean_gs_map, clean_gs_conf = vggt_model.gs_head(image_tokens_list, images, patch_start_idx)
@@ -2962,7 +3097,7 @@ def render_validation_rgb_gt_sky(
         dynamic_conf,
         device,
         frames,
-        background_mode="sky",
+        background_mode="gt_sky",
         use_sky_mask=True,
     )
     del depth, dynamic_conf, clean_gs_map, clean_gs_conf
@@ -3003,7 +3138,7 @@ def render_validation_rgb_gt_sky(
         generated_dynamic_conf,
         device,
         frames,
-        background_mode="sky",
+        background_mode="gt_sky",
         use_sky_mask=True,
     )
     del (
@@ -3037,7 +3172,7 @@ def render_validation_rgb_gt_sky(
         recon_dynamic_conf,
         device,
         frames,
-        background_mode="sky",
+        background_mode="gt_sky",
         use_sky_mask=True,
     )
     del render_pose_enc_dggt, recon_depth, recon_dynamic_conf, recon_gs_map, recon_gs_conf
@@ -3056,9 +3191,10 @@ def render_validation_generated_rgb_gt_sky(
     args,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Render a generated branch with fixed input-DGGT camera over GT sky."""
+    """Render a generated branch with cached full-context DGGT camera over GT sky."""
     images = batch["images"].to(device, non_blocking=True)
     masks = batch["masks"].to(device, non_blocking=True)
+    render_pose_enc_dggt = _cached_render_pose_from_batch(batch, images, device)
     frames = min(int(args.val_log_images), int(images.shape[1]))
     sf = unwrap_ddp(scene_flow)
     timestamps_raw = batch["timestamps"]
@@ -3066,13 +3202,8 @@ def render_validation_generated_rgb_gt_sky(
 
     with autocast_context(args, device):
         outputs = vggt_model.get_aggregator_token_outputs(images)
-        aggregated_tokens_list = outputs["aggregated_tokens_list"]
         patch_start_idx = int(outputs["patch_start_idx"])
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            render_pose_enc_dggt = vggt_model.camera_head(aggregated_tokens_list)[-1]
-            if render_pose_enc_dggt.ndim != 3 or render_pose_enc_dggt.shape[-1] != 9 or not bool(torch.isfinite(render_pose_enc_dggt).all()):
-                raise RuntimeError("render_pose_enc_dggt must be finite [B,S,9] from the input DGGT CameraHead")
-        del outputs, aggregated_tokens_list
+        del outputs
         geometry = decode_generated_dggt_geometry(
             vggt_model=vggt_model,
             scene_flow_root=sf,
@@ -3107,7 +3238,7 @@ def render_validation_generated_rgb_gt_sky(
             generated_dynamic_conf,
             device,
             frames,
-            background_mode="sky",
+            background_mode="gt_sky",
             use_sky_mask=True,
         ),
     }
@@ -3246,6 +3377,38 @@ def run_validation(
     text_encoder: nn.Module | None = None,
     vggt_model: nn.Module | None = None,
 ) -> dict[str, float]:
+    with preserve_validation_rng_state(device):
+        return _run_validation_impl(
+            loader,
+            assembler,
+            scene_flow,
+            scheduler,
+            device,
+            args,
+            step,
+            log_dir,
+            wandb_run,
+            ema,
+            text_encoder,
+            vggt_model,
+        )
+
+
+@torch.no_grad()
+def _run_validation_impl(
+    loader: DataLoader,
+    assembler: FlowFeatureAssembler,
+    scene_flow: nn.Module,
+    scheduler: Any,
+    device: torch.device,
+    args,
+    step: int,
+    log_dir: Path,
+    wandb_run,
+    ema: EMAModel | None = None,
+    text_encoder: nn.Module | None = None,
+    vggt_model: nn.Module | None = None,
+) -> dict[str, float]:
     was_training = scene_flow.training
     scene_flow.eval()
     assembler.eval()
@@ -3258,6 +3421,7 @@ def run_validation(
     sums: dict[str, float] = {}
     count = 0
     first_item: dict[str, Any] | None = None
+    validation_generator = make_validation_generator(device, int(args.seed))
     iterator = loader
     if is_main_process() and not args.no_tqdm:
         iterator = tqdm(loader, total=args.val_batches, desc=f"val {step:06d}", dynamic_ncols=True, leave=False)
@@ -3268,7 +3432,16 @@ def run_validation(
         if first_item is None and is_main_process():
             first_item = _first_item(item)
         with autocast_context(args, device):
-            loss, logs = train_step(item, assembler, scene_flow, scheduler, device, args, text_encoder)
+            loss, logs = train_step(
+                item,
+                assembler,
+                scene_flow,
+                scheduler,
+                device,
+                args,
+                text_encoder,
+                generator=validation_generator,
+            )
         logs = dict(logs)
         logs["loss"] = float(loss.detach().item())
         for key, value in logs.items():
@@ -3349,6 +3522,13 @@ def load_resume_checkpoint(
         )
     validate_formal_flow_domain_config(payload, args, resume_path)
     _validate_scene_flow_checkpoint_config(scene_flow, payload, resume_path)
+    validate_checkpoint_flow_schedule(
+        payload,
+        args,
+        resume_path,
+        prediction_type=_scene_flow_prediction_type_from_module(scene_flow),
+        t_eps=scene_flow_t_eps(scene_flow),
+    )
     required_keys = {"step", "scene_flow", "scaffold_packer", "ema_scene_flow", "optimizer", "lr_scheduler"}
     missing_keys = sorted(required_keys.difference(payload.keys()))
     if missing_keys:
@@ -3413,6 +3593,8 @@ def main() -> None:
         caption_root=args.caption_root,
         include_sky_training_data=False,
         include_rgb_training_data=enable_rgb_render_loss,
+        require_edit_window=True,
+        edit_domain_threshold=args.edit_domain_threshold,
     )
     independent_val = args.val_manifest_path is not None or args.val_cache_root is not None
     val_caption_root = args.val_caption_root
@@ -3431,6 +3613,9 @@ def main() -> None:
             caption_root=val_caption_root,
             include_sky_training_data=False,
             include_rgb_training_data=False,
+            require_edit_window=True,
+            edit_domain_threshold=args.edit_domain_threshold,
+            deterministic_windows=True,
         )
     else:
         if args.val_caption_root is not None:
@@ -3545,29 +3730,39 @@ def main() -> None:
             "Formal training DGGT checkpoint does not match the pretrain camera provenance: "
             f"pretrain={recorded_hash!r}, current={args.dggt_checkpoint_sha256!r}."
         )
+    recorded_stats_version = provenance.get("camera_stats_version") if isinstance(provenance, dict) else None
+    if recorded_stats_version != CAMERA_STATS_VERSION:
+        raise ValueError(
+            "Formal training requires global-context camera stats provenance: "
+            f"checkpoint={recorded_stats_version!r}, required={CAMERA_STATS_VERSION!r}."
+        )
+    if int(provenance.get("dggt_context_length", 0)) != 29:
+        raise ValueError(
+            "Formal training requires a pretrain checkpoint built from complete 29-frame DGGT context."
+        )
     if str(scene_flow.config.asset_position_mode) != str(args.asset_position_mode):
         raise ValueError(
             f"checkpoint asset_position_mode={scene_flow.config.asset_position_mode!r} "
             f"!= --asset_position_mode={args.asset_position_mode!r}"
         )
     scene_flow.enable_gradient_checkpointing()
-    load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
-    if args.feature_stats_path:
-        stats_payload = torch.load(args.feature_stats_path, map_location="cpu")
-        if not isinstance(stats_payload, dict):
-            raise TypeError("feature stats payload must be a dict")
-        validate_camera_stats_provenance(stats_payload, args.dggt_checkpoint_sha256)
     text_encoder = setup_text_encoder(args, device)
     warm_start_info = load_scene_flow_warm_start(
         scene_flow,
         args.scene_flow_pretrain_path,
         use_ema=bool(args.scene_flow_pretrain_ema),
+        args=args,
     )
     if is_main_process() and warm_start_info is not None:
         print(f"[warm-start] {warm_start_info}", flush=True)
 
     ema = EMAModel(scene_flow.parameters(), decay=args.ema_decay)
     ema.to(device)
+    # DDP broadcasts rank-0 module parameters in its constructor.  Non-resume
+    # runs must rebuild the EMA after that broadcast so rank-local random
+    # initialization cannot survive in EMA shadow params.  Exact resume loads a
+    # checkpointed EMA below and must preserve it.
+    sync_ema_after_ddp_initial_broadcast = not bool(args.resume_path)
 
     if world_size > 1:
         scene_flow = DistributedDataParallel(
@@ -3584,6 +3779,8 @@ def main() -> None:
             gradient_as_bucket_view=True,
             find_unused_parameters=False,
         )
+    if sync_ema_after_ddp_initial_broadcast:
+        sync_ema_shadow_from_model(scene_flow, ema)
 
     clip_params = list(unwrap_ddp(scene_flow).parameters()) + list(
         unwrap_ddp(assembler.scaffold_packer).parameters()
@@ -3623,6 +3820,23 @@ def main() -> None:
         device,
         args,
     )
+    if args.feature_stats_path:
+        load_all_stats_into_buffers(
+            unwrap_ddp(scene_flow),
+            args.feature_stats_path,
+            token_dim=int(args.latent_dim),
+            expected_dggt_sha256=args.dggt_checkpoint_sha256,
+            expected_sequence_length=int(args.sequence_length),
+            require_existing_match=True,
+        )
+        stats_sha256 = checkpoint_sha256(args.feature_stats_path)
+        if is_main_process():
+            checkpoint_kind = "resume" if args.resume_path else "warm-start"
+            print(
+                f"[stats] verified latent+camera stats against the effective {checkpoint_kind} "
+                f"checkpoint and loaded {args.feature_stats_path} (sha256={stats_sha256})",
+                flush=True,
+            )
 
     sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
     loader = DataLoader(
@@ -3848,20 +4062,35 @@ def _save_checkpoint(
     sf = unwrap_ddp(scene_flow)
     scene_flow_state = sf.state_dict()
     ema_scene_flow_state = materialize_ema_state_dict(scene_flow, ema)
+    # ScaffoldPacker is optimized during formal training, but is intentionally
+    # not part of the SceneFlow EMA (matching validation, which uses EMA
+    # SceneFlow weights together with the current trained packer).  Every
+    # inference-oriented export must therefore carry this state explicitly;
+    # otherwise a weights-only checkpoint silently falls back to a freshly
+    # initialized packer and changes the edit-control conditioning.
+    scaffold_packer_state = unwrap_ddp(assembler.scaffold_packer).state_dict()
     scene_flow_config = sf.config.to_dict() if hasattr(sf, "config") and hasattr(sf.config, "to_dict") else {}
+    flow_schedule_config = build_flow_schedule_config(
+        args,
+        prediction_type=_scene_flow_prediction_type_from_module(sf),
+        t_eps=scene_flow_t_eps(sf),
+    )
     flow_domain_config = formal_flow_domain_config(args)
     provenance = {
         "dggt_checkpoint_sha256": str(args.dggt_checkpoint_sha256),
         "camera_generation_representation": str(scene_flow_config.get("camera_generation_representation")),
         "camera_target_source": "frozen_dggt_camera_head",
+        "camera_stats_version": CAMERA_STATS_VERSION,
+        "dggt_context_length": 29,
     }
     state = {
         "step": int(step),
         "scene_flow": scene_flow_state,
         "scene_flow_config": scene_flow_config,
+        "flow_schedule_config": flow_schedule_config,
         "ema_scene_flow": ema.state_dict(),
         "ema_scene_flow_state_dict": ema_scene_flow_state,
-        "scaffold_packer": unwrap_ddp(assembler.scaffold_packer).state_dict(),
+        "scaffold_packer": scaffold_packer_state,
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
         "args": vars(args),
@@ -3873,7 +4102,9 @@ def _save_checkpoint(
     torch.save(
         {
             "scene_flow": scene_flow_state,
+            "scaffold_packer": scaffold_packer_state,
             "scene_flow_config": scene_flow_config,
+            "flow_schedule_config": flow_schedule_config,
             "camera_dggt_provenance": provenance,
             "formal_flow_domain_version": FORMAL_FLOW_DOMAIN_VERSION,
             "formal_flow_domain_config": flow_domain_config,
@@ -3883,7 +4114,9 @@ def _save_checkpoint(
     torch.save(
         {
             "scene_flow": ema_scene_flow_state,
+            "scaffold_packer": scaffold_packer_state,
             "scene_flow_config": scene_flow_config,
+            "flow_schedule_config": flow_schedule_config,
             "step": int(step),
             "is_ema_weights": True,
             "camera_dggt_provenance": provenance,

@@ -1,6 +1,7 @@
 """Losses and rectified-flow target helpers for SceneFlow training."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -62,13 +63,13 @@ def preserve_loss(
     z_pred: torch.Tensor | None = None,
     z_preserve_target: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # The rectified-flow convention in this module is
-    #   z_t = (1 - sigma) * z_clean + sigma * eps
-    #   v = eps - z_clean
-    # so the clean prediction recovered from a velocity is eps - v.  Main
-    # training callers currently pass z_pred explicitly, but keep the fallback
-    # correct for auxiliary/legacy callers as well.
-    z_hat = z_pred if z_pred is not None else eps - v_pred
+    del v_pred, eps
+    if z_pred is None:
+        raise ValueError(
+            "preserve_loss requires an explicit clean prediction. RAE velocity cannot be "
+            "reconstructed from eps-v_pred when sigma is below t_eps or the flow path is masked."
+        )
+    z_hat = z_pred
     target = z_clean if z_preserve_target is None else z_preserve_target
     diff = (z_hat - target).square().mean(dim=-1, keepdim=True)
     return masked_mean(diff, M_preserve)
@@ -121,7 +122,7 @@ def compute_total_loss(
     lambda_boundary: float = 0.0,
     lambda_repa: float = 0.0,
     lambda_identity: float = 0.0,
-    identity_batch: bool = False,
+    identity_batch: bool | torch.Tensor = False,
     preserve_floor: float = 0.2,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     z_clean = getattr(bundle, "z_clean_n", None)
@@ -142,13 +143,17 @@ def compute_total_loss(
         loss_flow = masked_flow_edit_loss(v_pred, v_gt, M_edit, sd3_weights=sd3_weights)
     if M_preserve_loss is None:
         M_preserve_loss = bundle.M_preserve
-    loss_preserve = preserve_loss(
-        v_pred,
-        eps,
-        z_clean,
-        M_preserve_loss,
-        z_pred=z_pred,
-        z_preserve_target=z_preserve_target,
+    loss_preserve = (
+        preserve_loss(
+            v_pred,
+            eps,
+            z_clean,
+            M_preserve_loss,
+            z_pred=z_pred,
+            z_preserve_target=z_preserve_target,
+        )
+        if float(lambda_preserve) != 0.0
+        else zero_loss_like(v_pred)
     )
     loss_boundary = (
         boundary_loss(z_pred, z_clean, boundary_mask)
@@ -158,12 +163,28 @@ def compute_total_loss(
     if repa_target is None:
         repa_target = z_clean
     loss_repa = repa_loss(mid_repa, repa_target) if float(lambda_repa) != 0.0 else zero_loss_like(v_pred)
-    if identity_batch and float(lambda_identity) != 0.0:
+    identity_mask = None
+    if torch.is_tensor(identity_batch):
+        identity_mask = identity_batch.to(device=v_pred.device, dtype=torch.bool).reshape(-1)
+        if int(identity_mask.numel()) != int(v_pred.shape[0]):
+            raise ValueError(
+                f"identity mask must have B={v_pred.shape[0]} entries, got {identity_mask.numel()}"
+            )
+        has_identity = bool(identity_mask.any().item())
+    else:
+        has_identity = bool(identity_batch)
+
+    if has_identity and float(lambda_identity) != 0.0:
         if z_pred is not None:
             identity_target = z_clean if z_preserve_target is None else z_preserve_target
-            loss_identity = (z_pred - identity_target).square().mean()
+            identity_error = (z_pred - identity_target).square().flatten(1).mean(dim=1)
         else:
-            loss_identity = identity_loss(v_pred, v_gt)
+            identity_error = (v_pred - v_gt).square().flatten(1).mean(dim=1)
+        if identity_mask is None:
+            loss_identity = identity_error.mean()
+        else:
+            weight = identity_mask.to(dtype=identity_error.dtype)
+            loss_identity = (identity_error * weight).sum() / weight.sum().clamp_min(1.0)
     else:
         loss_identity = zero_loss_like(v_pred)
     if v_base_pred is not None and float(base_model_coeff) != 0.0:
@@ -260,10 +281,29 @@ def rae_t_grid(
     time_shift: float,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
+    t_eps: float = 0.05,
 ) -> torch.Tensor:
-    t = torch.linspace(1.0, 0.0, int(num_steps) + 1, device=device, dtype=torch.float32)
+    steps = int(num_steps)
     shift = float(time_shift)
+    floor = float(t_eps)
+    if steps <= 0:
+        raise ValueError(f"RAE sampling requires num_steps > 0, got {steps}")
+    if not math.isfinite(shift) or shift <= 0.0:
+        raise ValueError(f"RAE sampling requires time_shift > 0, got {shift}")
+    if not math.isfinite(floor) or not 0.0 < floor <= 1.0:
+        raise ValueError(f"RAE sampling requires 0 < t_eps <= 1, got {floor}")
+
+    t = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)
     t = shift * t / (1.0 + (shift - 1.0) * t)
+    last_sigma = float(t[-2].item())
+    if last_sigma + 1e-7 < floor:
+        max_steps = max(1, math.floor(shift / floor - shift + 1.0 + 1e-9))
+        raise ValueError(
+            "RAE sampling grid enters the clamped pseudo-velocity region: "
+            f"last nonzero sigma={last_sigma:.8g} < t_eps={floor:.8g}. "
+            f"Use num_steps <= {max_steps} for time_shift={shift:.8g}, or change the "
+            "checkpointed flow schedule instead of silently producing an inexact clean endpoint."
+        )
     return t.to(dtype=dtype)
 
 

@@ -6,7 +6,7 @@
 * `/data/flow_cache_mode_b/{split}/{scene}/{clip:04d}.pt` — Mode B 片段（规划器想象的目标位置 + 场景 Gaussian 伪删除）。
 * `/data/flow_cache/{split}_manifest.jsonl` — 扩散数据加载器使用的合并训练 manifest（每个片段一行，两种模式混合在一起）。
 
-当前 `.pt` 文件仍保持 `schema_version=8` 和原有逻辑 schema，但物理存储已经改为 **chunked zstd SQLite container**：每个帧/字段独立压缩，训练时只读取随机 8 帧窗口需要的 chunk。新生成的 cache 还会写入 `pass2_splatted_tok_low.flow_inputs`，其中包含正式训练直接消费的 `M_preserve/M_source/M_dest`、pooled scaffold 输入和 Mode-A asset coverage。`WaymoFlowCacheDataset` 会优先走 `scene_flow_fast` 读取路径：只读取 scene/pass2 token、flow inputs 和 asset LUT，不读取 raw image、dense pass1 heads、asset Gaussian 或 asset render；如果旧 cache 没有 `flow_inputs`，会自动回退到原完整读取路径。
+当前 `.pt` 文件使用 `schema_version=9`，物理存储为 **chunked zstd SQLite container**：每个帧/字段独立压缩，训练时只读取随机窗口需要的 chunk。新生成的 cache 还会写入 `pass2_splatted_tok_low.flow_inputs`，其中包含正式训练直接消费的 `M_preserve/M_source/M_dest`、pooled scaffold 输入和 Mode-A asset coverage。Mode-A 额外在每个 asset 的轻量 meta chunk 保存 `[S,P]` 的 `asset_patch_valid_mask`（`asset_patch_mask_version=alpha_max_t005_v1`）；fast loader 只读取 scene/pass2 token、flow inputs、asset LUT 和该轻量 mask，不读取 raw image、dense pass1 heads、asset Gaussian、asset RGB/alpha 或 pointer。
 
 两种缓存共享相同的逻辑 schema。它们只在 payload 顶层的 `mode_kind` 字段以及下面两个 sibling 中哪一个被填充上有所不同：
 
@@ -26,9 +26,9 @@
 
 ## Cache 语义：full-source-Gaussian splat
 
-v8 的 `pass2_splatted_tok_low` 缓存的是 tokenizer 之前的 splat→blend 特征。它的 source Gaussian 集合是完整 clip 的所有帧；训练时随机选连续 4-8 帧窗口时，dataset 只在 target frame 维度做 `index_select`。v7 把 `pass1.gs_conf` 从旧版 fp16 改为 finite fp32，避免大置信度值溢出为 `inf`；v8 修正了动态 Gaussian 生命周期阈值。chunked v8 仍然写 `schema_version=8`，只是把正式训练和 tokenizer Stage-B 需要的内容分块保存。
+v9 的 `pass2_splatted_tok_low` 仍缓存 tokenizer 之前的 splat→blend 特征，并新增严格的 formal asset patch mask。mask 由目标位置 isolated `A_asset` 以 `alpha>=0.05` 二值化、按 DGGT patch cell max-pool 得到，不 dilation；训练时再与 `phase1_coverage` 和选中 slot 取交集。旧 Mode-A cache 不做兼容回退，必须重新生成。Mode-B 没有真实 asset condition，不需要该字段。
 
-chunked v8 包含：
+chunked v9 包含：
 
 * SceneFlow fallback / debug：`raw`、`pass1` heads、由 `semantic_logits` 派生出的 `semantic_vehicle_prob/mask`、scene LUT、`pass2_splatted_tok_low`、Mode-A `phase1_localized`/`asset_pass`、Mode-B planner/delete masks。
 * SceneFlow fast training：scene LUT、`pass2_splatted_tok_low`、`flow_inputs`、Mode-A 完整 4-level asset LUT。训练时 tokenizer.encode 和可训练的 `ScaffoldPacker.mlp` 仍在线运行；FeatureSplatter、SoftMask render、CleanSceneState 构建和 asset Gaussian 读取都会跳过。
@@ -79,7 +79,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/precompute_flow_features.py \
     --max_save_threads 1
 ```
 
-如果已有旧 cache，只想升级旧文件并保留已生成的当前格式文件，可在 Mode A / Mode B 预计算命令里加 `--overwrite_v7`。它会读取已存在 `.pt` 的 `schema_version` 和 chunked `format_version`：当前 v8 chunked format 直接跳过，v6/v7、旧 chunked format v1、非 chunked 或无法读取的文件会重新生成并覆盖。`--force_overwrite` 仍表示无条件重算覆盖。
+如果已有旧 cache，只想升级旧文件并保留已生成的当前格式文件，可在预计算命令里加 `--overwrite_v7`。它会读取已存在 `.pt` 的 `schema_version` 和 chunked `format_version`：当前 v9 chunked format 直接跳过，旧 schema、旧 chunked format、非 chunked 或无法读取的文件会重新生成并覆盖。`--force_overwrite` 仍表示无条件重算覆盖。训练和验证只接受 schema v9；Mode-A 与 Mode-B 的旧 cache 都必须重新生成，不提供旧 schema 兼容路径。
 
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python inference_scene_editor.py \
     --output_dir runs/mode_a_all_vis \
@@ -107,7 +107,8 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python tools/precompute_flow_features.py \
     --views 1 \
     --planner_seed 0 \
     --allow_empty_plan --start 500 \
-    --save_compression chunked_zstd --gzip_level 1
+    --save_compression chunked_zstd --gzip_level 1 \
+    --overwrite_v7
 ```
 
 `--allow_empty_plan` 会为规划器无法满足条件的片段保留缓存文件（这样 manifest 条目可以与 manifest split 保持 1:1）。如果不使用它，脚本会报错并跳过该片段。
@@ -131,9 +132,11 @@ Mode B 的 `--dump_features` 同样走训练用 `FlowFeatureAssembler(mode_kind=
 训练同路径的 feature splat，因此比只画框和 `D_map` 慢。
 
 
-## 2.5 旧 cache 转换为 chunked v8
+## 2.5 cache 转换为 chunked v9
 
-已有 monolithic gzip/zstd/plain `.pt` 可直接原地转换；转换后逻辑 `schema_version` 不变，路径仍是原来的 `.pt`：
+只有已经携带 v9 asset patch mask 的 Mode-A monolithic cache 或 schema v9 Mode-B cache，
+才可只做物理格式转换；转换后逻辑 `schema_version` 不变，路径仍是原来的 `.pt`。所有旧 schema
+cache 都不能通过物理格式转换升级，必须重新运行相应的 Mode-A/Mode-B 预计算：
 
 ```bash
 python tools/convert_flow_cache_to_chunked.py \
@@ -148,9 +151,9 @@ python tools/convert_flow_cache_to_chunked.py \
 `--mode_a_source_dir/--mode_a_output_dir` 用于这批迁移：Mode-A 从 disk3 旧 cache 读取，转换后写到 disk2；Mode-B 仍按 manifest 原地转换。`--verify` 会在覆盖/落盘前，对临时 chunked 文件分别走 SceneFlow 默认读取路径和 tokenizer Stage-B 读取路径，并与原始 `.pt` 做逐 tensor 精确比较；通过后才执行原子替换。manifest 路径不需要改变。
 
 
-## 2.6 旧 chunked v8 原地补写 flow_inputs
+## 2.6 chunked cache 原地补写 flow_inputs
 
-已有 chunked v8 cache 若缺少 `pass2_splatted_tok_low.flow_inputs`，可以原地追加训练 fast path 所需的小 chunk。该工具不会重写整个 `.pt`，也不会重算 `pass2_splatted_tok_low` 或运行 FeatureSplatter；它只用 dense heads、Phase-1 / Mode-B masks 和 asset Gaussian 渲染 masks 与 pooled scaffold 输入。
+已有 chunked cache 若缺少 `pass2_splatted_tok_low.flow_inputs`，可以原地追加训练 fast path 所需的小 chunk。该工具不会生成 v9 所要求的 Mode-A asset patch mask，因此不能用它把旧 Mode-A cache 兼容升级到 v9；Mode-A 仍须重新预计算。
 
 先 dry-run 估算新增体积：
 

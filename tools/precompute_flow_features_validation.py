@@ -8,7 +8,7 @@ decoupled localization ONCE, then derive 5 variant caches:
 * ``deletion`` / ``insertion`` / ``replacement`` / ``repositioning`` --
   single-edit-type caches.
 
-Output (schema-identical to Mode A v8, ``mode_kind="mode_a"``) uses the same
+Output (schema-identical to Mode A v9, ``mode_kind="mode_a"``) uses the same
 six-digit padding as training plus a readable edit suffix:
 
     {out_root}/validation/{entry_index:06d}_{edit_name}.pt
@@ -53,7 +53,7 @@ from datasets.waymo_validation_edit_dataset import (
     MissingAssetError,
     WaymoValidationEditDataset,
 )
-from dggt.models.asset_pass import AssetAggregatorPass
+from dggt.models.asset_pass import ASSET_PATCH_MASK_VERSION, AssetAggregatorPass
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.flow_cache_io import (
     CURRENT_FLOW_CACHE_SCHEMA_VERSION,
@@ -175,7 +175,7 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Deprecated compatibility flag. Validation now always regenerates existing "
-            "v6/v7 or non-chunked files and only skips current v8 chunked-zstd caches."
+            "legacy or non-chunked files and only skips current v9 chunked-zstd caches."
         ),
     )
     p.add_argument("--asset_batch_size", type=int, default=1)
@@ -187,7 +187,7 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["chunked_zstd", "gzip", "zstd", "none"],
         default="chunked_zstd",
         help=(
-            "Cache physical format. Default matches current training: schema-v8 "
+            "Cache physical format. Default matches current training: schema-v9 "
             "chunked-zstd SQLite. Legacy monolithic formats are retained only for debugging."
         ),
     )
@@ -204,11 +204,11 @@ def _should_skip_existing_validation_cache(
     *,
     force_overwrite: bool,
 ) -> tuple[bool, str]:
-    """Only reuse a current v8 cache in the current chunked physical format.
+    """Only reuse a current v9 cache in the current chunked physical format.
 
     Validation must not silently retain v6/v7 payloads (which predate the
     finite-fp32 gs_conf and corrected dynamic lifecycle threshold) or an older
-    monolithic v8 file. Both are regenerated into the same format as training.
+    monolithic legacy file. Both are regenerated into the same format as training.
     """
     if not path.is_file():
         return False, "missing"
@@ -315,6 +315,7 @@ def _assemble_payload(
             "num_frames": int(S),
             "asset_meta": sample_cached.get("asset_meta", {}),
             "asset_pass_space": "dggt_fitted",
+            "asset_patch_mask_version": ASSET_PATCH_MASK_VERSION,
             "editor_config": {
                 "use_pose_refine": True,
                 "max_pose_refine_yaw_deg": float(args.max_pose_refine_yaw_deg),

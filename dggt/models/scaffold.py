@@ -42,8 +42,34 @@ class ScaffoldPacker(nn.Module):
             nn.Linear(hidden_dim, out_dim),
         )
 
-    def forward(self, scaffold_hires: torch.Tensor, target_grid: int | tuple[int, int] = 37) -> torch.Tensor:
-        """Pool `[B, S, H, W, C]` to `[B, S, grid_h*grid_w, out_dim]`."""
+    def forward(
+        self,
+        scaffold_hires: torch.Tensor,
+        target_grid: int | tuple[int, int] = 37,
+        *,
+        already_pooled: bool = False,
+    ) -> torch.Tensor:
+        """Pack a hires scaffold or an already-pooled cache tensor.
+
+        The live path passes ``[B,S,H,W,C]`` and pools it to the requested
+        patch grid.  Schema-v9 fast caches persist that pooled representation
+        as ``[B,S,P,C]``; accepting it through ``forward`` is important because
+        formal multi-GPU training wraps this module in DDP and must not bypass
+        the wrapper by calling ``module.mlp`` directly.
+        """
+        if already_pooled:
+            if scaffold_hires.dim() != 4:
+                raise ValueError(
+                    "already-pooled scaffold must be 4D [B,S,P,C], "
+                    f"got {tuple(scaffold_hires.shape)}"
+                )
+            if int(scaffold_hires.shape[-1]) != self.in_channels:
+                raise ValueError(
+                    f"already-pooled scaffold last dim {scaffold_hires.shape[-1]} "
+                    f"!= in_channels {self.in_channels}"
+                )
+            return self.mlp(scaffold_hires)
+
         if scaffold_hires.dim() != 5:
             raise ValueError(
                 f"scaffold_hires must be 5D [B,S,H,W,C], got {tuple(scaffold_hires.shape)}"

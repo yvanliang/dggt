@@ -25,7 +25,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dggt.models.asset_pass import AssetPassResult
+from dggt.models.asset_pass import (
+    AssetPassResult,
+    build_asset_condition_slots,
+    require_asset_patch_valid_mask,
+)
 from dggt.models.feature_splatter import FeatureSplatter
 from dggt.models.gaussian_pointers import (
     GaussianPointers,
@@ -606,37 +610,16 @@ class FlowFeatureAssembler(nn.Module):
 
         del generator
 
-        asset_latents: list[torch.Tensor] = []
-        asset_masks: list[torch.Tensor] = []
-        for obj_key in sorted(int(k) for k in F_g_lut_asset.keys())[:5]:
-            levels = F_g_lut_asset[obj_key]
-            if len(levels) != len(F_g_lut_scene):
-                continue
-            z_asset = self.scene_tokenizer.encode(levels, patch_grid=self.patch_grid)
-            valid = torch.ones(z_asset.shape[:-1], device=z_asset.device, dtype=torch.bool)
-            if obj_key < int(phase1_coverage.shape[0]):
-                cov = phase1_coverage[obj_key].to(device=z_asset.device, dtype=torch.bool)
-                if cov.ndim != 1 or int(cov.numel()) != int(z_asset.shape[1]):
-                    raise ValueError(
-                        f"Asset {obj_key} coverage must be [S]={int(z_asset.shape[1])}, "
-                        f"got {tuple(cov.shape)} for latent {tuple(z_asset.shape)}."
-                    )
-                # z_asset/valid are [B,S,P,C]/[B,S,P]. Coverage is temporal.
-                valid = valid & cov.reshape(1, -1, 1)
-            asset_latents.append(z_asset)
-            asset_masks.append(valid)
-        F_asset_tokens = z_clean.new_zeros((B, 5, S, z_clean.shape[2], z_clean.shape[-1]))
-        encoder_attention_mask = torch.zeros((B, 5, S, z_clean.shape[2]), device=z_clean.device, dtype=torch.bool)
-        if asset_latents:
-            n_assets = min(len(asset_latents), 5)
-            F_asset_tokens[:, :n_assets] = torch.stack(asset_latents[:n_assets], dim=1).to(
-                device=z_clean.device,
-                dtype=z_clean.dtype,
-            )
-            encoder_attention_mask[:, :n_assets] = torch.stack(asset_masks[:n_assets], dim=1).to(
-                device=z_clean.device,
-                dtype=torch.bool,
-            )
+        F_asset_tokens, encoder_attention_mask = build_asset_condition_slots(
+            asset_pass_result,
+            phase1_coverage=phase1_coverage,
+            phase4_slots=phase4_slots,
+            scene_tokenizer=self.scene_tokenizer,
+            patch_grid=self.patch_grid,
+            reference=z_clean,
+            max_assets=5,
+            expected_num_levels=len(F_g_lut_scene),
+        )
 
         return FlowFeatureBundle(
             edit_bundle=edit_bundle,
@@ -1921,9 +1904,25 @@ class FlowFeatureAssembler(nn.Module):
         )
         I_asset: dict[int, torch.Tensor] = {}
         A_asset: dict[int, torch.Tensor] = {}
+        asset_patch_valid_mask: dict[int, torch.Tensor] = {}
 
         for k in kept_keys:
             cov_k = phase1_coverage[k]  # [S] bool for this slot
+            reference_level = asset_pass_result.F_g_lut_asset[k][0]
+            patch_valid = require_asset_patch_valid_mask(
+                asset_pass_result,
+                k,
+                expected_shape=(
+                    int(reference_level.shape[0]),
+                    int(reference_level.shape[1]),
+                    int(reference_level.shape[2]),
+                ),
+                device=reference_level.device,
+            )
+            asset_patch_valid_mask[k] = (
+                patch_valid
+                & cov_k.view(1, -1, 1).to(device=reference_level.device, dtype=torch.bool)
+            )
             # LUT shape: [1, S, P, 3072] per level; zero-out non-covered frames.
             F_g_lut_asset[k] = [
                 lvl * cov_k.view(1, -1, 1, 1).to(lvl.dtype).to(lvl.device)
@@ -1977,6 +1976,7 @@ class FlowFeatureAssembler(nn.Module):
             G_asset_dggt=G_asset_dggt_out,
             I_asset=I_asset,
             A_asset=A_asset,
+            asset_patch_valid_mask=asset_patch_valid_mask,
             asset_pass_space=asset_pass_result.asset_pass_space,
             fit_metrics=None
             if asset_pass_result.fit_metrics is None

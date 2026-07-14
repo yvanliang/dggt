@@ -36,7 +36,7 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset, get_worker_info
 
-from dggt.models.asset_pass import AssetPassResult
+from dggt.models.asset_pass import ASSET_PATCH_MASK_VERSION, AssetPassResult
 from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
 from dggt.utils.camera_condition import normalize_front_image_hw
@@ -53,13 +53,14 @@ from dggt.utils.flow_cache_io import (
 from dggt.utils.gaussian_edit import Sim3Transform
 from dggt.utils.validation_cache_naming import (
     is_canonical_validation_cache_filename,
+    normalize_validation_variant,
     parse_validation_cache_filename,
     validation_cache_filename,
     validation_cache_index,
 )
 
 
-SUPPORTED_CACHE_SCHEMA_VERSIONS = (6, 7, 8)
+SUPPORTED_CACHE_SCHEMA_VERSIONS = (9,)
 GS_CONF_REPAIR_VALUE = 1_000_000.0
 EXPECTED_ASSET_LUT_LEVELS = 4
 
@@ -70,6 +71,10 @@ class CaptionLookupError(RuntimeError):
 
 class AssetLutIncompleteError(RuntimeError):
     pass
+
+
+class EmptyEditWindowError(RuntimeError):
+    """Raised when formal training cannot find a window with edit supervision."""
 
 
 def repair_cached_gs_conf(gs_conf: torch.Tensor) -> torch.Tensor:
@@ -199,6 +204,55 @@ def _dequantize_nplc_subset(
     return dequantize_tokens(q, dtype=dtype)
 
 
+def _camera_context_for_subset(
+    object_meta: dict[str, Any],
+    camera_front: torch.Tensor,
+    subset: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resolve clip-global Waymo camera context for a selected frame window.
+
+    Plain caches retain the full camera trajectory, so the context can be
+    derived here.  Chunked cache reads retain only the selected poses and must
+    provide the two explicit context tensors injected by ``flow_cache_io``.
+    """
+    anchor = object_meta.get("camera_trajectory_anchor_to_world_corrected")
+    previous = object_meta.get("camera_previous_to_world_corrected")
+
+    if anchor is None:
+        anchor = camera_front[:1]
+    elif not torch.is_tensor(anchor):
+        raise TypeError(
+            "object_meta['camera_trajectory_anchor_to_world_corrected'] must be a tensor"
+        )
+
+    if previous is None:
+        previous_indices = (subset.to(dtype=torch.long) - 1).clamp_min(0)
+        previous = camera_front.index_select(0, previous_indices)
+    elif not torch.is_tensor(previous):
+        raise TypeError(
+            "object_meta['camera_previous_to_world_corrected'] must be a tensor"
+        )
+    elif previous.ndim == 3 and int(previous.shape[0]) == int(camera_front.shape[0]):
+        # A fully reconstructed chunked cache carries clip-aligned explicit
+        # previous poses.  Offline inference then builds several windows from
+        # that payload, so select the same window here.  A cache loaded directly
+        # as a frame subset also enters this branch with local ``0..S-1``
+        # indices, preserving the existing fast training path.
+        previous = previous.index_select(0, subset.to(dtype=torch.long))
+
+    expected_previous = (int(subset.numel()), 4, 4)
+    if tuple(anchor.shape) != (1, 4, 4):
+        raise ValueError(
+            "camera trajectory anchor must be [1,4,4], "
+            f"got {tuple(anchor.shape)}"
+        )
+    if tuple(previous.shape) != expected_previous:
+        raise ValueError(
+            f"previous camera poses must be {expected_previous}, got {tuple(previous.shape)}"
+        )
+    return anchor.contiguous(), previous.contiguous()
+
+
 def _normalize_level_indices(level_indices: list[int] | tuple[int, ...], num_levels: int) -> list[int]:
     out: list[int] = []
     for raw in level_indices:
@@ -326,13 +380,25 @@ class WaymoFlowCacheDataset(Dataset):
         max_read_retries: int = 16,
         include_sky_training_data: bool = False,
         include_rgb_training_data: bool = False,
+        require_edit_window: bool = False,
+        edit_domain_threshold: float = 1e-4,
+        deterministic_windows: bool = False,
     ) -> None:
         super().__init__()
         if min_frames <= 0 or max_frames < min_frames:
             raise ValueError(f"Invalid frame range [{min_frames}, {max_frames}]")
         self.min_frames = int(min_frames)
         self.max_frames = int(max_frames)
-        self._rng = random.Random(int(seed))
+        self._window_seed = int(seed)
+        self._rng = random.Random(self._window_seed)
+        self.deterministic_windows = bool(deterministic_windows)
+        # ``random.Random`` is part of the dataset object and is therefore
+        # copied with identical state into every DataLoader worker.  Seed the
+        # private generator lazily from PyTorch's per-worker seed on the first
+        # item read in each worker process; persistent workers then keep
+        # advancing their own independent stream instead of being rewound for
+        # every sample.
+        self._rng_worker_seed: int | None = None
         self.lut_dtype = lut_dtype
         self.split = str(split)
         self.include_aux_tokens = bool(include_aux_tokens)
@@ -344,6 +410,12 @@ class WaymoFlowCacheDataset(Dataset):
         self.max_read_retries = max(1, int(max_read_retries))
         self.include_sky_training_data = bool(include_sky_training_data)
         self.include_rgb_training_data = bool(include_rgb_training_data)
+        self.require_edit_window = bool(require_edit_window)
+        self.edit_domain_threshold = float(edit_domain_threshold)
+        if not 0.0 <= self.edit_domain_threshold < 1.0:
+            raise ValueError(
+                f"edit_domain_threshold must be in [0, 1), got {self.edit_domain_threshold}"
+            )
 
         if manifest_path is not None:
             self.manifest_path = Path(manifest_path)
@@ -387,7 +459,18 @@ class WaymoFlowCacheDataset(Dataset):
 
     # ------------------------------------------------------------------ #
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        self._reseed_rng_for_worker_if_needed()
         return self._getitem_with_cache_read_retry(idx, self._load_item_at_index)
+
+    def _reseed_rng_for_worker_if_needed(self) -> None:
+        worker = get_worker_info()
+        if worker is None:
+            return
+        worker_seed = int(worker.seed)
+        if getattr(self, "_rng_worker_seed", None) == worker_seed:
+            return
+        self._rng.seed(worker_seed)
+        self._rng_worker_seed = worker_seed
 
     def _getitem_with_cache_read_retry(self, idx: int, load_fn) -> Any:
         dataset_len = len(self.entries)
@@ -487,6 +570,8 @@ class WaymoFlowCacheDataset(Dataset):
                 clip_name = cache_path.stem
         clip_name = str(clip_name)
         out = {"scene_name": str(scene_name), "clip_name": clip_name}
+        if meta.get("variant") is not None:
+            out["validation_variant"] = normalize_validation_variant(str(meta["variant"]))
         if self.caption_root is not None:
             caption_dir = self.caption_root / "pinhole_front"
             if not caption_dir.is_dir():
@@ -536,6 +621,7 @@ class WaymoFlowCacheDataset(Dataset):
             cache_path,
             entry,
             consumer=consumer,
+            sample_index=int(idx),
         )
         return self._build_item_from_payload(
             payload=payload,
@@ -551,12 +637,14 @@ class WaymoFlowCacheDataset(Dataset):
         entry: dict[str, Any],
         *,
         consumer: str,
+        sample_index: int | None = None,
     ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
+        window_rng = self._window_rng(sample_index)
         if is_chunked_flow_cache(cache_path):
             probe = load_chunked_flow_cache_probe(cache_path)
             self._validate_v6_payload(probe, cache_path=cache_path, entry=entry)
             num_frames_all = int(probe["meta"]["num_frames"])
-            subset_t = self._sample_contiguous_subset(probe, num_frames_all)
+            subset_t = self._sample_contiguous_subset(probe, num_frames_all, rng=window_rng)
             try:
                 payload = load_chunked_flow_cache_subset(
                     cache_path,
@@ -586,8 +674,14 @@ class WaymoFlowCacheDataset(Dataset):
         )
         self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
         num_frames_all = int(payload["meta"]["num_frames"])
-        subset_t = self._sample_contiguous_subset(payload, num_frames_all)
+        subset_t = self._sample_contiguous_subset(payload, num_frames_all, rng=window_rng)
         return payload, subset_t, subset_t
+
+    def _window_rng(self, sample_index: int | None) -> random.Random:
+        if not bool(getattr(self, "deterministic_windows", False)) or sample_index is None:
+            return self._rng
+        seed = int(getattr(self, "_window_seed", 0)) + int(sample_index) * 1_000_003
+        return random.Random(seed)
 
     def _build_item_from_payload(
         self,
@@ -773,35 +867,100 @@ class WaymoFlowCacheDataset(Dataset):
         }
 
     # ------------------------------------------------------------------ #
-    def _sample_contiguous_subset(self, payload: dict[str, Any], num_frames_all: int) -> torch.Tensor:
-        n_select = self._rng.randint(self.min_frames, self.max_frames)
+    def _sample_contiguous_subset(
+        self,
+        payload: dict[str, Any],
+        num_frames_all: int,
+        *,
+        rng: random.Random | None = None,
+    ) -> torch.Tensor:
+        rng = self._rng if rng is None else rng
+        n_select = rng.randint(self.min_frames, self.max_frames)
         n_select = min(n_select, int(num_frames_all))
         if n_select <= 0:
             raise ValueError(f"Invalid selected frame count: {n_select}")
 
-        subset = self._random_contiguous_subset(int(num_frames_all), n_select)
-        if self._subset_has_edit(payload, subset):
+        if not self.require_edit_window:
+            subset = self._random_contiguous_subset(int(num_frames_all), n_select, rng=rng)
+            if self._subset_has_edit(payload, subset, threshold=self.edit_domain_threshold):
+                return subset
+            for _ in range(3):
+                subset = self._random_contiguous_subset(int(num_frames_all), n_select, rng=rng)
+                if self._subset_has_edit(payload, subset, threshold=self.edit_domain_threshold):
+                    break
             return subset
 
-        # Initial sample plus up to three retries. If the cache itself has no
-        # editable frames, keep the last sampled window instead of failing the
-        # dataloader worker.
-        for _ in range(3):
-            candidate = self._random_contiguous_subset(int(num_frames_all), n_select)
-            subset = candidate
-            if self._subset_has_edit(payload, candidate):
-                break
-        return subset
+        # Formal editing must not silently turn into identity training. Enumerate
+        # all starts once and sample only from windows that contain supervision.
+        valid_subsets = []
+        for start in range(int(num_frames_all) - n_select + 1):
+            candidate = torch.arange(start, start + n_select, dtype=torch.long)
+            if self._subset_has_edit(
+                payload,
+                candidate,
+                threshold=self.edit_domain_threshold,
+            ):
+                valid_subsets.append(candidate)
+        if not valid_subsets:
+            raise EmptyEditWindowError(
+                f"cache has no {n_select}-frame window with a valid formal edit"
+            )
+        return valid_subsets[rng.randrange(len(valid_subsets))]
 
-    def _random_contiguous_subset(self, num_frames_all: int, n_select: int) -> torch.Tensor:
+    def _random_contiguous_subset(
+        self,
+        num_frames_all: int,
+        n_select: int,
+        *,
+        rng: random.Random | None = None,
+    ) -> torch.Tensor:
+        rng = self._rng if rng is None else rng
         if n_select >= num_frames_all:
             start = 0
         else:
-            start = self._rng.randint(0, num_frames_all - n_select)
+            start = rng.randint(0, num_frames_all - n_select)
         return torch.arange(start, start + n_select, dtype=torch.long)
 
     @staticmethod
-    def _subset_has_edit(payload: dict[str, Any], subset: torch.Tensor) -> bool:
+    def _subset_has_edit(
+        payload: dict[str, Any],
+        subset: torch.Tensor,
+        *,
+        threshold: float = 1e-4,
+    ) -> bool:
+        # Prefer the exact masks consumed by formal flow matching. This avoids
+        # treating a bbox/asset metadata hit as an edit after rasterization has
+        # produced no editable token.
+        flow_inputs = payload.get("flow_inputs")
+        if not isinstance(flow_inputs, dict):
+            pass2 = payload.get("pass2_splatted_tok_low")
+            if isinstance(pass2, dict):
+                flow_inputs = pass2.get("flow_inputs")
+        if isinstance(flow_inputs, dict):
+            source = flow_inputs.get("M_source")
+            dest = flow_inputs.get("M_dest")
+            if torch.is_tensor(source) and torch.is_tensor(dest):
+                if source.shape != dest.shape or source.ndim < 1:
+                    raise ValueError(
+                        "cached M_source/M_dest must have matching frame-first shapes, got "
+                        f"{tuple(source.shape)} and {tuple(dest.shape)}"
+                    )
+                rows = subset.to(dtype=torch.long)
+                if rows.numel() and int(rows.max().item()) >= int(source.shape[0]):
+                    raise IndexError(
+                        f"edit-mask cache has {source.shape[0]} frames but subset is {rows.tolist()}"
+                    )
+                soft_edit = (
+                    source.index_select(0, rows).float()
+                    + dest.index_select(0, rows).float()
+                ).clamp(0.0, 1.0)
+                return bool(soft_edit.gt(float(threshold)).any().item())
+
+        edit_max = payload.get("flow_edit_max_per_frame")
+        if torch.is_tensor(edit_max) and edit_max.numel() > 0:
+            rows = subset.clamp(min=0, max=int(edit_max.numel()) - 1)
+            return bool(edit_max.index_select(0, rows).gt(float(threshold)).any().item())
+
         mode_kind = str(payload.get("mode_kind", "mode_a"))
         if mode_kind == "mode_b":
             block = payload.get("mode_b") or {}
@@ -876,6 +1035,16 @@ class WaymoFlowCacheDataset(Dataset):
                 f"Manifest mode_kind={entry_mode!r} disagrees with cache "
                 f"mode_kind={mode_kind!r} for {cache_path}."
             )
+        cache_variant = payload.get("meta", {}).get("variant")
+        entry_variant = entry.get("variant")
+        if cache_variant is not None and entry_variant is not None:
+            cache_variant = normalize_validation_variant(str(cache_variant))
+            entry_variant = normalize_validation_variant(str(entry_variant))
+            if cache_variant != entry_variant:
+                raise RuntimeError(
+                    f"Manifest variant={entry_variant!r} disagrees with cache "
+                    f"variant={cache_variant!r} for {cache_path}."
+                )
         if payload.get("pass2_splatted_tok_low") is None:
             raise RuntimeError(
                 f"Cache {cache_path} missing pass2_splatted_tok_low; "
@@ -989,11 +1158,11 @@ class WaymoFlowCacheDataset(Dataset):
         camera_full = obj["camera_to_world_corrected"]
         out["camera_to_world_corrected"] = camera_full.index_select(0, subset)
         camera_front = camera_full[:, 0] if camera_full.ndim == 4 else camera_full
-        previous_indices = (subset.to(dtype=torch.long) - 1).clamp_min(0)
-        out["camera_trajectory_anchor_to_world_corrected"] = camera_front[:1].contiguous()
-        out["camera_previous_to_world_corrected"] = camera_front.index_select(
-            0, previous_indices
-        ).contiguous()
+        camera_anchor, camera_previous = _camera_context_for_subset(
+            obj, camera_front, subset
+        )
+        out["camera_trajectory_anchor_to_world_corrected"] = camera_anchor
+        out["camera_previous_to_world_corrected"] = camera_previous
         out["intrinsics"] = obj["intrinsics"]
 
         out["images"] = images_clean
@@ -1068,15 +1237,21 @@ class WaymoFlowCacheDataset(Dataset):
             "patch_start_idx": int(payload["meta"]["patch_start_idx"]),
         }
 
-    def _build_fast_predictions(self, payload: dict[str, Any], subset: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _build_fast_predictions(self, payload: dict[str, Any], subset: torch.Tensor) -> dict[str, Any]:
         pass1 = payload["pass1"]
+        pose_enc = pass1.get("pose_enc")
+        if torch.is_tensor(pose_enc):
+            pose_enc = pose_enc.index_select(0, subset).unsqueeze(0).contiguous()
         return {
             "image_tokens_quantized": {
                 "data": pass1["F_g_lut_scene_int8"].index_select(0, subset).contiguous(),
                 "scale": pass1["F_g_lut_scene_scale"].index_select(0, subset).contiguous(),
                 "layout": "NPLC",
             },
-            "pose_enc": pass1["pose_enc"].index_select(0, subset).unsqueeze(0).contiguous(),
+            # scene_flow_fast intentionally omits dense DGGT heads.  pose_enc is
+            # required only by the RGB-render context; that consumer loads it
+            # and _formal_rgb_context remains strict when RGB is requested.
+            "pose_enc": pose_enc,
             "patch_start_idx": int(payload["meta"]["patch_start_idx"]),
         }
 
@@ -1114,14 +1289,16 @@ class WaymoFlowCacheDataset(Dataset):
                 "camera_to_world_corrected must be [S,V,4,4] or [S,4,4], "
                 f"got {tuple(camera_full.shape)}"
             )
-        previous_indices = (subset.to(dtype=torch.long) - 1).clamp_min(0)
+        camera_anchor, camera_previous = _camera_context_for_subset(
+            obj, camera_front, subset
+        )
         intrinsics = obj["intrinsics"].contiguous()
         return {
             "camera_to_world_corrected": camera_to_world,
             "intrinsics": intrinsics,
             "raw_image_size_hw": raw_image_size_hw,
-            "trajectory_anchor_to_world": camera_front[:1].contiguous(),
-            "previous_camera_to_world": camera_front.index_select(0, previous_indices).contiguous(),
+            "trajectory_anchor_to_world": camera_anchor,
+            "previous_camera_to_world": camera_previous,
         }
 
     def _build_fast_asset_pass(
@@ -1134,12 +1311,29 @@ class WaymoFlowCacheDataset(Dataset):
         asset = payload.get("asset_pass") or {}
         patch_grid = tuple(int(v) for v in meta["patch_grid"])
         patch_start_idx = int(meta["patch_start_idx"])
+        if str(meta.get("asset_patch_mask_version", "")) != ASSET_PATCH_MASK_VERSION:
+            raise RuntimeError(
+                f"Mode-A cache {cache_path} has asset_patch_mask_version="
+                f"{meta.get('asset_patch_mask_version')!r}; expected {ASSET_PATCH_MASK_VERSION!r}. "
+                "Regenerate the Mode-A cache."
+            )
         object_keys = sorted(int(k) for k in asset.keys())
         if len(object_keys) == 0:
             return _empty_asset_pass(patch_grid, patch_start_idx)
         F_g_lut_asset: dict[int, list[torch.Tensor]] = {}
+        asset_patch_valid_mask: dict[int, torch.Tensor] = {}
         for k in object_keys:
             entry = asset[k]
+            patch_mask = entry.get("asset_patch_valid_mask")
+            if not torch.is_tensor(patch_mask):
+                raise RuntimeError(
+                    f"Mode-A cache {cache_path} asset {k} is missing asset_patch_valid_mask; "
+                    "regenerate the Mode-A cache with schema v9."
+                )
+            if patch_mask.ndim != 2:
+                raise ValueError(
+                    f"Mode-A asset {k} patch mask must be [S,P], got {tuple(patch_mask.shape)}"
+                )
             if self.asset_lut_level_indices is None:
                 F_sub = _dequantize_nplc_subset(
                     data=entry["F_g_lut_asset_int8"],
@@ -1161,7 +1355,14 @@ class WaymoFlowCacheDataset(Dataset):
                 obj_key=k,
                 cache_path=cache_path or Path(str(meta.get("clip_name", "?"))),
             )
+            expected_mask_shape = (int(levels[0].shape[1]), int(levels[0].shape[2]))
+            if tuple(patch_mask.shape) != expected_mask_shape:
+                raise ValueError(
+                    f"Mode-A asset {k} patch mask shape {tuple(patch_mask.shape)} "
+                    f"!= LUT [S,P] {expected_mask_shape}"
+                )
             F_g_lut_asset[k] = levels
+            asset_patch_valid_mask[k] = patch_mask.to(torch.bool).unsqueeze(0).contiguous()
         return AssetPassResult(
             patch_grid=patch_grid,
             patch_start_idx=patch_start_idx,
@@ -1173,6 +1374,7 @@ class WaymoFlowCacheDataset(Dataset):
             G_asset_dggt={},
             I_asset={},
             A_asset={},
+            asset_patch_valid_mask=asset_patch_valid_mask,
             asset_pass_space="fast_lut_only",
             fit_metrics={},
         )
@@ -1188,6 +1390,12 @@ class WaymoFlowCacheDataset(Dataset):
         asset = payload["asset_pass"]
         patch_grid = tuple(int(v) for v in meta["patch_grid"])
         patch_start_idx = int(meta["patch_start_idx"])
+        if str(meta.get("asset_patch_mask_version", "")) != ASSET_PATCH_MASK_VERSION:
+            raise RuntimeError(
+                f"Mode-A cache {cache_path} has asset_patch_mask_version="
+                f"{meta.get('asset_patch_mask_version')!r}; expected {ASSET_PATCH_MASK_VERSION!r}. "
+                "Regenerate the Mode-A cache."
+            )
         object_keys = sorted(int(k) for k in asset.keys())
         if len(object_keys) == 0:
             return _empty_asset_pass(patch_grid, patch_start_idx)
@@ -1205,10 +1413,18 @@ class WaymoFlowCacheDataset(Dataset):
         G_asset_dggt: dict[int, list[dict[str, torch.Tensor]]] = {}
         I_asset: dict[int, torch.Tensor] = {}
         A_asset: dict[int, torch.Tensor] = {}
+        asset_patch_valid_mask: dict[int, torch.Tensor] = {}
         fit_metrics: dict[int, list[dict[str, Any]]] = {}
 
         for k in object_keys:
             entry = asset[k]
+            patch_mask = entry.get("asset_patch_valid_mask")
+            if not torch.is_tensor(patch_mask):
+                raise RuntimeError(
+                    f"Mode-A cache {cache_path} asset {k} is missing asset_patch_valid_mask; "
+                    "regenerate the Mode-A cache with schema v9."
+                )
+            patch_mask = patch_mask.index_select(0, subset).to(torch.bool).contiguous()
             if self.asset_lut_level_indices is None:
                 F_sub = _dequantize_nplc_subset(
                     data=entry["F_g_lut_asset_int8"],
@@ -1230,6 +1446,12 @@ class WaymoFlowCacheDataset(Dataset):
                 obj_key=k,
                 cache_path=cache_path or Path(str(meta.get("clip_name", "?"))),
             )
+            expected_mask_shape = (int(levels[0].shape[1]), int(levels[0].shape[2]))
+            if tuple(patch_mask.shape) != expected_mask_shape:
+                raise ValueError(
+                    f"Mode-A asset {k} patch mask shape {tuple(patch_mask.shape)} "
+                    f"!= LUT [S,P] {expected_mask_shape}"
+                )
             F_g_lut_asset[k] = levels
 
             subset_list = subset.tolist()
@@ -1268,6 +1490,7 @@ class WaymoFlowCacheDataset(Dataset):
 
             I_asset[k] = entry["I_asset"].index_select(0, subset).to(torch.float32).div(255.0).unsqueeze(0)
             A_asset[k] = entry["A_asset"].index_select(0, subset).to(torch.float32).div(255.0).unsqueeze(0)
+            asset_patch_valid_mask[k] = patch_mask.unsqueeze(0)
 
         return AssetPassResult(
             patch_grid=patch_grid,
@@ -1280,6 +1503,7 @@ class WaymoFlowCacheDataset(Dataset):
             G_asset_dggt=G_asset_dggt,
             I_asset=I_asset,
             A_asset=A_asset,
+            asset_patch_valid_mask=asset_patch_valid_mask,
             asset_pass_space=asset_pass_space,
             fit_metrics=fit_metrics,
         )

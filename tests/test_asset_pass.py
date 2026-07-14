@@ -8,11 +8,25 @@ from datasets.waymo_edit_dataset import transform_box_xyxy
 from dggt.models.asset_pass import (
     AssetAggregatorPass,
     apply_pointer_fallback,
+    build_asset_patch_valid_mask,
     compute_model_intrinsics,
     compute_runtime_patch_grid,
 )
 from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
 from dggt.utils.gaussian_edit import Sim3Transform, apply_sim3_to_gaussian_dict
+
+
+def test_asset_patch_valid_mask_uses_exact_alpha_support_without_dilation():
+    alpha = torch.zeros(1, 2, 1, 28, 42)
+    alpha[0, 0, 0, 2, 3] = 0.049
+    alpha[0, 0, 0, 5, 16] = 0.05
+    alpha[0, 1, 0, 20, 41] = 1.0
+
+    mask = build_asset_patch_valid_mask(alpha, (2, 3))
+
+    assert mask.shape == (1, 2, 6)
+    assert torch.equal(mask[0, 0], torch.tensor([False, True, False, False, False, False]))
+    assert torch.equal(mask[0, 1], torch.tensor([False, False, False, False, False, True]))
 
 
 def _map_raw_box_with_intrinsics(
