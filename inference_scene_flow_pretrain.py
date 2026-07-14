@@ -111,6 +111,7 @@ from train_scene_flow_pretrain import (
     build_pretrain_bundle_from_batch,
     cfg_sample_pretrain_latents,
     decode_pose_from_camera_features,
+    decode_sky_patch_tokens,
     discover_scene_names,
     load_dggt_aggregator_and_tokenizer,
     seed_everything,
@@ -336,6 +337,7 @@ def sync_args_from_model(args: argparse.Namespace, scene_flow: nn.Module) -> Non
     args.prediction_type = str(config.prediction_type)
     args.sky_grid = tuple(int(v) for v in config.sky_grid)
     args.sky_grid_h, args.sky_grid_w = args.sky_grid
+    args.sky_atlas_hw = tuple(int(v) for v in getattr(config, "sky_atlas_hw", (32, 64)))
     args.sky_mask_refine_scale = int(config.sky_mask_refine_scale)
     args.sky_mask_refine_channels = int(config.sky_mask_refine_channels)
     args.asset_position_mode = str(getattr(config, "asset_position_mode", "localized"))
@@ -369,10 +371,9 @@ def build_generated_dggt_scene_state(
     images_clean = torch.zeros((seq_len, 3, height, width), dtype=torch.float32)
     sky_probability = sky_mask[0].detach().cpu().float().mean(dim=1).clamp(0.0, 1.0)
     non_sky_probability = 1.0 - sky_probability
-    # DGGT's canonical builder accepts a binary validity mask. Keep every point
-    # with meaningful foreground mass, then apply the soft probability to its
-    # Gaussian opacity below.
-    sky_mask_cpu = (non_sky_probability <= 1.0e-4).float().unsqueeze(1)
+    # Keep depth-valid points in the canonical state, then apply one explicit
+    # hard sky threshold to both PLY formats at export time.
+    sky_mask_cpu = torch.zeros_like(non_sky_probability).unsqueeze(1)
     sample = {
         "images_clean": images_clean,
         # build_clean_scene_state's fallback expression accesses `masks`
@@ -394,6 +395,7 @@ def build_generated_dggt_scene_state(
         state.source_y,
         state.source_x,
     ].reshape(-1, 1)
+    state.sky_probabilities = 1.0 - point_non_sky
     state.opacities = state.opacities * point_non_sky
     return state
 
@@ -404,6 +406,8 @@ def export_generated_pointclouds(
     output_dir: Path,
     suffix: str,
     stride: int,
+    sky_probability_threshold: float = 0.5,
+    min_effective_opacity: float = 0.01,
 ) -> dict[str, Any]:
     """Write one DGGT canonical Gaussian/point PLY pair per generated frame.
 
@@ -418,11 +422,26 @@ def export_generated_pointclouds(
     frame_summaries: list[dict[str, Any]] = []
     frame_counts: list[int] = []
     total_points = 0
+    total_before = 0
+    total_sky_removed = 0
+    total_opacity_removed = 0
+    sky_probabilities = getattr(scene_state, "sky_probabilities", None)
+    if not torch.is_tensor(sky_probabilities):
+        raise RuntimeError("generated scene state is missing per-point sky probabilities")
     for frame_idx in range(seq_len):
-        keep = scene_state.source_image_ids == int(frame_idx)
+        frame_keep = scene_state.source_image_ids == int(frame_idx)
         if stride > 1:
-            keep &= torch.remainder(scene_state.source_y, stride) == 0
-            keep &= torch.remainder(scene_state.source_x, stride) == 0
+            frame_keep &= torch.remainder(scene_state.source_y, stride) == 0
+            frame_keep &= torch.remainder(scene_state.source_x, stride) == 0
+        before = int(frame_keep.sum().item())
+        sky_keep = sky_probabilities.reshape(-1) < float(sky_probability_threshold)
+        opacity_keep = scene_state.opacities.reshape(-1) >= float(min_effective_opacity)
+        sky_removed = int((frame_keep & ~sky_keep).sum().item())
+        opacity_removed = int((frame_keep & sky_keep & ~opacity_keep).sum().item())
+        keep = frame_keep & sky_keep & opacity_keep
+        total_before += before
+        total_sky_removed += sky_removed
+        total_opacity_removed += opacity_removed
 
         points = scene_state.means[keep]
         colors = scene_state.colors[keep]
@@ -446,24 +465,32 @@ def export_generated_pointclouds(
             },
             gaussian_path,
         )
-        write_point_ply(points, colors, point_path)
+        write_point_ply(points, colors, point_path, opacities=opacities)
         frame_summaries.append(
             {
                 "frame": int(frame_idx),
                 "gaussian_ply": str(gaussian_path),
                 "point_ply": str(point_path),
                 "num_points": count,
+                "num_points_before_filter": before,
+                "sky_removed": sky_removed,
+                "low_opacity_removed": opacity_removed,
             }
         )
 
     return {
         "frames": frame_summaries,
         "num_points": int(total_points),
+        "num_points_before_filter": int(total_before),
+        "sky_removed": int(total_sky_removed),
+        "low_opacity_removed": int(total_opacity_removed),
+        "sky_probability_threshold": float(sky_probability_threshold),
+        "min_effective_opacity": float(min_effective_opacity),
         "frame_counts": frame_counts,
         "stride": stride,
         "schema": "Per-frame DGGT Gaussian PLY + MeshLab xyz/uchar-RGB PLY",
         "scene_builder": "dggt.utils.gaussian_edit.build_clean_scene_state",
-        "validity_rule": "generated non-sky mask AND generated depth > 1e-4",
+        "validity_rule": "generated depth > 1e-4 AND p_sky < threshold AND effective opacity >= threshold",
         "coordinates": "DGGT generated-camera world coordinates",
         "merged_ply_saved": False,
         "meshlab_note": "Open one frame PLY at a time; merged multi-frame clouds visually over-densify points.",
@@ -521,10 +548,10 @@ def render_and_export_generated(
     sky_background = None
     sky_grid_image = None
     if sky_generated is not None:
-        sky_h, sky_w = sky_grid_shape(args)
+        sky_h, sky_w = args.sky_atlas_hw
         extrinsic, intrinsic = _predict_camera_mats(generated_pose, (height, width), device)
         sky_background = sky_tokens_to_background(
-            sky_generated.to(device),
+            decode_sky_patch_tokens(sky_generated.to(device)),
             seq_len=seq_len,
             height=height,
             width=width,
@@ -572,6 +599,8 @@ def render_and_export_generated(
         output_dir=output_dir,
         suffix=suffix,
         stride=args.ply_stride,
+        sky_probability_threshold=float(args.ply_sky_probability_threshold),
+        min_effective_opacity=float(args.ply_min_effective_opacity),
     )
     del generated_pose, generated_depth, generated_dynamic, generated_sky_mask, gs_map, gs_conf, scene_state
     if torch.cuda.is_available():
@@ -730,6 +759,8 @@ def build_argparser() -> argparse.ArgumentParser:
             "Default 1 preserves the exact DGGT scene; >1 is explicit export-only downsampling."
         ),
     )
+    parser.add_argument("--ply_sky_probability_threshold", type=float, default=0.5)
+    parser.add_argument("--ply_min_effective_opacity", type=float, default=0.01)
     parser.add_argument(
         "--val_sliding_window",
         type=int,
@@ -756,7 +787,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--sky_mask_refine_scale", type=int, default=4)
     parser.add_argument("--sky_mask_refine_channels", type=int, default=256)
     parser.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
-    parser.add_argument("--sky_unobserved_loss_weight", type=float, default=0.05)
+    parser.add_argument("--sky_unobserved_loss_weight", type=float, default=0.0)
     return parser
 
 
@@ -769,6 +800,10 @@ def validate_args(args: argparse.Namespace) -> list[float]:
         raise ValueError("--sample_steps must be positive.")
     if int(args.ply_stride) <= 0:
         raise ValueError("--ply_stride must be positive.")
+    if not 0.0 <= float(args.ply_sky_probability_threshold) <= 1.0:
+        raise ValueError("--ply_sky_probability_threshold must be in [0,1].")
+    if not 0.0 <= float(args.ply_min_effective_opacity) <= 1.0:
+        raise ValueError("--ply_min_effective_opacity must be in [0,1].")
     if int(args.num_workers) < 0:
         raise ValueError("--num_workers must be non-negative.")
     if int(args.val_scene_end) <= int(args.val_scene_start):

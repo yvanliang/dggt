@@ -35,7 +35,7 @@ export QWEN_TEXT_ENCODER=/home/dancer/model/Qwen/Qwen3-0.6B/
 * 实现设计说明见 `docs/scene_flow_model_design.md`。本文档只维护运行命令和参数。
 * `--shift 10.0`、`--weighting_scheme waver --mode_scale 1.29`、`--lambda_repa 0.5`、EMA 验证默认开启；pretrain 和正式训练保持一致。
 * Gaussian 时间轴固定为 `clip_local_frame_id / 4`，新 cache 必须携带 `meta.gaussian_time_representation=clip_local_frame_id_div4_v1`。缺少该标记的 cache 会被训练/offline 拒绝；修改代码前已经启动的 precompute 进程不会热加载新实现，必须重启。chunked cache summary 同样携带该标记，因此 `--overwrite_v7` 能识别并重建旧时间轴 cache。
-* mRoPE 坐标已固定为 A1 设计，不再提供 `--mrope_temporal_margin`：text/timestep 使用 RAE-style zero RoPE；video、asset、edit-control 与 camera 共享视频时间轴；camera 空间位置固定在 patch grid 中心；pretrain sky atlas 使用独立 temporal offset `128`。checkpoint 会记录 `rope_layout_version=a1_camera_center_sky128`，旧全局 margin 版本不要直接续训或推理。
+* mRoPE 坐标使用 A2 设计：text/timestep 使用 zero RoPE；video、asset、edit-control 与 camera 共享 `[0,15000)` 视频时间轴；camera 位于 patch grid 中心；sky 固定使用 temporal position `15000`。`rope_max_position=16384` 会真实检查越界，checkpoint 记录 `rope_layout_version=a2_camera_center_sky15000`。
 
 ## 1. Pretrain 正式参数
 
@@ -99,7 +99,6 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
     --lambda_camera_flow 0.1 \
     --lambda_camera_pose 1.0 \
     --lambda_sky_flow 0.1 \
-    --sky_unobserved_loss_weight 0.05 \
     --lambda_rgb_render 0.01 \
     --rgb_render_every 4 \
     --rgb_render_start_step 5000 \
@@ -108,7 +107,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
     --rgb_render_max_frames 4 \
     --rgb_render_stride 2 \
     --rgb_render_camera_grad_scale 0.0 \
-    --rgb_render_sky_mask_grad_scale 0.0 \
+    --rgb_render_sky_mask_grad_scale 0.05 \
     --rgb_render_lpips_weight 0.01 \
     --uncond_drop_prob 0.1 \
     --text_uncond_drop_prob 0.1 \
@@ -166,7 +165,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
 * pretrain 现在固定为 full_scene；旧的 `pseudo_edit/random_inpaint/mixed` CLI 参数已经删除。
 * `--uncond_drop_prob` 保留为旧参数 fallback；正式控制建议显式传 `--text_uncond_drop_prob --asset_uncond_drop_prob --camera_uncond_drop_prob --all_cond_drop_prob`。
 * 默认训练 sky generation；如需关闭，加 `--no_sky_generation`。
-* sky mask 只用于构造 sky RGB target 和 `sky_gen_loss_weight`；SceneFlow forward 不接收 GT 派生的 sky attention mask。`--sky_unobserved_loss_weight 0.05` 给未观测 atlas cell 弱监督，保持开放推理时完整 sky atlas 可生成。
+* sky target 是 `32×64` 上半球 RGB atlas，每个方向选置信度最高的可见帧；未观测区域 observation weight 为零，不再填全局均色。通过固定 `2×2` pixel-unshuffle 打包为 `16×32×12`，SceneFlow 仍只处理 512 个 sky token，不需要独立 sky tokenizer 或额外 checkpoint。
 * validation 图像会保存到 `logs/scene_flow_pretrain_1024/validation/step_xxxxxx/`；默认包含 `generated_raw_3dgs_rgb__cfg*.jpg`、`generated_sky_rgb__cfg*.jpg`、`generated_pred_sky_mask__cfg*.jpg`、latent PCA 和误差图。额外 CFG scale 会追加 `*_cfg{scale}` 后缀。
 * `--val_sample_steps` 只控制 validation 图像采样步数，不影响训练本身。`15` 偏少，适合 smoke test；正式看图建议先用 `30`，需要更稳定的样本再用 `50`。FlowMatch/RAE 的生成采样也不是训练时的 1000 timestep 全跑，而是在 scheduler timestep 上做几十步推理。
 * 训练内 validation 默认 `--val_sliding_window 10 --val_sliding_stride 7`，即相邻窗口重叠 3 帧。长序列必须满足 `1 <= stride < window`；`stride>=window` 直接报错。采样维护 full video/camera/sky 状态，对 video/camera/mask logits 用 cosine coverage 逐帧归一化；scene-global sky 使用 `sum(w/C)` 窗口权重，使每个全局帧贡献相等。
@@ -176,7 +175,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
 ## 1.5 关键参数说明
 
 * `--no_val_ema`：默认 validation 使用 EMA 权重；加这个参数才会用实时裸权重验证。
-* mRoPE A1 固定坐标：video/asset/edit-control 使用真实 `(t,y,x)`；camera condition 和 camera generation 使用同一帧 `t`、空间中心 `(H//2,W//2)`，避免把全局相机条件绑到左上角 patch；sky generation 使用独立 sky atlas grid 和 temporal offset `128`，避免 scene-level 天空 token 与视频 patch 共享位置。这个设置是模型结构的一部分，不通过命令行覆盖，并通过 `rope_layout_version=a1_camera_center_sky128` 写入 checkpoint config。
+* mRoPE A2 固定坐标：video/asset/edit-control 使用真实 `(t,y,x)`；camera condition/generation 使用同帧 `t` 和空间中心；sky 使用独立 latent grid 与 temporal position `15000`。frame id `15000` 会 fail-fast。
 * `--weighting_scheme waver --mode_scale 1.29 --shift 10.0 --prediction_type x`：pretrain、正式训练、训练内 validation、离线 inference 需要保持一致。`logit_mean/logit_std` 只在显式切回 `--weighting_scheme logit_normal` 做 ablation 时使用。`x` 是 RAEv2 T2I 的 clean-latent 输出参数化；代码仍会把它转换成 velocity 做 flow matching loss 和 ODE 采样。
 * `--lambda_repa 0.5`：推荐命令显式打开；CLI 默认仍是 `0.0`。
 * `--guidance_scale --asset_control_guidance_scale --camera_guidance_scale --camera_text_guidance_scale`：前三者分别控制全局 text、asset/control residual、camera condition residual；最后一个只控制 camera 输出的 text residual，默认 `1.0`。因此 `--val_guidance_scales` / offline `--cfg` 扫描全局 text scale 时 camera trajectory 保持不变。

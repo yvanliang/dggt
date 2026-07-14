@@ -364,3 +364,12 @@ def test_differentiable_renderer_matches_deployment_renderer():
         soft_sky_mask=True,
     )
     torch.testing.assert_close(training.detach().cpu(), deployment, rtol=2.0e-4, atol=2.0e-4)
+
+
+@pytest.mark.parametrize("grad_scale,expect_nonzero", [(0.0, False), (0.05, True)])
+def test_rgb_to_mask_gradient_scale_is_finite(grad_scale: float, expect_nonzero: bool) -> None:
+    logits = torch.tensor([0.25, -0.5], requires_grad=True)
+    probability = scale_gradient(torch.sigmoid(logits), grad_scale)
+    probability.sum().backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+    assert bool((logits.grad.abs() > 0).any()) is expect_nonzero

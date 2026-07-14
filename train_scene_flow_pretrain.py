@@ -100,9 +100,13 @@ from diffusers.training_utils import EMAModel
 
 TOKENIZER_LEVELS = (4, 11, 17, 23)
 SKY_CLASS_INDEX = 9
-SKY_TOKEN_DIM = 3
+SKY_RGB_DIM = 3
+SKY_REPRESENTATION_VERSION = "rgb_patch_v2"
+DEFAULT_SKY_ATLAS_HW = (32, 64)
 DEFAULT_SKY_GRID = (16, 32)
-DEFAULT_SKY_UNOBSERVED_LOSS_WEIGHT = 0.05
+SKY_PATCH_SIZE = 2
+SKY_TOKEN_DIM = SKY_RGB_DIM * SKY_PATCH_SIZE * SKY_PATCH_SIZE
+DEFAULT_SKY_UNOBSERVED_LOSS_WEIGHT = 0.0
 
 
 def is_distributed() -> bool:
@@ -357,6 +361,10 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "patch_grid",
     "out_channels",
     "sky_grid",
+    "sky_representation_version",
+    "sky_atlas_hw",
+    "sky_token_dim",
+    "rope_max_position",
     "camera_gen_dim",
     "camera_generation_representation",
     "camera_stats_version",
@@ -459,6 +467,11 @@ def validate_scene_flow_checkpoint_config(
     saved_cfg = payload.get("scene_flow_config")
     if not isinstance(saved_cfg, dict):
         return
+    if saved_cfg.get("sky_representation_version") != SKY_REPRESENTATION_VERSION:
+        raise ValueError(
+            f"{path} is not a {SKY_REPRESENTATION_VERSION} sky checkpoint. Old RGB-atlas checkpoints "
+            "cannot be resumed directly; use an explicit non-sky partial warm-start."
+        )
     if saved_cfg.get("camera_generation_representation") == CAMERA_GENERATION_REPRESENTATION:
         provenance = payload.get("camera_dggt_provenance")
         recorded_hash = provenance.get("dggt_checkpoint_sha256") if isinstance(provenance, dict) else None
@@ -486,8 +499,8 @@ def validate_scene_flow_checkpoint_config(
     if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
         raise ValueError(
             f"{path} was saved with the legacy global mrope_temporal_margin RoPE layout. "
-            "The current SceneFlow model uses the fixed A1 layout "
-            "(video/asset/camera shared video time, camera center, sky temporal offset 128); "
+            "The current SceneFlow model uses the fixed A2 layout "
+            "(video/asset/camera shared video time, camera center, sky temporal offset 15000); "
             "do not resume/warm-start across these incompatible position semantics."
         )
     current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)
@@ -1122,7 +1135,11 @@ def save_checkpoint(
     }
     torch.save(payload, ckpt_dir / f"pretrain_step{step:06d}.pt")
     torch.save(
-        {"scene_flow": scene_flow_state, "scene_flow_config": scene_flow_config, "camera_dggt_provenance": provenance},
+        {
+            "scene_flow": scene_flow_state,
+            "scene_flow_config": scene_flow_config,
+            "camera_dggt_provenance": provenance,
+        },
         ckpt_dir / f"pretrain_step{step:06d}_weights_only.pt",
     )
     torch.save(
@@ -1347,6 +1364,40 @@ def sky_grid_shape(args: argparse.Namespace) -> tuple[int, int]:
     if h <= 0 or w <= 0:
         raise ValueError(f"sky grid must be positive, got {(h, w)}")
     return h, w
+
+
+def sky_atlas_shape(args: argparse.Namespace) -> tuple[int, int]:
+    value = getattr(args, "sky_atlas_hw", DEFAULT_SKY_ATLAS_HW)
+    if value is None:
+        value = DEFAULT_SKY_ATLAS_HW
+    h, w = (int(v) for v in value)
+    if h <= 0 or w <= 0:
+        raise ValueError(f"sky atlas must be positive, got {(h, w)}")
+    return h, w
+
+
+def pack_sky_rgb_atlas(atlas_rgb: torch.Tensor) -> torch.Tensor:
+    """Deterministically pack a 32x64 RGB atlas into 512 12D tokens."""
+    if atlas_rgb.ndim != 4 or int(atlas_rgb.shape[1]) != SKY_RGB_DIM:
+        raise ValueError(f"sky atlas must be [B,3,H,W], got {tuple(atlas_rgb.shape)}")
+    ah, aw = int(atlas_rgb.shape[-2]), int(atlas_rgb.shape[-1])
+    if (ah, aw) != DEFAULT_SKY_ATLAS_HW:
+        raise ValueError(f"sky atlas must be {DEFAULT_SKY_ATLAS_HW}, got {(ah, aw)}")
+    packed = torch.nn.functional.pixel_unshuffle(atlas_rgb.float() * 2.0 - 1.0, SKY_PATCH_SIZE)
+    return packed.permute(0, 2, 3, 1).reshape(atlas_rgb.shape[0], -1, SKY_TOKEN_DIM).contiguous()
+
+
+def decode_sky_patch_tokens(tokens: torch.Tensor) -> torch.Tensor:
+    """Decode [B,512,12] tokens to flattened [-1,1] 32x64 RGB atlas."""
+    if tokens.ndim != 3 or int(tokens.shape[1]) != DEFAULT_SKY_GRID[0] * DEFAULT_SKY_GRID[1] or int(tokens.shape[2]) != SKY_TOKEN_DIM:
+        raise ValueError(
+            f"sky tokens must be [B,{DEFAULT_SKY_GRID[0] * DEFAULT_SKY_GRID[1]},{SKY_TOKEN_DIM}], "
+            f"got {tuple(tokens.shape)}"
+        )
+    packed = tokens.reshape(tokens.shape[0], *DEFAULT_SKY_GRID, SKY_TOKEN_DIM)
+    packed = packed.permute(0, 3, 1, 2).contiguous()
+    atlas = torch.nn.functional.pixel_shuffle(packed, SKY_PATCH_SIZE)
+    return atlas.permute(0, 2, 3, 1).reshape(tokens.shape[0], -1, SKY_RGB_DIM).contiguous()
 
 
 def _sky_mask_1ch(masks: torch.Tensor | None, images: torch.Tensor) -> torch.Tensor:
@@ -1713,26 +1764,21 @@ def _build_directional_sky_tokens_from_images(
         padding_mode="zeros",
         align_corners=True,
     ).reshape(b, s, k)
-    valid = visible & sampled_sky.gt(0.5)
-    valid_count = valid.float().sum(dim=1)
-    rgb = (sampled_rgb * valid.unsqueeze(-1).to(dtype=sampled_rgb.dtype)).sum(dim=1)
-    rgb = rgb / valid_count.unsqueeze(-1).clamp_min(1.0)
-
-    global_sky_sum = (images.float() * sky.float()).sum(dim=(1, 3, 4))
-    global_sky_count = sky.float().sum(dim=(1, 3, 4)).clamp_min(1.0)
-    fallback = global_sky_sum / global_sky_count
-    sky_count = sky.float().sum(dim=(1, 3, 4)).reshape(b)
-    image_mean = images.float().mean(dim=(1, 3, 4))
-    fallback = torch.where(sky_count.gt(0.0).view(b, 1), fallback, image_mean)
-
-    coverage = valid_count / float(max(s, 1))
-    coverage_valid = coverage.gt(float(valid_threshold)) & valid_count.gt(0.0)
-    rgb = torch.where(coverage_valid.unsqueeze(-1), rgb, fallback[:, None, :].expand(b, k, 3))
+    # Keep one sharp observation per direction. Averaging across frames turns
+    # small CameraHead rotation errors into visibly blurred cloud texture.
+    confidence = sampled_sky.clamp(0.0, 1.0) * visible.to(dtype=sampled_sky.dtype)
+    best_confidence, best_frame = confidence.max(dim=1)
+    gather_index = best_frame[:, None, :, None].expand(b, 1, k, 3)
+    rgb = sampled_rgb.gather(1, gather_index).squeeze(1)
+    coverage_valid = best_confidence.gt(float(valid_threshold))
+    # Unknown atlas cells carry no supervision. Their RGB payload is a stable
+    # zero placeholder and is disambiguated by the tokenizer observation mask.
+    rgb = torch.where(coverage_valid.unsqueeze(-1), rgb, torch.zeros_like(rgb))
     rgb = rgb.clamp(0.0, 1.0)
     loss_weight = torch.where(
         coverage_valid,
-        torch.ones_like(coverage, dtype=torch.float32),
-        torch.full_like(coverage, float(unobserved_weight), dtype=torch.float32),
+        torch.ones_like(best_confidence, dtype=torch.float32),
+        torch.full_like(best_confidence, float(unobserved_weight), dtype=torch.float32),
     )
     tokens = rgb * 2.0 - 1.0
     return tokens.to(dtype=images.dtype), loss_weight.to(device=images.device, dtype=torch.float32)
@@ -1757,8 +1803,8 @@ def build_sky_tokens_from_images(
     `[-1,1]`.
 
     When DGGT-space camera matrices are provided, each token is an upper-
-    hemisphere direction bin. The target color is sampled from all frames where
-    that direction projects into GT sky, then averaged across visible frames.
+    hemisphere direction bin. The target color comes from the visible frame
+    with the highest sky confidence; frames are never averaged.
     Without camera matrices the legacy image-grid averaging path is used.
     """
     if images.ndim != 5:
@@ -1784,7 +1830,7 @@ def build_sky_tokens_from_images(
     flat_images = images.float().reshape(b * s, 3, height, width)
     flat_sky = sky.float().reshape(b * s, 1, height, width)
     weighted_rgb = torch.nn.functional.interpolate(
-        flat_images * flat_sky,
+        flat_images,
         size=(grid_h, grid_w),
         mode="area",
     ).reshape(b, s, 3, grid_h, grid_w)
@@ -1793,30 +1839,51 @@ def build_sky_tokens_from_images(
         size=(grid_h, grid_w),
         mode="area",
     ).reshape(b, s, 1, grid_h, grid_w)
-    coverage_sum = coverage.sum(dim=1)
-    coverage_mean = coverage.mean(dim=1)
-    rgb = weighted_rgb.sum(dim=1) / coverage_sum.clamp_min(1e-6)
-
-    global_sky_sum = (images.float() * sky.float()).sum(dim=(1, 3, 4), keepdim=True)
-    global_sky_count = sky.float().sum(dim=(1, 3, 4), keepdim=True).clamp_min(1.0)
-    fallback = (global_sky_sum / global_sky_count).reshape(b, 3, 1, 1)
-    coverage_valid = coverage_mean.gt(float(valid_threshold))
-    sky_count = sky.float().sum(dim=(1, 3, 4), keepdim=False).clamp_min(0.0)  # [B,1]
-    image_mean = images.float().mean(dim=(1, 3, 4), keepdim=False)  # [B,3]
-    fallback = torch.where(
-        sky_count.gt(0.0),
-        fallback.reshape(b, 3),
-        image_mean,
-    ).reshape(b, 3, 1, 1)
-    rgb = torch.where(coverage_valid, rgb, fallback.expand_as(rgb))
+    best_confidence, best_frame = coverage.squeeze(2).max(dim=1)
+    gather_index = best_frame[:, None, None].expand(b, 1, 3, grid_h, grid_w)
+    rgb = weighted_rgb.gather(1, gather_index).squeeze(1)
+    coverage_valid = best_confidence.gt(float(valid_threshold))
+    rgb = torch.where(coverage_valid[:, None], rgb, torch.zeros_like(rgb))
     rgb = rgb.clamp(0.0, 1.0)
     loss_weight = torch.where(
-        coverage_valid.reshape(b, grid_h, grid_w),
-        torch.ones((b, grid_h, grid_w), device=images.device, dtype=torch.float32),
-        torch.full((b, grid_h, grid_w), float(unobserved_weight), device=images.device, dtype=torch.float32),
-    )
-    tokens = (rgb * 2.0 - 1.0).permute(0, 2, 3, 1).reshape(b, grid_h * grid_w, SKY_TOKEN_DIM)
+        coverage_valid,
+        torch.ones_like(best_confidence, dtype=torch.float32),
+        torch.full_like(best_confidence, float(unobserved_weight), dtype=torch.float32),
+    ).to(device=images.device)
+    tokens = (rgb * 2.0 - 1.0).permute(0, 2, 3, 1).reshape(b, grid_h * grid_w, SKY_RGB_DIM)
     return tokens.to(dtype=images.dtype), loss_weight.reshape(b, grid_h * grid_w)
+
+
+def build_sky_atlas_from_images(
+    images: torch.Tensor,
+    masks: torch.Tensor | None,
+    *,
+    atlas_hw: tuple[int, int] = DEFAULT_SKY_ATLAS_HW,
+    valid_threshold: float = 0.05,
+    extrinsics: torch.Tensor | None = None,
+    intrinsics: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a sharp RGB atlas and its binary observation mask.
+
+    RGB is in [0,1] and shaped [B,3,H,W]; unknown cells are zeros and must only
+    be consumed together with the returned [B,1,H,W] mask.
+    """
+    ah, aw = (int(v) for v in atlas_hw)
+    tokens, observed = build_sky_tokens_from_images(
+        images,
+        masks,
+        grid_h=ah,
+        grid_w=aw,
+        valid_threshold=float(valid_threshold),
+        unobserved_weight=0.0,
+        extrinsics=extrinsics,
+        intrinsics=intrinsics,
+    )
+    atlas = ((tokens.float() + 1.0) * 0.5).reshape(images.shape[0], ah, aw, 3)
+    atlas = atlas.permute(0, 3, 1, 2).contiguous()
+    observation = observed.reshape(images.shape[0], 1, ah, aw).to(dtype=atlas.dtype)
+    atlas = atlas * observation
+    return atlas.to(dtype=images.dtype), observation
 
 
 def build_sky_rectified_flow_target(
@@ -1827,8 +1894,11 @@ def build_sky_rectified_flow_target(
 ) -> SimpleNamespace | None:
     if sky_clean is None:
         return None
-    if sky_clean.ndim != 3 or int(sky_clean.shape[-1]) != SKY_TOKEN_DIM:
-        raise ValueError(f"sky_clean must be [B,K,{SKY_TOKEN_DIM}], got {tuple(sky_clean.shape)}")
+    if sky_clean.ndim != 3 or int(sky_clean.shape[-1]) not in (SKY_RGB_DIM, SKY_TOKEN_DIM):
+        raise ValueError(
+            f"sky_clean must be legacy RGB [B,K,{SKY_RGB_DIM}] or latent [B,K,{SKY_TOKEN_DIM}], "
+            f"got {tuple(sky_clean.shape)}"
+        )
     b = int(sky_clean.shape[0])
     if video_target.sigmas.shape != (b,):
         raise ValueError(f"video_target sigmas shape {tuple(video_target.sigmas.shape)} != {(b,)}")
@@ -2041,6 +2111,69 @@ def sky_token_validation_metrics(
     return {
         f"{prefix}_rgb_mae": float((diff.sum() / (weight.sum().clamp_min(1e-6) * 3.0)).detach().item()),
         f"{prefix}_weight_mean": float(weight.mean().detach().item()),
+    }
+
+
+def generated_sky_view_reconstruction_loss(
+    *,
+    vggt_model: VGGT,
+    sky_latent: torch.Tensor,
+    images: torch.Tensor,
+    sky_mask: torch.Tensor,
+    gt_pose_enc_dggt: torch.Tensor,
+    lpips_model: nn.Module | None = None,
+    lpips_weight: float = 0.01,
+    high_frequency_weight: float = 0.25,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Reproject generated sky with the frozen GT DGGT camera."""
+    del vggt_model
+    rgb_tokens = decode_sky_patch_tokens(sky_latent)
+    atlas_hw = DEFAULT_SKY_ATLAS_HW
+    mask = _sky_mask_1ch(sky_mask, images).float()
+    total = sky_latent.sum() * 0.0
+    charbonnier_total = 0.0
+    high_total = 0.0
+    lpips_total = 0.0
+    for row in range(int(images.shape[0])):
+        extrinsics, intrinsics = pose_encoding_to_extri_intri(
+            gt_pose_enc_dggt[row : row + 1].float(),
+            (int(images.shape[-2]), int(images.shape[-1])),
+        )
+        background = sky_tokens_to_background(
+            rgb_tokens[row : row + 1],
+            seq_len=int(images.shape[1]),
+            height=int(images.shape[-2]),
+            width=int(images.shape[-1]),
+            grid_h=int(atlas_hw[0]),
+            grid_w=int(atlas_hw[1]),
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+        ).permute(0, 3, 1, 2)
+        target = images[row].float()
+        weight = mask[row]
+        denom = (weight.sum() * 3.0).clamp_min(1.0)
+        charb = (torch.sqrt((background - target).square() + 1.0e-6) * weight).sum() / denom
+        dx = (background[..., :, 1:] - background[..., :, :-1]) - (target[..., :, 1:] - target[..., :, :-1])
+        dy = (background[..., 1:, :] - background[..., :-1, :]) - (target[..., 1:, :] - target[..., :-1, :])
+        wx = weight[..., :, 1:] * weight[..., :, :-1]
+        wy = weight[..., 1:, :] * weight[..., :-1, :]
+        high = (dx.abs() * wx).sum() / (wx.sum() * 3.0).clamp_min(1.0)
+        high = high + (dy.abs() * wy).sum() / (wy.sum() * 3.0).clamp_min(1.0)
+        row_loss = charb + float(high_frequency_weight) * high
+        lpips_value = background.new_zeros(())
+        if lpips_model is not None and float(lpips_weight) > 0.0:
+            pred_masked = weight * background + (1.0 - weight) * 0.5
+            target_masked = weight * target + (1.0 - weight) * 0.5
+            lpips_value = lpips_model(pred_masked * 2.0 - 1.0, target_masked * 2.0 - 1.0).mean()
+            row_loss = row_loss + float(lpips_weight) * lpips_value
+        total = total + row_loss / float(images.shape[0])
+        charbonnier_total += float(charb.detach().item()) / float(images.shape[0])
+        high_total += float(high.detach().item()) / float(images.shape[0])
+        lpips_total += float(lpips_value.detach().item()) / float(images.shape[0])
+    return total, {
+        "loss_sky_view_charbonnier": charbonnier_total,
+        "loss_sky_view_high_frequency": high_total,
+        "loss_sky_view_lpips": lpips_total,
     }
 
 
@@ -2527,14 +2660,14 @@ def render_validation_rgb(
     result["generated_pred_sky_mask"] = _sky_mask_image_grid(generated_sky_mask, frames)
     generated_sky_background = None
     if generated_sky_tokens is not None:
-        sky_h, sky_w = sky_grid_shape(args)
+        sky_h, sky_w = sky_atlas_shape(args)
         generated_sky_extrinsic, generated_sky_intrinsic = _predict_camera_mats(
             generated_pose_enc,
             (int(images.shape[-2]), int(images.shape[-1])),
             device,
         )
         generated_sky_background = sky_tokens_to_background(
-            generated_sky_tokens.to(device),
+            decode_sky_patch_tokens(generated_sky_tokens.to(device)),
             seq_len=int(images.shape[1]),
             height=int(images.shape[-2]),
             width=int(images.shape[-1]),
@@ -2643,14 +2776,14 @@ def render_validation_generated_rgb(
     generated_sky_background = None
     sky_grid_image = None
     if generated_sky_tokens is not None:
-        sky_h, sky_w = sky_grid_shape(args)
+        sky_h, sky_w = sky_atlas_shape(args)
         generated_sky_extrinsic, generated_sky_intrinsic = _predict_camera_mats(
             generated_pose_enc,
             (height, width),
             device,
         )
         generated_sky_background = sky_tokens_to_background(
-            generated_sky_tokens.to(device),
+            decode_sky_patch_tokens(generated_sky_tokens.to(device)),
             seq_len=seq_len,
             height=height,
             width=width,
@@ -2835,7 +2968,9 @@ def _cfg_sample_pretrain_latents_sliding(
     final_sky_mask_refined_logits = None
 
     for i in range(int(args.val_sample_steps)):
-        read_final_sky_mask = bool(return_sky_mask) and i == int(args.val_sample_steps) - 1
+        # The clean-state mask is evaluated once at sigma=0 after ODE
+        # integration. Reading logits here would condition them on z_t>0.
+        read_final_sky_mask = False
         step_h = t_steps[i] - t_steps[i + 1]
         sigma = torch.full((batch_size,), float(t_steps[i].item()), device=device)
         v_acc = torch.zeros_like(z)
@@ -3075,6 +3210,85 @@ def _cfg_sample_pretrain_latents_sliding(
             final_sky_mask_refined_logits = mask_refined_acc / mask_refined_weight.clamp_min(1e-6)
 
     z = M_keep * z_splat + M_edit * z
+    if return_sky_mask:
+        sigma = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        patch_acc = torch.zeros(z.shape[:3] + (1,), device=device, dtype=z.dtype)
+        patch_weight = torch.zeros((1, seq_len, 1, 1), device=device, dtype=z.dtype)
+        refined_acc = None
+        refined_weight = None
+        for start, end in windows:
+            actual = end - start
+            weight_w = cosine_window(actual, device=device, dtype=z.dtype).view(1, actual, 1, 1)
+            camera_tokens_w = _slice_time(full_camera_tokens, start, end, seq_len)
+            camera_mask_w = _slice_time(full_camera_mask, start, end, seq_len)
+
+            def endpoint_branch(
+                asset_tokens: torch.Tensor,
+                asset_mask: torch.Tensor | None,
+                asset_kind: Any,
+                branch_text: torch.Tensor | None,
+                branch_text_mask: torch.Tensor | None,
+                camera_kind: Any,
+                control_drop: torch.Tensor | None = None,
+            ) -> dict[str, torch.Tensor]:
+                result = sf(
+                    z[:, start:end], sigma, z_splat[:, start:end], scaffold_tok[:, start:end],
+                    bundle.M_preserve[:, start:end], bundle.M_source[:, start:end], bundle.M_dest[:, start:end],
+                    _slice_asset_time(asset_tokens, start, end, seq_len),
+                    encoder_attention_mask=_slice_asset_time(asset_mask, start, end, seq_len),
+                    text_tokens=branch_text, text_attention_mask=branch_text_mask,
+                    camera_condition_tokens=camera_tokens_w, camera_attention_mask=camera_mask_w,
+                    camera_condition_kind=camera_kind,
+                    camera_gen_tokens=None if camera_z is None else camera_z[:, start:end],
+                    camera_gen_anchor_mask=_slice_time(getattr(bundle, "camera_gen_anchor_mask", None), start, end, seq_len),
+                    sky_gen_tokens=sky_z, return_dict=True, return_sky_mask=True,
+                    asset_condition_kind=asset_kind, control_drop_mask=control_drop,
+                    frame_ids=frame_ids_full[:, start:end], fps=None,
+                )
+                if not isinstance(result, dict):
+                    raise RuntimeError("SceneFlow sliding endpoint mask forward must return a dict")
+                return result
+
+            full = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask, full_asset_kind,
+                                   text_tokens, text_mask, full_camera_kind)
+            no_text = text_only = text_asset = None
+            if do_cfg and (abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6):
+                no_text = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
+                                          full_asset_kind, text_null, text_null_mask, full_camera_kind)
+            if do_cfg and abs(asset_control_scale - 1.0) > 1e-6:
+                text_only = endpoint_branch(F_uncond, uncond_asset_mask, asset_null_kind,
+                                            text_tokens, text_mask, camera_null_kind, drop_all_control)
+                text_asset = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
+                                             full_asset_kind, text_tokens, text_mask, camera_null_kind)
+            elif do_cfg and abs(camera_scale - 1.0) > 1e-6:
+                text_asset = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
+                                             full_asset_kind, text_tokens, text_mask, camera_null_kind)
+
+            def combine(key: str) -> torch.Tensor:
+                value = full[key]
+                if no_text is not None and abs(scale - 1.0) > 1e-6:
+                    value = value + (scale - 1.0) * (full[key] - no_text[key])
+                if abs(asset_control_scale - 1.0) > 1e-6:
+                    assert text_only is not None and text_asset is not None
+                    value = value + (asset_control_scale - 1.0) * (text_asset[key] - text_only[key])
+                if abs(camera_scale - 1.0) > 1e-6:
+                    assert text_asset is not None
+                    value = value + (camera_scale - 1.0) * (full[key] - text_asset[key])
+                return value
+
+            patch_w = combine("sky_mask_logits")
+            refined_w = combine("sky_mask_refined_logits")
+            patch_acc[:, start:end] += patch_w.to(patch_acc.dtype) * weight_w
+            patch_weight[:, start:end] += weight_w
+            if refined_acc is None:
+                refined_acc = torch.zeros((batch_size, seq_len) + tuple(refined_w.shape[2:]), device=device, dtype=refined_w.dtype)
+                refined_weight = torch.zeros((1, seq_len, 1, 1, 1), device=device, dtype=refined_w.dtype)
+            refined_weight_w = weight_w.view(1, actual, 1, 1, 1).to(refined_w.dtype)
+            refined_acc[:, start:end] += refined_w * refined_weight_w
+            refined_weight[:, start:end] += refined_weight_w
+        final_sky_mask_logits = patch_acc / patch_weight.clamp_min(1.0e-6)
+        assert refined_acc is not None and refined_weight is not None
+        final_sky_mask_refined_logits = refined_acc / refined_weight.clamp_min(1.0e-6)
     sky_mask_logits = final_sky_mask_logits
     sky_mask_refined_logits = final_sky_mask_refined_logits
     sky_mask_patch = None if sky_mask_logits is None else torch.sigmoid(sky_mask_logits.float()).to(sky_mask_logits.dtype)
@@ -3213,7 +3427,7 @@ def cfg_sample_pretrain_latents(
     final_sky_mask_refined_logits = None
 
     for i in range(int(args.val_sample_steps)):
-        read_final_sky_mask = bool(return_sky_mask) and i == int(args.val_sample_steps) - 1
+        read_final_sky_mask = False
         step_h = t_steps[i] - t_steps[i + 1]
         sigma = torch.full((batch_size,), float(t_steps[i].item()), device=device)
 
@@ -3371,6 +3585,74 @@ def cfg_sample_pretrain_latents(
             sky_z = sky_z - step_h.to(dtype=sky_z.dtype) * v_sky
 
     z = M_keep * z_splat + M_edit * z
+    if return_sky_mask:
+        # Reuse the exact CFG branches at the final clean state. This forward
+        # predicts only the masks and does not mutate video/camera/sky states.
+        sigma = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        read_final_sky_mask = True
+        endpoint_full = _run_branch(
+            F_asset_tokens=bundle.F_asset_tokens,
+            asset_mask=bundle.encoder_attention_mask,
+            asset_kind=full_asset_kind,
+            branch_text_tokens=text_tokens,
+            branch_text_mask=text_mask,
+            camera_kind=full_camera_kind,
+        )
+        endpoint_no_text = endpoint_text = endpoint_text_asset = None
+        if do_cfg and (abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6):
+            endpoint_no_text = _run_branch(
+                F_asset_tokens=bundle.F_asset_tokens,
+                asset_mask=bundle.encoder_attention_mask,
+                asset_kind=full_asset_kind,
+                branch_text_tokens=text_null,
+                branch_text_mask=text_null_mask,
+                camera_kind=full_camera_kind,
+            )
+        if do_cfg and abs(asset_control_scale - 1.0) > 1e-6:
+            endpoint_text = _run_branch(
+                F_asset_tokens=F_uncond,
+                asset_mask=uncond_asset_mask,
+                asset_kind=asset_null_kind,
+                branch_text_tokens=text_tokens,
+                branch_text_mask=text_mask,
+                camera_kind=camera_null_kind,
+                control_drop_mask=drop_all_control,
+            )
+            endpoint_text_asset = _run_branch(
+                F_asset_tokens=bundle.F_asset_tokens,
+                asset_mask=bundle.encoder_attention_mask,
+                asset_kind=full_asset_kind,
+                branch_text_tokens=text_tokens,
+                branch_text_mask=text_mask,
+                camera_kind=camera_null_kind,
+            )
+        elif do_cfg and abs(camera_scale - 1.0) > 1e-6:
+            endpoint_text_asset = _run_branch(
+                F_asset_tokens=bundle.F_asset_tokens,
+                asset_mask=bundle.encoder_attention_mask,
+                asset_kind=full_asset_kind,
+                branch_text_tokens=text_tokens,
+                branch_text_mask=text_mask,
+                camera_kind=camera_null_kind,
+            )
+
+        def combine_endpoint(key: str) -> torch.Tensor:
+            full = endpoint_full[key]
+            value = full
+            if endpoint_no_text is not None and abs(scale - 1.0) > 1e-6:
+                value = value + (scale - 1.0) * (full - endpoint_no_text[key])
+            if abs(asset_control_scale - 1.0) > 1e-6:
+                assert endpoint_text is not None and endpoint_text_asset is not None
+                value = value + (asset_control_scale - 1.0) * (
+                    endpoint_text_asset[key] - endpoint_text[key]
+                )
+            if abs(camera_scale - 1.0) > 1e-6:
+                assert endpoint_text_asset is not None
+                value = value + (camera_scale - 1.0) * (full - endpoint_text_asset[key])
+            return value
+
+        final_sky_mask_logits = combine_endpoint("sky_mask_logits")
+        final_sky_mask_refined_logits = combine_endpoint("sky_mask_refined_logits")
     sky_mask_logits = final_sky_mask_logits
     sky_mask_refined_logits = final_sky_mask_refined_logits
     sky_mask_patch = None if sky_mask_logits is None else torch.sigmoid(sky_mask_logits.float()).to(sky_mask_logits.dtype)
@@ -3793,8 +4075,10 @@ def train_step(
             loss = loss + 0.0 * pred_camera.sum()
             logs["loss_camera_flow"] = 0.0
             logs["loss_camera_pose"] = 0.0
+        z_sky_pred = None
         if sky_target is not None and pred_sky is not None:
             v_sky_pred = model_prediction_to_velocity(scene_flow, pred_sky, sky_target)
+            z_sky_pred = model_prediction_to_clean(scene_flow, pred_sky, sky_target)
             loss_sky_flow = sky_flow_loss(v_sky_pred, sky_target, bundle.sky_gen_clean)
             loss = loss + float(args.lambda_sky_flow) * loss_sky_flow
             logs["loss_sky_flow"] = float(loss_sky_flow.detach().item())
@@ -3803,6 +4087,57 @@ def train_step(
             logs["loss_sky_flow"] = 0.0
         elif getattr(bundle, "sky_gen_clean", None) is not None:
             logs["loss_sky_flow"] = 0.0
+
+        endpoint_every = int(getattr(args, "sky_mask_endpoint_every", 4))
+        endpoint_start = int(getattr(args, "sky_mask_endpoint_start_step", 5000))
+        endpoint_due = bool(
+            is_training
+            and global_step is not None
+            and int(global_step) >= endpoint_start
+            and endpoint_every > 0
+            and int(global_step) % endpoint_every == 0
+        )
+        endpoint_due = endpoint_due or bool(rgb_render_active)
+        endpoint_out = None
+        if endpoint_due:
+            endpoint_video = (
+                (1.0 - target.M_edit).to(dtype=z_pred.dtype) * z_splat
+                + target.M_edit.to(dtype=z_pred.dtype) * z_pred.detach()
+            )
+            endpoint_sigma = torch.zeros_like(target.sigmas, dtype=torch.float32)
+            endpoint_out = scene_flow(
+                endpoint_video,
+                endpoint_sigma,
+                z_splat,
+                scaffold_tok,
+                bundle.M_preserve,
+                bundle.M_source,
+                bundle.M_dest,
+                bundle.F_asset_tokens,
+                encoder_attention_mask=bundle.encoder_attention_mask,
+                text_tokens=text_tokens,
+                text_attention_mask=text_mask,
+                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
+                camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
+                camera_condition_kind=getattr(bundle, "camera_condition_kind", None),
+                camera_gen_tokens=None if z_camera_pred is None else z_camera_pred.detach(),
+                camera_gen_attention_mask=camera_gen_attention_mask,
+                camera_gen_anchor_mask=getattr(bundle, "camera_gen_anchor_mask", None),
+                sky_gen_tokens=None if z_sky_pred is None else z_sky_pred.detach(),
+                sky_gen_attention_mask=None,
+                return_mid=False,
+                return_dict=True,
+                return_sky_mask=True,
+                asset_condition_kind=getattr(bundle, "asset_condition_kind", None),
+                control_drop_mask=asset_control_drop_mask,
+                frame_ids=getattr(bundle, "frame_ids", None),
+                fps=None,
+            )
+            if not isinstance(endpoint_out, dict):
+                raise RuntimeError("sigma=0 sky-mask endpoint forward must return a dict")
+            logs["sky_mask_endpoint_active"] = 1.0
+        else:
+            logs["sky_mask_endpoint_active"] = 0.0
         sky_mask_target = getattr(bundle, "sky_mask_clean", None)
         if pred_sky_mask_logits is not None and torch.is_tensor(sky_mask_target):
             loss_sky_mask, sky_mask_logs = sky_mask_patch_loss(
@@ -3839,6 +4174,30 @@ def train_step(
                 torch.sigmoid(pred_sky_mask_refined_logits.float()).mean().detach().item()
             )
 
+        if endpoint_out is not None and torch.is_tensor(sky_mask_target) and torch.is_tensor(sky_mask_refined_target):
+            endpoint_patch_logits = endpoint_out["sky_mask_logits"]
+            endpoint_refined_logits = endpoint_out["sky_mask_refined_logits"]
+            endpoint_patch_loss, endpoint_patch_logs = sky_mask_patch_loss(
+                endpoint_patch_logits,
+                sky_mask_target,
+                dice_weight=float(getattr(args, "sky_mask_dice_weight", 0.5)),
+                pos_weight_max=float(getattr(args, "sky_mask_pos_weight_max", 10.0)),
+            )
+            endpoint_refined_loss, endpoint_refined_logs = sky_mask_refined_loss(
+                endpoint_refined_logits,
+                sky_mask_refined_target,
+                dice_weight=float(getattr(args, "sky_mask_dice_weight", 0.5)),
+                pos_weight_max=float(getattr(args, "sky_mask_pos_weight_max", 10.0)),
+                boundary_weight=float(getattr(args, "sky_mask_refine_boundary_weight", 4.0)),
+                boundary_loss_weight=float(getattr(args, "sky_mask_refine_boundary_loss_weight", 0.25)),
+            )
+            loss = loss + float(getattr(args, "lambda_sky_mask", 0.05)) * endpoint_patch_loss
+            loss = loss + float(getattr(args, "lambda_sky_mask_refine", 0.1)) * endpoint_refined_loss
+            logs["loss_sky_mask_endpoint"] = float(endpoint_patch_loss.detach().item())
+            logs["loss_sky_mask_refine_endpoint"] = float(endpoint_refined_loss.detach().item())
+            logs.update({f"endpoint_{key}": value for key, value in endpoint_patch_logs.items()})
+            logs.update({f"endpoint_{key}": value for key, value in endpoint_refined_logs.items()})
+
         if rgb_render_active:
             if z_camera_pred is None or pred_camera_state is None:
                 raise RuntimeError(
@@ -3858,11 +4217,41 @@ def train_step(
             ).pose_encoding
             sky_tokens_for_rgb = None
             if pred_sky is not None and sky_target is not None:
-                sky_tokens_for_rgb = model_prediction_to_clean(scene_flow, pred_sky, sky_target)
-            if pred_sky_mask_refined_logits is not None:
-                render_sky_probability = torch.sigmoid(pred_sky_mask_refined_logits.float())
-            elif pred_sky_mask_logits is not None:
-                render_sky_probability = torch.sigmoid(pred_sky_mask_logits.float())
+                sky_latent_for_rgb = model_prediction_to_clean(scene_flow, pred_sky, sky_target)
+                sky_tokens_for_rgb = decode_sky_patch_tokens(sky_latent_for_rgb)
+                sky_view_samples = int(args.rgb_render_max_samples)
+                sky_view_frames = int(args.rgb_render_max_frames)
+                sky_view_samples = (
+                    int(sky_latent_for_rgb.shape[0])
+                    if sky_view_samples <= 0
+                    else min(sky_view_samples, int(sky_latent_for_rgb.shape[0]))
+                )
+                sky_view_frames = (
+                    int(bundle.rgb_render_images.shape[1])
+                    if sky_view_frames <= 0
+                    else min(sky_view_frames, int(bundle.rgb_render_images.shape[1]))
+                )
+                sky_view_loss, sky_view_logs = generated_sky_view_reconstruction_loss(
+                    vggt_model=vggt_model,
+                    sky_latent=sky_latent_for_rgb[:sky_view_samples],
+                    images=bundle.rgb_render_images[:sky_view_samples, :sky_view_frames],
+                    sky_mask=bundle.rgb_render_masks[:sky_view_samples, :sky_view_frames],
+                    gt_pose_enc_dggt=bundle.camera_pose_gt_dggt[:sky_view_samples, :sky_view_frames],
+                    lpips_model=lpips_model,
+                    lpips_weight=float(getattr(args, "sky_view_lpips_weight", 0.01)),
+                    high_frequency_weight=float(getattr(args, "sky_view_high_frequency_weight", 0.25)),
+                )
+                loss = loss + float(getattr(args, "lambda_sky_view_reconstruction", 0.1)) * sky_view_loss
+                logs.update(sky_view_logs)
+                logs["loss_sky_view_weighted"] = float(
+                    (float(getattr(args, "lambda_sky_view_reconstruction", 0.1)) * sky_view_loss).detach().item()
+                )
+            endpoint_refined_logits = None if endpoint_out is None else endpoint_out.get("sky_mask_refined_logits")
+            endpoint_patch_logits = None if endpoint_out is None else endpoint_out.get("sky_mask_logits")
+            if endpoint_refined_logits is not None:
+                render_sky_probability = torch.sigmoid(endpoint_refined_logits.float())
+            elif endpoint_patch_logits is not None:
+                render_sky_probability = torch.sigmoid(endpoint_patch_logits.float())
             else:
                 raise RuntimeError(
                     "Pretrain RGB loss requires a generated sky-mask prediction."
@@ -3883,11 +4272,14 @@ def train_step(
                 render_stride=int(args.rgb_render_stride),
                 background_mode="sky_tokens" if sky_tokens_for_rgb is not None else "black",
                 sky_tokens=sky_tokens_for_rgb,
-                sky_grid=sky_grid_shape(args),
+                sky_grid=sky_atlas_shape(args),
                 patch_weight_mask=target.M_edit,
                 sky_weight=float(args.rgb_render_sky_weight),
                 camera_grad_scale=float(args.rgb_render_camera_grad_scale),
-                sky_mask_grad_scale=float(args.rgb_render_sky_mask_grad_scale),
+                sky_mask_grad_scale=(
+                    float(args.rgb_render_sky_mask_grad_scale)
+                    * float(rgb_render_loss_ramp(args, global_step))
+                ),
                 lpips_model=lpips_model,
                 lpips_weight=float(args.rgb_render_lpips_weight),
             )
@@ -4038,21 +4430,27 @@ def build_pretrain_bundle_from_batch(
     )
     sky_gen_clean = None
     sky_gen_loss_weight = None
+    sky_atlas_clean = None
+    sky_atlas_observation_mask = None
     if sky_generation_enabled(args):
         sky_h, sky_w = sky_grid_shape(args)
+        atlas_h, atlas_w = sky_atlas_shape(args)
         sky_extrinsics, sky_intrinsics = pose_encoding_to_extri_intri(
             camera_pose_gt_dggt,
             (int(images.shape[-2]), int(images.shape[-1])),
         )
-        sky_gen_clean, sky_gen_loss_weight = build_sky_tokens_from_images(
+        sky_atlas_clean, sky_atlas_observation_mask = build_sky_atlas_from_images(
             images,
             masks_device,
-            grid_h=sky_h,
-            grid_w=sky_w,
-            unobserved_weight=float(getattr(args, "sky_unobserved_loss_weight", DEFAULT_SKY_UNOBSERVED_LOSS_WEIGHT)),
+            atlas_hw=(atlas_h, atlas_w),
             extrinsics=sky_extrinsics,
             intrinsics=sky_intrinsics,
         )
+        sky_gen_clean = pack_sky_rgb_atlas(sky_atlas_clean).to(dtype=images.dtype)
+        latent_coverage = torch.nn.functional.adaptive_avg_pool2d(
+            sky_atlas_observation_mask.float(), (sky_h, sky_w)
+        )
+        sky_gen_loss_weight = latent_coverage.reshape(images.shape[0], sky_h * sky_w)
 
     frame_ids_raw = batch.get("frame_ids")
     if frame_ids_raw is not None:
@@ -4098,6 +4496,8 @@ def build_pretrain_bundle_from_batch(
         sky_mask_refined_clean=sky_mask_refined_clean,
         frame_ids=frame_ids.contiguous(),
     )
+    bundle.sky_atlas_clean = sky_atlas_clean
+    bundle.sky_atlas_observation_mask = sky_atlas_observation_mask
     object_patch_mask = batch.get("pretrain_object_patch_mask")
     source_kind_raw = batch.get("pretrain_asset_source_kind")
     if isinstance(source_kind_raw, str):
@@ -4490,8 +4890,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--resume_path", type=str, default=None)
     parser.add_argument("--warm_start_path", type=str, default=None,
                         help="加载模型权重以从头开始训练，不恢复优化器和step")
+    parser.add_argument(
+        "--partial_warm_start_non_sky",
+        action="store_true",
+        help="Explicitly transfer shape-compatible non-sky weights from an old checkpoint; optimizer/EMA are reset.",
+    )
     parser.add_argument("--patch_grid_h", type=int, default=25)
     parser.add_argument("--patch_grid_w", type=int, default=37)
+    parser.add_argument("--rope_max_position", type=int, default=16384)
     parser.add_argument(
         "--latent_dim",
         type=int,
@@ -4660,6 +5066,12 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sky_grid_h", type=int, default=DEFAULT_SKY_GRID[0])
     parser.add_argument("--sky_grid_w", type=int, default=DEFAULT_SKY_GRID[1])
+    parser.add_argument("--sky_atlas_h", type=int, default=DEFAULT_SKY_ATLAS_HW[0])
+    parser.add_argument("--sky_atlas_w", type=int, default=DEFAULT_SKY_ATLAS_HW[1])
+    parser.add_argument(
+        "--sky_representation_version", choices=(SKY_REPRESENTATION_VERSION,),
+        default=SKY_REPRESENTATION_VERSION,
+    )
     parser.add_argument(
         "--sky_unobserved_loss_weight",
         type=float,
@@ -4723,6 +5135,8 @@ def build_argparser() -> argparse.ArgumentParser:
         default=0.25,
         help="Weight of the boundary BCE term inside the refined sky mask auxiliary loss.",
     )
+    parser.add_argument("--sky_mask_endpoint_start_step", type=int, default=5000)
+    parser.add_argument("--sky_mask_endpoint_every", type=int, default=4)
     parser.add_argument(
         "--lambda_rgb_render",
         type=float,
@@ -4740,7 +5154,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb_render_max_samples", type=int, default=1)
     parser.add_argument("--rgb_render_max_frames", type=int, default=4)
     parser.add_argument("--rgb_render_stride", type=int, default=2)
-    parser.add_argument("--rgb_render_sky_weight", type=float, default=0.25)
+    parser.add_argument("--rgb_render_sky_weight", type=float, default=1.0)
     parser.add_argument(
         "--rgb_render_camera_grad_scale",
         type=float,
@@ -4750,11 +5164,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rgb_render_sky_mask_grad_scale",
         type=float,
-        default=0.0,
+        default=0.05,
         help="RGB-to-sky-mask gradient scale; render always uses the predicted mask.",
     )
     parser.add_argument("--rgb_render_lpips_weight", type=float, default=0.01)
     parser.add_argument("--rgb_render_lpips_net", type=str, default="alex")
+    parser.add_argument("--lambda_sky_view_reconstruction", type=float, default=0.1)
+    parser.add_argument("--sky_view_lpips_weight", type=float, default=0.01)
+    parser.add_argument("--sky_view_high_frequency_weight", type=float, default=0.25)
 
     parser.add_argument(
         "--guidance_scale",
@@ -4883,12 +5300,20 @@ def main() -> None:
     args = build_argparser().parse_args()
     args.patch_grid = (int(args.patch_grid_h), int(args.patch_grid_w))
     args.sky_grid = sky_grid_shape(args)
+    args.sky_atlas_hw = (int(args.sky_atlas_h), int(args.sky_atlas_w))
     if args.patch_grid[0] <= 0 or args.patch_grid[1] <= 0:
         raise ValueError("--patch_grid_h and --patch_grid_w must be positive.")
     if int(args.sky_mask_refine_scale) <= 0 or int(args.sky_mask_refine_scale) & (int(args.sky_mask_refine_scale) - 1):
         raise ValueError("--sky_mask_refine_scale must be a positive power of two.")
     if int(args.sky_mask_refine_channels) <= 0:
         raise ValueError("--sky_mask_refine_channels must be positive.")
+    if int(args.sky_mask_endpoint_start_step) < 0 or int(args.sky_mask_endpoint_every) < 0:
+        raise ValueError("sky mask endpoint start/every must be non-negative.")
+    if args.sky_atlas_hw != DEFAULT_SKY_ATLAS_HW or args.sky_grid != DEFAULT_SKY_GRID:
+        raise ValueError(
+            f"{SKY_REPRESENTATION_VERSION} requires sky_atlas_hw={DEFAULT_SKY_ATLAS_HW} "
+            f"and sky_grid={DEFAULT_SKY_GRID}"
+        )
     if args.sequence_length < 2:
         raise ValueError("--sequence_length must be >= 2.")
     if not 0.0 <= float(args.camera_anchor_context_dropout) <= 1.0:
@@ -4987,6 +5412,9 @@ def main() -> None:
         max_sky_tokens=int(args.sky_grid[0] * args.sky_grid[1]),
         sky_mask_refine_scale=int(args.sky_mask_refine_scale),
         sky_mask_refine_channels=int(args.sky_mask_refine_channels),
+        rope_max_position=int(args.rope_max_position),
+        sky_representation_version=str(args.sky_representation_version),
+        sky_atlas_hw=args.sky_atlas_hw,
         prediction_type=args.prediction_type,
     ).to(device)
     scene_flow.enable_gradient_checkpointing()
@@ -5090,14 +5518,50 @@ def main() -> None:
     # 如果指定了 warm_start_path，则覆盖模型和 EMA 的权重，但保留 global_step = 0
     if args.warm_start_path:
         payload = torch.load(args.warm_start_path, map_location=device)
-        saved_camera_rep, saved_camera_dim = _checkpoint_camera_representation(payload)
-        legacy_camera_migration = saved_camera_rep == "dggt_hidden_v1" and saved_camera_dim == 2048
-        if legacy_camera_migration:
+        if args.partial_warm_start_non_sky:
+            if isinstance(payload, dict) and isinstance(payload.get("ema_scene_flow_state_dict"), dict):
+                source_state = payload["ema_scene_flow_state_dict"]
+                warm_source = "ema_scene_flow_state_dict:partial_non_sky"
+            elif isinstance(payload, dict) and isinstance(payload.get("scene_flow"), dict):
+                source_state = payload["scene_flow"]
+                warm_source = "scene_flow:partial_non_sky"
+            elif isinstance(payload, dict):
+                source_state = payload
+                warm_source = "state_dict:partial_non_sky"
+            else:
+                raise ValueError("partial warm-start requires a checkpoint state dict")
+            source_state = strip_module_prefix(source_state)
+            target_model = unwrap_ddp(scene_flow)
+            current_state = target_model.state_dict()
+            transferred = {
+                key: value
+                for key, value in source_state.items()
+                if key in current_state
+                and torch.is_tensor(value)
+                and tuple(value.shape) == tuple(current_state[key].shape)
+                and not key.startswith(("sky_gen_",))
+            }
+            current_state.update(transferred)
+            target_model.load_state_dict(current_state, strict=True)
+            sync_ema_shadow_from_model(scene_flow, ema)
+            warm_source += f":loaded={len(transferred)}:skipped={len(source_state) - len(transferred)}"
+            ema.optimization_step = 0
+            if is_main_process():
+                print(f"[warm start] loaded {warm_source}; optimizer and EMA history were not restored", flush=True)
+            payload = None
+        if payload is None:
+            pass
+        else:
+            saved_camera_rep, saved_camera_dim = _checkpoint_camera_representation(payload)
+        legacy_camera_migration = False if payload is None else saved_camera_rep == "dggt_hidden_v1" and saved_camera_dim == 2048
+        if payload is None:
+            pass
+        elif legacy_camera_migration:
             validate_prediction_type_checkpoint(scene_flow, payload, args.warm_start_path)
             loaded_count, skipped_count, warm_source = migrate_legacy_camera_checkpoint(scene_flow, payload)
             sync_ema_shadow_from_model(scene_flow, ema)
             warm_source = f"{warm_source}:shared={loaded_count}:skipped={skipped_count}"
-        else:
+        elif payload is not None:
             validate_scene_flow_checkpoint_config(
                 scene_flow,
                 payload,
@@ -5105,7 +5569,9 @@ def main() -> None:
                 expected_dggt_sha256=args.dggt_checkpoint_sha256,
             )
 
-        if legacy_camera_migration:
+        if payload is None:
+            pass
+        elif legacy_camera_migration:
             pass
         elif isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
             unwrap_ddp(scene_flow).load_state_dict(payload["ema_scene_flow_state_dict"], strict=True)
@@ -5134,7 +5600,7 @@ def main() -> None:
             warm_source = "scene_flow"
         ema.optimization_step = 0
 
-        if is_main_process():
+        if is_main_process() and payload is not None:
             print(
                 f"[warm start] 成功从 {args.warm_start_path} 加载 {warm_source}，将从 step 0 开始全新训练",
                 flush=True,

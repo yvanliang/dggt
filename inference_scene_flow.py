@@ -761,6 +761,10 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "patch_grid",
     "out_channels",
     "sky_grid",
+    "sky_representation_version",
+    "sky_atlas_hw",
+    "sky_token_dim",
+    "rope_max_position",
     "camera_gen_dim",
     "camera_generation_representation",
     "camera_stats_version",
@@ -821,11 +825,13 @@ def _validate_scene_flow_checkpoint_config(scene_flow: nn.Module, payload: Any, 
     saved_cfg = payload.get("scene_flow_config")
     if not isinstance(saved_cfg, dict):
         return
+    if saved_cfg.get("sky_representation_version") != "rgb_patch_v2":
+        raise ValueError(f"{path} is not an rgb_patch_v2 sky checkpoint.")
     if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
         raise ValueError(
             f"{path} was saved with the legacy global mrope_temporal_margin RoPE layout. "
-            "The current SceneFlow model uses the fixed A1 layout "
-            "(video/asset/camera shared video time, camera center, sky temporal offset 128); "
+            "The current SceneFlow model uses the fixed A2 layout "
+            "(video/asset/camera shared video time, camera center, sky temporal offset 15000); "
             "do not run inference across these incompatible position semantics."
         )
     current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)

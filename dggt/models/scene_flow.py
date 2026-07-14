@@ -68,9 +68,23 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
 
 COSMOS_MROPE_SECTION = (24, 20, 20)
 VIDEO_STATE_DIM = 6
-ROPE_LAYOUT_VERSION = "a1_camera_center_sky128"
-SKY_MROPE_TEMPORAL_OFFSET = 128
+ROPE_LAYOUT_VERSION = "a2_camera_center_sky15000"
+SKY_MROPE_TEMPORAL_OFFSET = 15000
+VIDEO_MROPE_TEMPORAL_LIMIT = SKY_MROPE_TEMPORAL_OFFSET
+DEFAULT_ROPE_MAX_POSITION = 16384
 CAMERA_ROPE_SPATIAL_MODE = "center"
+
+
+def _validate_video_frame_ids(frame_ids: torch.Tensor) -> None:
+    if frame_ids.numel() == 0:
+        return
+    minimum = int(frame_ids.min().item())
+    maximum = int(frame_ids.max().item())
+    if minimum < 0 or maximum >= VIDEO_MROPE_TEMPORAL_LIMIT:
+        raise ValueError(
+            f"frame_ids must satisfy 0 <= id < {VIDEO_MROPE_TEMPORAL_LIMIT} "
+            f"to stay below the sky RoPE modality margin; got range [{minimum}, {maximum}]"
+        )
 
 
 def _scaled_mrope_section(
@@ -733,7 +747,7 @@ class RAEVideoSceneFlow(nn.Module):
         ffn_dim: int | None = None,
         num_layers: int = 28,
         eps: float = 1e-6,
-        rope_max_seq_len: int = 128,
+        rope_max_position: int = DEFAULT_ROPE_MAX_POSITION,
         repa_block_frac: float = 1.0 / 3.0,
         repa_layer_depth: int | None = None,
         null_kv_std: float = 0.02,
@@ -770,6 +784,8 @@ class RAEVideoSceneFlow(nn.Module):
         ddt_mrope_section: tuple[int, int, int] | list[int] | None = None,
         timestep_scale: float = 1.0,
         t_eps: float = 0.05,
+        sky_representation_version: str | None = None,
+        sky_atlas_hw: tuple[int, int] | list[int] = (32, 64),
         **unused: Any,
     ) -> None:
         super().__init__()
@@ -827,6 +843,13 @@ class RAEVideoSceneFlow(nn.Module):
             sky_grid_t = (int(sky_grid[0]), int(sky_grid[1]))
             if sky_grid_t[0] <= 0 or sky_grid_t[1] <= 0:
                 raise ValueError(f"sky_grid entries must be positive, got {sky_grid_t}")
+        if sky_representation_version is None:
+            sky_representation_version = "rgb_patch_v2" if int(sky_token_dim) == 12 else "legacy_rgb_v1"
+        if str(sky_representation_version) == "rgb_patch_v2":
+            if int(sky_token_dim) != 12 or tuple(int(v) for v in sky_atlas_hw) != (32, 64) or sky_grid_t != (16, 32):
+                raise ValueError(
+                    "rgb_patch_v2 requires sky_token_dim=12, sky_atlas_hw=(32,64), and sky_grid=(16,32)"
+                )
         video_state_dim = int(video_state_dim)
         if video_state_dim != VIDEO_STATE_DIM:
             raise ValueError(f"video_state_dim must be {VIDEO_STATE_DIM}, got {video_state_dim}")
@@ -838,6 +861,11 @@ class RAEVideoSceneFlow(nn.Module):
             )
         if sky_mask_refine_channels <= 0:
             raise ValueError(f"sky_mask_refine_channels must be positive, got {sky_mask_refine_channels}")
+        if int(rope_max_position) <= SKY_MROPE_TEMPORAL_OFFSET:
+            raise ValueError(
+                f"rope_max_position={rope_max_position} must exceed the sky modality position "
+                f"{SKY_MROPE_TEMPORAL_OFFSET}"
+            )
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
         if not 1 <= base_model_depth <= num_layers:
@@ -856,9 +884,12 @@ class RAEVideoSceneFlow(nn.Module):
         del timestep_scale
         if "mrope_temporal_margin" in unused:
             raise TypeError(
-                "mrope_temporal_margin has been removed. SceneFlow now uses fixed A1 RoPE positions: "
-                "video/asset/control temporal offset 0, camera on the video frame center, and sky temporal offset 128."
+                "mrope_temporal_margin has been removed. SceneFlow now uses fixed A2 RoPE positions: "
+                "video/asset/control temporal offset 0, camera on the video frame center, and sky temporal offset 15000."
             )
+        # Accepted only so tiny downstream constructors using the former inert
+        # field keep working. It is deliberately not serialized or used.
+        unused.pop("rope_max_seq_len", None)
         # These are serialized derived/version fields. They are accepted on a
         # config round-trip but recomputed or fixed by the current model.
         for derived_name in (
@@ -887,7 +918,7 @@ class RAEVideoSceneFlow(nn.Module):
             ffn_dim=ffn_dim_i,
             num_layers=num_layers,
             eps=float(eps),
-            rope_max_seq_len=int(rope_max_seq_len),
+            rope_max_position=int(rope_max_position),
             repa_block_frac=float(repa_block_frac),
             repa_layer_depth=repa_layer_depth_i,
             null_kv_std=float(null_kv_std),
@@ -920,6 +951,8 @@ class RAEVideoSceneFlow(nn.Module):
             sky_mask_head_version=str(sky_mask_head_version),
             sky_mask_refine_scale=sky_mask_refine_scale,
             sky_mask_refine_channels=sky_mask_refine_channels,
+            sky_representation_version=str(sky_representation_version),
+            sky_atlas_hw=tuple(int(v) for v in sky_atlas_hw),
             rope_layout_version=ROPE_LAYOUT_VERSION,
             sky_rope_temporal_offset=SKY_MROPE_TEMPORAL_OFFSET,
             camera_rope_spatial_mode=CAMERA_ROPE_SPATIAL_MODE,
@@ -972,9 +1005,9 @@ class RAEVideoSceneFlow(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, int(camera_gen_dim)),
         )
-        # Sky tokens are RGB states.  Their norm encodes absolute brightness,
-        # so RMSNorm over the three channels would make proportional colors
-        # (for example a dim and a bright grey) indistinguishable.  Retain a
+        # Sky tokens are deterministically packed RGB patch states. Their norm
+        # encodes absolute brightness, so RMSNorm across the packed channels
+        # would make proportional colors indistinguishable. Retain a
         # learned channel calibration, but never normalize each RGB token.
         # ``ChannelScale.weight`` deliberately preserves strict compatibility
         # with the legacy ``sky_gen_norm.weight`` checkpoint entry.
@@ -1209,8 +1242,8 @@ class RAEVideoSceneFlow(nn.Module):
     ) -> "RAEVideoSceneFlow":
         if "mrope_temporal_margin" in kwargs:
             raise TypeError(
-                "mrope_temporal_margin has been removed. Use the fixed A1 RoPE layout "
-                "(video/asset/camera shared grid, sky offset 128)."
+                "mrope_temporal_margin has been removed. Use the fixed A2 RoPE layout "
+                "(video/asset/camera shared grid, sky offset 15000)."
             )
         if bring_up:
             defaults = {
@@ -2124,6 +2157,7 @@ class RAEVideoSceneFlow(nn.Module):
                 frames = frames.view(1, -1).expand(batch_size, -1)
             if frames.shape != (batch_size, seq_len):
                 raise ValueError(f"frame_ids must be [S] or [B,S], got {tuple(frame_ids.shape)}")
+        _validate_video_frame_ids(frames)
         patch_idx = torch.arange(num_patches, device=device, dtype=torch.long)
         y = torch.div(patch_idx, gw, rounding_mode="floor")
         x = patch_idx % gw
@@ -2169,6 +2203,7 @@ class RAEVideoSceneFlow(nn.Module):
                 frames = frames.view(1, -1).expand(batch_size, -1)
             if frames.shape != (batch_size, seq_len):
                 raise ValueError(f"frame_ids must be [S] or [B,S], got {tuple(frame_ids.shape)}")
+        _validate_video_frame_ids(frames)
         if fps is None:
             temporal = frames.to(dtype=torch.long)
             pos_dtype = torch.long
@@ -2497,6 +2532,9 @@ class RAEVideoSceneFlow(nn.Module):
             camera_condition_tokens = camera_pose_tokens
         self._validate_video_control_inputs(z_t, z_splat, scaffold_tok, M_preserve, M_source, M_dest)
         b, s, p, _ = z_t.shape
+        if frame_ids is not None:
+            frame_ids_check = torch.as_tensor(frame_ids, device=z_t.device)
+            _validate_video_frame_ids(frame_ids_check)
         patch_grid = _normalize_patch_grid(p, self.config.patch_grid)
         sigma = sigma.to(device=z_t.device, dtype=torch.float32)
         if sigma.ndim == 0:
@@ -2636,6 +2674,14 @@ class RAEVideoSceneFlow(nn.Module):
         gen_pos = torch.cat([target_pos, camera_gen_pos, sky_gen_pos], dim=1)
         full_seq = torch.cat([gen_seq, cond_seq], dim=1)
         full_pos = torch.cat([gen_pos, cond_pos], dim=1)
+        if full_pos.numel():
+            max_position = float(full_pos.max().item())
+            min_position = float(full_pos.min().item())
+            if min_position < 0.0 or max_position >= float(self.config.rope_max_position):
+                raise ValueError(
+                    f"RoPE position ids must be in [0,{self.config.rope_max_position}); "
+                    f"got range [{min_position},{max_position}]"
+                )
         full_mask = torch.cat([gen_mask, cond_mask], dim=1)
         full_attn_mask = self._key_padding_attention_mask(full_mask, full_seq.dtype)
         if full_attn_mask is not None:

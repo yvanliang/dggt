@@ -175,7 +175,7 @@ def write_gaussian_ply(gaussians: dict[str, Any], path: str | Path) -> None:
     _write_binary_float_tensor(Path(path), header_text, matrix)
 
 
-def write_point_ply(points: Any, colors: Any, path: str | Path) -> None:
+def write_point_ply(points: Any, colors: Any, path: str | Path, opacities: Any | None = None) -> None:
     points_t = _to_float_tensor(points, shape_last=3)
     colors_t = _to_float_tensor(colors, shape_last=3).clamp(0.0, 1.0)
     if points_t.shape[0] != colors_t.shape[0]:
@@ -186,6 +186,12 @@ def write_point_ply(points: Any, colors: Any, path: str | Path) -> None:
     # MeshLab compatibility is better with uchar vertex colors.
     colors_u8 = torch.round(colors_t * 255.0).to(torch.uint8).contiguous()
     count = points_t.shape[0]
+    opacity_t = None
+    if opacities is not None:
+        opacity_t = _to_float_tensor(opacities, shape_last=1).reshape(-1).clamp(0.0, 1.0)
+        if int(opacity_t.shape[0]) != int(count):
+            raise ValueError(f"Point/opacity count mismatch: {count} vs {opacity_t.shape[0]}")
+    opacity_header = "property float opacity\n" if opacity_t is not None else ""
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
@@ -196,23 +202,24 @@ def write_point_ply(points: Any, colors: Any, path: str | Path) -> None:
         "property uchar red\n"
         "property uchar green\n"
         "property uchar blue\n"
+        f"{opacity_header}"
         "end_header\n"
     )
     out_path = Path(path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(header.encode("ascii"))
-        payload = np.empty(
-            count,
-            dtype=[
+        dtype = [
                 ("x", "<f4"),
                 ("y", "<f4"),
                 ("z", "<f4"),
                 ("red", "u1"),
                 ("green", "u1"),
                 ("blue", "u1"),
-            ],
-        )
+            ]
+        if opacity_t is not None:
+            dtype.append(("opacity", "<f4"))
+        payload = np.empty(count, dtype=dtype)
         xyz = points_t.detach().cpu().numpy()
         rgb = colors_u8.detach().cpu().numpy()
         payload["x"] = xyz[:, 0]
@@ -221,4 +228,6 @@ def write_point_ply(points: Any, colors: Any, path: str | Path) -> None:
         payload["red"] = rgb[:, 0]
         payload["green"] = rgb[:, 1]
         payload["blue"] = rgb[:, 2]
+        if opacity_t is not None:
+            payload["opacity"] = opacity_t.detach().cpu().numpy()
         payload.tofile(f)

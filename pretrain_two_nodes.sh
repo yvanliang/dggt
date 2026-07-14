@@ -305,7 +305,7 @@ build_train_args() {
         --lambda_boundary 0.25
         --lambda_camera_flow 0.1
         --lambda_camera_pose 0.5
-        --lambda_sky_flow 0.05
+        --lambda_sky_flow 0.1
         --uncond_drop_prob "${UNCOND_DROP_PROB}"
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
         --asset_uncond_drop_prob "${ASSET_UNCOND_DROP_PROB}"
