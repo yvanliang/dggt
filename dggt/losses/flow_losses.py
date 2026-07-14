@@ -16,6 +16,7 @@ class FlowTarget:
     eps: torch.Tensor
     weights: torch.Tensor
     z_cond: torch.Tensor | None = None
+    z_clean_target: torch.Tensor | None = None
     M_edit: torch.Tensor | None = None
     t_eps: float = 0.05
 
@@ -107,9 +108,11 @@ def compute_total_loss(
     bundle,
     sd3_weights: torch.Tensor | None = None,
     mid_repa: torch.Tensor | None = None,
+    repa_target: torch.Tensor | None = None,
     z_pred: torch.Tensor | None = None,
     z_preserve_target: torch.Tensor | None = None,
     M_edit: torch.Tensor | None = None,
+    M_preserve_loss: torch.Tensor | None = None,
     boundary_mask: torch.Tensor | None = None,
     v_base_pred: torch.Tensor | None = None,
     base_model_coeff: float = 0.0,
@@ -137,11 +140,13 @@ def compute_total_loss(
         )
     else:
         loss_flow = masked_flow_edit_loss(v_pred, v_gt, M_edit, sd3_weights=sd3_weights)
+    if M_preserve_loss is None:
+        M_preserve_loss = bundle.M_preserve
     loss_preserve = preserve_loss(
         v_pred,
         eps,
         z_clean,
-        bundle.M_preserve,
+        M_preserve_loss,
         z_pred=z_pred,
         z_preserve_target=z_preserve_target,
     )
@@ -150,7 +155,9 @@ def compute_total_loss(
         if float(lambda_boundary) != 0.0
         else zero_loss_like(v_pred)
     )
-    loss_repa = repa_loss(mid_repa, z_clean) if float(lambda_repa) != 0.0 else zero_loss_like(v_pred)
+    if repa_target is None:
+        repa_target = z_clean
+    loss_repa = repa_loss(mid_repa, repa_target) if float(lambda_repa) != 0.0 else zero_loss_like(v_pred)
     if identity_batch and float(lambda_identity) != 0.0:
         if z_pred is not None:
             identity_target = z_clean if z_preserve_target is None else z_preserve_target
@@ -363,18 +370,100 @@ def build_masked_rectified_flow_target(
         t_eps=t_eps,
     )
     edit = M_edit.to(device=z_clean.device, dtype=z_clean.dtype).clamp(0.0, 1.0)
-    z_t = edit * base.z_t + (1.0 - edit) * z_cond
+    keep = 1.0 - edit
+    # Define one explicit conditional probability path.  Both endpoints keep
+    # the condition latent outside the edit domain:
+    #   clean_target = edit * clean + keep * condition
+    #   noise_target = edit * noise + keep * condition
+    # Hence z_t = edit * base.z_t + keep * condition and its RAE-style target
+    # is exactly edit * base.v_gt.  Reusing the unscaled base velocity here is
+    # only correct when edit is binary and the loss is restricted to edit=1.
+    z_clean_target = edit * z_clean + keep * z_cond
+    z_t = edit * base.z_t + keep * z_cond
     return FlowTarget(
         sigmas=base.sigmas,
         sigmas4=base.sigmas4,
         z_t=z_t,
-        v_gt=base.v_gt,
+        v_gt=edit * base.v_gt,
         eps=base.eps,
         weights=base.weights,
         z_cond=z_cond,
+        z_clean_target=z_clean_target,
         M_edit=edit,
         t_eps=float(t_eps),
     )
+
+
+def build_hard_edit_domain(
+    M_source: torch.Tensor,
+    M_dest: torch.Tensor,
+    patch_grid: tuple[int, int] | list[int],
+    *,
+    threshold: float = 1e-4,
+    dilation_radius: int = 1,
+) -> torch.Tensor:
+    """Build the binary state/noise domain from soft edit semantics.
+
+    ``M_source`` and ``M_dest`` remain continuous model conditions.  This
+    binary domain is reserved for the flow path, effective timestep, losses,
+    and the idempotent sampler projection.
+    """
+    if M_source.shape != M_dest.shape or M_source.ndim != 4 or int(M_source.shape[-1]) != 1:
+        raise ValueError(
+            "M_source and M_dest must share shape [B,S,P,1], got "
+            f"{tuple(M_source.shape)} and {tuple(M_dest.shape)}"
+        )
+    if float(threshold) < 0.0 or float(threshold) >= 1.0:
+        raise ValueError(f"threshold must be in [0,1), got {threshold}")
+    b, s, p, _ = M_source.shape
+    gh, gw = int(patch_grid[0]), int(patch_grid[1])
+    if gh * gw != int(p):
+        raise ValueError(f"patch_grid={tuple(patch_grid)} incompatible with P={p}")
+    soft_edit = (M_source.float() + M_dest.float()).clamp(0.0, 1.0)
+    support = soft_edit.gt(float(threshold))
+    radius = int(dilation_radius)
+    if radius < 0:
+        raise ValueError(f"dilation_radius must be non-negative, got {dilation_radius}")
+    if radius > 0:
+        grid = support.reshape(b * s, gh, gw, 1).permute(0, 3, 1, 2).float()
+        kernel = 2 * radius + 1
+        support = F.max_pool2d(grid, kernel_size=kernel, stride=1, padding=radius).gt(0.0)
+        support = support.permute(0, 2, 3, 1).reshape(b, s, p, 1)
+    return support.to(device=M_source.device, dtype=M_source.dtype)
+
+
+def project_masked_flow_state(
+    generated: torch.Tensor,
+    condition: torch.Tensor,
+    edit_domain: torch.Tensor,
+) -> torch.Tensor:
+    """Project onto a *binary* edit domain; the projection is idempotent."""
+    if generated.shape != condition.shape:
+        raise ValueError(f"generated shape {tuple(generated.shape)} != condition shape {tuple(condition.shape)}")
+    if edit_domain.shape != generated.shape[:-1] + (1,):
+        raise ValueError(f"edit_domain must be [B,S,P,1], got {tuple(edit_domain.shape)}")
+    domain = edit_domain.to(device=generated.device)
+    if domain.dtype != torch.bool:
+        rounded = domain.round()
+        if not bool(torch.allclose(domain.float(), rounded.float(), atol=1e-6, rtol=0.0)):
+            raise ValueError("edit_domain must be binary; soft masks are not valid ODE projections")
+        domain = rounded.to(dtype=torch.bool)
+    return torch.where(domain, generated, condition.to(device=generated.device, dtype=generated.dtype))
+
+
+def masked_flow_euler_step(
+    state: torch.Tensor,
+    velocity: torch.Tensor,
+    step_size: torch.Tensor | float,
+    condition: torch.Tensor,
+    edit_domain: torch.Tensor,
+) -> torch.Tensor:
+    """Euler update in the editable subspace followed by a hard projection."""
+    if velocity.shape != state.shape:
+        raise ValueError(f"velocity shape {tuple(velocity.shape)} != state shape {tuple(state.shape)}")
+    domain = edit_domain.to(device=state.device, dtype=state.dtype)
+    updated = state - torch.as_tensor(step_size, device=state.device, dtype=state.dtype) * domain * velocity
+    return project_masked_flow_state(updated, condition, edit_domain)
 
 
 def boundary_mask_from_edit_mask(

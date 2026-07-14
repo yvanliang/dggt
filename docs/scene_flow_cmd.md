@@ -238,6 +238,8 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
     --base_model_coeff 0.1 \
     --lambda_boundary 0.25 \
     --lambda_identity 1.0 \
+    --edit_domain_threshold 1e-4 \
+    --edit_domain_dilation 1 \
     --uncond_drop_prob 0.1 \
     --guidance_scale 1.0 \
     --asset_control_guidance_scale 1.0 \
@@ -326,6 +328,7 @@ python inference_scene_flow.py \
   --scene_flow_ckpt_path /path/to/flow_stepXXXXXX.pt --ckpt_path $DGGT_CKPT \
   --tokenizer_ckpt_path $TOKENIZER_CKPT --manifest_path $SCENE_FLOW_VAL_MANIFEST \
   --output_dir runs/scene_flow_offline --window 8 --window_stride 4 \
+  --edit_domain_threshold 1e-4 --edit_domain_dilation 1 \
   --guidance_scales 1,2,4
 ```
 

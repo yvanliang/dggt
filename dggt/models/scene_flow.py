@@ -1357,6 +1357,7 @@ class RAEVideoSceneFlow(nn.Module):
         M_preserve: torch.Tensor,
         M_source: torch.Tensor,
         M_dest: torch.Tensor,
+        flow_edit_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Per-token inpaint state: preserve/source/dest/edit/keep/effective sigma."""
         b, s, p, c = M_preserve.shape
@@ -1373,7 +1374,19 @@ class RAEVideoSceneFlow(nn.Module):
             )
         edit = (source + dest).clamp(0.0, 1.0)
         keep = 1.0 - edit
-        sigma_eff = sigma.to(device=M_preserve.device, dtype=torch.float32).view(b, 1, 1, 1) * edit
+        if flow_edit_mask is None:
+            noise_domain = edit
+        else:
+            if flow_edit_mask.shape != (b, s, p, 1):
+                raise ValueError(
+                    f"flow_edit_mask must match [B,S,P,1], got {tuple(flow_edit_mask.shape)}"
+                )
+            noise_domain = flow_edit_mask.to(device=M_preserve.device, dtype=torch.float32)
+            rounded = noise_domain.round()
+            if not bool(torch.allclose(noise_domain, rounded, atol=1e-6, rtol=0.0)):
+                raise ValueError("flow_edit_mask must be binary")
+            noise_domain = rounded
+        sigma_eff = sigma.to(device=M_preserve.device, dtype=torch.float32).view(b, 1, 1, 1) * noise_domain
         state = torch.cat([preserve, source, dest, edit, keep, sigma_eff], dim=-1)
         if int(state.shape[-1]) != int(self.config.video_state_dim):
             raise RuntimeError(
@@ -2476,6 +2489,7 @@ class RAEVideoSceneFlow(nn.Module):
         use_masked_edit: bool = True,
         control_drop_mask: torch.Tensor | None = None,
         return_sky_mask: bool = False,
+        flow_edit_mask: torch.Tensor | None = None,
     ):
         if camera_condition_tokens is not None and camera_pose_tokens is not None:
             raise ValueError("pass camera_condition_tokens, not both camera condition aliases")
@@ -2491,7 +2505,13 @@ class RAEVideoSceneFlow(nn.Module):
             raise ValueError(f"sigma must be shape [B], got {tuple(sigma.shape)}")
 
         video_flat = z_t.reshape(b, s * p, int(self.config.out_channels))
-        video_state = self._build_video_state(sigma, M_preserve, M_source, M_dest)
+        video_state = self._build_video_state(
+            sigma,
+            M_preserve,
+            M_source,
+            M_dest,
+            flow_edit_mask=flow_edit_mask,
+        )
         state_flat = video_state.reshape(b, s * p, int(self.config.video_state_dim))
 
         video_seq = self.video_embed(video_flat)

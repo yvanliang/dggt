@@ -56,7 +56,20 @@ shift = 10.0
 
 `prediction_type=x` 对齐 RAEv2 T2I：DDT head 直接输出 clean latent，再按 `(z_t - x_pred) / sigma` 转换成 velocity 做 flow matching loss 和 ODE 采样。`shift=10.0` 是显式工程取值，不按视频 token 总维度继续放大，避免 `S*P*C` 使 shift 过大。pretrain、正式训练、训练内 validation 和离线 inference 必须保持同一组 flow/timestep 参数。
 
-pretrain 是 full-scene prior：`M_preserve=0, M_source=0, M_dest=1`，从噪声生成完整 scene latent。正式训练是 masked local edit：edit 区域加噪并监督 velocity，preserve 区域输入和采样都 clamp 到 `z_splat`。
+pretrain 是 full-scene prior：`M_preserve=0, M_source=0, M_dest=1`，从噪声生成完整 scene latent。正式训练把两类 mask 分开使用：连续的 `M_preserve/M_source/M_dest` 只表达几何覆盖和编辑语义；flow state 使用由 `M_source+M_dest` threshold 后再在 patch grid 上 dilation 得到的二值 `H_edit`。默认 `threshold=1e-4`、`dilation=1`，并由 train、训练内 validation 和 offline inference 共用同一个 helper。
+
+正式阶段定义唯一的 conditional flow path：
+
+```text
+x_target = H_edit * z_clean + (1 - H_edit) * z_splat
+z_sigma  = H_edit * ((1 - sigma) * z_clean + sigma * eps)
+         + (1 - H_edit) * z_splat
+v_gt     = H_edit * (z_base_sigma - z_clean) / max(sigma, t_eps)
+```
+
+采样只在初始化时把 noise 与 `z_splat` 组合；每步只更新 `H_edit` 子空间，再用同一张二值 mask hard-project。二值投影是幂等的，不允许把 soft coverage 当作每步 `alpha*z+(1-alpha)*z_splat` 的投影，否则结果会随采样步数按 `alpha^N` 收缩。preserve loss 使用 `1-H_edit`，boundary ring 位于 dilation 后的 `H_edit` 内，因此不会再和 clean/boundary target 冲突。
+
+正式 checkpoint 写入 `formal_flow_domain_version=hard_binary_edit_domain_v1`。resume 和 offline inference 会拒绝缺少该标记的旧正式 checkpoint，避免把旧 soft-path 训练权重与新 sampler 静默混用；需要从 pretrain 权重重新进行 formal fine-tuning。
 
 ## 3. Timestep 注入
 
@@ -90,7 +103,7 @@ DDT 的视觉 embedder 只吃当前噪声 latent `z_t`，不再吃旧实验中�
 [preserve, source, dest, edit, keep, sigma_eff]
 ```
 
-其中 `sigma_eff = sigma * edit`。这样 preserve 区域在表示上明确是条件区域，edit 区域明确是需要生成的区域。
+其中 `preserve/source/dest/edit/keep` 仍保留连续覆盖语义，但正式阶段的 `sigma_eff = sigma * H_edit`，必须精确反映实际加噪域；pretrain 的全场景 `H_edit=1`。这样 preserve 区域在表示上明确是条件区域，edit 区域明确是需要生成的区域。
 
 ## 6. Cosmos-style mRoPE
 

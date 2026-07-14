@@ -144,7 +144,11 @@ import torch.nn as nn
 from datasets.waymo_flow_cache_dataset import (
     WaymoFlowCacheDataset,
 )
-from dggt.losses.flow_losses import rae_t_grid
+from dggt.losses.flow_losses import (
+    masked_flow_euler_step,
+    project_masked_flow_state,
+    rae_t_grid,
+)
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_stats import checkpoint_sha256, load_into_buffers, validate_camera_stats_provenance
@@ -155,11 +159,13 @@ from dggt.utils.sliding_window import cosine_window, window_slices
 # Reuse the formal-training (train_scene_flow.py) cache->bundle helpers verbatim
 # so the bundle is byte-for-byte what the trainer feeds the model.
 from train_scene_flow import (
+    FORMAL_FLOW_DOMAIN_VERSION,
     _asset_condition_kind_for_model,
     _bundle_frame_ids,
     _infer_cache_patch_grid,
     _slice_asset_time,
     _slice_time,
+    build_formal_edit_domains,
     build_flow_bundle as build_train_flow_bundle,
     encode_text_condition,
     freeze_module,
@@ -167,6 +173,7 @@ from train_scene_flow import (
     render_validation_rgb_gt_sky,
     sampler_prediction_to_velocity,
     setup_text_encoder,
+    validate_formal_flow_domain_config,
 )
 
 # Reuse pretrain latent-grid helpers; RGB rendering uses formal T1 GT-sky helper.
@@ -266,6 +273,10 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="FlowMatch inference steps (15 smoke / 30 normal / 50 stable).")
     p.add_argument("--shift", type=float, default=10.0,
                    help="FlowMatch / RAE time distribution shift used for sampling.")
+    p.add_argument("--edit_domain_threshold", type=float, default=1e-4,
+                   help="Threshold soft source+destination coverage into the binary flow domain.")
+    p.add_argument("--edit_domain_dilation", type=int, default=1,
+                   help="Patch-grid dilation radius for the binary flow domain.")
     p.add_argument("--guidance_scales", type=str, default="1.0,2.0",
                    help="Comma-sep text CFG scales; one edited render per scale.")
     p.add_argument("--asset_control_guidance_scale", type=float, default=1.0,
@@ -348,8 +359,12 @@ def _cfg_sample_edit_latents_sliding(
     M_preserve = bundle.M_preserve.to(device=device, dtype=z_clean_n.dtype)
     M_source = bundle.M_source.to(device=device, dtype=z_clean_n.dtype)
     M_dest = bundle.M_dest.to(device=device, dtype=z_clean_n.dtype)
-    M_edit = (M_source.float() + M_dest.float()).clamp(0.0, 1.0).to(device=device, dtype=z_clean_n.dtype)
-    M_keep = 1.0 - M_edit
+    _, M_edit, _, _ = build_formal_edit_domains(
+        bundle,
+        args,
+        device=device,
+        dtype=z_clean_n.dtype,
+    )
     batch_size = int(z_clean_n.shape[0])
     seq_len = int(z_clean_n.shape[1])
     frame_ids = _bundle_frame_ids(bundle, batch_size=batch_size, seq_len=seq_len, device=device)
@@ -357,7 +372,7 @@ def _cfg_sample_edit_latents_sliding(
 
     z = torch.empty_like(z_clean_n)
     z.normal_(generator=generator)
-    z = M_edit * z + M_keep * z_splat_n
+    z = project_masked_flow_state(z, z_splat_n, M_edit)
 
     F_asset = normalize_asset_latents(sf, bundle.F_asset_tokens)
     if F_asset.ndim in (4, 5):
@@ -396,6 +411,7 @@ def _cfg_sample_edit_latents_sliding(
             M_preserve_w = M_preserve[:, start:end]
             M_source_w = M_source[:, start:end]
             M_dest_w = M_dest[:, start:end]
+            M_edit_w = M_edit[:, start:end]
             frame_ids_w = frame_ids[:, start:end]
             camera_tokens_w = _slice_time(camera_condition_tokens, start, end, seq_len)
             camera_mask_w = _slice_time(camera_attention_mask, start, end, seq_len)
@@ -417,6 +433,7 @@ def _cfg_sample_edit_latents_sliding(
                 return_mid=False,
                 frame_ids=frame_ids_w,
                 fps=None,
+                flow_edit_mask=M_edit_w,
             )
             if do_cfg:
                 v_text = sf(
@@ -432,6 +449,7 @@ def _cfg_sample_edit_latents_sliding(
                     control_drop_mask=drop_all_control,
                     frame_ids=frame_ids_w,
                     fps=None,
+                    flow_edit_mask=M_edit_w,
                 )
                 v_uncond = sf(
                     z_w, sigma, z_splat_w, scaffold_w,
@@ -446,6 +464,7 @@ def _cfg_sample_edit_latents_sliding(
                     control_drop_mask=drop_all_control,
                     frame_ids=frame_ids_w,
                     fps=None,
+                    flow_edit_mask=M_edit_w,
                 )
                 v_pred = (
                     v_uncond
@@ -459,10 +478,9 @@ def _cfg_sample_edit_latents_sliding(
             v_weight[:, start:end] += w
 
         v = v_acc / v_weight.clamp_min(1e-6)
-        z = z - step_h.to(dtype=z.dtype) * v
-        z = M_keep * z_splat_n + M_edit * z
+        z = masked_flow_euler_step(z, v, step_h, z_splat_n, M_edit)
 
-    return M_keep * z_splat_n + M_edit * z
+    return project_masked_flow_state(z, z_splat_n, M_edit)
 
 
 @torch.no_grad()
@@ -510,13 +528,17 @@ def cfg_sample_edit_latents(
     M_preserve = bundle.M_preserve.to(device=device, dtype=z_clean_n.dtype)
     M_source = bundle.M_source.to(device=device, dtype=z_clean_n.dtype)
     M_dest = bundle.M_dest.to(device=device, dtype=z_clean_n.dtype)
-    M_edit = (M_source.float() + M_dest.float()).clamp(0.0, 1.0).to(device=device, dtype=z_clean_n.dtype)
-    M_keep = 1.0 - M_edit
+    _, M_edit, _, _ = build_formal_edit_domains(
+        bundle,
+        args,
+        device=device,
+        dtype=z_clean_n.dtype,
+    )
     batch_size = z_clean_n.shape[0]
 
     z = torch.empty_like(z_clean_n)
     z.normal_(generator=generator)
-    z = M_edit * z + M_keep * z_splat_n
+    z = project_masked_flow_state(z, z_splat_n, M_edit)
     frame_ids = _bundle_frame_ids(bundle, batch_size=int(batch_size), seq_len=int(z.shape[1]), device=device)
 
     F_asset = normalize_asset_latents(sf, bundle.F_asset_tokens)
@@ -555,6 +577,7 @@ def cfg_sample_edit_latents(
             return_mid=False,
             frame_ids=frame_ids,
             fps=None,
+            flow_edit_mask=M_edit,
         )
         if do_cfg:
             v_text = sf(
@@ -570,6 +593,7 @@ def cfg_sample_edit_latents(
                 control_drop_mask=drop_all_control,
                 frame_ids=frame_ids,
                 fps=None,
+                flow_edit_mask=M_edit,
             )
             v_uncond = sf(
                 z, sigma, z_splat_n, bundle.scaffold_tok,
@@ -584,6 +608,7 @@ def cfg_sample_edit_latents(
                 control_drop_mask=drop_all_control,
                 frame_ids=frame_ids,
                 fps=None,
+                flow_edit_mask=M_edit,
             )
             v = (
                 v_uncond
@@ -593,10 +618,9 @@ def cfg_sample_edit_latents(
         else:
             v = v_full
         v = sampler_prediction_to_velocity(sf, v, z, sigma)
-        z = z - step_h.to(dtype=z.dtype) * v
-        z = M_keep * z_splat_n + M_edit * z
+        z = masked_flow_euler_step(z, v, step_h, z_splat_n, M_edit)
 
-    return M_keep * z_splat_n + M_edit * z
+    return project_masked_flow_state(z, z_splat_n, M_edit)
 
 
 # ---------------------------------------------------------------------- #
@@ -834,6 +858,13 @@ def load_scene_flow_ckpt(
     device: torch.device,
 ) -> dict[str, Any]:
     payload = torch.load(ckpt_path, map_location="cpu")
+    saved_flow_domain = payload.get("formal_flow_domain_version") if isinstance(payload, dict) else None
+    if saved_flow_domain != FORMAL_FLOW_DOMAIN_VERSION:
+        raise ValueError(
+            f"{ckpt_path} formal_flow_domain_version={saved_flow_domain!r}, expected "
+            f"{FORMAL_FLOW_DOMAIN_VERSION!r}. Refusing to combine a legacy soft-mask-flow "
+            "checkpoint with the corrected binary-domain sampler."
+        )
     _validate_scene_flow_checkpoint_config(scene_flow, payload, ckpt_path)
     info: dict[str, Any] = {
         "ckpt_path": ckpt_path,
@@ -1105,6 +1136,7 @@ def main() -> None:
     print(f"[ckpt:scene_flow] {ckpt_info}", flush=True)
     dggt_sha256 = checkpoint_sha256(args.ckpt_path)
     checkpoint_payload = torch.load(args.scene_flow_ckpt_path, map_location="cpu")
+    validate_formal_flow_domain_config(checkpoint_payload, args, args.scene_flow_ckpt_path)
     provenance = checkpoint_payload.get("camera_dggt_provenance") if isinstance(checkpoint_payload, dict) else None
     recorded_hash = provenance.get("dggt_checkpoint_sha256") if isinstance(provenance, dict) else None
     if recorded_hash != dggt_sha256:
