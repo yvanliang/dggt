@@ -6,6 +6,8 @@ import torch
 from dggt.utils.sliding_window import (
     cosine_coverage,
     cosine_window,
+    default_window_stride,
+    resolve_offline_window,
     scene_global_window_weight,
     window_slices,
 )
@@ -32,3 +34,13 @@ def test_scene_global_sky_weights_give_equal_per_frame_contribution() -> None:
         total_global_weight += float(scene_global_window_weight(start, end, coverage))
     assert torch.allclose(per_frame, torch.ones_like(per_frame), atol=1e-6)
     assert total_global_weight == pytest.approx(17.0, abs=1e-5)
+
+
+def test_offline_window_policy_automatically_bounds_long_requests() -> None:
+    assert default_window_stride(10) == 7
+    assert resolve_offline_window(10, 0, 0) == (10, 7, False)
+    assert resolve_offline_window(11, 0, 0) == (10, 7, True)
+    assert resolve_offline_window(29, 29, 7) == (10, 7, True)
+    assert resolve_offline_window(7, 4, 2) == (4, 2, True)
+    with pytest.raises(ValueError, match="requires overlap"):
+        resolve_offline_window(11, 10, 10)

@@ -4,6 +4,57 @@ from __future__ import annotations
 import torch
 
 
+OFFLINE_MAX_SINGLE_WINDOW = 10
+OFFLINE_DEFAULT_OVERLAP = 3
+
+
+def default_window_stride(window_size: int) -> int:
+    """Use a three-frame overlap while keeping tiny windows valid."""
+    window_size = int(window_size)
+    if window_size <= 0:
+        raise ValueError(f"window_size must be positive, got {window_size}")
+    return max(1, window_size - min(OFFLINE_DEFAULT_OVERLAP, window_size - 1))
+
+
+def resolve_offline_window(
+    seq_len: int,
+    requested_window: int | None,
+    requested_stride: int | None,
+    *,
+    max_single_window: int = OFFLINE_MAX_SINGLE_WINDOW,
+) -> tuple[int, int, bool]:
+    """Resolve the bounded window policy shared by offline inference.
+
+    A non-positive window means automatic selection, not disabling sliding.
+    No offline SceneFlow forward receives more than ``max_single_window``
+    frames; longer requests are covered by overlapping windows.
+    """
+    seq_len = int(seq_len)
+    max_single_window = int(max_single_window)
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if max_single_window <= 0:
+        raise ValueError(
+            f"max_single_window must be positive, got {max_single_window}"
+        )
+
+    raw_window = 0 if requested_window is None else int(requested_window)
+    window = max_single_window if raw_window <= 0 else min(raw_window, max_single_window)
+    window = max(1, window)
+    sliding = seq_len > window
+
+    raw_stride = 0 if requested_stride is None else int(requested_stride)
+    if raw_stride < 0:
+        raise ValueError(f"stride must be non-negative, got {raw_stride}")
+    stride = default_window_stride(window) if raw_stride == 0 else raw_stride
+    if sliding and stride >= window:
+        raise ValueError(
+            "offline sliding inference requires overlap: "
+            f"frames={seq_len}, effective_window={window}, stride={stride}"
+        )
+    return window, stride, sliding
+
+
 def cosine_window(window_size: int, *, device=None, dtype=None) -> torch.Tensor:
     if int(window_size) <= 0:
         raise ValueError(f"window_size must be positive, got {window_size}")

@@ -14,6 +14,8 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset
 
+from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
+
 
 CAM_NAME_TO_ID = {
     "pinhole_front": 0,
@@ -1034,18 +1036,16 @@ class WaymoEditDataset(Dataset):
             frame_has_editable_object = torch.ones((clip_len,), dtype=torch.bool)
         return frame_has_present_editable_object, frame_has_editable_object
 
-    def _build_normalized_timestamps(self, local_indices):
-        timestamps = np.array(local_indices, dtype=np.float32)
-        if len(timestamps) == 0:
-            return timestamps
-        timestamps = timestamps - float(timestamps[0])
-        if len(timestamps) > 1 and float(timestamps[-1]) > 0:
-            timestamps = timestamps / float(timestamps[-1])
-        else:
-            timestamps = np.zeros_like(timestamps, dtype=np.float32)
+    def _build_gaussian_timestamps(self, local_indices):
+        timestamps = gaussian_timestamps_from_frame_ids(local_indices)
         if len(self.camera_ids) > 1:
             timestamps = np.repeat(timestamps, len(self.camera_ids))
         return timestamps.astype(np.float32, copy=False)
+
+    # Kept as an internal alias for downstream utilities that call the helper
+    # directly; its semantics are now the canonical clip-global Gaussian time.
+    def _build_normalized_timestamps(self, local_indices):
+        return self._build_gaussian_timestamps(local_indices)
 
     def _build_base_sample(
         self,
@@ -1776,7 +1776,7 @@ class WaymoEditDataset(Dataset):
         dynamic_masks = self._load_optional_mask_stack(dynamic_mask_paths, images)
         gt_depth = self._load_optional_depth_stack(depth_flow_paths, images)
 
-        timestamps = self._build_normalized_timestamps(local_indices)
+        timestamps = self._build_gaussian_timestamps(local_indices)
 
         annotation = scene_cache["annotation"]
         camera_to_world = []

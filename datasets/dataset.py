@@ -12,6 +12,8 @@ from torchvision import transforms as TF
 import numpy as np
 import json
 
+from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
+
 
 WAYMO_OPENCV2DATASET = np.array(
     [
@@ -923,13 +925,24 @@ class WaymoOpenDataset(Dataset):
 
         cam_to_ego = _load_waymo_matrix4(camera_extrinsic_path, "front camera extrinsics")
         cam_to_ego = (cam_to_ego @ WAYMO_OPENCV2DATASET).astype(np.float32)
-        ego_to_world_start = _load_waymo_matrix4(ego_pose_paths[indices[0]], "ego pose")
+        # Keep every sampled window in one clip-global Waymo coordinate frame.
+        # Sliding inference constructs the full trajectory before slicing; using
+        # the sampled window start here would give training a different camera
+        # condition representation.
+        clip_start = int(indices[0] // 29) * 29
+        ego_to_world_start = _load_waymo_matrix4(ego_pose_paths[clip_start], "ego pose")
         ego_start_inv = np.linalg.inv(ego_to_world_start).astype(np.float32)
-        camera_to_world = []
-        for frame_idx in indices:
+        context_indices = sorted(set([clip_start] + [max(clip_start, int(frame_idx) - 1) for frame_idx in indices] + list(indices)))
+        camera_by_frame = {}
+        for frame_idx in context_indices:
             ego_to_world = _load_waymo_matrix4(ego_pose_paths[frame_idx], "ego pose")
-            camera_to_world.append((ego_start_inv @ ego_to_world @ cam_to_ego).astype(np.float32))
+            camera_by_frame[int(frame_idx)] = (ego_start_inv @ ego_to_world @ cam_to_ego).astype(np.float32)
+        camera_to_world = [camera_by_frame[int(frame_idx)] for frame_idx in indices]
         camera_to_world = np.stack(camera_to_world, axis=0)[:, None]
+        camera_anchor_to_world = camera_by_frame[clip_start][None]
+        previous_camera_to_world = np.stack(
+            [camera_by_frame[max(clip_start, int(frame_idx) - 1)] for frame_idx in indices], axis=0
+        )
 
         intrinsics = _load_waymo_intrinsics_matrix(intrinsic_path)[None]
         with Image.open(image_seq[0]) as img:
@@ -939,6 +952,8 @@ class WaymoOpenDataset(Dataset):
             torch.tensor(camera_to_world.tolist(), dtype=torch.float32),
             torch.tensor(intrinsics.tolist(), dtype=torch.float32),
             raw_image_size_hw,
+            torch.tensor(camera_anchor_to_world.tolist(), dtype=torch.float32),
+            torch.tensor(previous_camera_to_world.tolist(), dtype=torch.float32),
         )
 
     def _load_instance_metadata(self, idx):
@@ -1271,9 +1286,8 @@ class WaymoOpenDataset(Dataset):
                         mask_seq.append(sky_mask_paths[v][i])
                 masks = load_and_preprocess_binary_masks(mask_seq)  # [S*3, C, H, W]
 
-            timestamps = np.array(indices) - start_idx
-            timestamps = timestamps / timestamps[-1] * (self.sequence_length / 4)
             frame_ids = np.array(indices, dtype=np.int64) - int(start_idx // 29) * 29
+            timestamps = gaussian_timestamps_from_frame_ids(frame_ids)
             if self.views == 3:
                 timestamps = np.repeat(timestamps, 3)
                 frame_ids = np.repeat(frame_ids, 3)
@@ -1297,10 +1311,18 @@ class WaymoOpenDataset(Dataset):
                 input_dict["caption_path"] = self._caption_path(self.scenes[idx], start_idx)
 
             if self.views == 1:
-                camera_to_world, intrinsics, raw_image_size_hw = self._load_front_waymo_camera_gt(idx, indices, seq)
+                (
+                    camera_to_world,
+                    intrinsics,
+                    raw_image_size_hw,
+                    camera_anchor_to_world,
+                    previous_camera_to_world,
+                ) = self._load_front_waymo_camera_gt(idx, indices, seq)
                 input_dict["camera_to_world_corrected"] = camera_to_world
                 input_dict["intrinsics"] = intrinsics
                 input_dict["raw_image_size_hw"] = raw_image_size_hw
+                input_dict["camera_trajectory_anchor_to_world_corrected"] = camera_anchor_to_world
+                input_dict["camera_previous_to_world_corrected"] = previous_camera_to_world
         
             if len(dynamic_mask_paths) > 0:
                 if self.views == 1:
@@ -1340,9 +1362,8 @@ class WaymoOpenDataset(Dataset):
             indices = [start_idx + i * self.interval for i in range(self.sequence_length)]
             intervals = [self.interval for _ in range(self.sequence_length - 1)]
             
-            timestamps = np.array(indices) - start_idx
-            timestamps = timestamps / timestamps[-1] * (self.sequence_length / 4)
             frame_ids = np.array(indices, dtype=np.int64) - int(start_idx // 29) * 29
+            timestamps = gaussian_timestamps_from_frame_ids(frame_ids)
             if self.views == 3:
                 timestamps = np.repeat(timestamps, 3)
                 frame_ids = np.repeat(frame_ids, 3)
@@ -1433,8 +1454,7 @@ class WaymoOpenDataset(Dataset):
             intervals = [self.interval for _ in range(self.sequence_length - 1)]
             target_indices = [start_idx + i for i in range(self.sequence_length * self.interval - (self.interval - 1))]
 
-            timestamps = np.array(indices) - start_idx
-            timestamps = timestamps / timestamps[-1] * (self.sequence_length / 4)
+            timestamps = gaussian_timestamps_from_frame_ids(np.array(indices, dtype=np.int64))
             if self.views == 3:
                 timestamps = np.repeat(timestamps, 3)
             

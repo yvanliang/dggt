@@ -43,6 +43,14 @@ from dggt.losses.flow_losses import (
     compute_total_loss,
     rae_t_grid,
 )
+from dggt.losses.rgb_render_loss import (
+    compute_rgb_render_loss,
+    decode_generated_dggt_geometry,
+    rgb_render_loss_enabled,
+    rgb_render_loss_ramp,
+    setup_lpips_for_rgb_loss,
+    should_apply_rgb_render_loss,
+)
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.vggt import VGGT
@@ -75,9 +83,11 @@ from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
 from dggt.utils.sliding_window import (
     cosine_coverage,
     cosine_window,
+    default_window_stride,
     scene_global_window_weight,
     window_slices,
 )
+from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
 from dggt.utils.tokens import (
     reattach_special_tokens,
     replace_selected_levels,
@@ -616,6 +626,29 @@ def build_camera_rectified_flow_target(
         weights=torch.ones((b, 1, 1), device=camera_clean.device, dtype=camera_clean.dtype),
         t_eps=float(getattr(video_target, "t_eps", 0.05)),
     )
+
+
+def build_camera_anchor_context_dropout(
+    anchor_mask: torch.Tensor,
+    drop_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Hide the global camera anchor while retaining supervision on deltas.
+
+    This exposes training to the exact context available in later sliding
+    windows: all non-anchor camera-state tokens remain visible, while the one
+    global anchor token is outside the window.  The hidden anchor output is not
+    included in the camera flow loss for dropped rows.
+    """
+    anchors = anchor_mask.to(dtype=torch.bool)
+    rows = drop_rows.to(device=anchors.device, dtype=torch.bool).view(-1)
+    if anchors.ndim != 2 or int(anchors.shape[0]) != int(rows.numel()):
+        raise ValueError(
+            f"anchor_mask must be [B,S] and drop_rows [B], got {tuple(anchors.shape)} and {tuple(rows.shape)}"
+        )
+    hidden_anchor = anchors & rows[:, None]
+    attention_mask = ~hidden_anchor
+    supervision_mask = (~hidden_anchor).unsqueeze(-1)
+    return attention_mask, supervision_mask
 
 
 def camera_generation_tokens_from_aggregated(
@@ -2292,8 +2325,9 @@ def _timestamps_for_generated_render(
         return timestamps[:seq_len].to(device=device, dtype=torch.float32)
     if seq_len <= 1:
         return torch.zeros((seq_len,), device=device, dtype=torch.float32)
-    timestamps = torch.arange(seq_len, device=device, dtype=torch.float32)
-    return timestamps / timestamps[-1].clamp_min(1.0) * (float(seq_len) / 4.0)
+    return gaussian_timestamps_from_frame_ids(
+        torch.arange(seq_len, device=device, dtype=torch.long)
+    )
 
 
 def _required_head_levels(vggt_model: VGGT) -> tuple[int, ...]:
@@ -2582,46 +2616,29 @@ def render_validation_generated_rgb(
     frames = min(int(args.val_log_images), seq_len)
     timestamps = _timestamps_for_generated_render(batch, seq_len=seq_len, device=device)
 
+    patch_start_idx = int(getattr(vggt_model.aggregator, "patch_start_idx", 5))
     with autocast_context(args, device):
-        generated_image_tokens, patch_start_idx = _decode_generated_tokens_without_template(
-            vggt_model,
-            scene_flow,
-            z_generated_raw_n,
-            args,
+        geometry = decode_generated_dggt_geometry(
+            vggt_model=vggt_model,
+            scene_flow_root=unwrap_ddp(scene_flow),
+            z_clean_pred_n=z_generated_raw_n,
+            patch_grid=args.patch_grid,
+            patch_start_idx=patch_start_idx,
+            image_hw=(height, width),
+        )
+        generated_pose_enc = decode_pose_from_camera_features(
+            vggt_model, generated_camera_features.to(device)
+        )
+        generated_sky_mask = _sky_mask_patch_to_image(
+            generated_sky_mask_refined if generated_sky_mask_refined is not None else generated_sky_mask_patch,
+            patch_grid=args.patch_grid,
+            height=height,
+            width=width,
             device=device,
         )
-
-    with autocast_context(args, device):
-        gen_agg, gen_dino = _split_sparse_generated_tokens_for_heads(generated_image_tokens)
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            raw_gs_map, raw_gs_conf = vggt_model.gs_head(
-                generated_image_tokens,
-                None,
-                patch_start_idx,
-                image_hw=(height, width),
-            )
-            generated_pose_enc = decode_pose_from_camera_features(vggt_model, generated_camera_features.to(device))
-            generated_depth, _ = vggt_model.depth_head(
-                gen_agg,
-                None,
-                patch_start_idx,
-                image_hw=(height, width),
-            )
-            generated_dynamic_conf, _ = vggt_model.instance_head(
-                gen_dino,
-                None,
-                patch_start_idx,
-                image_hw=(height, width),
-            )
-            generated_sky_mask = _sky_mask_patch_to_image(
-                generated_sky_mask_refined if generated_sky_mask_refined is not None else generated_sky_mask_patch,
-                patch_grid=args.patch_grid,
-                height=height,
-                width=width,
-                device=device,
-            )
-
-    del generated_image_tokens, gen_agg, gen_dino
+    raw_gs_map, raw_gs_conf = geometry.gs_map, geometry.gs_conf
+    generated_depth = geometry.depth
+    generated_dynamic_conf = geometry.dynamic_conf
 
     generated_sky_background = None
     sky_grid_image = None
@@ -2716,7 +2733,7 @@ def _validation_sliding_params(args: argparse.Namespace, seq_len: int) -> tuple[
         return None
     stride = int(getattr(args, "val_sliding_stride", 0) or 0)
     if stride <= 0:
-        stride = max(1, window // 2)
+        stride = default_window_stride(window)
     return min(window, int(seq_len)), max(1, stride)
 
 
@@ -3519,8 +3536,22 @@ def train_step(
     device: torch.device,
     args: argparse.Namespace,
     text_encoder: nn.Module | None = None,
+    *,
+    global_step: int | None = None,
+    lpips_model: nn.Module | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    bundle = build_pretrain_bundle_from_batch(batch, vggt_model, scene_flow, device, args)
+    is_training = unwrap_ddp(scene_flow).training
+    rgb_render_active = should_apply_rgb_render_loss(
+        args, global_step, training=is_training
+    )
+    bundle = build_pretrain_bundle_from_batch(
+        batch,
+        vggt_model,
+        scene_flow,
+        device,
+        args,
+        include_rgb_render_context=rgb_render_active,
+    )
 
     legacy_drop_prob = float(getattr(args, "uncond_drop_prob", 0.0))
     text_drop_prob = float(
@@ -3533,8 +3564,6 @@ def train_step(
         legacy_drop_prob if getattr(args, "camera_uncond_drop_prob", None) is None else args.camera_uncond_drop_prob
     )
     all_drop_prob = float(getattr(args, "all_cond_drop_prob", 0.0))
-    is_training = unwrap_ddp(scene_flow).training
-
     # CFG training prerequisite: independently hide text, asset/control, and
     # camera condition tokens per sample. Camera generation targets/losses stay
     # present; only the input camera condition is replaced by a learned null.
@@ -3591,6 +3620,21 @@ def train_step(
         time_shift=float(args.shift),
     )
     camera_target = build_camera_rectified_flow_target(getattr(bundle, "camera_target_clean_n", None), target)
+    camera_gen_attention_mask = None
+    camera_flow_supervision_mask = None
+    camera_anchor_context_drop_rows = None
+    if camera_target is not None:
+        anchor_mask = getattr(bundle, "camera_gen_anchor_mask", None)
+        if not torch.is_tensor(anchor_mask):
+            raise RuntimeError("camera target requires bundle.camera_gen_anchor_mask")
+        drop_prob = float(getattr(args, "camera_anchor_context_dropout", 0.0))
+        camera_anchor_context_drop_rows = torch.rand(
+            int(camera_target.z_t.shape[0]), device=camera_target.z_t.device
+        ) < drop_prob
+        camera_gen_attention_mask, camera_flow_supervision_mask = build_camera_anchor_context_dropout(
+            anchor_mask,
+            camera_anchor_context_drop_rows,
+        )
     sky_target = build_sky_rectified_flow_target(
         getattr(bundle, "sky_gen_clean", None),
         target,
@@ -3622,6 +3666,7 @@ def train_step(
             camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
             camera_condition_kind=getattr(bundle, "camera_condition_kind", None),
             camera_gen_tokens=None if camera_target is None else camera_target.z_t,
+            camera_gen_attention_mask=camera_gen_attention_mask,
             camera_gen_anchor_mask=getattr(bundle, "camera_gen_anchor_mask", None),
             sky_gen_tokens=None if sky_target is None else sky_target.z_t,
             sky_gen_attention_mask=None,
@@ -3671,26 +3716,40 @@ def train_step(
             identity_batch=False,
             preserve_floor=args.preserve_floor,
         )
+        z_camera_pred = None
+        pred_camera_state = None
         if camera_target is not None and pred_camera is not None:
             v_camera_pred = model_prediction_to_velocity(scene_flow, pred_camera, camera_target)
             z_camera_pred = model_prediction_to_clean(scene_flow, pred_camera, camera_target)
-            loss_camera_flow = torch.nn.functional.mse_loss(
-                v_camera_pred.float(),
-                camera_target.v_gt.to(device=v_camera_pred.device, dtype=torch.float32),
+            camera_sq_error = (
+                v_camera_pred.float()
+                - camera_target.v_gt.to(device=v_camera_pred.device, dtype=torch.float32)
+            ).square()
+            camera_loss_mask = camera_flow_supervision_mask.to(
+                device=v_camera_pred.device, dtype=torch.float32
             )
+            loss_camera_flow = (camera_sq_error * camera_loss_mask).sum() / (
+                camera_loss_mask.sum() * int(camera_sq_error.shape[-1])
+            ).clamp_min(1.0)
             loss = loss + float(args.lambda_camera_flow) * loss_camera_flow
             logs["loss_camera_flow"] = float(loss_camera_flow.detach().item())
-            if float(args.lambda_camera_pose) != 0.0:
+            logs["camera_anchor_context_dropout_frac"] = float(
+                camera_anchor_context_drop_rows.float().mean().detach().item()
+            )
+            camera_anchor_mask = bundle.camera_gen_anchor_mask
+            pred_camera_state = unwrap_ddp(scene_flow).denormalize_camera(
+                z_camera_pred.float(), camera_anchor_mask
+            )
+            camera_pose_rows = ~camera_anchor_context_drop_rows
+            if float(args.lambda_camera_pose) != 0.0 and bool(camera_pose_rows.any().item()):
                 if getattr(bundle, "camera_loss_gt_space", None) != CAMERA_TARGET_SPACE:
                     raise RuntimeError("camera geometry loss GT must be explicitly marked as DGGT CameraHead space")
-                camera_anchor_mask = bundle.camera_gen_anchor_mask
-                pred_camera_state = unwrap_ddp(scene_flow).denormalize_camera(
-                    z_camera_pred.float(), camera_anchor_mask
-                )
                 loss_cam_pose, geometry_logs = camera_geometry_loss(
-                    pred_camera_state,
-                    bundle.camera_target_state_dggt.to(device=pred_camera_state.device, dtype=pred_camera_state.dtype),
-                    camera_anchor_mask,
+                    pred_camera_state[camera_pose_rows],
+                    bundle.camera_target_state_dggt.to(
+                        device=pred_camera_state.device, dtype=pred_camera_state.dtype
+                    )[camera_pose_rows],
+                    camera_anchor_mask[camera_pose_rows],
                     absolute_weight=float(getattr(args, "camera_absolute_weight", 1.0)),
                     relative_weight=float(getattr(args, "camera_relative_weight", 1.0)),
                     smoothness_weight=float(getattr(args, "camera_smoothness_weight", 0.25)),
@@ -3699,8 +3758,13 @@ def train_step(
                 logs["loss_camera_pose"] = float(loss_cam_pose.detach().item())
                 for name, value in geometry_logs.items():
                     logs[name] = float(value.detach().item())
-                decoded_pred = decode_camera_trajectory(pred_camera_state, camera_anchor_mask)
-                decoded_gt = decode_camera_trajectory(bundle.camera_target_state_dggt, camera_anchor_mask)
+                decoded_pred = decode_camera_trajectory(
+                    pred_camera_state[camera_pose_rows], camera_anchor_mask[camera_pose_rows]
+                )
+                decoded_gt = decode_camera_trajectory(
+                    bundle.camera_target_state_dggt[camera_pose_rows],
+                    camera_anchor_mask[camera_pose_rows],
+                )
                 logs["camera_translation_error"] = float(
                     (decoded_pred.camera_to_world[..., :3, 3] - decoded_gt.camera_to_world[..., :3, 3])
                     .norm(dim=-1).mean().detach().item()
@@ -3714,7 +3778,7 @@ def train_step(
                 logs["camera_fov_error_deg"] = float(
                     torch.rad2deg((decoded_pred.fov_xy - decoded_gt.fov_xy).abs()).mean().detach().item()
                 )
-                pred_rot = rotation_6d_to_matrix(pred_camera_state[..., 3:9])
+                pred_rot = rotation_6d_to_matrix(pred_camera_state[camera_pose_rows][..., 3:9])
                 identity = torch.eye(3, device=pred_rot.device, dtype=pred_rot.dtype)
                 logs["camera_so3_determinant_error"] = float(
                     (torch.det(pred_rot) - 1.0).abs().mean().detach().item()
@@ -3775,6 +3839,68 @@ def train_step(
                 torch.sigmoid(pred_sky_mask_refined_logits.float()).mean().detach().item()
             )
 
+        if rgb_render_active:
+            if z_camera_pred is None or pred_camera_state is None:
+                raise RuntimeError(
+                    "Pretrain RGB loss requires SceneFlow-generated camera tokens; "
+                    "teacher-camera fallback is forbidden."
+                )
+            if not torch.is_tensor(getattr(bundle, "rgb_render_images", None)):
+                raise RuntimeError("Pretrain RGB render context is missing target images.")
+            if not torch.is_tensor(getattr(bundle, "rgb_render_masks", None)):
+                raise RuntimeError(
+                    "Pretrain RGB loss requires the GT sky mask for loss weighting; "
+                    "the renderer itself still uses the predicted sky mask."
+                )
+            generated_pose = decode_camera_trajectory(
+                pred_camera_state,
+                bundle.camera_gen_anchor_mask,
+            ).pose_encoding
+            sky_tokens_for_rgb = None
+            if pred_sky is not None and sky_target is not None:
+                sky_tokens_for_rgb = model_prediction_to_clean(scene_flow, pred_sky, sky_target)
+            if pred_sky_mask_refined_logits is not None:
+                render_sky_probability = torch.sigmoid(pred_sky_mask_refined_logits.float())
+            elif pred_sky_mask_logits is not None:
+                render_sky_probability = torch.sigmoid(pred_sky_mask_logits.float())
+            else:
+                raise RuntimeError(
+                    "Pretrain RGB loss requires a generated sky-mask prediction."
+                )
+            rgb_result = compute_rgb_render_loss(
+                vggt_model=vggt_model,
+                scene_flow_root=unwrap_ddp(scene_flow),
+                z_clean_pred_n=z_pred,
+                images=bundle.rgb_render_images,
+                timestamps=bundle.rgb_render_timestamps,
+                render_pose_enc_dggt=generated_pose,
+                render_sky_probability=render_sky_probability,
+                loss_sky_mask_gt=bundle.rgb_render_masks,
+                patch_grid=args.patch_grid,
+                patch_start_idx=int(bundle.rgb_render_patch_start_idx),
+                max_samples=int(args.rgb_render_max_samples),
+                max_frames=int(args.rgb_render_max_frames),
+                render_stride=int(args.rgb_render_stride),
+                background_mode="sky_tokens" if sky_tokens_for_rgb is not None else "black",
+                sky_tokens=sky_tokens_for_rgb,
+                sky_grid=sky_grid_shape(args),
+                patch_weight_mask=target.M_edit,
+                sky_weight=float(args.rgb_render_sky_weight),
+                camera_grad_scale=float(args.rgb_render_camera_grad_scale),
+                sky_mask_grad_scale=float(args.rgb_render_sky_mask_grad_scale),
+                lpips_model=lpips_model,
+                lpips_weight=float(args.rgb_render_lpips_weight),
+            )
+            ramp = rgb_render_loss_ramp(args, global_step)
+            weighted = float(args.lambda_rgb_render) * float(ramp) * rgb_result.loss
+            loss = loss + weighted
+            logs.update(rgb_result.logs)
+            logs["loss_rgb_render_weighted"] = float(weighted.detach().item())
+            logs["rgb_render_ramp"] = float(ramp)
+            logs["rgb_render_active"] = 1.0
+        else:
+            logs["rgb_render_active"] = 0.0
+
     logs["kv_tokens_mean"] = float(bundle.F_asset_lengths.float().mean().item())
     asset_source_kinds = getattr(bundle, "asset_condition_source_kind", None)
     if asset_source_kinds is not None:
@@ -3826,6 +3952,8 @@ def build_pretrain_bundle_from_batch(
     scene_flow: nn.Module,
     device: torch.device,
     args: argparse.Namespace,
+    *,
+    include_rgb_render_context: bool = False,
 ):
     images = batch["images"].to(device, non_blocking=True)
     if images.ndim != 5:
@@ -3879,6 +4007,20 @@ def build_pretrain_bundle_from_batch(
             c2w_all,
             intrinsics_all,
             image_hw=raw_hw_front,
+            trajectory_anchor_to_world=(
+                batch["camera_trajectory_anchor_to_world_corrected"].to(
+                    device=device, dtype=torch.float32, non_blocking=True
+                )
+                if torch.is_tensor(batch.get("camera_trajectory_anchor_to_world_corrected"))
+                else None
+            ),
+            previous_camera_to_world=(
+                batch["camera_previous_to_world_corrected"].to(
+                    device=device, dtype=torch.float32, non_blocking=True
+                )
+                if torch.is_tensor(batch.get("camera_previous_to_world_corrected"))
+                else None
+            ),
         )
         del outputs, aggregated_tokens_list, image_tokens_list, tokens_4, z_clean
 
@@ -4014,6 +4156,16 @@ def build_pretrain_bundle_from_batch(
     bundle.asset_condition_kind = asset_kinds
     bundle.asset_condition_source_kind = asset_source_kinds
     bundle.captions = captions_from_pretrain_batch(batch, int(z_clean_n.shape[0]))
+    if bool(include_rgb_render_context):
+        timestamps = batch.get("timestamps")
+        if not torch.is_tensor(timestamps):
+            timestamps = torch.as_tensor(timestamps, device=device, dtype=torch.float32)
+        else:
+            timestamps = timestamps.to(device=device, dtype=torch.float32, non_blocking=True)
+        bundle.rgb_render_images = images.detach()
+        bundle.rgb_render_masks = None if masks_device is None else masks_device.detach()
+        bundle.rgb_render_timestamps = timestamps.detach()
+        bundle.rgb_render_patch_start_idx = int(patch_start_idx)
     return bundle
 
 
@@ -4360,7 +4512,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     parser.add_argument("--scene_start", type=int, default=0)
     parser.add_argument("--scene_end", type=int, default=600)
-    parser.add_argument("--sequence_length", type=int, default=4)
+    parser.add_argument("--sequence_length", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=2)
@@ -4408,19 +4560,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--val_scene_end", type=int, default=None)
     parser.add_argument("--val_every", type=int, default=1000)
     parser.add_argument("--val_batches", type=int, default=8)
-    parser.add_argument("--val_log_images", type=int, default=4)
+    parser.add_argument("--val_log_images", type=int, default=10)
     parser.add_argument("--val_sample_steps", type=int, default=30)
     parser.add_argument(
         "--val_sliding_window",
         type=int,
-        default=8,
+        default=10,
         help="Validation CFG sampling window. 0 disables sliding; use sequence_length/training S for long clips.",
     )
     parser.add_argument(
         "--val_sliding_stride",
         type=int,
-        default=4,
-        help="Validation CFG sampling stride. 0 defaults to half the window; overlap is mandatory for long clips.",
+        default=7,
+        help="Validation CFG sampling stride. 0 defaults to a three-frame overlap; overlap is mandatory for long clips.",
     )
     parser.add_argument("--no_val_render_rgb", action="store_true")
     parser.add_argument(
@@ -4571,6 +4723,38 @@ def build_argparser() -> argparse.ArgumentParser:
         default=0.25,
         help="Weight of the boundary BCE term inside the refined sky mask auxiliary loss.",
     )
+    parser.add_argument(
+        "--lambda_rgb_render",
+        type=float,
+        default=0.01,
+        help="Deployment-aligned differentiable RGB loss using generated camera/depth/GS.",
+    )
+    parser.add_argument("--rgb_render_every", type=int, default=4)
+    parser.add_argument(
+        "--rgb_render_start_step",
+        type=int,
+        default=5000,
+        help="Keep RGB supervision disabled until video/camera flow has a stable x0 estimate.",
+    )
+    parser.add_argument("--rgb_render_warmup_steps", type=int, default=5000)
+    parser.add_argument("--rgb_render_max_samples", type=int, default=1)
+    parser.add_argument("--rgb_render_max_frames", type=int, default=4)
+    parser.add_argument("--rgb_render_stride", type=int, default=2)
+    parser.add_argument("--rgb_render_sky_weight", type=float, default=0.25)
+    parser.add_argument(
+        "--rgb_render_camera_grad_scale",
+        type=float,
+        default=0.0,
+        help="RGB-to-generated-camera gradient scale; forward always uses generated camera.",
+    )
+    parser.add_argument(
+        "--rgb_render_sky_mask_grad_scale",
+        type=float,
+        default=0.0,
+        help="RGB-to-sky-mask gradient scale; render always uses the predicted mask.",
+    )
+    parser.add_argument("--rgb_render_lpips_weight", type=float, default=0.01)
+    parser.add_argument("--rgb_render_lpips_net", type=str, default="alex")
 
     parser.add_argument(
         "--guidance_scale",
@@ -4598,6 +4782,15 @@ def build_argparser() -> argparse.ArgumentParser:
         type=float,
         default=1.0,
         help="Independent text-CFG scale for generated camera state; global text CFG does not affect camera.",
+    )
+    parser.add_argument(
+        "--camera_anchor_context_dropout",
+        type=float,
+        default=0.25,
+        help=(
+            "Training probability of hiding the global generated-camera anchor token while "
+            "supervising all delta tokens; covers anchorless later sliding windows."
+        ),
     )
     parser.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
     parser.add_argument("--uncond_drop_prob", type=float, default=0.1,
@@ -4698,6 +4891,8 @@ def main() -> None:
         raise ValueError("--sky_mask_refine_channels must be positive.")
     if args.sequence_length < 2:
         raise ValueError("--sequence_length must be >= 2.")
+    if not 0.0 <= float(args.camera_anchor_context_dropout) <= 1.0:
+        raise ValueError("--camera_anchor_context_dropout must be in [0, 1].")
     if int(args.pretrain_instance_cache_size) < 0:
         raise ValueError("--pretrain_instance_cache_size must be non-negative.")
     if float(args.lambda_rgb_render) < 0.0:
@@ -4708,6 +4903,14 @@ def main() -> None:
         raise ValueError("--rgb_render_max_samples and --rgb_render_max_frames must be non-negative; 0 means all.")
     if int(args.rgb_render_stride) <= 0:
         raise ValueError("--rgb_render_stride must be positive.")
+    if int(args.rgb_render_start_step) < 0 or int(args.rgb_render_warmup_steps) < 0:
+        raise ValueError("RGB render start/warmup steps must be non-negative.")
+    if not 0.0 <= float(args.rgb_render_sky_weight) <= 1.0:
+        raise ValueError("--rgb_render_sky_weight must be in [0,1].")
+    if float(args.rgb_render_camera_grad_scale) < 0.0:
+        raise ValueError("--rgb_render_camera_grad_scale must be non-negative.")
+    if float(args.rgb_render_sky_mask_grad_scale) < 0.0:
+        raise ValueError("--rgb_render_sky_mask_grad_scale must be non-negative.")
     if args.val_image_dir is None:
         args.val_image_dir = args.image_dir
     if args.val_scene_start is None:
@@ -4764,6 +4967,7 @@ def main() -> None:
         args.tokenizer_ckpt_path,
         device,
     )
+    lpips_model = setup_lpips_for_rgb_loss(args, device)
 
     # Legacy config compatibility: in_channels records the old packed vector
     # [z_t, z_splat, scaffold_tok, M_preserve, M_source, M_dest]. The RAEv2 DDT
@@ -4976,7 +5180,17 @@ def main() -> None:
                 )
                 with ddp_context:
                     try:
-                        loss, logs = train_step(batch, vggt_model, scene_flow, flow_scheduler, device, args, text_encoder)
+                        loss, logs = train_step(
+                            batch,
+                            vggt_model,
+                            scene_flow,
+                            flow_scheduler,
+                            device,
+                            args,
+                            text_encoder,
+                            global_step=global_step,
+                            lpips_model=lpips_model,
+                        )
                     except RuntimeError as exc:
                         if "out of memory" not in str(exc).lower():
                             raise

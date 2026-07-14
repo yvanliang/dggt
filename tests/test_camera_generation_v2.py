@@ -18,11 +18,12 @@ from dggt.utils.camera_generation import (
     rotation_6d_to_matrix,
     rotation_matrix_to_6d,
 )
-from dggt.utils.camera_condition import fov_from_intrinsics
+from dggt.utils.camera_condition import camera_summary_from_waymo_gt, fov_from_intrinsics
+from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
 from dggt.utils.rotation import mat_to_quat
 from dggt.models.scene_flow import ChannelScale
 from dggt.utils.feature_stats import compute_camera_role_stats, validate_camera_stats_provenance
-from train_scene_flow_pretrain import cfg_sample_pretrain_latents
+from train_scene_flow_pretrain import build_camera_anchor_context_dropout, cfg_sample_pretrain_latents
 from tools.compute_pretrain_feature_stats import compute_dggt_stats_single_pass
 
 
@@ -96,6 +97,42 @@ def test_sliding_windows_only_slice_the_global_anchor_mask() -> None:
     state = torch.zeros(1, 8, CAMERA_GENERATION_DIM)
     with pytest.raises(ValueError, match="global anchor"):
         decode_camera_trajectory(state, torch.zeros(1, 8, dtype=torch.bool))
+
+
+def test_global_waymo_camera_context_matches_full_trajectory_slice() -> None:
+    frames = 14
+    c2w = torch.eye(4).repeat(frames, 1, 1)
+    c2w[:, 0, 3] = torch.arange(frames, dtype=torch.float32)
+    K = torch.tensor([[1000.0, 0.0, 960.0], [0.0, 1000.0, 640.0], [0.0, 0.0, 1.0]]).repeat(frames, 1, 1)
+    full, _ = camera_summary_from_waymo_gt(c2w, K, image_hw=(1280, 1920))
+    start, end = 4, 14
+    window, _ = camera_summary_from_waymo_gt(
+        c2w[start:end],
+        K[start:end],
+        image_hw=(1280, 1920),
+        trajectory_anchor_to_world=c2w[:1],
+        previous_camera_to_world=c2w[start - 1 : end - 1],
+    )
+    assert torch.allclose(window, full[:, start:end], atol=1e-6)
+    assert window[0, 0, 0].item() == pytest.approx(0.4)
+    assert window[0, 0, 9].item() == pytest.approx(0.1)
+
+
+def test_anchor_context_dropout_exposes_delta_only_training_context() -> None:
+    anchors = camera_anchor_mask(2, 10)
+    attention, supervision = build_camera_anchor_context_dropout(
+        anchors, torch.tensor([True, False])
+    )
+    assert attention[0].tolist() == [False] + [True] * 9
+    assert attention[1].tolist() == [True] * 10
+    assert torch.equal(supervision.squeeze(-1), attention)
+
+
+def test_gaussian_time_is_window_length_independent() -> None:
+    full = gaussian_timestamps_from_frame_ids(torch.arange(29))
+    window = gaussian_timestamps_from_frame_ids(torch.arange(7, 17))
+    assert torch.equal(window, full[7:17])
+    assert full[-1].item() == pytest.approx(7.0)
 
 
 def test_gt_camera_prediction_has_zero_geometry_loss_and_gradient() -> None:

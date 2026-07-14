@@ -37,6 +37,14 @@ from dggt.losses.flow_losses import (
     project_masked_flow_state,
     rae_t_grid,
 )
+from dggt.losses.rgb_render_loss import (
+    compute_rgb_render_loss,
+    decode_generated_dggt_geometry,
+    rgb_render_loss_enabled,
+    rgb_render_loss_ramp,
+    setup_lpips_for_rgb_loss,
+    should_apply_rgb_render_loss,
+)
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.scene_flow import WanSceneFlow
@@ -54,7 +62,7 @@ from dggt.utils.flow_cache_io import (
 )
 from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
-from dggt.utils.sliding_window import cosine_window, window_slices
+from dggt.utils.sliding_window import cosine_window, default_window_stride, window_slices
 from dggt.utils.tokens import reattach_special_tokens, replace_selected_levels, select_patch_pyramid
 from diffusers.training_utils import EMAModel
 from train_scene_flow_pretrain import (
@@ -228,6 +236,8 @@ def build_camera_condition_from_waymo_gt(
     *,
     device: torch.device,
     image_hw: tuple[int, int] | None = None,
+    trajectory_anchor_to_world: torch.Tensor | None = None,
+    previous_camera_to_world: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if not torch.is_tensor(camera_to_world) or not torch.is_tensor(intrinsics):
         return None, None
@@ -235,6 +245,16 @@ def build_camera_condition_from_waymo_gt(
         camera_to_world.to(device=device, dtype=torch.float32),
         intrinsics.to(device=device, dtype=torch.float32),
         image_hw=image_hw,
+        trajectory_anchor_to_world=(
+            None
+            if not torch.is_tensor(trajectory_anchor_to_world)
+            else trajectory_anchor_to_world.to(device=device, dtype=torch.float32)
+        ),
+        previous_camera_to_world=(
+            None
+            if not torch.is_tensor(previous_camera_to_world)
+            else previous_camera_to_world.to(device=device, dtype=torch.float32)
+        ),
     )
 
 
@@ -249,6 +269,8 @@ def build_camera_condition_from_sample(
         sample.get("intrinsics"),
         device=device,
         image_hw=image_hw,
+        trajectory_anchor_to_world=sample.get("camera_trajectory_anchor_to_world_corrected"),
+        previous_camera_to_world=sample.get("camera_previous_to_world_corrected"),
     )
 
 
@@ -726,7 +748,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb_name", type=str, default=None)
     parser.add_argument("--wandb_log_every", type=int, default=50)
 
-    parser.add_argument("--sequence_length", type=int, default=8,
+    parser.add_argument("--sequence_length", type=int, default=10,
                         help="Fixed number of frames sampled from each cache clip.")
     parser.add_argument("--batch_size", type=int, default=1, help="Per-process cache items per micro-batch.")
     parser.add_argument("--grad_accum_steps", type=int, default=1)
@@ -759,19 +781,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--val_every", type=int, default=1000)
     parser.add_argument("--val_batches", type=int, default=8)
-    parser.add_argument("--val_log_images", type=int, default=4)
+    parser.add_argument("--val_log_images", type=int, default=10)
     parser.add_argument("--val_sample_steps", type=int, default=50)
     parser.add_argument(
         "--val_sliding_window",
         type=int,
-        default=8,
+        default=10,
         help="Validation CFG sampling window. 0 disables sliding; use the training sequence length for long clips.",
     )
     parser.add_argument(
         "--val_sliding_stride",
         type=int,
-        default=4,
-        help="Validation CFG sampling stride. 0 defaults to half the window; overlap is mandatory.",
+        default=7,
+        help="Validation CFG sampling stride. 0 defaults to a three-frame overlap; overlap is mandatory.",
     )
     parser.add_argument("--no_val_render_rgb", action="store_true",
                         help="Skip validation 3DGS RGB renders and log latent/mask diagnostics only.")
@@ -809,6 +831,20 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_boundary", type=float, default=0.25)
     parser.add_argument("--lambda_identity", type=float, default=1.0)
     parser.add_argument("--preserve_floor", type=float, default=0.2)
+    parser.add_argument(
+        "--lambda_rgb_render",
+        type=float,
+        default=0.01,
+        help="Deployment-aligned RGB loss with generated depth and fixed input-DGGT camera.",
+    )
+    parser.add_argument("--rgb_render_every", type=int, default=4)
+    parser.add_argument("--rgb_render_start_step", type=int, default=5000)
+    parser.add_argument("--rgb_render_warmup_steps", type=int, default=5000)
+    parser.add_argument("--rgb_render_max_samples", type=int, default=1)
+    parser.add_argument("--rgb_render_max_frames", type=int, default=4)
+    parser.add_argument("--rgb_render_stride", type=int, default=2)
+    parser.add_argument("--rgb_render_lpips_weight", type=float, default=0.01)
+    parser.add_argument("--rgb_render_lpips_net", type=str, default="alex")
     parser.add_argument(
         "--edit_domain_threshold",
         type=float,
@@ -1298,11 +1334,103 @@ def _frame_ids_from_item(
     )
 
 
+def _formal_rgb_context(
+    item: dict[str, Any],
+    *,
+    device: torch.device,
+    strict: bool,
+) -> dict[str, torch.Tensor | int] | None:
+    """Load only RGB targets/GT sky and the fixed input-DGGT camera.
+
+    Depth is intentionally absent: the primary RGB path must decode depth from
+    the SceneFlow-generated video tokens.
+    """
+    source = item.get("rgb_training")
+    if not isinstance(source, dict):
+        sample = item.get("sample")
+        source = sample if isinstance(sample, dict) else None
+    predictions = item.get("predictions")
+    predictions = predictions if isinstance(predictions, dict) else {}
+    where = str(item.get("cache_path", "<unknown>"))
+    if not isinstance(source, dict):
+        if strict:
+            raise RuntimeError(f"{where} has no RGB training payload.")
+        return None
+    images = source.get("images", source.get("images_clean"))
+    if not torch.is_tensor(images):
+        if strict:
+            raise RuntimeError(f"{where} RGB payload is missing images.")
+        return None
+    images = images.to(device=device, dtype=torch.float32)
+    if images.ndim == 4:
+        images = images.unsqueeze(0)
+    if images.ndim != 5 or int(images.shape[2]) != 3:
+        raise ValueError(f"{where} RGB images must be [B,S,3,H,W], got {images.shape}")
+    masks = source.get("masks", source.get("sky_mask"))
+    if torch.is_tensor(masks):
+        masks = masks.to(device=device, dtype=torch.float32)
+        if masks.ndim == 4:
+            masks = masks.unsqueeze(0)
+    else:
+        masks = None
+    timestamps = source.get("timestamps", item.get("subset_frames"))
+    if torch.is_tensor(timestamps):
+        timestamps = timestamps.to(device=device, dtype=torch.float32)
+    else:
+        timestamps = torch.arange(int(images.shape[1]), device=device, dtype=torch.float32)
+    if timestamps.ndim == 1:
+        timestamps = timestamps.unsqueeze(0)
+    pose = predictions.get("pose_enc")
+    if not torch.is_tensor(pose):
+        if strict:
+            raise RuntimeError(
+                f"{where} is missing frozen input-DGGT pose_enc required by formal RGB loss."
+            )
+        return None
+    pose = pose.to(device=device, dtype=torch.float32)
+    if pose.ndim == 2:
+        pose = pose.unsqueeze(0)
+    if pose.ndim != 3 or int(pose.shape[-1]) != 9:
+        raise ValueError(f"{where} DGGT pose_enc must be [B,S,9], got {pose.shape}")
+    seq_len = int(images.shape[1])
+    if int(pose.shape[1]) < seq_len:
+        raise ValueError(f"{where} pose has {pose.shape[1]} frames, RGB has {seq_len}")
+    return {
+        "rgb_render_images": images.contiguous(),
+        "rgb_render_masks": None if masks is None else masks[:, :seq_len].contiguous(),
+        "rgb_render_timestamps": timestamps[:, :seq_len].contiguous(),
+        "rgb_render_pose_enc_dggt": pose[:, :seq_len].contiguous(),
+        "rgb_render_patch_start_idx": int(predictions.get("patch_start_idx", 5)),
+    }
+
+
+def _attach_rgb_context(bundle: Any, context: dict[str, Any] | None) -> Any:
+    if context is not None:
+        for key, value in context.items():
+            setattr(bundle, key, value)
+    return bundle
+
+
+def _merge_rgb_contexts(bundles: list[Any]) -> dict[str, Any] | None:
+    if not bundles or not all(torch.is_tensor(getattr(b, "rgb_render_images", None)) for b in bundles):
+        return None
+    masks = [getattr(b, "rgb_render_masks", None) for b in bundles]
+    return {
+        "rgb_render_images": torch.cat([b.rgb_render_images for b in bundles], dim=0),
+        "rgb_render_masks": torch.cat(masks, dim=0) if all(torch.is_tensor(m) for m in masks) else None,
+        "rgb_render_timestamps": torch.cat([b.rgb_render_timestamps for b in bundles], dim=0),
+        "rgb_render_pose_enc_dggt": torch.cat([b.rgb_render_pose_enc_dggt for b in bundles], dim=0),
+        "rgb_render_patch_start_idx": int(bundles[0].rgb_render_patch_start_idx),
+    }
+
+
 def build_cached_flow_bundle(
     item: dict[str, Any],
     assembler: FlowFeatureAssembler,
     device: torch.device,
     args=None,
+    *,
+    include_rgb_render_context: bool = False,
 ) -> Any:
     flow_inputs = {
         k: (v.to(device) if torch.is_tensor(v) else v)
@@ -1363,6 +1491,8 @@ def build_cached_flow_bundle(
         camera_gt.get("intrinsics"),
         device=device,
         image_hw=camera_gt.get("raw_image_size_hw"),
+        trajectory_anchor_to_world=camera_gt.get("trajectory_anchor_to_world"),
+        previous_camera_to_world=camera_gt.get("previous_camera_to_world"),
     )
     if camera_condition_tokens is None:
         raise RuntimeError(
@@ -1389,7 +1519,10 @@ def build_cached_flow_bundle(
         F_g_lut_scene=F_g_lut_scene,
         frame_ids=_frame_ids_from_item(item, seq_len=int(z_clean.shape[1]), device=device, flow_inputs=flow_inputs),
     )
-    return _attach_sky_tokens_to_bundle(bundle, item, args, device)
+    bundle = _attach_sky_tokens_to_bundle(bundle, item, args, device)
+    if include_rgb_render_context:
+        bundle = _attach_rgb_context(bundle, _formal_rgb_context(item, device=device, strict=True))
+    return bundle
 
 
 def build_cached_flow_batch_bundle(
@@ -1397,6 +1530,8 @@ def build_cached_flow_batch_bundle(
     assembler: FlowFeatureAssembler,
     device: torch.device,
     args=None,
+    *,
+    include_rgb_render_context: bool = False,
 ) -> tuple[Any, list[int], float]:
     if len(items) == 0:
         raise ValueError("Cannot build an empty cached flow batch.")
@@ -1473,6 +1608,8 @@ def build_cached_flow_batch_bundle(
             camera_gt.get("intrinsics"),
             device=device,
             image_hw=camera_gt.get("raw_image_size_hw"),
+            trajectory_anchor_to_world=camera_gt.get("trajectory_anchor_to_world"),
+            previous_camera_to_world=camera_gt.get("previous_camera_to_world"),
         )
         if camera_tokens_i is None:
             raise RuntimeError(
@@ -1508,7 +1645,7 @@ def build_cached_flow_batch_bundle(
         dim=0,
     )
 
-    return SimpleNamespace(
+    merged = SimpleNamespace(
         z_clean=z_clean,
         z_splat=z_splat,
         scaffold_tok=scaffold_tok,
@@ -1532,7 +1669,15 @@ def build_cached_flow_batch_bundle(
         splatted_tok_low=splatted_tok_low,
         F_g_lut_scene=F_g_lut_scene,
         frame_ids=frame_ids,
-    ), asset_lengths, num_objects / float(len(items))
+    )
+    if include_rgb_render_context:
+        contexts = []
+        for item in items:
+            holder = SimpleNamespace()
+            _attach_rgb_context(holder, _formal_rgb_context(item, device=device, strict=True))
+            contexts.append(holder)
+        merged = _attach_rgb_context(merged, _merge_rgb_contexts(contexts))
+    return merged, asset_lengths, num_objects / float(len(items))
 
 
 # ---------------------------------------------------------------------- #
@@ -1543,9 +1688,17 @@ def build_flow_bundle(
     assembler: FlowFeatureAssembler,
     device: torch.device,
     args=None,
+    *,
+    include_rgb_render_context: bool = False,
 ) -> Any:
     if item.get("flow_inputs_cached") is not None:
-        return build_cached_flow_bundle(item, assembler, device, args=args)
+        return build_cached_flow_bundle(
+            item,
+            assembler,
+            device,
+            args=args,
+            include_rgb_render_context=include_rgb_render_context,
+        )
 
     sample = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item["sample"].items()}
     predictions = _move_predictions(item["predictions"], device)
@@ -1585,7 +1738,10 @@ def build_flow_bundle(
     bundle.frame_ids = _frame_ids_from_item(item, seq_len=int(bundle.z_clean.shape[1]), device=device, sample=sample)
     kind = str(getattr(bundle, "extras", {}).get("asset_condition_kind", mode_kind))
     bundle.asset_condition_kind = "mode_b_empty" if kind in ("mode_b", "mode_b_empty") else "mode_a"
-    return _attach_sky_tokens_to_bundle(bundle, item, args, device)
+    bundle = _attach_sky_tokens_to_bundle(bundle, item, args, device)
+    if include_rgb_render_context:
+        bundle = _attach_rgb_context(bundle, _formal_rgb_context(item, device=device, strict=True))
+    return bundle
 
 
 def _asset_condition_kinds(bundle, batch_size: int) -> list[str]:
@@ -1767,7 +1923,71 @@ def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor
         phase4_slots=[],
         captions=[caption for bundle in bundles for caption in getattr(bundle, "captions", [""])],
     )
+    merged = _attach_rgb_context(merged, _merge_rgb_contexts(bundles))
     return merged, asset_mask, lengths
+
+
+def _add_formal_rgb_render_loss(
+    loss: torch.Tensor,
+    metrics: dict[str, float],
+    *,
+    args: argparse.Namespace,
+    global_step: int | None,
+    active: bool,
+    render_vggt_model: nn.Module | None,
+    scene_flow_root: nn.Module,
+    z_pred: torch.Tensor,
+    bundle: Any,
+    target: Any,
+    lpips_model: nn.Module | None,
+) -> torch.Tensor:
+    if not active:
+        metrics["rgb_render_active"] = 0.0
+        return loss
+    if render_vggt_model is None:
+        raise RuntimeError("Formal RGB loss requires the frozen DGGT decode/render model.")
+    images = getattr(bundle, "rgb_render_images", None)
+    masks = getattr(bundle, "rgb_render_masks", None)
+    pose = getattr(bundle, "rgb_render_pose_enc_dggt", None)
+    timestamps = getattr(bundle, "rgb_render_timestamps", None)
+    if not all(torch.is_tensor(value) for value in (images, masks, pose, timestamps)):
+        raise RuntimeError(
+            "Formal RGB loss requires RGB, GT sky mask, timestamps, and input-DGGT pose; "
+            "teacher depth is deliberately not part of this contract."
+        )
+    result = compute_rgb_render_loss(
+        vggt_model=unwrap_ddp(render_vggt_model),
+        scene_flow_root=scene_flow_root,
+        z_clean_pred_n=z_pred,
+        images=images,
+        timestamps=timestamps,
+        render_pose_enc_dggt=pose,
+        render_sky_probability=masks,
+        loss_sky_mask_gt=masks,
+        patch_grid=getattr(bundle, "patch_grid", getattr(args, "patch_grid", (25, 37))),
+        patch_start_idx=int(
+            getattr(bundle, "rgb_render_patch_start_idx", getattr(bundle, "patch_start_idx", 5))
+        ),
+        max_samples=int(args.rgb_render_max_samples),
+        max_frames=int(args.rgb_render_max_frames),
+        render_stride=int(args.rgb_render_stride),
+        background_mode="sky_model",
+        sky_tokens=None,
+        sky_grid=tuple(getattr(args, "sky_grid", DEFAULT_SKY_GRID)),
+        patch_weight_mask=target.M_edit,
+        sky_weight=0.0,
+        camera_grad_scale=0.0,
+        sky_mask_grad_scale=0.0,
+        lpips_model=lpips_model,
+        lpips_weight=float(args.rgb_render_lpips_weight),
+    )
+    ramp = rgb_render_loss_ramp(args, global_step)
+    weighted = float(args.lambda_rgb_render) * float(ramp) * result.loss
+    metrics.update(result.logs)
+    metrics["loss_rgb_render_weighted"] = float(weighted.detach().item())
+    metrics["rgb_render_ramp"] = float(ramp)
+    metrics["rgb_render_active"] = 1.0
+    return loss + weighted
 
 
 def train_step(
@@ -1778,16 +1998,40 @@ def train_step(
     device: torch.device,
     args,
     text_encoder: nn.Module | None = None,
+    *,
+    global_step: int | None = None,
+    render_vggt_model: nn.Module | None = None,
+    lpips_model: nn.Module | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    rgb_render_active = should_apply_rgb_render_loss(
+        args,
+        global_step,
+        training=unwrap_ddp(scene_flow).training,
+    )
     if isinstance(item, list):
         if len(item) == 0:
             raise ValueError("Received an empty training micro-batch.")
         if len(item) > 1 and not bool(getattr(args, "no_batch_scene_flow", False)):
             if all(single.get("flow_inputs_cached") is not None for single in item):
-                bundle, asset_lengths, mean_num_objects = build_cached_flow_batch_bundle(item, assembler, device, args=args)
+                bundle, asset_lengths, mean_num_objects = build_cached_flow_batch_bundle(
+                    item,
+                    assembler,
+                    device,
+                    args=args,
+                    include_rgb_render_context=rgb_render_active,
+                )
                 asset_mask = getattr(bundle, "encoder_attention_mask", None)
             else:
-                bundles = [build_flow_bundle(single, assembler, device, args=args) for single in item]
+                bundles = [
+                    build_flow_bundle(
+                        single,
+                        assembler,
+                        device,
+                        args=args,
+                        include_rgb_render_context=rgb_render_active,
+                    )
+                    for single in item
+                ]
                 bundle, asset_mask, asset_lengths = _merge_bundles_for_scene_flow(bundles)
                 mean_num_objects = sum(float(len(b.phase4_slots)) for b in bundles) / float(len(bundles))
             text_drop_mask = sample_uncond_drop_mask(
@@ -1915,13 +2159,37 @@ def train_step(
                 "sigma_mean": float(target.sigmas.float().mean().item()),
                 "micro_batch_size": float(len(item)),
             })
+            loss = _add_formal_rgb_render_loss(
+                loss,
+                metrics,
+                args=args,
+                global_step=global_step,
+                active=rgb_render_active,
+                render_vggt_model=render_vggt_model,
+                scene_flow_root=sf,
+                z_pred=z_pred,
+                bundle=bundle,
+                target=target,
+                lpips_model=lpips_model,
+            )
             metrics["loss"] = float(loss.detach().item())
             return loss, metrics
 
         losses: list[torch.Tensor] = []
         metric_sums: dict[str, float] = {}
         for single in item:
-            loss_i, metrics_i = train_step(single, assembler, scene_flow, scheduler, device, args, text_encoder)
+            loss_i, metrics_i = train_step(
+                single,
+                assembler,
+                scene_flow,
+                scheduler,
+                device,
+                args,
+                text_encoder,
+                global_step=global_step,
+                render_vggt_model=render_vggt_model,
+                lpips_model=lpips_model,
+            )
             losses.append(loss_i)
             for key, value in metrics_i.items():
                 metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
@@ -1930,7 +2198,13 @@ def train_step(
         metrics["micro_batch_size"] = float(len(item))
         return torch.stack(losses).mean(), metrics
 
-    bundle = build_flow_bundle(item, assembler, device, args=args)
+    bundle = build_flow_bundle(
+        item,
+        assembler,
+        device,
+        args=args,
+        include_rgb_render_context=rgb_render_active,
+    )
     sf = unwrap_ddp(scene_flow)
     z_clean_n = sf.normalize(bundle.z_clean)
     z_splat_n = sf.normalize(bundle.z_splat)
@@ -2058,6 +2332,19 @@ def train_step(
         ),
         "sigma_mean": float(target.sigmas.float().mean().item()),
     })
+    loss = _add_formal_rgb_render_loss(
+        loss,
+        metrics,
+        args=args,
+        global_step=global_step,
+        active=rgb_render_active,
+        render_vggt_model=render_vggt_model,
+        scene_flow_root=sf,
+        z_pred=z_pred,
+        bundle=bundle,
+        target=target,
+        lpips_model=lpips_model,
+    )
     metrics["loss"] = float(loss.detach().item())
     return loss, metrics
 
@@ -2160,7 +2447,7 @@ def _validation_sliding_params(args: argparse.Namespace, seq_len: int) -> tuple[
         return None
     stride = int(getattr(args, "val_sliding_stride", 0) or 0)
     if stride <= 0:
-        stride = max(1, window // 2)
+        stride = default_window_stride(window)
     return min(window, int(seq_len)), max(1, stride)
 
 
@@ -2622,23 +2909,6 @@ def render_validation_rgb_gt_sky(
         patch_start_idx = int(outputs["patch_start_idx"])
         del outputs
 
-        z_generated = sf.denormalize(z_generated_raw_n.float())
-        decoded_patch_tokens = vggt_model.scene_tokenizer.decode(z_generated, patch_grid=args.patch_grid)
-        del z_generated
-        decoded_full_tokens = reattach_special_tokens(
-            image_tokens_list,
-            TOKENIZER_LEVELS,
-            patch_start_idx,
-            decoded_patch_tokens,
-        )
-        del decoded_patch_tokens
-        generated_image_tokens = replace_selected_levels(
-            image_tokens_list,
-            TOKENIZER_LEVELS,
-            decoded_full_tokens,
-        )
-        del decoded_full_tokens
-
         tokens_4 = select_patch_pyramid(image_tokens_list, TOKENIZER_LEVELS, patch_start_idx)
         z_recon = vggt_model.scene_tokenizer.encode(tokens_4, patch_grid=args.patch_grid)
         del tokens_4
@@ -2691,15 +2961,24 @@ def render_validation_rgb_gt_sky(
     _cuda_empty_cache_if_available()
 
     with autocast_context(args, device):
-        gen_agg, gen_dino = split_image_tokens_for_heads(generated_image_tokens)
+        geometry = decode_generated_dggt_geometry(
+            vggt_model=vggt_model,
+            scene_flow_root=sf,
+            z_clean_pred_n=z_generated_raw_n,
+            patch_grid=args.patch_grid,
+            patch_start_idx=patch_start_idx,
+            image_hw=(int(images.shape[-2]), int(images.shape[-1])),
+        )
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            raw_gs_map, raw_gs_conf = vggt_model.gs_head(generated_image_tokens, images, patch_start_idx)
-            generated_depth, _ = vggt_model.depth_head(gen_agg, images, patch_start_idx)
-            generated_dynamic_conf, _ = vggt_model.instance_head(gen_dino, images, patch_start_idx)
-            generated_semantic_logits, _ = vggt_model.semantic_head(gen_dino, images, patch_start_idx)
+            generated_semantic_logits, _ = vggt_model.semantic_head(
+                geometry.dino_tokens,
+                None,
+                patch_start_idx,
+                image_hw=(int(images.shape[-2]), int(images.shape[-1])),
+            )
             generated_sky_mask = _semantic_logits_to_sky_mask(generated_semantic_logits)
-
-    del generated_image_tokens, gen_agg, gen_dino
+    raw_gs_map, raw_gs_conf = geometry.gs_map, geometry.gs_conf
+    generated_depth, generated_dynamic_conf = geometry.depth, geometry.dynamic_conf
 
     # Diagnostic only: formal rendering below still composites with the GT sky
     # mask passed as `masks`, not this DGGT semantic-head prediction.
@@ -2780,41 +3059,30 @@ def render_validation_generated_rgb_gt_sky(
     with autocast_context(args, device):
         outputs = vggt_model.get_aggregator_token_outputs(images)
         aggregated_tokens_list = outputs["aggregated_tokens_list"]
-        image_tokens_list = outputs["image_tokens_list"]
         patch_start_idx = int(outputs["patch_start_idx"])
         with torch.amp.autocast(device_type=device.type, enabled=False):
             render_pose_enc_dggt = vggt_model.camera_head(aggregated_tokens_list)[-1]
             if render_pose_enc_dggt.ndim != 3 or render_pose_enc_dggt.shape[-1] != 9 or not bool(torch.isfinite(render_pose_enc_dggt).all()):
                 raise RuntimeError("render_pose_enc_dggt must be finite [B,S,9] from the input DGGT CameraHead")
         del outputs, aggregated_tokens_list
-
-        z_generated = sf.denormalize(z_generated_raw_n.float())
-        decoded_patch_tokens = vggt_model.scene_tokenizer.decode(z_generated, patch_grid=args.patch_grid)
-        del z_generated
-        decoded_full_tokens = reattach_special_tokens(
-            image_tokens_list,
-            TOKENIZER_LEVELS,
-            patch_start_idx,
-            decoded_patch_tokens,
+        geometry = decode_generated_dggt_geometry(
+            vggt_model=vggt_model,
+            scene_flow_root=sf,
+            z_clean_pred_n=z_generated_raw_n,
+            patch_grid=args.patch_grid,
+            patch_start_idx=patch_start_idx,
+            image_hw=(int(images.shape[-2]), int(images.shape[-1])),
         )
-        del decoded_patch_tokens
-        generated_image_tokens = replace_selected_levels(
-            image_tokens_list,
-            TOKENIZER_LEVELS,
-            decoded_full_tokens,
-        )
-        del decoded_full_tokens, image_tokens_list
-
-    with autocast_context(args, device):
-        gen_agg, gen_dino = split_image_tokens_for_heads(generated_image_tokens)
         with torch.amp.autocast(device_type=device.type, enabled=False):
-            raw_gs_map, raw_gs_conf = vggt_model.gs_head(generated_image_tokens, images, patch_start_idx)
-            generated_depth, _ = vggt_model.depth_head(gen_agg, images, patch_start_idx)
-            generated_dynamic_conf, _ = vggt_model.instance_head(gen_dino, images, patch_start_idx)
-            generated_semantic_logits, _ = vggt_model.semantic_head(gen_dino, images, patch_start_idx)
+            generated_semantic_logits, _ = vggt_model.semantic_head(
+                geometry.dino_tokens,
+                None,
+                patch_start_idx,
+                image_hw=(int(images.shape[-2]), int(images.shape[-1])),
+            )
             generated_sky_mask = _semantic_logits_to_sky_mask(generated_semantic_logits)
-
-    del generated_image_tokens, gen_agg, gen_dino
+    raw_gs_map, raw_gs_conf = geometry.gs_map, geometry.gs_conf
+    generated_depth, generated_dynamic_conf = geometry.depth, geometry.dynamic_conf
 
     result = {
         # Diagnostic only; `_render_gs_map_rgb` below receives GT `masks`.
@@ -3099,6 +3367,16 @@ def load_resume_checkpoint(
 def main() -> None:
     args = build_argparser().parse_args()
     args.sky_grid = sky_grid_shape(args)
+    if float(args.lambda_rgb_render) < 0.0:
+        raise ValueError("--lambda_rgb_render must be non-negative.")
+    if int(args.rgb_render_every) < 0:
+        raise ValueError("--rgb_render_every must be non-negative.")
+    if int(args.rgb_render_start_step) < 0 or int(args.rgb_render_warmup_steps) < 0:
+        raise ValueError("RGB render start/warmup steps must be non-negative.")
+    if int(args.rgb_render_max_samples) < 0 or int(args.rgb_render_max_frames) < 0:
+        raise ValueError("RGB render sample/frame limits must be non-negative.")
+    if int(args.rgb_render_stride) <= 0:
+        raise ValueError("--rgb_render_stride must be positive.")
     device, local_rank, world_size = setup_distributed(args)
     if int(args.num_workers) > 0:
         torch.multiprocessing.set_sharing_strategy(str(args.mp_sharing_strategy))
@@ -3113,6 +3391,7 @@ def main() -> None:
         [m.strip() for m in args.mode_filter.split(",") if m.strip()]
         if args.mode_filter else None
     )
+    enable_rgb_render_loss = rgb_render_loss_enabled(args)
     train_ds = WaymoFlowCacheDataset(
         cache_root=args.cache_root,
         manifest_path=args.manifest_path,
@@ -3125,6 +3404,7 @@ def main() -> None:
         asset_lut_level_indices=None,
         caption_root=args.caption_root,
         include_sky_training_data=False,
+        include_rgb_training_data=enable_rgb_render_loss,
     )
     independent_val = args.val_manifest_path is not None or args.val_cache_root is not None
     val_caption_root = args.val_caption_root
@@ -3142,6 +3422,7 @@ def main() -> None:
             asset_lut_level_indices=None,
             caption_root=val_caption_root,
             include_sky_training_data=False,
+            include_rgb_training_data=False,
         )
     else:
         if args.val_caption_root is not None:
@@ -3198,15 +3479,21 @@ def main() -> None:
         and val_loader is not None
         and int(args.val_log_images) > 0
     )
-    if is_main_process() and enable_val_rgb_render:
+    if enable_rgb_render_loss or (is_main_process() and enable_val_rgb_render):
         render_vggt = load_dggt_aggregator_and_tokenizer(
             args.ckpt_path,
             args.tokenizer_ckpt_path,
             device,
         )
         render_vggt.scene_tokenizer.float()
-        if is_main_process():
+        if is_main_process() and enable_val_rgb_render:
             print("[validation] 3DGS RGB rendering enabled on rank 0.", flush=True)
+        if is_main_process() and enable_rgb_render_loss:
+            print(
+                "[train] deployment-aligned generated-depth RGB supervision enabled.",
+                flush=True,
+            )
+    lpips_model = setup_lpips_for_rgb_loss(args, device)
 
     tokenizer = (
         render_vggt.scene_tokenizer
@@ -3370,7 +3657,18 @@ def main() -> None:
                     if isinstance(assembler.scaffold_packer, DistributedDataParallel) and not sync_grad:
                         stack.enter_context(assembler.scaffold_packer.no_sync())
                     with autocast_context(args, device):
-                        loss, metrics = train_step(item, assembler, scene_flow, flow_scheduler, device, args, text_encoder)
+                        loss, metrics = train_step(
+                            item,
+                            assembler,
+                            scene_flow,
+                            flow_scheduler,
+                            device,
+                            args,
+                            text_encoder,
+                            global_step=global_step,
+                            render_vggt_model=render_vggt,
+                            lpips_model=lpips_model,
+                        )
                         loss = loss / max(1, args.grad_accum_steps)
                     loss.backward()
                 micro_wall_s = time.perf_counter() - micro_t0

@@ -40,6 +40,10 @@ from dggt.models.asset_pass import AssetPassResult
 from dggt.models.gaussian_pointers import GaussianPointers, SRC_KIND_ASSET
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
 from dggt.utils.camera_condition import normalize_front_image_hw
+from dggt.utils.gaussian_time import (
+    GAUSSIAN_TIME_REPRESENTATION,
+    gaussian_timestamps_from_frame_ids,
+)
 from dggt.utils.flow_cache_io import (
     is_chunked_flow_cache,
     load_chunked_flow_cache_probe,
@@ -321,6 +325,7 @@ class WaymoFlowCacheDataset(Dataset):
         caption_root: str | Path | None = None,
         max_read_retries: int = 16,
         include_sky_training_data: bool = False,
+        include_rgb_training_data: bool = False,
     ) -> None:
         super().__init__()
         if min_frames <= 0 or max_frames < min_frames:
@@ -338,6 +343,7 @@ class WaymoFlowCacheDataset(Dataset):
         self.caption_root = None if caption_root is None else Path(caption_root)
         self.max_read_retries = max(1, int(max_read_retries))
         self.include_sky_training_data = bool(include_sky_training_data)
+        self.include_rgb_training_data = bool(include_rgb_training_data)
 
         if manifest_path is not None:
             self.manifest_path = Path(manifest_path)
@@ -520,10 +526,16 @@ class WaymoFlowCacheDataset(Dataset):
     def _load_item_at_index(self, idx: int) -> dict[str, Any]:
         entry = self.entries[idx]
         cache_path = Path(entry["cache_path"])
+        if self.include_rgb_training_data:
+            consumer = "scene_flow_fast_rgb"
+        elif self.include_sky_training_data:
+            consumer = "scene_flow_fast_sky"
+        else:
+            consumer = "scene_flow_fast"
         payload, subset_t, subset_payload = self._load_payload_for_sample(
             cache_path,
             entry,
-            consumer="scene_flow_fast_sky" if self.include_sky_training_data else "scene_flow_fast",
+            consumer=consumer,
         )
         return self._build_item_from_payload(
             payload=payload,
@@ -698,6 +710,10 @@ class WaymoFlowCacheDataset(Dataset):
             "camera_gt": camera_gt,
             "cache_schema_version": int(payload["schema_version"]),
         }
+        if self.include_rgb_training_data:
+            rgb_training = self._build_fast_rgb_training(payload, subset_payload)
+            if rgb_training is not None:
+                item["rgb_training"] = rgb_training
         if self.include_sky_training_data:
             sky_training = self._build_fast_sky_training(payload, subset_payload)
             if sky_training is not None:
@@ -721,6 +737,39 @@ class WaymoFlowCacheDataset(Dataset):
         return {
             "images": images_sel.to(torch.float32).div(255.0).contiguous(),
             "masks": mask_sel.to(torch.float32).contiguous(),
+        }
+
+    @staticmethod
+    def _build_fast_rgb_training(payload: dict[str, Any], subset: torch.Tensor) -> dict[str, torch.Tensor] | None:
+        raw = payload.get("raw") or {}
+        images_u8 = raw.get("images_u8")
+        sky_mask = raw.get("sky_mask")
+        if not torch.is_tensor(images_u8) or not torch.is_tensor(sky_mask):
+            return None
+        if int(images_u8.shape[0]) == int(subset.numel()):
+            images_sel = images_u8
+            mask_sel = sky_mask
+        else:
+            images_sel = images_u8.index_select(0, subset)
+            mask_sel = sky_mask.index_select(0, subset)
+        timestamps = payload.get("meta", {}).get("timestamps")
+        if torch.is_tensor(timestamps):
+            timestamps_sel = (
+                timestamps
+                if int(timestamps.shape[0]) == int(subset.numel())
+                else timestamps.index_select(0, subset)
+            )
+        else:
+            frame_ids = payload.get("meta", {}).get("frame_indices_scene")
+            if torch.is_tensor(frame_ids):
+                frame_ids = frame_ids if int(frame_ids.shape[0]) == int(subset.numel()) else frame_ids.index_select(0, subset)
+            else:
+                frame_ids = subset
+            timestamps_sel = gaussian_timestamps_from_frame_ids(frame_ids)
+        return {
+            "images": images_sel.to(torch.float32).div(255.0).contiguous(),
+            "masks": mask_sel.to(torch.float32).contiguous(),
+            "timestamps": timestamps_sel.to(torch.float32).contiguous(),
         }
 
     # ------------------------------------------------------------------ #
@@ -813,6 +862,13 @@ class WaymoFlowCacheDataset(Dataset):
             raise RuntimeError(
                 f"Cache {cache_path} has invalid mode_kind={mode_kind!r}; "
                 "training caches must set 'mode_a' or 'mode_b'."
+            )
+        time_representation = payload.get("meta", {}).get("gaussian_time_representation")
+        if time_representation != GAUSSIAN_TIME_REPRESENTATION:
+            raise RuntimeError(
+                f"Cache {cache_path} has gaussian_time_representation={time_representation!r}; "
+                f"expected {GAUSSIAN_TIME_REPRESENTATION!r}. Restart cache generation with the "
+                "current code before training or offline inference."
             )
         entry_mode = entry.get("mode_kind")
         if entry_mode not in (None, "", "unknown") and str(entry_mode) != str(mode_kind):
@@ -930,7 +986,14 @@ class WaymoFlowCacheDataset(Dataset):
                 f"scene={meta.get('scene_name')!r}, clip={meta.get('clip_name')!r}. "
                 "Run tools/backfill_flow_cache_camera_gt.py to repair the cache."
             )
-        out["camera_to_world_corrected"] = obj["camera_to_world_corrected"].index_select(0, subset)
+        camera_full = obj["camera_to_world_corrected"]
+        out["camera_to_world_corrected"] = camera_full.index_select(0, subset)
+        camera_front = camera_full[:, 0] if camera_full.ndim == 4 else camera_full
+        previous_indices = (subset.to(dtype=torch.long) - 1).clamp_min(0)
+        out["camera_trajectory_anchor_to_world_corrected"] = camera_front[:1].contiguous()
+        out["camera_previous_to_world_corrected"] = camera_front.index_select(
+            0, previous_indices
+        ).contiguous()
         out["intrinsics"] = obj["intrinsics"]
 
         out["images"] = images_clean
@@ -1040,12 +1103,25 @@ class WaymoFlowCacheDataset(Dataset):
                 "Repair it with `python tools/backfill_flow_cache_camera_gt.py --cache_root <cache> "
                 "--processed_root <processed_root> --force`."
             )
-        camera_to_world = obj["camera_to_world_corrected"].index_select(0, subset).contiguous()
+        camera_full = obj["camera_to_world_corrected"]
+        camera_to_world = camera_full.index_select(0, subset).contiguous()
+        if camera_full.ndim == 4:
+            camera_front = camera_full[:, 0]
+        elif camera_full.ndim == 3:
+            camera_front = camera_full
+        else:
+            raise ValueError(
+                "camera_to_world_corrected must be [S,V,4,4] or [S,4,4], "
+                f"got {tuple(camera_full.shape)}"
+            )
+        previous_indices = (subset.to(dtype=torch.long) - 1).clamp_min(0)
         intrinsics = obj["intrinsics"].contiguous()
         return {
             "camera_to_world_corrected": camera_to_world,
             "intrinsics": intrinsics,
             "raw_image_size_hw": raw_image_size_hw,
+            "trajectory_anchor_to_world": camera_front[:1].contiguous(),
+            "previous_camera_to_world": camera_front.index_select(0, previous_indices).contiguous(),
         }
 
     def _build_fast_asset_pass(
@@ -1433,7 +1509,26 @@ class WaymoFlowCacheDataset(Dataset):
             out[key] = value.index_select(0, subset).unsqueeze(0).contiguous()
         coverage = payload.get("phase1_coverage")
         if torch.is_tensor(coverage):
-            out["phase1_coverage"] = coverage.to(torch.bool)
+            coverage = coverage.to(torch.bool)
+            if coverage.ndim != 2:
+                raise ValueError(
+                    "flow_inputs.phase1_coverage must be [K,S], got "
+                    f"{tuple(coverage.shape)}"
+                )
+            # Plain caches still contain the full-clip [K,S_full] metadata,
+            # while chunked subset loaders may already have reduced it to
+            # [K,S_local].  In both cases the returned coverage must describe
+            # exactly the same temporal slice as the asset LUTs.
+            if int(coverage.shape[1]) == int(subset.numel()):
+                coverage_subset = coverage
+            else:
+                if subset.numel() and int(subset.max().item()) >= int(coverage.shape[1]):
+                    raise IndexError(
+                        "phase1_coverage is shorter than the requested frame subset: "
+                        f"coverage={tuple(coverage.shape)}, subset={subset.tolist()}"
+                    )
+                coverage_subset = coverage.index_select(1, subset)
+            out["phase1_coverage"] = coverage_subset.contiguous()
         else:
             out["phase1_coverage"] = torch.zeros((0, int(subset.numel())), dtype=torch.bool)
         out["phase4_slots"] = [int(v) for v in payload.get("phase4_slots", [])]

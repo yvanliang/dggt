@@ -14,7 +14,7 @@ export WAYMO_DGGT_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/training
 export WAYMO_DGGT_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation
 export DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
 export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt
-export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain.pt
+export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain_v3_798.pt
 export SCENE_FLOW_PRETRAIN_CKPT=logs/scene_flow_pretrain_1024/ckpt/pretrain_step100000.pt
 export SCENE_CAPTION_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/training_captions
 export SCENE_CAPTION_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions
@@ -30,9 +30,11 @@ export QWEN_TEXT_ENCODER=/home/dancer/model/Qwen/Qwen3-0.6B/
 * `logs/tokenizer_t0_waymo_views1/feature_stats.pt` 是 tokenizer 训练用的 `4x3072` aggregator stats，不能直接给 SceneFlow pretrain；SceneFlow 需要下面重新计算的 latent stats（维度 = tokenizer latent dim）。
 * **删除 ae29c424 及所有 v2 camera stats/checkpoint，重新计算 stats 并从头 pretrain。** 当前代码不提供旧 v2 resume、推理或迁移兼容。
 * camera stats 固定来自 `$DGGT_CKPT` 的冻结 CameraHead；即使使用 `--latent_stats_path` 复用 latent stats，仍必须传 `--dggt_ckpt_path`。stats/pretrain/T1/offline inference 会核对同一 DGGT SHA256。
+* 当前 `feature_stats_pretrain.pt` 是缺少 v3 camera provenance 的旧文件，会被代码拒绝；正式命令必须使用上面的 `feature_stats_pretrain_v3_798.pt` 或重新运行 stats 命令生成同等 v3 文件。
 * **正式 pretrain 和正式训练统一使用 1024-dim tokenizer latent**：`$TOKENIZER_CKPT`、`$FEATURE_STATS`、`--latent_dim 1024`、`$SCENE_FLOW_PRETRAIN_CKPT` 必须来自同一套 1024 tokenizer / SceneFlow pretrain。三者维度不一致会在 `load_into_buffers`/`set_latent_stats` 或 warm-start 时直接报错。
 * 实现设计说明见 `docs/scene_flow_model_design.md`。本文档只维护运行命令和参数。
 * `--shift 10.0`、`--weighting_scheme waver --mode_scale 1.29`、`--lambda_repa 0.5`、EMA 验证默认开启；pretrain 和正式训练保持一致。
+* Gaussian 时间轴固定为 `clip_local_frame_id / 4`，新 cache 必须携带 `meta.gaussian_time_representation=clip_local_frame_id_div4_v1`。缺少该标记的 cache 会被训练/offline 拒绝；修改代码前已经启动的 precompute 进程不会热加载新实现，必须重启。chunked cache summary 同样携带该标记，因此 `--overwrite_v7` 能识别并重建旧时间轴 cache。
 * mRoPE 坐标已固定为 A1 设计，不再提供 `--mrope_temporal_margin`：text/timestep 使用 RAE-style zero RoPE；video、asset、edit-control 与 camera 共享视频时间轴；camera 空间位置固定在 patch grid 中心；pretrain sky atlas 使用独立 temporal offset `128`。checkpoint 会记录 `rope_layout_version=a1_camera_center_sky128`，旧全局 margin 版本不要直接续训或推理。
 
 ## 1. Pretrain 正式参数
@@ -50,7 +52,7 @@ CUDA_VISIBLE_DEVICES=2 python -u tools/compute_pretrain_feature_stats.py \
     --tokenizer_ckpt_path $TOKENIZER_CKPT \
     --output_path $FEATURE_STATS \
     --scene_start 0 --scene_end 800 \
-    --sequence_length 8 \
+    --sequence_length 10 \
     --batch_size 1 \
     --num_workers 2 \
     --max_batches 800 \
@@ -71,13 +73,16 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
     --val_caption_root $SCENE_CAPTION_VAL_ROOT \
     --text_encoder_path $QWEN_TEXT_ENCODER \
     --scene_start 0 --scene_end 800 \
-    --sequence_length 8 \
+    --sequence_length 10 \
     --patch_grid_h 25 --patch_grid_w 37 \
     --latent_dim 1024 \
     --batch_size 8 \
     --grad_accum_steps 1 \
     --num_workers 16 \
     --lr 2e-4 \
+    --final_lr 2e-5 \
+    --scheduler_type linear \
+    --decay_end_steps 150000 \
     --weight_decay 0.0 \
     --ema_decay 0.9995 \
     --warmup_steps 3000 \
@@ -95,6 +100,16 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
     --lambda_camera_pose 1.0 \
     --lambda_sky_flow 0.1 \
     --sky_unobserved_loss_weight 0.05 \
+    --lambda_rgb_render 0.01 \
+    --rgb_render_every 4 \
+    --rgb_render_start_step 5000 \
+    --rgb_render_warmup_steps 5000 \
+    --rgb_render_max_samples 1 \
+    --rgb_render_max_frames 4 \
+    --rgb_render_stride 2 \
+    --rgb_render_camera_grad_scale 0.0 \
+    --rgb_render_sky_mask_grad_scale 0.0 \
+    --rgb_render_lpips_weight 0.01 \
     --uncond_drop_prob 0.1 \
     --text_uncond_drop_prob 0.1 \
     --asset_uncond_drop_prob 0.2 \
@@ -111,7 +126,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
     --val_scene_start 0 --val_scene_end 100 \
     --val_every 1000 \
     --val_batches 1 \
-    --val_log_images 8 \
+    --val_log_images 10 \
     --val_sample_steps 35 \
     --seed 0 \
     --precision bf16 \
@@ -125,10 +140,10 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
 
 | 参数 | 取值 | 依据 |
 |---|---|---|
-| 有效 batch | `2 GPU × batch_size 8 × grad_accum 1 = 16` clip/step | 每 clip = 8 帧 × 925 patch ≈ 7.4K token-row → 每 step ≈ **118K token-row**，和 RAE DiT-XL（256 img × 256 tok ≈ 65K）同量级，足够稳定 |
+| 有效 batch | `2 GPU × batch_size 8 × grad_accum 1 = 16` clip/step | 每 clip = 10 帧 × 925 patch ≈ 9.25K token-row → 每 step ≈ **148K token-row**，和 RAE DiT-XL 同量级，足够稳定 |
 | `--lr 2e-4` | 默认 GMuon；如需 AdamW 显式加 `--optimizer_type adamw`，`--weight_decay 0.0` | RAE/DiT-XL 从头训冻结-encoder latent 的标配区间 1e-4–2e-4；不稳降 1e-4，开 REPA 后若仍停滞可升 3e-4 |
 | `--warmup_steps 3000` | ≈ 2% of max_steps | 大 batch 从头训练使用较短 warmup |
-| `--max_steps 150000` | cosine 衰减锚点 | **务必设成"现实总预算的上限而非下限"**：cosine 在 `max_steps` 处衰到 0，若你只训得到 40–60K，lr 仍在高位（好）；若把它设成 30000 而实际想训更久，lr 会过早衰到 ~0（坏） |
+| `--max_steps/--decay_end_steps 150000` | linear 衰减终点 | 与代码默认 `scheduler_type=linear` 对齐；LR 从 `2e-4` 衰减到 `final_lr=2e-5`，不会衰到 0 |
 | `--ema_decay 0.9995` | half-life ≈ 1.4K step | RAE 取值；EMA 验证默认开启，见文末 |
 
 显存兜底（80GB 仍 OOM 时按序降级，保持有效 batch≈16）：
@@ -137,12 +152,13 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
 * 再不够：`--sequence_length 6`
 * 仍不够：`--val_batches 4 --val_log_images 2 --no_val_render_rgb`（只降验证开销，不动训练）
 
-> 旧的 4 卡 `--sequence_length 4 --batch_size 1` 配置已弃用；当前命令统一使用 `--sequence_length 8 --latent_dim 1024`。
+> 旧的 4 卡 `--sequence_length 4 --batch_size 1` 配置已弃用；当前命令统一使用 `--sequence_length 10 --latent_dim 1024`。
 
 新增运行行为：
 
 * pretrain 训练使用 tqdm 进度条；如果日志系统不适合交互式进度条，可加 `--no_tqdm`。
 * tqdm 会每个 optimizer step 实时显示当前 loss 和 lr；train 标量也会每个 optimizer step 写入 wandb。
+* RGB loss 的前向渲染始终使用 SceneFlow 生成的 DGGT camera、generated depth/GS 和 predicted sky mask；`camera/sky_mask_grad_scale=0` 只切断对应 RGB 梯度，不会回退 teacher geometry。建议主 flow 收敛后再把 camera gradient 小幅升到 `0.05～0.1`。
 * `--seed` 会设置 Python/NumPy/PyTorch/CUDA 随机种子；DDP 下每个 rank 使用 `seed + rank`。
 * `--val_image_dir` 指定 validation split 根目录；`--val_scene_start/--val_scene_end` 是在该 validation split 内部选 scene 范围，不要用 training split 的 800-850 做验证。
 * `--val_every 1000` 表示每 1000 个 optimizer step 跑一次 validation；不是每 1000 个 batch，也不是每 1000 个 epoch。
@@ -153,7 +169,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
 * sky mask 只用于构造 sky RGB target 和 `sky_gen_loss_weight`；SceneFlow forward 不接收 GT 派生的 sky attention mask。`--sky_unobserved_loss_weight 0.05` 给未观测 atlas cell 弱监督，保持开放推理时完整 sky atlas 可生成。
 * validation 图像会保存到 `logs/scene_flow_pretrain_1024/validation/step_xxxxxx/`；默认包含 `generated_raw_3dgs_rgb__cfg*.jpg`、`generated_sky_rgb__cfg*.jpg`、`generated_pred_sky_mask__cfg*.jpg`、latent PCA 和误差图。额外 CFG scale 会追加 `*_cfg{scale}` 后缀。
 * `--val_sample_steps` 只控制 validation 图像采样步数，不影响训练本身。`15` 偏少，适合 smoke test；正式看图建议先用 `30`，需要更稳定的样本再用 `50`。FlowMatch/RAE 的生成采样也不是训练时的 1000 timestep 全跑，而是在 scheduler timestep 上做几十步推理。
-* 训练内 validation 默认 `--val_sliding_window 8 --val_sliding_stride 4`。长序列必须满足 `1 <= stride < window`；`stride=0` 自动取半窗，`stride>=window` 直接报错。采样维护 full video/camera/sky 状态，对 video/camera/mask logits 用 cosine coverage 逐帧归一化；scene-global sky 使用 `sum(w/C)` 窗口权重，使每个全局帧贡献相等。
+* 训练内 validation 默认 `--val_sliding_window 10 --val_sliding_stride 7`，即相邻窗口重叠 3 帧。长序列必须满足 `1 <= stride < window`；`stride>=window` 直接报错。采样维护 full video/camera/sky 状态，对 video/camera/mask logits 用 cosine coverage 逐帧归一化；scene-global sky 使用 `sum(w/C)` 窗口权重，使每个全局帧贡献相等。
 * 如需只记录 latent/mask 诊断图并跳过较慢的 3DGS RGB 渲染，可额外加 `--no_val_render_rgb`。
 * 若当前机器未登录 wandb，可先执行 `wandb login`，或临时去掉 `--wandb` 相关参数。
 
@@ -215,7 +231,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
     --text_encoder_path $QWEN_TEXT_ENCODER \
     --manifest_path $SCENE_FLOW_TRAIN_MANIFEST \
     --log_dir logs/scene_flow_t1_1024 \
-    --sequence_length 8 \
+    --sequence_length 10 \
     --batch_size 2 \
     --grad_accum_steps 4 \
     --num_workers 4 \
@@ -223,6 +239,9 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
     --lr 2e-4 \
     --weight_decay 0.0 \
     --ema_decay 0.9995 \
+    --final_lr 2e-5 \
+    --scheduler_type linear \
+    --decay_end_steps 150000 \
     --warmup_steps 3000 \
     --max_steps 150000 \
     --save_every 5000 \
@@ -240,13 +259,21 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
     --lambda_identity 1.0 \
     --edit_domain_threshold 1e-4 \
     --edit_domain_dilation 1 \
+    --lambda_rgb_render 0.01 \
+    --rgb_render_every 4 \
+    --rgb_render_start_step 5000 \
+    --rgb_render_warmup_steps 5000 \
+    --rgb_render_max_samples 1 \
+    --rgb_render_max_frames 4 \
+    --rgb_render_stride 2 \
+    --rgb_render_lpips_weight 0.01 \
     --uncond_drop_prob 0.1 \
     --guidance_scale 1.0 \
     --asset_control_guidance_scale 1.0 \
     --val_guidance_scales "1.0,2.0,4.0" \
     --val_every 1000 \
     --val_batches 1 \
-    --val_log_images 8 \
+    --val_log_images 10 \
     --val_sample_steps 50 \
     --grad_clip_norm 1.0 \
     --seed 0 \
@@ -262,26 +289,27 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 |---|---|---|
 | tokenizer latent | `--latent_dim 1024` + `$TOKENIZER_CKPT` + `$FEATURE_STATS` | 与 pretrain 使用同一个 1024 tokenizer / latent stats |
 | warm-start | `$SCENE_FLOW_PRETRAIN_CKPT` + `--scene_flow_pretrain_ema` | 从正式 pretrain 的 EMA SceneFlow 权重继续训练 |
-| 帧数 | `--sequence_length 8` | 固定 8 帧，和 pretrain `--sequence_length 8` 一致 |
+| 帧数 | `--sequence_length 10` | 固定 10 帧，和 pretrain `--sequence_length 10` 一致 |
 | 有效 batch | `2 GPU × batch_size 2 × grad_accum 4 = 16` clip/optimizer update | 与 pretrain 完全一致；DataLoader 现在返回完整 micro-batch list，不再丢弃 `batch[1:]` |
 | micro-batch 执行 | 默认将 `batch_size>1` 的 bundle 合并后一次 forward/backward | 如需回退旧路径可加 `--no_batch_scene_flow` |
 | asset/cache 输入 | cache 读取所有可用 asset LUT levels，并使用 cached `pass2_splatted_tok_low` | 不再 live splat/blend；cache 字段缺失会在 DataLoader/assembler 阶段报错 |
 | camera 输入/渲染 | SceneFlow 条件输入使用 Waymo `camera_to_world_corrected + intrinsics` 摘要；RGB render 固定使用输入图像经 DGGT 预测的 DGGT camera | Waymo camera 只作为条件，不直接给 renderer；正式训练/离线推理不启用 camera generation token，也不让 edited latent 重新定义相机 |
+| RGB 几何链 | generated video latent 经 frozen tokenizer decoder + DGGT depth/GS/instance heads 后可微渲染；GT sky mask 同时用于渲染和 masked LPIPS | teacher depth 不进入主 RGB renderer；正式阶段固定 input-DGGT camera，pretrain 才生成 camera/sky |
 | sky handling | T1 不启用 pretrain sky generation 参数 | 正式训练 RGB validation 仍使用 cache/GT sky 相关字段 |
 | DataLoader | `--num_workers 4 --prefetch_factor 1`，默认不启用 `pin_memory` | 每个 cache 文件平均约 651MB，低 prefetch 避免 8 workers × 2 prefetch × batch_size 2 造成几十个大文件并发读；GB 级 batch 走 pin-memory 线程容易触发 `received 0 items of ancdata` |
 | worker tensor sharing | 默认 `--mp_sharing_strategy file_system` | 减少 multiprocessing 通过大量 fd 传递超大 tensor 时的稳定性问题；若系统 `/dev/shm`/临时目录策略特殊，可显式改回 `file_descriptor` |
-| cache 读取 | 默认读取 chunked zstd `.pt`；每个样本只解压 8 帧窗口需要的 chunk | 逻辑 `schema_version` 仍为 v8。旧 monolithic cache 可用 `tools/convert_flow_cache_to_chunked.py` 转换并逐 tensor 校验 |
+| cache 读取 | 默认读取 chunked zstd `.pt`；每个样本只解压 10 帧窗口需要的 chunk | 逻辑 `schema_version` 仍为 v8。旧 monolithic cache 可用 `tools/convert_flow_cache_to_chunked.py` 转换并逐 tensor 校验 |
 | sigma / target | `--shift 10.0 --weighting_scheme waver --mode_scale 1.29 --loss_weighting_scheme none --prediction_type x` | 与 pretrain 保持一致 |
 | REPA | `--lambda_repa 0.5` | 与 pretrain 保持一致 |
 | EMA | `--ema_decay 0.9995`，validation 默认用 EMA | checkpoint 同时保存 raw / full / EMA-only 权重 |
-| validation | `--val_manifest_path $SCENE_FLOW_VAL_MANIFEST --val_caption_root $SCENE_CAPTION_VAL_ROOT --val_every 1000 --val_batches 8 --val_log_images 4 --val_sample_steps 50 --guidance_scale 1.0 --asset_control_guidance_scale 1.0 --val_guidance_scales "1.0,2.0,4.0"`，长 clip 训练内采样才加 `--val_sliding_window 8 --val_sliding_stride 4` | 独立 validation manifest/cache 可使用 validation captions；内部 holdout 仍可用，但不能混用 validation caption root。采样噪声用 `seed + step`，和 pretrain validation 一样可复现。滑窗采样按 full latent 状态做 per-step velocity blending，并传入 clip-local `frame_ids` |
-| schedule | `--lr 2e-4 --weight_decay 0.0 --warmup_steps 3000 --max_steps 150000` | 与正式 pretrain 的 optimizer / warmup / cosine horizon 一致 |
+| validation | `--val_manifest_path $SCENE_FLOW_VAL_MANIFEST --val_caption_root $SCENE_CAPTION_VAL_ROOT --val_every 1000 --val_batches 8 --val_log_images 10 --val_sample_steps 50 --guidance_scale 1.0 --asset_control_guidance_scale 1.0 --val_guidance_scales "1.0,2.0,4.0"`，长 clip 训练内采样才加 `--val_sliding_window 10 --val_sliding_stride 7` | 独立 validation manifest/cache 可使用 validation captions；内部 holdout 仍可用，但不能混用 validation caption root。采样噪声用 `seed + step`，和 pretrain validation 一样可复现。滑窗采样按 full latent 状态做 per-step velocity blending，并传入 clip-local `frame_ids` |
+| schedule | `--lr 2e-4 --final_lr 2e-5 --scheduler_type linear --decay_end_steps 150000 --weight_decay 0.0 --warmup_steps 3000 --max_steps 150000` | 与正式 pretrain 的 optimizer / warmup / linear horizon 一致 |
 
 注意：`train_scene_flow.py` 的 `global_step` 现在和 pretrain 一样是 optimizer update 口径；`--max_steps/--save_every/--vis_every/--val_every` 都按 optimizer update 触发。
 
 注意：正式训练 validation 会保存 loss 标量、latent PCA / mask / CFG 采样诊断图到 `logs/scene_flow_t1_1024/validation/step_xxxxxx/` 并写入 wandb。训练内 validation 保持轻量，避免每 1000 step 做 3DGS 渲染拖慢训练。
 
-注意：正式 offline 入口是 `inference_scene_flow.py --window 8 --window_stride 4`，不是不存在的 `inference_scene_flow_validation.py`。它维护 full 29 帧 latent，在每个采样步对窗口 velocity 做 cosine coverage 归一化后统一更新；正式阶段始终使用 input DGGT camera 与 GT sky/mask，不生成 11D camera/sky。
+注意：正式 offline 入口是 `inference_scene_flow.py`，不是不存在的 `inference_scene_flow_validation.py`。29 帧输入会自动解析为 `window=10, stride=7`（重叠 3 帧）；它维护 full 29 帧 latent，在每个采样步对窗口 velocity 做 cosine coverage 归一化后统一更新。正式阶段始终使用 input DGGT camera 与 GT sky/mask，不生成 11D camera/sky。
 
 ## 2.1 Camera cache 修复与旧 checkpoint 迁移
 
@@ -303,7 +331,7 @@ role embedding 与 stats，重置 EMA step/optimizer/scheduler，并从 pretrain
 ## 4. 四类 validation / offline inference
 
 训练内 pretrain validation 使用 `train_scene_flow_pretrain.py` 的
-`--val_sliding_window 8 --val_sliding_stride 4 --val_sample_steps 35`；正式训练 validation
+`--val_sliding_window 10 --val_sliding_stride 7 --val_sample_steps 35`；正式训练 validation
 使用 `train_scene_flow.py` 的同名滑窗参数。正式 validation 不 pack、不加噪、不预测 camera/sky
 generation state。
 
@@ -314,11 +342,12 @@ python inference_scene_flow_pretrain.py \
   --weights $SCENE_FLOW_PRETRAIN_CKPT --dggt_ckpt_path $DGGT_CKPT \
   --tokenizer_ckpt_path $TOKENIZER_CKPT --feature_stats_path $FEATURE_STATS \
   --val_image_dir $WAYMO_DGGT_VAL_ROOT --val_caption_root $SCENE_CAPTION_VAL_ROOT \
-  --num_frames 8 --val_sliding_window 8 --val_sliding_stride 4 --cfg 1 2 4
+  --num_frames 10 --val_sliding_window 10 --val_sliding_stride 7 --cfg 1 2 4
 ```
 
-Pretrain offline 重叠长窗只需改为 `--num_frames 29 --val_sliding_window 8
---val_sliding_stride 4`。两者默认 `--camera_text_guidance_scale 1`，所以全局 CFG sweep 不改变
+Pretrain offline 只需指定 `--num_frames 29`；当请求帧数超过单次推理上限 10 时，入口会自动启用
+`window=10, stride=7`（重叠 3 帧）的滑窗。`--val_sliding_window <= 0` 表示自动选择，不再表示禁用滑窗；显式传入
+大于 10 的窗口也会被截断为 10。默认 `--camera_text_guidance_scale 1`，所以全局 CFG sweep 不改变
 camera trajectory。
 
 正式 offline 单窗/短 clip 与重叠长 clip 统一使用真实入口：
@@ -327,13 +356,14 @@ camera trajectory。
 python inference_scene_flow.py \
   --scene_flow_ckpt_path /path/to/flow_stepXXXXXX.pt --ckpt_path $DGGT_CKPT \
   --tokenizer_ckpt_path $TOKENIZER_CKPT --manifest_path $SCENE_FLOW_VAL_MANIFEST \
-  --output_dir runs/scene_flow_offline --window 8 --window_stride 4 \
+  --output_dir runs/scene_flow_offline --window 10 --window_stride 7 \
   --edit_domain_threshold 1e-4 --edit_domain_dilation 1 \
   --guidance_scales 1,2,4
 ```
 
-长度不超过 8 时公共 scheduler 自动返回单窗；长 clip 自动走 overlap schedule。所有入口都禁止
-`stride>=window`（只有 `sequence_length<=window` 的天然单窗不受该限制）。
+长度不超过 10 时公共 scheduler 自动返回单窗；长 clip 无论是否显式传 `--window` 都自动走最大 10 帧的
+overlap schedule。`--window <= 0` 表示自动选择，`--window > 10` 会被截断为 10。所有入口都禁止
+实际启用滑窗时 `stride>=window`。
 
 旧 monolithic cache 转换为当前 chunked cache：
 
@@ -363,7 +393,7 @@ CUDA_VISIBLE_DEVICES=2 python -u train_scene_flow.py \
     --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
     --mode_filter mode_a \
     --log_dir logs/scene_flow_t1_mode_a_smoke \
-    --sequence_length 8 \
+    --sequence_length 10 \
     --batch_size 1 \
     --grad_accum_steps 1 \
     --num_workers 0 \

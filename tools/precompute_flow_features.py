@@ -69,6 +69,7 @@ from dggt.utils.flow_cache_io import (
     save_flow_cache_chunked,
 )
 from dggt.utils.gaussian_edit import parse_object_slots
+from dggt.utils.gaussian_time import GAUSSIAN_TIME_REPRESENTATION
 from dggt.utils.tokens import select_patch_pyramid
 
 
@@ -1492,6 +1493,7 @@ def precompute_one_clip(
             "frame_indices_scene": sample["frame_indices"].cpu().to(torch.long),
             "cam_ids": sample["cam_ids"].cpu().to(torch.long),
             "timestamps": sample["timestamps"].cpu().to(torch.float32),
+            "gaussian_time_representation": GAUSSIAN_TIME_REPRESENTATION,
             "image_size_model_hw": (H_img, W_img),
             "patch_grid": (H_img // 14, W_img // 14),
             "patch_start_idx": patch_start_idx,

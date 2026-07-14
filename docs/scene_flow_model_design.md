@@ -25,6 +25,14 @@ Forward 中先拼接 generation sequence，再拼接 condition sequence：
 full_seq = [video, camera_gen, sky_gen, timestep, text, camera_cond, asset, edit_control]
 ```
 
+时间和长视频 camera 采用 clip-global 约定：Gaussian timestamp 恒为
+`clip_local_frame_id / 4`，不再随训练窗口长度归一化；Waymo camera condition 的
+`rel pose` 始终相对 clip frame 0，`delta pose` 始终相对真实前一帧。训练随机截取
+10 帧时仍携带这两个全局上下文，因此与 offline 先编码完整轨迹再切 10 帧窗口完全
+一致。Pretrain 另外以 `camera_anchor_context_dropout=0.25` 隐藏 global camera-gen
+anchor，仅监督可见 delta token，从而覆盖长视频后续滑窗不包含 anchor 的输入分布。
+默认长视频窗口为 10 帧、stride 7，即重叠 3 帧。
+
 所有可见 token 一起做 full self-attention。模型只对 generation spans 解码：video span 走 RAEv2 DDT head；camera/sky spans 分别走独立 decoder head。
 
 ## 2. Latent 与 Flow Matching
@@ -408,9 +416,15 @@ scene latent + camera_gen token + sky token
 
 RGB render 不再把 GT image 送入 DGGT aggregator，也不再使用 validation batch 的 image-token 模板。SceneFlow 输出的 latent 经 tokenizer decode 成 selected DGGT patch levels；selected levels 的 special tokens 固定补零后送入 DGGT heads。render 尺寸由 `patch_grid * 14` 固定得到。
 
+训练 RGB loss 与 validation/offline 共用同一个 generated-token DGGT 解码入口：`latent -> tokenizer.decode -> frozen depth/GS/instance heads`。frozen head 参数不更新，但解码过程不能放在 `no_grad` 中；generated depth 反投影与 point means 不允许 detach。主 RGB renderer 的接口不接受 teacher depth。
+
+pretrain RGB 使用 `z_camera_pred -> denormalize_camera -> decode_camera_trajectory -> DGGT pose_enc`，并使用 generated sky atlas 与 predicted refined sky mask。正式训练固定使用输入图像的 DGGT camera 和 GT sky/sky mask。Waymo camera 始终只作为 SceneFlow condition。pretrain 的 GT sky mask 只作为 RGB/LPIPS 权重，renderer 的 sky split 使用 predicted mask，避免训练时 teacher-mask 捷径。
+
+gsplat 在无 background 时返回 premultiplied RGB，因此合成公式固定为 `rendered_rgb + (1-alpha)*background`，禁止再次乘 alpha。LPIPS 使用 spatial 输出并应用与 Charbonnier 相同的 edit/sky 权重；正式训练 `sky_weight=0` 时天空不参与 LPIPS。
+
 生成分支的 sky/non-sky split 来自 SceneFlow refined sky mask，而不是 `semantic_head`。generated sky atlas 只提供 sky background RGB；refined mask 决定哪些 image-plane pixels/points 作为非天空 Gaussian 参与渲染。
 
-pretrain validation 可用 GT/DGGT-space pose 模拟用户输入 render camera；这只用于渲染，不应在 optional camera condition 缺失时作为模型输入条件。
+pretrain validation/offline 的 generated branch 必须使用 SceneFlow 生成的 DGGT camera；只有 clean/tokenizer-reconstruction 诊断分支可以使用 frozen DGGT teacher pose。任何 render camera 都不应在 optional camera condition 缺失时回灌成模型输入条件。
 
 正式训练 validation 和离线 inference 不使用 generated camera/sky token。生成分支固定复用输入图像经 DGGT 预测出的 DGGT camera，并使用 GT sky mask 和 sky model 背景合成；`generated_pred_sky_mask` 是 edited latent 送入 DGGT `semantic_head` 得到的诊断图，不参与 sky/non-sky 合成，也不是 SceneFlow sky mask 输出。
 

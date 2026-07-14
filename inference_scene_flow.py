@@ -38,9 +38,11 @@ Environment (see docs/scene_flow_cmd.md §0 and docs/flow_cache_validation_cmd.m
     export SCENE_CAPTION_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions
 
 Sliding window: the validation clips are 29 frames but WanSceneFlow is trained
-on short windows (pretrain S=8 / T1 4-8). The clip is tiled into ``--window``
-(default 8) frame windows with stride ``--window_stride``; every window has
-exactly ``--window`` frames (the last start is clamped so the clip tail is
+on 10-frame windows in both stages. Requests longer than 10 frames are
+automatically tiled into at most 8-frame windows with ``--window_stride``;
+``--window <= 0`` selects this automatic policy and values above 8 are capped.
+Every full window has exactly the resolved effective-window number of frames
+(the last start is clamped so the clip tail is
 covered). Sampling keeps one full-clip latent state; at each denoising step the
 model is run on window slices, window velocities are blended in overlap regions,
 and the full latent is updated once. Per-window bundles are still dumped for
@@ -48,7 +50,7 @@ diagnostics, while the final 3DGS render uses the full-clip latent.
 
 A) Validation manifest, formal-training (T1) checkpoint, all entries:
 
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow_validation.py \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
         --ckpt_path $DGGT_CKPT \
         --tokenizer_ckpt_path $TOKENIZER_CKPT \
         --scene_flow_ckpt_path logs/scene_flow_t1/ckpt/flow_step040000.pt \
@@ -56,16 +58,16 @@ A) Validation manifest, formal-training (T1) checkpoint, all entries:
         --manifest_path $VAL_MANIFEST \
         --split validation \
         --output_dir runs/scene_flow_val_t1 \
-        --window 8 --window_stride 8 \
+        --window 0 --window_stride 7 \
         --sample_steps 30 --shift 10.0 \
         --guidance_scales 1.0,2.0,4.0 \
         --asset_control_guidance_scale 1.0 \
-        --val_log_images 8 \
+        --val_log_images 10 \
         --seed 0 --precision bf16
 
 B) Pretrain checkpoint, cache_root scan (no manifest), EMA weights (default):
 
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow_validation.py \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
         --ckpt_path $DGGT_CKPT \
         --tokenizer_ckpt_path $TOKENIZER_CKPT \
         --scene_flow_ckpt_path logs/scene_flow_pretrain/ckpt/pretrain_step100000.pt \
@@ -75,18 +77,18 @@ B) Pretrain checkpoint, cache_root scan (no manifest), EMA weights (default):
         --output_dir runs/scene_flow_val_pretrain \
         --start 0 --end 5 \
         --sample_steps 30 --shift 10.0 --guidance_scales 2.0 \
-        --window 8 --render_per_window
+        --window 0 --render_per_window
 
 C) Single entry smoke (entry 0 -> manifest index 0, combined variant):
 
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow_validation.py \
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
         --ckpt_path $DGGT_CKPT --tokenizer_ckpt_path $TOKENIZER_CKPT \
         --scene_flow_ckpt_path logs/scene_flow_pretrain/ckpt/pretrain_step100000.pt \
         --feature_stats_path $FEATURE_STATS \
         --manifest_path $VAL_MANIFEST --split validation \
         --output_dir /tmp/scene_flow_val_smoke \
         --index 0 --sample_steps 15 --guidance_scales 2.0 \
-        --window 8 --no_render_rgb --splat_pca
+        --window 0 --no_render_rgb --splat_pca
 
 Notes:
   * ``--scene_flow_ckpt_path`` accepts the formal-training checkpoint
@@ -114,7 +116,7 @@ Notes:
     ``--latent_dim``; e.g. ``feature_stats_pretrain.pt``).
   * Memory: the default single 29-frame render does one VGGT-L pass on the
     full clip (~25GB free, same as the validation-cache precompute). Use
-    ``--render_per_window`` (per-window 8-frame renders) or ``--no_render_rgb``
+    ``--render_per_window`` (per-window 10-frame renders) or ``--no_render_rgb``
     if tight.
 
 Output (per entry, under ``{output_dir}/{tag}/``):
@@ -154,7 +156,12 @@ from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_stats import checkpoint_sha256, load_into_buffers, validate_camera_stats_provenance
 from dggt.utils.flow_cache_io import load_flow_cache
 from dggt.utils.flow_viz import dump_flow_features, save_image_grid
-from dggt.utils.sliding_window import cosine_window, window_slices
+from dggt.utils.sliding_window import (
+    OFFLINE_MAX_SINGLE_WINDOW,
+    cosine_window,
+    resolve_offline_window,
+    window_slices,
+)
 
 # Reuse the formal-training (train_scene_flow.py) cache->bundle helpers verbatim
 # so the bundle is byte-for-byte what the trainer feeds the model.
@@ -256,10 +263,16 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Sliding window over the (29-frame) clip; each denoising step blends
     # window velocities into one full-clip latent state.
-    p.add_argument("--window", type=int, default=8,
-                   help="Frames per scene_flow window (match training S; "
-                        "pretrain S=8 / T1 4-8).")
-    p.add_argument("--window_stride", type=int, default=4,
+    p.add_argument(
+        "--window",
+        type=int,
+        default=10,
+        help=(
+            "Frames per SceneFlow window, capped at 10. Values <=0 select automatic mode; "
+            "clips longer than 10 frames always use overlapping sliding windows."
+        ),
+    )
+    p.add_argument("--window_stride", type=int, default=7,
                    help="Window step in frames; overlap is mandatory for clips longer than --window.")
 
     # Selection
@@ -288,7 +301,7 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Deprecated compatibility flag; non-edit tokens are pinned to z_splat each ODE step.")
 
     # Visualization (consumed by reused pretrain render helpers)
-    p.add_argument("--val_log_images", type=int, default=8,
+    p.add_argument("--val_log_images", type=int, default=10,
                    help="Number of frames rendered/tiled per grid.")
     p.add_argument("--splat_pca", action="store_true",
                    help="Also dump splat_pca grids in flow_features/.")
@@ -1183,9 +1196,15 @@ def main() -> None:
             payload, cache_path=cache_path, entry=entry
         )
         num_frames = int(payload["meta"]["num_frames"])
+        effective_window, effective_stride, offline_sliding = resolve_offline_window(
+            num_frames,
+            int(args.window),
+            int(args.window_stride),
+            max_single_window=OFFLINE_MAX_SINGLE_WINDOW,
+        )
         windows = [
             list(range(start, end))
-            for start, end in window_slices(num_frames, args.window, args.window_stride)
+            for start, end in window_slices(num_frames, effective_window, effective_stride)
         ]
 
         # Full-clip bundle drives stepwise sliding sampling; model forward still
@@ -1206,6 +1225,7 @@ def main() -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         win_root = out_dir / "windows"
         print(f"[{pos}/{len(indices)}] row={idx} frames={num_frames} "
+              f"window={effective_window} stride={effective_stride} sliding={offline_sliding} "
               f"windows={[ (w[0], w[-1]) for w in windows ]} -> {out_dir}",
               flush=True)
 
@@ -1283,8 +1303,8 @@ def main() -> None:
                 guidance_scale=scale,
                 seed=int(args.seed) + idx * 1000,
                 text_encoder=text_encoder,
-                sliding_window=int(args.window),
-                sliding_stride=int(args.window_stride),
+                sliding_window=effective_window,
+                sliding_stride=effective_stride,
             )
             save_edit_grids(
                 z_edit_full[scale], z_clean_full, out_dir, args, suffix, frames
@@ -1352,8 +1372,9 @@ def main() -> None:
             "mode_kind": str(payload["mode_kind"]),
             "num_frames": num_frames,
             "frames_rendered": frames,
-            "window": int(args.window),
-            "window_stride": int(args.window_stride),
+            "window": effective_window,
+            "window_stride": effective_stride,
+            "sliding_window_active": offline_sliding,
             "num_windows": len(windows),
             "render_per_window": bool(args.render_per_window),
             "patch_grid": list(args.patch_grid),

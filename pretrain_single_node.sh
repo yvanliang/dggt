@@ -27,7 +27,7 @@ WAYMO_DGGT_ROOT="${DATASET_ROOT}/training"
 WAYMO_DGGT_VAL_ROOT="${DATASET_ROOT}/validation"
 DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
 TOKENIZER_CKPT="${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
-FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_camera_v2.pt"
+FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v3_798.pt"
 SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-/mnt/vol1/liangyy_workspace/model/Qwen/Qwen3-0.6B}"
@@ -156,7 +156,10 @@ build_train_args() {
         --text_encoder_path "${QWEN_TEXT_ENCODER}"
         --scene_start 0
         --scene_end 800
-        --sequence_length 8
+        --sequence_length 10
+        --val_sliding_window 10
+        --val_sliding_stride 7
+        --camera_anchor_context_dropout 0.25
         --patch_grid_h 25
         --patch_grid_w 37
         --latent_dim 1024
@@ -196,7 +199,7 @@ build_train_args() {
         --val_scene_end 100
         --val_every 1000
         --val_batches 1
-        --val_log_images 8
+        --val_log_images 10
         --val_sample_steps 35
         --grad_clip_norm 1.0
         --seed 0

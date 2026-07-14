@@ -21,6 +21,8 @@ from typing import Any
 
 import torch
 
+from dggt.utils.gaussian_time import GAUSSIAN_TIME_REPRESENTATION
+
 
 GZIP_MAGIC = b"\x1f\x8b"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
@@ -35,6 +37,8 @@ def is_current_flow_cache_summary(summary: dict[str, Any]) -> bool:
         str(summary.get("format", "")) == CHUNKED_FLOW_CACHE_FORMAT
         and int(summary.get("format_version", 0)) == CHUNKED_FLOW_CACHE_FORMAT_VERSION
         and int(summary.get("schema_version", 0)) == CURRENT_FLOW_CACHE_SCHEMA_VERSION
+        and str(summary.get("gaussian_time_representation", ""))
+        == GAUSSIAN_TIME_REPRESENTATION
     )
 
 
@@ -395,6 +399,7 @@ def save_flow_cache_chunked(
             "format": CHUNKED_FLOW_CACHE_FORMAT,
             "format_version": CHUNKED_FLOW_CACHE_FORMAT_VERSION,
             "schema_version": int(payload.get("schema_version", 0)),
+            "gaussian_time_representation": meta.get("gaussian_time_representation"),
             "mode_kind": mode_kind,
             "num_frames": num_frames,
             "patch_grid": list(meta.get("patch_grid", [])),
@@ -954,7 +959,16 @@ def load_chunked_flow_cache_subset(
                 "scaffold_pooled": torch.stack([chunk["scaffold_pooled"] for chunk in flow_chunks], dim=0).contiguous(),
             }
             if payload["mode_kind"] == "mode_a" and _has_chunk(conn, "mode_a/flow_inputs_meta"):
-                payload["flow_inputs"].update(_get_chunk(conn, dctx, "mode_a/flow_inputs_meta"))
+                flow_meta = _get_chunk(conn, dctx, "mode_a/flow_inputs_meta")
+                coverage = flow_meta.get("phase1_coverage")
+                if torch.is_tensor(coverage):
+                    if coverage.ndim != 2:
+                        raise ValueError(
+                            "mode_a/flow_inputs_meta.phase1_coverage must be [K,S], got "
+                            f"{tuple(coverage.shape)}"
+                        )
+                    flow_meta["phase1_coverage"] = coverage.index_select(1, subset).contiguous()
+                payload["flow_inputs"].update(flow_meta)
             payload["_fast_scene_flow"] = True
 
         if consumer == "tokenizer_stage_b":

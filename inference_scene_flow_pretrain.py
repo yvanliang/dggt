@@ -22,7 +22,7 @@ Example:
 
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow_pretrain.py \
         --cfg 1.0,2.0,4.0 \
-        --num_frames 8 \
+        --num_frames 10 \
         --start 0 --end 8 \
         --output_dir runs/scene_flow_pretrain_inference
 
@@ -86,16 +86,17 @@ except ModuleNotFoundError:
 
 from datasets.dataset import WaymoOpenDataset
 from dggt.models.scene_flow import WanSceneFlow
+from dggt.losses.rgb_render_loss import decode_generated_dggt_geometry
 from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers, load_into_buffers
 from dggt.utils.camera_generation import CAMERA_GENERATION_DIM, CAMERA_GENERATION_REPRESENTATION
 from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.gaussian_edit import CleanSceneState, build_clean_scene_state
 from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
+from dggt.utils.sliding_window import resolve_offline_window
 from train_scene_flow_pretrain import (
     DEFAULT_SKY_GRID,
     SKY_TOKEN_DIM,
     CyclicSequentialSampler,
-    _decode_generated_tokens_without_template,
     _fixed_render_hw,
     _image_grid,
     _latent_pca_grid,
@@ -105,7 +106,6 @@ from train_scene_flow_pretrain import (
     _sky_background_image_grid,
     _sky_mask_image_grid,
     _sky_mask_patch_to_image,
-    _split_sparse_generated_tokens_for_heads,
     _timestamps_for_generated_render,
     autocast_context,
     build_pretrain_bundle_from_batch,
@@ -119,6 +119,7 @@ from train_scene_flow_pretrain import (
     sky_grid_shape,
     sky_tokens_to_background,
     validate_scene_flow_checkpoint_config,
+    unwrap_ddp,
 )
 
 
@@ -496,30 +497,26 @@ def render_and_export_generated(
     frames = min(int(args.val_log_images), seq_len)
     timestamps = _timestamps_for_generated_render(batch, seq_len=seq_len, device=device)
 
+    patch_start_idx = int(getattr(vggt_model.aggregator, "patch_start_idx", 5))
     with autocast_context(args, device):
-        generated_tokens, patch_start_idx = _decode_generated_tokens_without_template(
-            vggt_model, scene_flow, z_generated, args, device=device
+        geometry = decode_generated_dggt_geometry(
+            vggt_model=vggt_model,
+            scene_flow_root=unwrap_ddp(scene_flow),
+            z_clean_pred_n=z_generated,
+            patch_grid=args.patch_grid,
+            patch_start_idx=patch_start_idx,
+            image_hw=(height, width),
         )
-        gen_agg, gen_dino = _split_sparse_generated_tokens_for_heads(generated_tokens)
-        with torch.amp.autocast(device_type=device.type, enabled=False):
-            gs_map, gs_conf = vggt_model.gs_head(
-                generated_tokens, None, patch_start_idx, image_hw=(height, width)
-            )
-            generated_pose = decode_pose_from_camera_features(vggt_model, camera_generated.to(device))
-            generated_depth, _ = vggt_model.depth_head(
-                gen_agg, None, patch_start_idx, image_hw=(height, width)
-            )
-            generated_dynamic, _ = vggt_model.instance_head(
-                gen_dino, None, patch_start_idx, image_hw=(height, width)
-            )
-            generated_sky_mask = _sky_mask_patch_to_image(
-                sky_mask_refined if sky_mask_refined is not None else sky_mask_patch,
-                patch_grid=args.patch_grid,
-                height=height,
-                width=width,
-                device=device,
-            )
-    del generated_tokens, gen_agg, gen_dino
+        generated_pose = decode_pose_from_camera_features(vggt_model, camera_generated.to(device))
+        generated_sky_mask = _sky_mask_patch_to_image(
+            sky_mask_refined if sky_mask_refined is not None else sky_mask_patch,
+            patch_grid=args.patch_grid,
+            height=height,
+            width=width,
+            device=device,
+        )
+    gs_map, gs_conf = geometry.gs_map, geometry.gs_conf
+    generated_depth, generated_dynamic = geometry.depth, geometry.dynamic_conf
 
     sky_background = None
     sky_grid_image = None
@@ -678,8 +675,8 @@ def build_argparser() -> argparse.ArgumentParser:
         "--frames",
         dest="num_frames",
         type=int,
-        default=8,
-        help="Contiguous frames per validation sample (default: 8).",
+        default=10,
+        help="Contiguous frames per validation sample (default: 10).",
     )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--pin_memory", action="store_true")
@@ -733,8 +730,21 @@ def build_argparser() -> argparse.ArgumentParser:
             "Default 1 preserves the exact DGGT scene; >1 is explicit export-only downsampling."
         ),
     )
-    parser.add_argument("--val_sliding_window", type=int, default=8)
-    parser.add_argument("--val_sliding_stride", type=int, default=4)
+    parser.add_argument(
+        "--val_sliding_window",
+        type=int,
+        default=10,
+        help=(
+            "Offline SceneFlow window size, capped at 10. Values <=0 select automatic mode; "
+            "requests longer than 10 frames always use overlapping sliding windows."
+        ),
+    )
+    parser.add_argument(
+        "--val_sliding_stride",
+        type=int,
+        default=7,
+        help="Sliding stride; it must be smaller than the effective window for long clips.",
+    )
 
     # Fallback architecture only; saved scene_flow_config takes precedence.
     parser.add_argument("--patch_grid_h", type=int, default=25)
@@ -769,6 +779,11 @@ def validate_args(args: argparse.Namespace) -> list[float]:
 def main() -> None:
     args = build_argparser().parse_args()
     cfg_scales = validate_args(args)
+    args.val_sliding_window, args.val_sliding_stride, offline_sliding = resolve_offline_window(
+        int(args.num_frames),
+        int(args.val_sliding_window),
+        int(args.val_sliding_stride),
+    )
     args.patch_grid = (int(args.patch_grid_h), int(args.patch_grid_w))
     args.sky_grid = (int(args.sky_grid_h), int(args.sky_grid_w))
     # Bare legacy checkpoints have no config and are interpreted as CameraHead hidden v1.
@@ -876,7 +891,12 @@ def main() -> None:
         f"order=trunk-major modes={','.join(CONDITION_MODES)} frames={args.num_frames}",
         flush=True,
     )
-    print(f"[sampling] cfg={cfg_scales} steps={args.val_sample_steps} shift={args.shift}", flush=True)
+    print(
+        f"[sampling] cfg={cfg_scales} steps={args.val_sample_steps} shift={args.shift} "
+        f"window={args.val_sliding_window} stride={args.val_sliding_stride} "
+        f"sliding={offline_sliding}",
+        flush=True,
+    )
 
     all_summaries: list[dict[str, Any]] = []
     iterator = tqdm(loader, total=selected_count, desc="pretrain inference", dynamic_ncols=True)
@@ -966,6 +986,9 @@ def main() -> None:
             "condition_policy": "text always; optional asset/camera rotate none,asset,cam,asset_cam",
             "actual_condition_rows": condition_rows,
             "num_frames": int(args.num_frames),
+            "window": int(args.val_sliding_window),
+            "window_stride": int(args.val_sliding_stride),
+            "sliding_window_active": bool(offline_sliding),
             "sample_steps": int(args.val_sample_steps),
             "shift": float(args.shift),
             "checkpoint": checkpoint_info,
@@ -994,6 +1017,9 @@ def main() -> None:
         "camera_text_guidance_scale": float(args.camera_text_guidance_scale),
         "condition_cycle": list(CONDITION_MODES),
         "num_frames": int(args.num_frames),
+        "window": int(args.val_sliding_window),
+        "window_stride": int(args.val_sliding_stride),
+        "sliding_window_active": bool(offline_sliding),
         "sample_steps": int(args.val_sample_steps),
         "shift": float(args.shift),
         "ply_stride": int(args.ply_stride),

@@ -97,6 +97,8 @@ def _camera_summary_from_c2w(
     fov: torch.Tensor,
     *,
     translation_scale: float = 10.0,
+    trajectory_anchor_to_world: torch.Tensor | None = None,
+    previous_camera_to_world: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     c2w = _to_batched_sequence(camera_to_world.float(), last_dims=3, name="camera_to_world")
     if c2w.shape[-2:] != (4, 4):
@@ -106,10 +108,35 @@ def _camera_summary_from_c2w(
     if fov.shape != (b, s, 2):
         raise ValueError(f"fov must be [B,S,2], got {tuple(fov.shape)} for B={b}, S={s}")
 
-    c0_inv = _invert_se3(c2w[:, :1]).expand(-1, s, -1, -1)
+    if trajectory_anchor_to_world is None:
+        anchor = c2w[:, :1]
+    else:
+        anchor = _to_batched_sequence(
+            trajectory_anchor_to_world.float(), last_dims=3, name="trajectory_anchor_to_world"
+        )
+        if int(anchor.shape[1]) != 1:
+            raise ValueError(
+                f"trajectory_anchor_to_world must contain one pose, got {tuple(anchor.shape)}"
+            )
+        if int(anchor.shape[0]) == 1 and b > 1:
+            anchor = anchor.expand(b, -1, -1, -1)
+        if int(anchor.shape[0]) != b:
+            raise ValueError(f"trajectory anchor batch {anchor.shape[0]} != camera batch {b}")
+    c0_inv = _invert_se3(anchor).expand(-1, s, -1, -1)
     rel = c0_inv @ c2w
 
-    prev = torch.cat([c2w[:, :1], c2w[:, :-1]], dim=1)
+    if previous_camera_to_world is None:
+        prev = torch.cat([c2w[:, :1], c2w[:, :-1]], dim=1)
+    else:
+        prev = _to_batched_sequence(
+            previous_camera_to_world.float(), last_dims=3, name="previous_camera_to_world"
+        )
+        if int(prev.shape[0]) == 1 and b > 1:
+            prev = prev.expand(b, -1, -1, -1)
+        if prev.shape != c2w.shape:
+            raise ValueError(
+                f"previous_camera_to_world shape {tuple(prev.shape)} != camera shape {tuple(c2w.shape)}"
+            )
     delta = _invert_se3(prev) @ c2w
 
     scale = max(float(translation_scale), 1e-6)
@@ -185,6 +212,8 @@ def camera_summary_from_waymo_gt(
     *,
     image_hw: tuple[int, int] | None = None,
     translation_scale: float = 10.0,
+    trajectory_anchor_to_world: torch.Tensor | None = None,
+    previous_camera_to_world: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build camera summary tokens from dataset GT camera trajectory.
 
@@ -198,4 +227,10 @@ def camera_summary_from_waymo_gt(
     image_hw = normalize_front_image_hw(image_hw)
     fov_xy = fov_from_intrinsics(Ks, image_hw)
     fov = torch.stack((fov_xy[..., 1], fov_xy[..., 0]), dim=-1)
-    return _camera_summary_from_c2w(c2w, fov, translation_scale=translation_scale)
+    return _camera_summary_from_c2w(
+        c2w,
+        fov,
+        translation_scale=translation_scale,
+        trajectory_anchor_to_world=trajectory_anchor_to_world,
+        previous_camera_to_world=previous_camera_to_world,
+    )

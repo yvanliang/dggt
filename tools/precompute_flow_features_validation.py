@@ -64,6 +64,7 @@ from dggt.utils.flow_cache_io import (
     save_flow_cache,
     save_flow_cache_chunked,
 )
+from dggt.utils.gaussian_time import GAUSSIAN_TIME_REPRESENTATION
 from dggt.utils.validation_edit_localize import (
     VALIDATION_LOCALIZATION_POLICY,
     VARIANT_SLOTS,
@@ -306,6 +307,7 @@ def _assemble_payload(
             "frame_indices_scene": sample_cached["frame_indices"].cpu().to(torch.long),
             "cam_ids": sample_cached["cam_ids"].cpu().to(torch.long),
             "timestamps": sample_cached["timestamps"].cpu().to(torch.float32),
+            "gaussian_time_representation": GAUSSIAN_TIME_REPRESENTATION,
             "image_size_model_hw": (H_img, W_img),
             "patch_grid": (H_img // 14, W_img // 14),
             "patch_start_idx": patch_start_idx,

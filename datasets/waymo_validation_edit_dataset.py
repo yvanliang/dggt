@@ -37,6 +37,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
+
 from datasets.waymo_edit_dataset import (
     DEFAULT_PROCESSED_ROOT,
     DEFAULT_TRANSFER_HW,
@@ -487,7 +489,7 @@ class WaymoValidationEditDataset:
             "images": images,
             "images_clean": images,
             "image_paths": image_paths,
-            "timestamps": torch.linspace(0.0, 1.0, S, dtype=torch.float32),
+            "timestamps": gaussian_timestamps_from_frame_ids(torch.arange(S)),
             "scene_id": scene_idx,
             "scene_name": f"{self.split}_{scene_dir}",
             "scene_dir": scene_dir,
