@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Sequence
 
 import torch
@@ -283,6 +284,19 @@ class LearnedQueryPool(nn.Module):
             nn.init.zeros_(self.attn.in_proj_bias)
         nn.init.trunc_normal_(self.attn.in_proj_weight, std=0.02)
 
+    def _forward_ppu(self, kv: torch.Tensor) -> torch.Tensor:
+        chunk_size = int(os.environ.get("DGGT_PPU_MHA_BATCH_CHUNK_SIZE", "4096"))
+        if chunk_size <= 0:
+            raise ValueError(f"DGGT_PPU_MHA_BATCH_CHUNK_SIZE must be positive, got {chunk_size}")
+
+        outputs = []
+        query = self.query.unsqueeze(0)
+        for kv_chunk in kv.split(chunk_size, dim=0):
+            q_chunk = query.expand(kv_chunk.shape[0], -1, -1)
+            out_chunk, _ = self.attn(q_chunk, kv_chunk, kv_chunk, need_weights=False)
+            outputs.append(out_chunk)
+        return torch.cat(outputs, dim=0)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim == 5:
             batch_size, seq_len, num_patches, num_levels, dim = x.shape
@@ -293,8 +307,11 @@ class LearnedQueryPool(nn.Module):
         else:
             raise ValueError(f"Expected [B, S, P, D] or [B, S, P, L, D], got shape={tuple(x.shape)}")
 
-        q = self.query.unsqueeze(0).expand(kv.shape[0], -1, -1)
-        out, _ = self.attn(q, kv, kv, need_weights=False)
+        if os.environ.get("DGGT_DEVICE_BACKEND", "").strip().lower() == "ppu":
+            out = self._forward_ppu(kv)
+        else:
+            q = self.query.unsqueeze(0).expand(kv.shape[0], -1, -1)
+            out, _ = self.attn(q, kv, kv, need_weights=False)
         out = self.norm(out)
         out = out.reshape(batch_size, seq_len, num_patches, -1, dim)
         if out.shape[-2] == 1:

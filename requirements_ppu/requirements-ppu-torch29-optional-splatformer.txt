@@ -1,0 +1,11 @@
+# Optional PPU wheels for dggt/splatformer.
+#
+# The current VGGT path has splatformer imports commented out, so do not install
+# this file unless you re-enable dggt/splatformer. Install from the Alibaba PPU
+# index only:
+#   python -m pip install --index-url "${PPU_INDEX_URL}" -r requirements-ppu-torch29-optional-splatformer.txt
+
+torch_scatter==2.1.2
+cumm-cu129==0.8.1
+spconv-cu129==2.3.6
+

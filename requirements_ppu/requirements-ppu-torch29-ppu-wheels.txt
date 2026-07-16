@@ -1,0 +1,22 @@
+# Alibaba ZHENWU PPU-ZW810E / PPU SDK 2.x / torch 2.9 stack.
+#
+# Install this file from the Alibaba PPU index, not from PyPI:
+#   python -m pip install --index-url "${PPU_INDEX_URL}" -r requirements-ppu-torch29-ppu-wheels.txt
+#
+# Default PPU index:
+#   https://aiext-pypi.mirrors.aliyuncs.com/pg1-pip/pypi_index/simple/
+#
+# This file assumes the PPU base environment already provides torch 2.9.
+# Do not reinstall torch here: Alibaba PPU images ship patched torch builds
+# with local version suffixes that vary by image/SDK. The installer script
+# validates torch before installing these torch-bound wheels.
+#
+# Keep these torch-bound wheels together. They must match the PPU torch 2.9
+# runtime; using upstream CUDA/NVIDIA wheels for gsplat/torchvision/torchaudio
+# will usually import but fail at runtime on PPU.
+torchvision==0.24.0
+torchaudio==2.9.0
+triton==3.5.0
+
+# PPU-adapted binary packages used by DGGT.
+gsplat==1.5.3
