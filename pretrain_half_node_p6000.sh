@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export WANDB_API_KEY="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"
 set -euo pipefail
 
 umask 000

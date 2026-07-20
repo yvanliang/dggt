@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export WANDB_API_KEY="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"
 set -Eeuo pipefail
 
 trap 'rc=$?; echo "[错误] 命令失败：line ${LINENO}: ${BASH_COMMAND}，exit_code=${rc}" >&2' ERR
@@ -6,16 +7,16 @@ trap 'rc=$?; echo "[错误] 命令失败：line ${LINENO}: ${BASH_COMMAND}，exi
 # ============================================================
 # 使用方式
 #   在主节点 A 上执行：
-#     bash pretrain_two_nodes.sh
+#     bash pretrain_three_nodes.sh
 #
 # 脚本会：
-#   1. 检查主节点 A 的文件、Python、PyTorch、GPU、网卡和 IB；
-#   2. 通过 SSH 检查副节点 B；
-#   3. 先在 B 上启动 node_rank=1；
-#   4. 再在 A 上启动 node_rank=0。
+#   1. 检查主节点 26 的文件、Python、PyTorch、GPU、网卡和 IB；
+#   2. 通过 SSH 检查 25、31；
+#   3. 先启动 worker ranks 1、2；
+#   4. 再在 26 上启动 node_rank=0。
 #
 # 注意：
-#   - 两台机器上的项目、数据、环境和模型路径统一通过 /home/wuzn/liangyy 访问；
+#   - 三台机器上的项目、数据、环境和模型路径统一通过 /home/wuzn/liangyy 访问；
 #   - 不执行 conda activate；
 #   - 始终使用 CONDA_ENV/bin/python，避免激活到其他同名环境。
 # ============================================================
@@ -23,20 +24,24 @@ trap 'rc=$?; echo "[错误] 命令失败：line ${LINENO}: ${BASH_COMMAND}，exi
 MODE="${1:---launch}"
 
 # ============================================================
-# 分布式配置：2 台机器 × 每台 8 GPU
+# 分布式配置：3 台机器 × 每台 8 GPU
 # ============================================================
-MASTER_ADDR="10.199.7.31"
+MASTER_ADDR="10.199.7.26"
 MASTER_PORT="22229"
 
-NNODES=2
+NNODES=3
 NPROC_PER_NODE=8
 
 MASTER_RANK=0
-WORKER_RANK=1
-
-WORKER_HOST="10.199.7.30"
 WORKER_USER="wuzn"
 SSH_PORT=2288
+
+NODE_HOSTS=(
+    "10.199.7.26"
+    "10.199.7.25"
+    "10.199.7.31"
+)
+WORKER_RANKS=(1 2)
 
 # ============================================================
 # 项目与 Python 环境
@@ -50,12 +55,12 @@ CONDA_ENV="${CONDA_ENV:-${CONDA_ROOT}/envs/dggt}"
 PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV}/bin/python}"
 
 # 远端 SSH 始终执行 canonical 项目路径下的脚本。这样即使主节点从
-# /mnt/vol1/liangyy_workspace/... 启动，也不会把 /mnt/vol1 前缀传给副节点。
-SCRIPT_PATH="${SCRIPT_PATH:-${PROJECT_ROOT}/pretrain_two_nodes.sh}"
+# /mnt/vol1/liangyy_workspace/... 启动，也不会把 /mnt/vol1 前缀传给 worker。
+SCRIPT_PATH="${SCRIPT_PATH:-${PROJECT_ROOT}/pretrain_three_nodes.sh}"
 
 # ============================================================
 # 数据与模型路径
-# 要求两台服务器上这些路径均存在
+# 要求三台服务器上这些路径均存在
 # ============================================================
 WAYMO_DGGT_ROOT="${DATASET_ROOT}/training"
 WAYMO_DGGT_VAL_ROOT="${DATASET_ROOT}/validation"
@@ -66,9 +71,9 @@ SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${LIANGYY_ROOT}/model/Qwen/Qwen3-0.6B}"
 
-# 双机训练使用独立目录，避免覆盖单机训练的 checkpoint、验证结果和状态文件。
-LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_two_nodes"
-LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/distributed_launch"
+# 三机训练使用独立目录，避免覆盖其他训练的 checkpoint、验证结果和状态文件。
+LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_three_nodes"
+LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/distributed_launch_three_nodes"
 
 # 以下变量在原脚本中定义，但当前训练命令没有使用。
 # 如果 train_scene_flow_pretrain.py 确实需要它们，请按实际参数名加入 TRAIN_ARGS。
@@ -82,7 +87,7 @@ SCENE_FLOW_VAL_MANIFEST="${DATASET_ROOT}/waymo_edit_cache/manifests/validation/v
 # 修改 BATCH_SIZE_PER_GPU 或 GRAD_ACCUM_STEPS 后，以启动时打印的 GLOBAL_BATCH_SIZE 为准。
 # ============================================================
 BATCH_SIZE_PER_GPU=1
-GRAD_ACCUM_STEPS=4
+GRAD_ACCUM_STEPS=3
 NUM_WORKERS=4
 PREFETCH_FACTOR=2
 
@@ -97,7 +102,7 @@ ASSET_CONTROL_GUIDANCE_SCALE=1.0
 CAMERA_GUIDANCE_SCALE=1.0
 VAL_GUIDANCE_SCALES="1.0,2.0,4.0"
 
-WANDB_NAME="scene_flow_pretrain_waymo_2node_16gpu_b4_gb64_lr1e4_optcond"
+WANDB_NAME="scene_flow_pretrain_waymo_3node_24gpu_b3_gb72_lr1e4_optcond"
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
 
 # ============================================================
@@ -105,12 +110,18 @@ GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_S
 # ============================================================
 
 # 用于 torchrun rendezvous、Gloo 和 NCCL bootstrap。
-# 默认优先 bond4；如果当前节点没有该网卡，启动时会按到对端 IP 的路由自动选择。
-SOCKET_IFNAME="${SOCKET_IFNAME:-bond4}"
+# 26/25/31 的管理/启动网络通常走 bond0；如果当前节点没有
+# 指定网卡，启动时会按到其它节点 IP 的路由自动选择。
+SOCKET_IFNAME="${SOCKET_IFNAME:-bond0}"
 
-# 大数据通信使用两条 200G HDR InfiniBand。
-# 两台机器上的 HCA 名称都必须为 mlx5_4、mlx5_5。
-NCCL_IB_HCA_VALUE="=mlx5_4:1,mlx5_5:1"
+# 大数据通信优先使用 200G HDR InfiniBand。auto 模式会在三台机器之间
+# 选择共同可用的 mlx5_4、mlx5_5；两条都可用时使用双 HCA。
+NCCL_IB_HCA_VALUE="${NCCL_IB_HCA_VALUE:-=mlx5_4:1,mlx5_5:1}"
+
+# auto: 启动时同时检查 26/25/31 的 mlx5_4/5，选择共同可用的最快方案。
+# ib:   强制要求本节点 NCCL_IB_HCA_VALUE 中指定的 HCA 可用，否则检查失败。
+# socket: 强制禁用 IB，只走 SOCKET_IFNAME。
+NETWORK_MODE="${NETWORK_MODE:-auto}"
 
 # ============================================================
 # SSH 公共参数
@@ -142,9 +153,9 @@ detect_socket_ifname() {
         echo "[警告] 当前节点不存在网卡 ${requested}，改为自动检测 socket 网卡。" >&2
     fi
 
-    # 优先使用系统路由表选择到对端 IP 的网卡。主节点到 WORKER_HOST，
-    # 副节点到 MASTER_ADDR；如果某个目标是本机导致 dev=lo，则跳过。
-    for target in "${MASTER_ADDR}" "${WORKER_HOST}"; do
+    # 优先使用系统路由表选择到其它节点 IP 的网卡；如果某个目标是本机
+    # 导致 dev=lo，则跳过。
+    for target in "${NODE_HOSTS[@]}"; do
         dev="$(ip -o -4 route get "${target}" 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
         if [[ -n "${dev}" && "${dev}" != "lo" && -d "/sys/class/net/${dev}" ]]; then
             echo "${dev}"
@@ -164,6 +175,225 @@ detect_socket_ifname() {
     echo "       当前网卡列表：" >&2
     ip -br link >&2 || true
     return 1
+}
+
+node_host_for_rank() {
+    local rank="$1"
+
+    if [[ ! "${rank}" =~ ^[0-9]+$ ]] || (( rank < 0 || rank >= NNODES )); then
+        echo "[错误] node_rank 无效：${rank}" >&2
+        return 1
+    fi
+
+    echo "${NODE_HOSTS[rank]}"
+}
+
+ib_hca_port_ready() {
+    local hca="$1"
+    local port="${2:-1}"
+    local base="/sys/class/infiniband/${hca}/ports/${port}"
+    local state
+    local phys
+    local rate
+
+    [[ -d "${base}" ]] || return 1
+
+    state="$(cat "${base}/state" 2>/dev/null || true)"
+    phys="$(cat "${base}/phys_state" 2>/dev/null || true)"
+    rate="$(cat "${base}/rate" 2>/dev/null || true)"
+
+    [[ "${state}" == *ACTIVE* ]] || return 1
+    [[ "${phys}" == *LinkUp* || "${phys}" == *LINK_UP* ]] || return 1
+    [[ "${rate}" == *"200 Gb/sec"* ]] || return 1
+}
+
+ib_ready() {
+    ib_hca_port_ready mlx5_4 1 && ib_hca_port_ready mlx5_5 1
+}
+
+ready_ib_hcas() {
+    local hca
+    local ready=()
+
+    for hca in mlx5_4 mlx5_5; do
+        if ib_hca_port_ready "${hca}" 1; then
+            ready+=("${hca}")
+        fi
+    done
+
+    echo "${ready[*]}"
+}
+
+required_ib_hcas() {
+    local spec="${NCCL_IB_HCA_VALUE}"
+    local item
+    local hca
+    local hcas=()
+    local -a items
+
+    spec="${spec#=}"
+    IFS=',' read -r -a items <<< "${spec}"
+    for item in "${items[@]}"; do
+        hca="${item%%:*}"
+        hca="${hca#=}"
+        if [[ -n "${hca}" ]]; then
+            hcas+=("${hca}")
+        fi
+    done
+
+    echo "${hcas[*]}"
+}
+
+required_ib_ready() {
+    local hca
+    local hcas
+
+    read -r -a hcas <<< "$(required_ib_hcas)"
+    if [[ "${#hcas[@]}" -eq 0 ]]; then
+        return 1
+    fi
+
+    for hca in "${hcas[@]}"; do
+        ib_hca_port_ready "${hca}" 1 || return 1
+    done
+}
+
+hca_list_contains() {
+    local needle="$1"
+    shift
+    local hca
+
+    for hca in "$@"; do
+        if [[ "${hca}" == "${needle}" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+intersect_hca_lists() {
+    local current_string="$1"
+    local next_string="$2"
+    local current
+    local next
+    local hca
+    local intersection=()
+
+    read -r -a current <<< "${current_string}"
+    read -r -a next <<< "${next_string}"
+
+    for hca in "${current[@]}"; do
+        if hca_list_contains "${hca}" "${next[@]}"; then
+            intersection+=("${hca}")
+        fi
+    done
+
+    echo "${intersection[*]}"
+}
+
+hca_value_from_list() {
+    local hcas=("$@")
+    local value=""
+    local hca
+
+    for hca in "${hcas[@]}"; do
+        if [[ -z "${value}" ]]; then
+            value="=${hca}:1"
+        else
+            value="${value},${hca}:1"
+        fi
+    done
+
+    echo "${value}"
+}
+
+print_ib_status() {
+    local hca
+    local port
+    local base
+
+    for hca in mlx5_4 mlx5_5; do
+        if [[ ! -d "/sys/class/infiniband/${hca}" ]]; then
+            echo "[WARN] IB HCA ${hca}: missing"
+            continue
+        fi
+
+        for base in "/sys/class/infiniband/${hca}/ports/"*; do
+            [[ -d "${base}" ]] || continue
+            port="${base##*/}"
+            echo "[INFO] ${hca}:${port} state=$(cat "${base}/state" 2>/dev/null || echo NA) phys=$(cat "${base}/phys_state" 2>/dev/null || echo NA) rate=$(cat "${base}/rate" 2>/dev/null || echo NA) layer=$(cat "${base}/link_layer" 2>/dev/null || echo NA)"
+        done
+    done
+}
+
+resolve_network_mode() {
+    case "${NETWORK_MODE}" in
+        ib)
+            if ! required_ib_ready; then
+                echo "[错误] NETWORK_MODE=ib，但本节点未满足 NCCL_IB_HCA_VALUE=${NCCL_IB_HCA_VALUE} 要求。" >&2
+                print_ib_status >&2
+                return 1
+            fi
+            echo "ib"
+            ;;
+        socket)
+            echo "socket"
+            ;;
+        auto)
+            if ib_ready; then
+                echo "ib"
+            else
+                echo "socket"
+            fi
+            ;;
+        *)
+            echo "[错误] NETWORK_MODE 只能是 auto、ib 或 socket，当前为：${NETWORK_MODE}" >&2
+            return 1
+            ;;
+    esac
+}
+
+select_launch_network_mode() {
+    local rank
+    local host
+    local common_hcas
+    local remote_hcas
+    local hcas
+    local hca_value
+
+    case "${NETWORK_MODE}" in
+        ib)
+            echo "ib ${NCCL_IB_HCA_VALUE}"
+            return 0
+            ;;
+        socket)
+            echo "socket -"
+            return 0
+            ;;
+        auto)
+            common_hcas="$(ready_ib_hcas)"
+
+            for rank in "${WORKER_RANKS[@]}"; do
+                host="$(node_host_for_rank "${rank}")"
+                remote_hcas="$(ssh "${SSH_OPTS[@]}" "${WORKER_USER}@${host}" \
+                    "test -r '${SCRIPT_PATH}' && bash '${SCRIPT_PATH}' --print-ready-ib-hcas" 2>/dev/null || true)"
+                common_hcas="$(intersect_hca_lists "${common_hcas}" "${remote_hcas}")"
+            done
+
+            read -r -a hcas <<< "${common_hcas}"
+            if [[ "${#hcas[@]}" -gt 0 ]]; then
+                hca_value="$(hca_value_from_list "${hcas[@]}")"
+                echo "ib ${hca_value}"
+            else
+                echo "socket -"
+            fi
+            ;;
+        *)
+            echo "[错误] NETWORK_MODE 只能是 auto、ib 或 socket，当前为：${NETWORK_MODE}" >&2
+            return 1
+            ;;
+    esac
 }
 
 setup_common_env() {
@@ -212,9 +442,16 @@ setup_common_env() {
     export NCCL_SOCKET_IFNAME="=${RUNTIME_SOCKET_IFNAME}"
     export NCCL_SOCKET_FAMILY="AF_INET"
 
-    # 跨节点张量通信使用双 HDR IB。
-    export NCCL_IB_DISABLE=0
-    export NCCL_IB_HCA="${NCCL_IB_HCA_VALUE}"
+    # 跨节点张量通信优先使用双 HDR IB；如果任一节点 mlx5_4/5 未恢复，则自动退回 socket。
+    RUNTIME_NETWORK_MODE="$(resolve_network_mode)"
+    export RUNTIME_NETWORK_MODE
+    if [[ "${RUNTIME_NETWORK_MODE}" == "ib" ]]; then
+        export NCCL_IB_DISABLE=0
+        export NCCL_IB_HCA="${NCCL_IB_HCA_VALUE}"
+    else
+        export NCCL_IB_DISABLE=1
+        unset NCCL_IB_HCA || true
+    fi
 
     # 首次启动用于确认 NCCL 是否走 IB；稳定后可改为 WARN。
     export NCCL_DEBUG=WARN  # export NCCL_DEBUG=INFO
@@ -282,8 +519,12 @@ check_required_paths() {
     check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
 
     echo "[OK] RUNTIME_SOCKET_IFNAME: ${RUNTIME_SOCKET_IFNAME:-未设置}"
-    check_dir "IB HCA mlx5_4" /sys/class/infiniband/mlx5_4
-    check_dir "IB HCA mlx5_5" /sys/class/infiniband/mlx5_5
+    echo "[OK] RUNTIME_NETWORK_MODE: ${RUNTIME_NETWORK_MODE:-未设置}"
+    echo "[OK] NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-未设置}"
+    if [[ "${RUNTIME_NETWORK_MODE:-}" == "ib" ]]; then
+        echo "[OK] NCCL_IB_HCA: ${NCCL_IB_HCA:-未设置}"
+    fi
+    print_ib_status
 
     if ! mkdir -p "${LOG_DIR}" "${LAUNCH_LOG_DIR}"; then
         echo "[错误] 创建日志目录失败：" >&2
@@ -337,7 +578,7 @@ preflight_check() {
 }
 
 # ============================================================
-# 训练参数：主副节点共用同一份，避免两边参数不一致
+# 训练参数：三个节点共用同一份，避免各节点参数不一致
 # ============================================================
 build_train_args() {
     TRAIN_ARGS=(
@@ -347,6 +588,7 @@ build_train_args() {
         --dggt_ckpt_path "${DGGT_CKPT}"
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
+        --resume_path "${LOG_DIR}/ckpt/pretrain_step016000.pt"
         --log_dir "${LOG_DIR}"
         --caption_root "${SCENE_CAPTION_ROOT}"
         --val_caption_root "${SCENE_CAPTION_VAL_ROOT}"
@@ -405,6 +647,8 @@ build_train_args() {
         --wandb
         --wandb_project dggt-flow
         --wandb_name "${WANDB_NAME}"
+        --wandb_run_id "0bmu7zky"
+        --wandb_resume must
     )
 }
 
@@ -490,25 +734,61 @@ stop_node() {
 # ============================================================
 # 日志与 PID 文件
 # ============================================================
-MASTER_LOG="${LAUNCH_LOG_DIR}/master_rank0.log"
-WORKER_LOG="${LAUNCH_LOG_DIR}/worker_rank1.log"
-MASTER_PID_FILE="${LAUNCH_LOG_DIR}/master_rank0.pid"
-WORKER_PID_FILE="${LAUNCH_LOG_DIR}/worker_rank1.pid"
+log_file_for_rank() {
+    local rank="$1"
+    echo "${LAUNCH_LOG_DIR}/node_rank${rank}.log"
+}
+
+pid_file_for_rank() {
+    local rank="$1"
+    echo "${LAUNCH_LOG_DIR}/node_rank${rank}.pid"
+}
+
+stop_remote_worker() {
+    local rank="$1"
+    local host
+
+    host="$(node_host_for_rank "${rank}")"
+    ssh "${SSH_OPTS[@]}" "${WORKER_USER}@${host}" \
+        "NETWORK_MODE='${NETWORK_MODE}' NCCL_IB_HCA_VALUE='${NCCL_IB_HCA_VALUE}' bash '${SCRIPT_PATH}' --stop-worker '${rank}'" || true
+}
+
+MASTER_LOG="$(log_file_for_rank "${MASTER_RANK}")"
+MASTER_PID_FILE="$(pid_file_for_rank "${MASTER_RANK}")"
 
 # ============================================================
 # 运行模式
 # ============================================================
 case "${MODE}" in
+    --print-ready-ib-hcas)
+        ready_ib_hcas
+        exit 0
+        ;;
+
+    --check-ib-ready)
+        if required_ib_ready; then
+            echo "[OK] NCCL_IB_HCA_VALUE=${NCCL_IB_HCA_VALUE} 中指定的 HCA 已达到 ACTIVE/LinkUp/200G。"
+            exit 0
+        fi
+        echo "[WARN] NCCL_IB_HCA_VALUE=${NCCL_IB_HCA_VALUE} 中指定的 HCA 未全部达到 ACTIVE/LinkUp/200G。"
+        print_ib_status
+        exit 1
+        ;;
+
     --check-worker)
-        preflight_check "副节点 ${WORKER_HOST}"
+        NODE_RANK="${2:?用法：bash ${0} --check-worker <node_rank>}"
+        NODE_HOST="$(node_host_for_rank "${NODE_RANK}")"
+        preflight_check "节点 rank ${NODE_RANK} ${NODE_HOST}"
         ;;
 
     --worker)
+        NODE_RANK="${2:?用法：bash ${0} --worker <node_rank>}"
+        NODE_HOST="$(node_host_for_rank "${NODE_RANK}")"
         launch_node \
-            "${WORKER_RANK}" \
-            "副节点 ${WORKER_HOST}" \
-            "${WORKER_LOG}" \
-            "${WORKER_PID_FILE}"
+            "${NODE_RANK}" \
+            "节点 rank ${NODE_RANK} ${NODE_HOST}" \
+            "$(log_file_for_rank "${NODE_RANK}")" \
+            "$(pid_file_for_rank "${NODE_RANK}")"
         ;;
 
     --master)
@@ -520,7 +800,9 @@ case "${MODE}" in
         ;;
 
     --stop-worker)
-        stop_node "副节点 ${WORKER_HOST}" "${WORKER_PID_FILE}"
+        NODE_RANK="${2:?用法：bash ${0} --stop-worker <node_rank>}"
+        NODE_HOST="$(node_host_for_rank "${NODE_RANK}")"
+        stop_node "节点 rank ${NODE_RANK} ${NODE_HOST}" "$(pid_file_for_rank "${NODE_RANK}")"
         ;;
 
     --stop-master)
@@ -528,12 +810,24 @@ case "${MODE}" in
         ;;
 
     --launch)
+        read -r LAUNCH_NETWORK_MODE LAUNCH_NCCL_IB_HCA_VALUE <<< "$(select_launch_network_mode)"
+        export NETWORK_MODE="${LAUNCH_NETWORK_MODE}"
+        if [[ "${NETWORK_MODE}" == "ib" ]]; then
+            export NCCL_IB_HCA_VALUE="${LAUNCH_NCCL_IB_HCA_VALUE}"
+        fi
+        LAUNCHED_WORKER_RANKS=()
+
         echo "============================================================"
-        echo "2 节点 × 8 GPU 分布式训练启动器"
+        echo "3 节点 × 8 GPU 分布式训练启动器"
         echo "脚本路径：${SCRIPT_PATH}"
         echo "主节点：${MASTER_ADDR}, rank=${MASTER_RANK}"
-        echo "副节点：${WORKER_USER}@${WORKER_HOST}:${SSH_PORT}, rank=${WORKER_RANK}"
+        echo "节点列表：${NODE_HOSTS[*]}"
+        echo "worker ranks：${WORKER_RANKS[*]}"
         echo "Python 环境：${CONDA_ENV}"
+        echo "网络模式：${NETWORK_MODE} (ib=共同可用 mlx5 HDR, socket=按路由选择 bond0/bond4)"
+        if [[ "${NETWORK_MODE}" == "ib" ]]; then
+            echo "NCCL_IB_HCA：${NCCL_IB_HCA_VALUE}"
+        fi
         echo "全局 batch size：${GLOBAL_BATCH_SIZE}"
         echo "============================================================"
 
@@ -542,16 +836,32 @@ case "${MODE}" in
         preflight_check "主节点 ${MASTER_ADDR}"
 
         echo
-        echo "=== 2/4 检查副节点 SSH 和运行环境 ==="
-        ssh "${SSH_OPTS[@]}" \
-            "${WORKER_USER}@${WORKER_HOST}" \
-            "test -r '${SCRIPT_PATH}' && bash '${SCRIPT_PATH}' --check-worker"
+        echo "=== 2/4 检查 worker 节点 SSH 和运行环境 ==="
+        for rank in "${WORKER_RANKS[@]}"; do
+            host="$(node_host_for_rank "${rank}")"
+            echo "[rank ${rank}] 检查 ${host}"
+            ssh "${SSH_OPTS[@]}" \
+                "${WORKER_USER}@${host}" \
+                "test -r '${SCRIPT_PATH}' && NETWORK_MODE='${NETWORK_MODE}' NCCL_IB_HCA_VALUE='${NCCL_IB_HCA_VALUE}' bash '${SCRIPT_PATH}' --check-worker '${rank}'"
+        done
 
         echo
-        echo "=== 3/4 启动副节点 rank ${WORKER_RANK} ==="
-        ssh "${SSH_OPTS[@]}" \
-            "${WORKER_USER}@${WORKER_HOST}" \
-            "bash '${SCRIPT_PATH}' --worker"
+        echo "=== 3/4 启动 worker ranks ${WORKER_RANKS[*]} ==="
+        for rank in "${WORKER_RANKS[@]}"; do
+            host="$(node_host_for_rank "${rank}")"
+            echo "[rank ${rank}] 启动 ${host}"
+            if ssh "${SSH_OPTS[@]}" \
+                "${WORKER_USER}@${host}" \
+                "NETWORK_MODE='${NETWORK_MODE}' NCCL_IB_HCA_VALUE='${NCCL_IB_HCA_VALUE}' bash '${SCRIPT_PATH}' --worker '${rank}'"; then
+                LAUNCHED_WORKER_RANKS+=("${rank}")
+            else
+                echo "worker rank ${rank} 启动失败，尝试终止已启动 worker……" >&2
+                for launched_rank in "${LAUNCHED_WORKER_RANKS[@]}"; do
+                    stop_remote_worker "${launched_rank}"
+                done
+                exit 1
+            fi
+        done
 
         echo
         echo "=== 4/4 启动主节点 rank ${MASTER_RANK} ==="
@@ -561,36 +871,43 @@ case "${MODE}" in
             "${MASTER_LOG}" \
             "${MASTER_PID_FILE}"; then
 
-            echo "主节点启动失败，尝试终止副节点进程……" >&2
-            ssh "${SSH_OPTS[@]}" \
-                "${WORKER_USER}@${WORKER_HOST}" \
-                "bash '${SCRIPT_PATH}' --stop-worker" || true
+            echo "主节点启动失败，尝试终止 worker 进程……" >&2
+            for launched_rank in "${LAUNCHED_WORKER_RANKS[@]}"; do
+                stop_remote_worker "${launched_rank}"
+            done
             exit 1
         fi
 
         echo
         echo "============================================================"
-        echo "2 节点 16 GPU 训练已启动"
+        echo "3 节点 24 GPU 训练已启动"
         echo "主节点日志：${MASTER_LOG}"
-        echo "副节点日志：${WORKER_LOG}"
         echo "主节点 PID 文件：${MASTER_PID_FILE}"
-        echo "副节点 PID 文件：${WORKER_PID_FILE}"
+        echo "网络模式：${NETWORK_MODE}"
+        if [[ "${NETWORK_MODE}" == "ib" ]]; then
+            echo "NCCL_IB_HCA：${NCCL_IB_HCA_VALUE}"
+        fi
+        for rank in "${WORKER_RANKS[@]}"; do
+            echo "worker rank ${rank} 日志：$(log_file_for_rank "${rank}")"
+            echo "worker rank ${rank} PID 文件：$(pid_file_for_rank "${rank}")"
+        done
         echo "全局 batch size：${GLOBAL_BATCH_SIZE} = ${NNODES} nodes × ${NPROC_PER_NODE} gpu/node × ${BATCH_SIZE_PER_GPU} batch/gpu × ${GRAD_ACCUM_STEPS} accum"
         echo
         echo "查看日志："
-        echo "  tail -f '${MASTER_LOG}'"
-        echo "  tail -f '${WORKER_LOG}'"
+        echo "  tail -f '${LAUNCH_LOG_DIR}'/node_rank*.log"
         echo "============================================================"
         ;;
 
     *)
         echo "未知参数：${MODE}" >&2
         echo "可用参数：" >&2
-        echo "  --launch        从主节点启动两机训练（默认）" >&2
-        echo "  --check-worker  只检查当前节点" >&2
-        echo "  --worker        在当前节点启动 worker rank" >&2
+        echo "  --launch        从主节点启动三机训练（默认）" >&2
+        echo "  --print-ready-ib-hcas 打印当前节点可用 mlx5_4/5 HCA 名称" >&2
+        echo "  --check-ib-ready 只检查当前节点 mlx5_4/5 是否达到 ACTIVE/LinkUp/200G" >&2
+        echo "  --check-worker <rank> 只检查当前节点" >&2
+        echo "  --worker <rank>        在当前节点启动 worker rank" >&2
         echo "  --master        在当前节点启动 master rank" >&2
-        echo "  --stop-worker   停止当前节点的 worker" >&2
+        echo "  --stop-worker <rank>   停止当前节点的 worker" >&2
         echo "  --stop-master   停止当前节点的 master" >&2
         exit 2
         ;;

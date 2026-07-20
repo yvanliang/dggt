@@ -16,9 +16,9 @@ NPROC_PER_NODE=8
 # ============================================================
 # Project and environment
 # ============================================================
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/vol1/liangyy_workspace/dggt}"
-DATASET_ROOT="${DATASET_ROOT:-/mnt/vol1/liangyy_workspace/waymo_processed_dggt}"
-CONDA_SH="${CONDA_SH:-/mnt/vol1/liangyy_workspace/miniconda3/etc/profile.d/conda.sh}"
+PROJECT_ROOT="${PROJECT_ROOT:-/mnt/data4/liangyy_workspace/dggt}"
+DATASET_ROOT="${DATASET_ROOT:-/mnt/data4/liangyy_workspace/waymo_processed_dggt}"
+CONDA_SH="${CONDA_SH:-/home/wuzn/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-dggt}"
 
 # ============================================================
@@ -31,7 +31,7 @@ TOKENIZER_CKPT="${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_st
 FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v2.pt"
 SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
-QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-/mnt/vol1/liangyy_workspace/model/Qwen/Qwen3-0.6B}"
+QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-/mnt/data4/liangyy_workspace/model/Qwen/Qwen3-0.6B}"
 
 LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_two_nodes"
 LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/single_node_launch"
@@ -149,6 +149,7 @@ build_train_args() {
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
         --log_dir "${LOG_DIR}"
+        --resume_path "${LOG_DIR}/ckpt/pretrain_step016000.pt"
         --caption_root "${SCENE_CAPTION_ROOT}"
         --val_caption_root "${SCENE_CAPTION_VAL_ROOT}"
         --text_encoder_path "${QWEN_TEXT_ENCODER}"
@@ -172,7 +173,7 @@ build_train_args() {
         --ema_decay 0.9995
         --warmup_steps 4000
         --max_steps 200000
-        --save_every 2000
+        --save_every 1000
         --shift 10.0
         --weighting_scheme waver
         --mode_scale 1.29
@@ -206,6 +207,8 @@ build_train_args() {
         --wandb
         --wandb_project dggt-flow
         --wandb_name "${WANDB_NAME}"
+        --wandb_run_id "0bmu7zky"
+        --wandb_resume must
     )
 }
 
