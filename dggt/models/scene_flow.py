@@ -28,6 +28,11 @@ from dggt.utils.camera_generation import (
     denormalize_camera_state,
     normalize_camera_state,
 )
+from dggt.utils.factorized_asset_condition import (
+    FACTORIZED_ASSET_CONDITION_VERSION,
+    PLACEMENT_STATE_DIM,
+    FactorizedAssetCondition,
+)
 
 
 def _normalize_patch_grid(
@@ -773,6 +778,10 @@ class RAEVideoSceneFlow(nn.Module):
         camera_condition_representation: str = CAMERA_CONDITION_REPRESENTATION,
         mask_compositing_version: str = "soft_opacity_premultiplied_v2",
         asset_position_mode: str = "localized",
+        asset_condition_protocol: str = "legacy_compatible",
+        factorized_asset_condition_version: str = FACTORIZED_ASSET_CONDITION_VERSION,
+        placement_mean: tuple[float, ...] | list[float] | None = None,
+        placement_std: tuple[float, ...] | list[float] | None = None,
         sky_token_dim: int = 3,
         sky_grid: tuple[int, int] | list[int] | None = (16, 32),
         max_sky_tokens: int = 512,
@@ -837,6 +846,33 @@ class RAEVideoSceneFlow(nn.Module):
             raise ValueError(f"unsupported camera generation representation {camera_generation_representation!r}")
         if str(asset_position_mode) not in ("localized", "canonical"):
             raise ValueError("asset_position_mode must be 'localized' or 'canonical'")
+        if str(asset_condition_protocol) not in ("legacy_compatible", "factorized_v1"):
+            raise ValueError(
+                "asset_condition_protocol must be 'legacy_compatible' or 'factorized_v1'"
+            )
+        if str(factorized_asset_condition_version) != FACTORIZED_ASSET_CONDITION_VERSION:
+            raise ValueError(
+                "unsupported factorized asset condition version "
+                f"{factorized_asset_condition_version!r}"
+            )
+        placement_mean_i = (
+            tuple(0.0 for _ in range(PLACEMENT_STATE_DIM))
+            if placement_mean is None
+            else tuple(float(value) for value in placement_mean)
+        )
+        placement_std_i = (
+            tuple(1.0 for _ in range(PLACEMENT_STATE_DIM))
+            if placement_std is None
+            else tuple(float(value) for value in placement_std)
+        )
+        if len(placement_mean_i) != PLACEMENT_STATE_DIM or len(placement_std_i) != PLACEMENT_STATE_DIM:
+            raise ValueError(
+                f"placement_mean/std must each have {PLACEMENT_STATE_DIM} values"
+            )
+        if any(not math.isfinite(value) for value in placement_mean_i + placement_std_i):
+            raise ValueError("placement_mean/std must be finite")
+        if any(value <= 0.0 for value in placement_std_i):
+            raise ValueError("placement_std entries must be positive")
         if int(max_asset_tokens) <= 0:
             raise ValueError(f"max_asset_tokens must be positive, got {max_asset_tokens}")
         sky_grid_t = None
@@ -947,6 +983,10 @@ class RAEVideoSceneFlow(nn.Module):
             camera_condition_representation=str(camera_condition_representation),
             mask_compositing_version=str(mask_compositing_version),
             asset_position_mode=str(asset_position_mode),
+            asset_condition_protocol=str(asset_condition_protocol),
+            factorized_asset_condition_version=FACTORIZED_ASSET_CONDITION_VERSION,
+            placement_mean=placement_mean_i,
+            placement_std=placement_std_i,
             sky_token_dim=int(sky_token_dim),
             sky_grid=sky_grid_t,
             max_sky_tokens=int(max_sky_tokens),
@@ -987,6 +1027,12 @@ class RAEVideoSceneFlow(nn.Module):
         self.text_proj = nn.Linear(int(qwen_dim), hidden_size)
         self.asset_latent_norm = RMSNorm(int(out_channels), eps=float(eps))
         self.asset_latent_proj = nn.Linear(int(out_channels), hidden_size)
+        self.asset_placement_mlp = nn.Sequential(
+            nn.Linear(PLACEMENT_STATE_DIM, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.asset_summary_appearance_proj = nn.Linear(hidden_size, hidden_size)
         self.asset_slot_embed = nn.Embedding(max(1, int(max_assets)), hidden_size)
         # Kept under the legacy parameter name so existing SceneFlow checkpoints
         # and optimizer states remain strictly loadable.  Its rows are reduced to
@@ -1077,6 +1123,8 @@ class RAEVideoSceneFlow(nn.Module):
 
         self.register_buffer("mu_z", torch.zeros(int(out_channels)))
         self.register_buffer("sigma_z", torch.ones(int(out_channels)))
+        self.register_buffer("placement_mean", torch.tensor(placement_mean_i, dtype=torch.float32))
+        self.register_buffer("placement_std", torch.tensor(placement_std_i, dtype=torch.float32))
         self.register_buffer("camera_anchor_mean", torch.zeros(int(camera_gen_dim)))
         self.register_buffer("camera_anchor_std", torch.ones(int(camera_gen_dim)))
         self.register_buffer("camera_delta_mean", torch.zeros(int(camera_gen_dim)))
@@ -1108,6 +1156,7 @@ class RAEVideoSceneFlow(nn.Module):
         for module in (
             self.text_proj,
             self.asset_latent_proj,
+            self.asset_summary_appearance_proj,
             self.control_proj,
             self.asset_direct_proj,
             self.asset_encoded_proj,
@@ -1117,6 +1166,10 @@ class RAEVideoSceneFlow(nn.Module):
         ):
             nn.init.xavier_uniform_(module.weight)
             nn.init.zeros_(module.bias)
+        for module in self.asset_placement_mlp:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
         nn.init.normal_(self.camera_gen_role_embed.weight, std=1.0 / math.sqrt(float(self.config.hidden_size)))
         for module in self.camera_gen_decoder:
             if isinstance(module, nn.Linear):
@@ -1192,6 +1245,18 @@ class RAEVideoSceneFlow(nn.Module):
             key = prefix + param_name
             if key not in state_dict:
                 state_dict[key] = getattr(self, param_name).detach().clone()
+        for name, value in self.state_dict().items():
+            if name.startswith(
+                (
+                    "asset_placement_mlp.",
+                    "asset_summary_appearance_proj.",
+                    "placement_mean",
+                    "placement_std",
+                )
+            ):
+                key = prefix + name
+                if key not in state_dict:
+                    state_dict[key] = value.detach().clone()
         if str(self.config.camera_generation_representation) != CAMERA_GENERATION_REPRESENTATION:
             for name in (
                 "camera_gen_role_embed.weight",
@@ -1352,6 +1417,35 @@ class RAEVideoSceneFlow(nn.Module):
 
     def denormalize(self, z: torch.Tensor) -> torch.Tensor:
         return z * self.sigma_z.to(device=z.device, dtype=z.dtype) + self.mu_z.to(device=z.device, dtype=z.dtype)
+
+    def set_placement_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        mean = torch.as_tensor(mean).float().reshape(-1)
+        std = torch.as_tensor(std).float().reshape(-1)
+        expected = (PLACEMENT_STATE_DIM,)
+        if tuple(mean.shape) != expected or tuple(std.shape) != expected:
+            raise ValueError(f"placement stats must have shape {expected}")
+        if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(std).all()):
+            raise ValueError("placement stats must be finite")
+        if bool((std <= 0.0).any()):
+            raise ValueError("placement std must be positive")
+        self.placement_mean.copy_(mean.to(device=self.placement_mean.device))
+        self.placement_std.copy_(std.to(device=self.placement_std.device))
+        self.config.placement_mean = tuple(float(value) for value in mean.tolist())
+        self.config.placement_std = tuple(float(value) for value in std.tolist())
+
+    def normalize_placement(self, state: torch.Tensor) -> torch.Tensor:
+        if int(state.shape[-1]) != PLACEMENT_STATE_DIM:
+            raise ValueError(
+                f"placement state last dim must be {PLACEMENT_STATE_DIM}, got {state.shape[-1]}"
+            )
+        mean = self.placement_mean.to(device=state.device, dtype=state.dtype)
+        std = self.placement_std.to(device=state.device, dtype=state.dtype).clamp_min(1.0e-6)
+        normalized = (state - mean) / std
+        # Yaw sin/cos and the binary frustum flag retain their natural scales.
+        normalized = normalized.clone()
+        normalized[..., 6:8] = state[..., 6:8]
+        normalized[..., 11] = state[..., 11]
+        return normalized
 
     @staticmethod
     def _key_padding_attention_mask(valid: torch.Tensor, dtype: torch.dtype) -> torch.Tensor | None:
@@ -1769,6 +1863,195 @@ class RAEVideoSceneFlow(nn.Module):
             positions[b, :n] = pos_rows[b][:n].to(device=device, dtype=pos_dtype)
             mask[b, :n] = True
         return tokens, mask, positions
+
+    def _build_factorized_asset_condition(
+        self,
+        condition: FactorizedAssetCondition,
+        *,
+        seq_len: int,
+        num_patches: int,
+        patch_grid: tuple[int, int],
+        asset_condition_kind: Any = None,
+        frame_ids: torch.Tensor | None = None,
+        fps: float | torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Compose appearance values with independent 3D placement and RoPE."""
+        condition.validate()
+        b, k, q, channels = condition.appearance_tokens.shape
+        device = condition.appearance_tokens.device
+        if int(condition.seq_len) != int(seq_len):
+            raise ValueError(
+                f"factorized placement has S={condition.seq_len}, model target has S={seq_len}"
+            )
+        if int(channels) != int(self.config.asset_dim):
+            raise ValueError(
+                f"appearance dim {channels} != asset_dim={self.config.asset_dim}"
+            )
+        if k > int(self.config.max_assets):
+            raise ValueError(
+                f"factorized condition has K={k}, max_assets={self.config.max_assets}"
+            )
+        appearance_mask = condition.appearance_mask.to(device=device, dtype=torch.bool)
+        track_valid = condition.track_valid.to(device=device, dtype=torch.bool)
+        source_valid = appearance_mask.any(dim=-1)
+        track_valid = track_valid & source_valid.unsqueeze(-1)
+        in_frustum = condition.placement_state[..., 11].to(device=device).gt(0.5)
+
+        appearance = self.asset_latent_proj(
+            self.asset_latent_norm(condition.appearance_tokens)
+        )
+        placement = self.asset_placement_mlp(
+            self.normalize_placement(condition.placement_state).to(
+                dtype=self.asset_placement_mlp[0].weight.dtype
+            )
+        ).to(dtype=appearance.dtype)
+        slot_ids = torch.arange(k, device=device, dtype=torch.long)
+        slot = self.asset_slot_embed(slot_ids).to(dtype=appearance.dtype)
+        patch_values = (
+            appearance[:, :, None, :, :]
+            + placement[:, :, :, None, :]
+            + slot[None, :, None, None, :]
+            + self.asset_patch_modality_embed.to(device=device, dtype=appearance.dtype)
+        )
+        appearance_weight = appearance_mask.to(dtype=appearance.dtype)
+        pooled_appearance = (
+            appearance * appearance_weight.unsqueeze(-1)
+        ).sum(dim=2) / appearance_weight.sum(dim=2, keepdim=True).clamp_min(1.0)
+        summary_values = (
+            self.asset_summary_appearance_proj(pooled_appearance)[:, :, None, :]
+            + placement
+            + slot[None, :, None, :]
+            + self.asset_summary_modality_embed.to(device=device, dtype=appearance.dtype)
+        )
+
+        temporal = self._target_position_ids(
+            batch_size=b,
+            seq_len=seq_len,
+            num_patches=num_patches,
+            patch_grid=patch_grid,
+            device=device,
+            frame_ids=frame_ids,
+            fps=fps,
+        ).reshape(b, seq_len, num_patches, 3)[:, :, 0, 0].float()
+        bbox = condition.target_bbox_patch.to(device=device, dtype=torch.float32)
+        uv = condition.canonical_uv.to(device=device, dtype=torch.float32)
+        x0, y0, x1, y1 = bbox.unbind(-1)
+        x = x0[..., None] + uv[:, :, None, :, 0] * (x1 - x0)[..., None]
+        y = y0[..., None] + uv[:, :, None, :, 1] * (y1 - y0)[..., None]
+        gh, gw = patch_grid
+        # Partial boxes retain continuous positions but visible patch-token
+        # RoPE must stay in the legal canvas range.
+        x = x.clamp(0.0, max(float(gw) - 1.0e-4, 0.0))
+        y = y.clamp(0.0, max(float(gh) - 1.0e-4, 0.0))
+        patch_pos = torch.stack(
+            (
+                temporal[:, None, :, None].expand(-1, k, -1, q),
+                y,
+                x,
+            ),
+            dim=-1,
+        )
+        patch_valid = (
+            appearance_mask[:, :, None, :]
+            & track_valid[..., None]
+            & in_frustum[..., None]
+        )
+        center_x = 0.5 * (x0 + x1)
+        center_y = 0.5 * (y0 + y1)
+        reserved_y = (
+            torch.arange(k, device=device, dtype=torch.float32)[None, :, None]
+            + float(gh)
+            + 1.0
+        ).expand(b, -1, seq_len)
+        reserved_x = (
+            torch.arange(k, device=device, dtype=torch.float32)[None, :, None]
+            + float(gw)
+            + 1.0
+        ).expand(b, -1, seq_len)
+        summary_x = torch.where(
+            in_frustum,
+            center_x.clamp(0.0, max(float(gw) - 1.0e-4, 0.0)),
+            reserved_x,
+        )
+        summary_y = torch.where(
+            in_frustum,
+            center_y.clamp(0.0, max(float(gh) - 1.0e-4, 0.0)),
+            reserved_y,
+        )
+        summary_pos = torch.stack(
+            (
+                temporal[:, None, :].expand(-1, k, -1),
+                summary_y,
+                summary_x,
+            ),
+            dim=-1,
+        )
+        summary_valid = track_valid
+
+        block_tokens = torch.cat((patch_values, summary_values.unsqueeze(-2)), dim=-2)
+        block_pos = torch.cat((patch_pos, summary_pos.unsqueeze(-2)), dim=-2)
+        block_mask = torch.cat((patch_valid, summary_valid.unsqueeze(-1)), dim=-1)
+        block_tokens = block_tokens.reshape(b, k * seq_len * (q + 1), -1)
+        block_pos = block_pos.reshape(b, k * seq_len * (q + 1), 3)
+        block_mask = block_mask.reshape(b, k * seq_len * (q + 1))
+
+        replace_rows, append_rows = self._empty_asset_rows(asset_condition_kind, b, device)
+        null_rows = self._asset_null_rows(asset_condition_kind, b, device)
+        max_tokens = int(self.config.max_asset_tokens)
+        token_rows: list[torch.Tensor] = []
+        pos_rows: list[torch.Tensor] = []
+        for row in range(b):
+            row_tokens = block_tokens[row, block_mask[row]]
+            row_pos = block_pos[row, block_mask[row]]
+            real_token_count = int(row_tokens.shape[0])
+            reserves_empty_token = (
+                append_rows is not None and bool(append_rows[row].item())
+            )
+            required_token_count = real_token_count + int(reserves_empty_token)
+            if required_token_count > max_tokens:
+                raise RuntimeError(
+                    "factorized asset token budget is too small: "
+                    f"row={row} requires {required_token_count} tokens "
+                    f"({real_token_count} real"
+                    f"{' + 1 explicit-empty' if reserves_empty_token else ''}), "
+                    f"but max_asset_tokens={max_tokens}. Increase the configured "
+                    "budget; legal frames or later object slots must not be "
+                    "silently truncated."
+                )
+            if null_rows is not None and bool(null_rows[row].item()):
+                row_tokens = self.asset_null_condition_embed.to(
+                    device=device, dtype=appearance.dtype
+                ).reshape(1, -1)
+                row_pos = torch.zeros((1, 3), device=device, dtype=torch.float32)
+            elif replace_rows is not None and bool(replace_rows[row].item()):
+                row_tokens = self.empty_asset_embed.to(
+                    device=device, dtype=appearance.dtype
+                ).reshape(1, -1)
+                row_pos = torch.zeros((1, 3), device=device, dtype=torch.float32)
+            elif append_rows is not None and bool(append_rows[row].item()):
+                real_budget = max(0, max_tokens - 1)
+                row_tokens = torch.cat(
+                    (
+                        row_tokens[:real_budget],
+                        self.empty_asset_embed.to(
+                            device=device, dtype=appearance.dtype
+                        ).reshape(1, -1),
+                    ),
+                    dim=0,
+                )
+                row_pos = torch.cat(
+                    (row_pos[:real_budget], torch.zeros((1, 3), device=device)),
+                    dim=0,
+                )
+            token_rows.append(row_tokens)
+            pos_rows.append(row_pos)
+        return self._pad_sparse_condition(
+            token_rows,
+            pos_rows,
+            device=device,
+            dtype=appearance.dtype,
+            max_tokens=max_tokens,
+        )
 
     def _build_sparse_asset_condition(
         self,
@@ -2659,6 +2942,7 @@ class RAEVideoSceneFlow(nn.Module):
         M_dest: torch.Tensor,
         F_asset_tokens: torch.Tensor,
         encoder_attention_mask: torch.Tensor | None = None,
+        factorized_asset_condition: FactorizedAssetCondition | None = None,
         return_mid: bool = False,
         return_dict: bool = False,
         text_tokens: torch.Tensor | None = None,
@@ -2741,16 +3025,44 @@ class RAEVideoSceneFlow(nn.Module):
             sky_gen_tokens,
             sky_gen_attention_mask,
         )
-        asset_seq, asset_mask, asset_pos = self._build_sparse_asset_condition(
-            F_asset_tokens,
-            encoder_attention_mask,
-            seq_len=s,
-            num_patches=p,
-            patch_grid=patch_grid,
-            asset_condition_kind=asset_condition_kind,
-            frame_ids=frame_ids,
-            fps=fps,
-        )
+        if factorized_asset_condition is not None:
+            if encoder_attention_mask is not None and bool(
+                torch.as_tensor(encoder_attention_mask).any().item()
+            ):
+                raise ValueError(
+                    "factorized asset condition has an independent appearance mask; "
+                    "legacy encoder_attention_mask must be empty"
+                )
+            if F_asset_tokens.ndim != 3 or int(F_asset_tokens.shape[1]) != 0:
+                raise ValueError(
+                    "factorized asset condition forbids legacy target-token values; "
+                    "F_asset_tokens must be an empty [B,0,C] compatibility tensor"
+                )
+            asset_seq, asset_mask, asset_pos = self._build_factorized_asset_condition(
+                factorized_asset_condition,
+                seq_len=s,
+                num_patches=p,
+                patch_grid=patch_grid,
+                asset_condition_kind=asset_condition_kind,
+                frame_ids=frame_ids,
+                fps=fps,
+            )
+        else:
+            if str(self.config.asset_condition_protocol) == "factorized_v1":
+                raise RuntimeError(
+                    "This SceneFlow configuration requires FactorizedAssetCondition; "
+                    "the legacy target-token copy/oracle path is disabled."
+                )
+            asset_seq, asset_mask, asset_pos = self._build_sparse_asset_condition(
+                F_asset_tokens,
+                encoder_attention_mask,
+                seq_len=s,
+                num_patches=p,
+                patch_grid=patch_grid,
+                asset_condition_kind=asset_condition_kind,
+                frame_ids=frame_ids,
+                fps=fps,
+            )
         control_seq, control_mask, control_pos = self._build_edit_control_condition(
             z_splat,
             scaffold_tok,

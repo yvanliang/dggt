@@ -82,14 +82,13 @@ def _connected_components_4n(union_mask: torch.Tensor, patch_grid: tuple[int, in
     return components
 
 
-def build_pretrain_asset_slots_from_dynamic_mask(
+def build_leaky_oracle_asset_slots_from_target_dynamic_mask(
     z_clean_n: torch.Tensor,
     dynamic_mask: torch.Tensor | None,
     patch_grid: tuple[int, int] | list[int],
     *,
     max_assets: int = 5,
     threshold: float = 0.5,
-    corruption_noise_std: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
     B, S, P, C = z_clean_n.shape
     gh, gw = int(patch_grid[0]), int(patch_grid[1])
@@ -124,10 +123,6 @@ def build_pretrain_asset_slots_from_dynamic_mask(
                 break
         lengths[row] = slot
         kinds.append("mode_a" if slot > 0 else "none")
-    noise_std = float(corruption_noise_std)
-    if noise_std > 0.0 and bool(asset_mask.any().item()):
-        noise = torch.randn_like(asset_tokens) * noise_std
-        asset_tokens = torch.where(asset_mask.unsqueeze(-1), asset_tokens + noise, asset_tokens)
     return asset_tokens, asset_mask, lengths, kinds
 
 
@@ -156,12 +151,11 @@ def _normalize_object_patch_mask_shape(
     return mask.contiguous()
 
 
-def build_pretrain_asset_slots_from_object_patch_mask(
+def build_leaky_oracle_asset_slots_from_target_latents(
     z_clean_n: torch.Tensor,
     object_patch_mask: torch.Tensor | None,
     *,
     max_assets: int = 5,
-    corruption_noise_std: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
     """Build pretrain asset slots from fixed object-id patch masks.
 
@@ -204,8 +198,20 @@ def build_pretrain_asset_slots_from_object_patch_mask(
         lengths[row] = slot_out
         kinds.append("mode_a" if slot_out > 0 else "none")
 
-    noise_std = float(corruption_noise_std)
-    if noise_std > 0.0 and bool(asset_mask.any().item()):
-        noise = torch.randn_like(asset_tokens) * noise_std
-        asset_tokens = torch.where(asset_mask.unsqueeze(-1), asset_tokens + noise, asset_tokens)
     return asset_tokens, asset_mask, lengths, kinds
+
+
+def build_pretrain_asset_slots_from_dynamic_mask(*_args, **_kwargs):
+    raise RuntimeError(
+        "Legacy target-z_clean/dynamic-mask asset copying is a leaky oracle baseline. "
+        "Call build_leaky_oracle_asset_slots_from_target_dynamic_mask explicitly "
+        "for an offline ablation; it is forbidden in formal pretraining."
+    )
+
+
+def build_pretrain_asset_slots_from_object_patch_mask(*_args, **_kwargs):
+    raise RuntimeError(
+        "Legacy target-z_clean asset copying is a leaky oracle baseline. "
+        "Call build_leaky_oracle_asset_slots_from_target_latents explicitly for "
+        "an offline ablation; it is forbidden in formal pretraining."
+    )

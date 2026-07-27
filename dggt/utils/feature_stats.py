@@ -206,6 +206,22 @@ def load_all_stats_into_buffers(
             raise ValueError("DGGT checkpoint path/hash is required to validate camera statistics")
         expected_dggt_sha256 = checkpoint_sha256(dggt_ckpt_path)
     camera = _camera_stats_from_payload(payload, expected_dggt_sha256=expected_dggt_sha256)
+    placement = None
+    if "placement_mean" in payload and "placement_std" in payload:
+        placement_mean = torch.as_tensor(payload["placement_mean"]).float().reshape(-1)
+        placement_std = torch.as_tensor(payload["placement_std"]).float().reshape(-1)
+        if placement_mean.numel() != 12 or placement_std.numel() != 12:
+            raise ValueError("placement_mean/std must each contain 12 values")
+        if not bool(torch.isfinite(placement_mean).all()) or not bool(torch.isfinite(placement_std).all()):
+            raise ValueError("placement statistics contain non-finite values")
+        if bool((placement_std <= 0.0).any()):
+            raise ValueError("placement_std must be positive")
+        placement = (placement_mean, placement_std)
+    elif str(getattr(getattr(module, "config", None), "asset_condition_protocol", "")) == "factorized_v1":
+        raise KeyError(
+            "Factorized SceneFlow pretraining requires placement_mean/placement_std "
+            "in the feature-stats file; regenerate it with tools/compute_pretrain_feature_stats.py."
+        )
     if not hasattr(module, "set_latent_stats") or not hasattr(module, "set_camera_stats"):
         raise AttributeError("SceneFlow module must expose set_latent_stats() and set_camera_stats()")
     values = {
@@ -216,6 +232,9 @@ def load_all_stats_into_buffers(
         "camera_delta_mean": camera[2],
         "camera_delta_std": camera[3],
     }
+    if placement is not None:
+        values["placement_mean"] = placement[0]
+        values["placement_std"] = placement[1]
     if require_existing_match:
         mismatches: list[str] = []
         for name, expected in values.items():
@@ -248,6 +267,10 @@ def load_all_stats_into_buffers(
             )
     module.set_latent_stats(mu, sigma)
     module.set_camera_stats(*camera)
+    if placement is not None:
+        if not hasattr(module, "set_placement_stats"):
+            raise AttributeError("SceneFlow module must expose set_placement_stats()")
+        module.set_placement_stats(*placement)
     return expected_dggt_sha256
 
 

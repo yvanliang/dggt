@@ -54,6 +54,7 @@ from dggt.losses.rgb_render_loss import (
     should_apply_rgb_render_loss,
 )
 from dggt.models.scene_flow import WanSceneFlow
+from dggt.models.canonical_asset_encoder import CanonicalAssetEncoder
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.vggt import VGGT
 from dggt.utils.feature_stats import (
@@ -86,9 +87,10 @@ from dggt.utils.flow_schedule import (
 from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_split_gs
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
-from dggt.utils.pretrain_asset_slots import (
-    build_pretrain_asset_slots_from_dynamic_mask,
-    build_pretrain_asset_slots_from_object_patch_mask,
+from dggt.utils.factorized_asset_condition import (
+    FACTORIZED_ASSET_CONDITION_VERSION,
+    FactorizedAssetCondition,
+    build_factorized_asset_condition,
 )
 from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
 from dggt.utils.sliding_window import (
@@ -396,6 +398,10 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "camera_condition_representation",
     "mask_compositing_version",
     "asset_position_mode",
+    "asset_condition_protocol",
+    "factorized_asset_condition_version",
+    "placement_mean",
+    "placement_std",
     "sky_rope_temporal_offset",
     "camera_rope_spatial_mode",
     "sky_mask_head_version",
@@ -939,8 +945,49 @@ def _asset_condition_rows(
     encoder_attention_mask: torch.Tensor | None,
     asset_condition_kind: Any,
     batch_size: int,
+    factorized_asset_condition: FactorizedAssetCondition | None = None,
+    factorized_asset_conditions_by_window: dict[
+        tuple[int, int], FactorizedAssetCondition
+    ]
+    | None = None,
 ) -> list[bool]:
-    mask_rows = _row_has_any(encoder_attention_mask, batch_size)
+    window_rows = None
+    if factorized_asset_conditions_by_window:
+        window_rows_t = torch.zeros(int(batch_size), dtype=torch.bool)
+        for key, window_condition in factorized_asset_conditions_by_window.items():
+            if (
+                not isinstance(key, tuple)
+                or len(key) != 2
+                or int(key[1]) <= int(key[0])
+            ):
+                raise ValueError(f"invalid factorized sliding-window key {key!r}")
+            window_condition.validate()
+            if window_condition.batch_size != int(batch_size):
+                raise ValueError(
+                    "factorized sliding-window condition batch size mismatch"
+                )
+            window_rows_t |= (
+                window_condition.appearance_mask.any(dim=(1, 2))
+                & window_condition.track_valid.any(dim=(1, 2))
+            ).detach().cpu()
+        window_rows = window_rows_t.tolist()
+    if factorized_asset_condition is not None:
+        factorized_asset_condition.validate()
+        if factorized_asset_condition.batch_size != int(batch_size):
+            raise ValueError("factorized asset condition batch size mismatch")
+        mask_rows = (
+            factorized_asset_condition.appearance_mask.any(dim=(1, 2))
+            & factorized_asset_condition.track_valid.any(dim=(1, 2))
+        ).detach().cpu().tolist()
+        if window_rows is not None:
+            mask_rows = [
+                bool(mask_rows[row]) or bool(window_rows[row])
+                for row in range(int(batch_size))
+            ]
+    elif window_rows is not None:
+        mask_rows = window_rows
+    else:
+        mask_rows = _row_has_any(encoder_attention_mask, batch_size)
     if mask_rows is not None:
         rows = list(mask_rows)
     elif torch.is_tensor(F_asset_tokens):
@@ -1013,6 +1060,8 @@ def resolve_pretrain_optional_cfg_conditions(
         getattr(bundle, "encoder_attention_mask", None),
         getattr(bundle, "asset_condition_kind", None),
         int(batch_size),
+        getattr(bundle, "factorized_asset_condition", None),
+        getattr(bundle, "factorized_asset_conditions_by_window", None),
     )
     camera_rows = _camera_condition_rows(
         getattr(bundle, "camera_condition_tokens", None),
@@ -1057,6 +1106,54 @@ def resolve_pretrain_optional_cfg_conditions(
         full_camera_tokens=full_camera_tokens,
         full_camera_mask=full_camera_mask,
     )
+
+
+def combine_pretrain_cfg_prediction(
+    key: str,
+    *,
+    full: dict[str, torch.Tensor],
+    no_text_full: dict[str, torch.Tensor] | None = None,
+    text_only: dict[str, torch.Tensor] | None = None,
+    text_asset: dict[str, torch.Tensor] | None = None,
+    text_scale: float = 1.0,
+    asset_scale: float = 1.0,
+    camera_scale: float = 1.0,
+) -> torch.Tensor | None:
+    """Compose independent text, asset and camera CFG deltas.
+
+    ``full`` is text+asset+camera. ``no_text_full`` removes text only,
+    ``text_only`` removes asset+camera, and ``text_asset`` removes camera only.
+    Keeping this algebra in one function prevents regular, sliding and endpoint
+    sampling from silently drifting apart.
+    """
+    value = full.get(key)
+    if value is None:
+        return None
+    guided = value
+    if abs(float(text_scale) - 1.0) > 1.0e-6:
+        if no_text_full is None or no_text_full.get(key) is None:
+            raise RuntimeError(f"Text-CFG branch is missing `{key}` predictions.")
+        guided = guided + (float(text_scale) - 1.0) * (
+            value - no_text_full[key]
+        )
+    if abs(float(asset_scale) - 1.0) > 1.0e-6:
+        if (
+            text_only is None
+            or text_asset is None
+            or text_only.get(key) is None
+            or text_asset.get(key) is None
+        ):
+            raise RuntimeError(f"Asset-CFG branch is missing `{key}` predictions.")
+        guided = guided + (float(asset_scale) - 1.0) * (
+            text_asset[key] - text_only[key]
+        )
+    if abs(float(camera_scale) - 1.0) > 1.0e-6:
+        if text_asset is None or text_asset.get(key) is None:
+            raise RuntimeError(f"Camera-CFG branch is missing `{key}` predictions.")
+        guided = guided + (float(camera_scale) - 1.0) * (
+            value - text_asset[key]
+        )
+    return guided
 
 
 def apply_asset_uncond_drop(
@@ -1127,10 +1224,20 @@ def estimate_sparse_asset_token_count(
     scene_flow_root: nn.Module,
     tokens: torch.Tensor,
     mask: torch.Tensor | None,
+    factorized_asset_condition: FactorizedAssetCondition | None = None,
 ) -> float:
     cfg = getattr(scene_flow_root, "config", None)
     max_patch = int(getattr(cfg, "max_asset_patch_tokens_per_asset_frame", 32))
     max_total = int(getattr(cfg, "max_asset_tokens", 4096))
+    if factorized_asset_condition is not None:
+        condition = factorized_asset_condition.validate()
+        patch = (
+            condition.appearance_mask[:, :, None, :]
+            & condition.track_valid[..., None]
+            & condition.placement_state[..., 11].gt(0.5).unsqueeze(-1)
+        ).sum(dim=-1)
+        summaries = condition.track_valid.to(dtype=patch.dtype)
+        return float((patch + summaries).sum(dim=(1, 2)).clamp_max(max_total).float().mean().item())
     if tokens.ndim == 5:
         valid = (
             torch.ones(tokens.shape[:-1], device=tokens.device, dtype=torch.bool)
@@ -3112,6 +3219,61 @@ def _slice_asset_time(tensor: torch.Tensor | None, start: int, end: int, seq_len
     return tensor
 
 
+def _slice_factorized_asset_condition(
+    condition: FactorizedAssetCondition | None,
+    start: int,
+    end: int,
+) -> FactorizedAssetCondition | None:
+    return None if condition is None else condition.slice_time(start, end)
+
+
+def _factorized_asset_condition_for_window(
+    bundle: Any,
+    start: int,
+    end: int,
+) -> FactorizedAssetCondition | None:
+    """Resolve a training-equivalent condition for a sampling window."""
+    by_window = getattr(bundle, "factorized_asset_conditions_by_window", None)
+    key = (int(start), int(end))
+    if by_window is not None:
+        if key not in by_window:
+            raise KeyError(
+                f"missing factorized asset condition for sliding window {key}; "
+                f"available={sorted(by_window)}"
+            )
+        condition = by_window[key].validate()
+        if condition.seq_len != int(end) - int(start):
+            raise ValueError(
+                f"factorized condition for window {key} has S={condition.seq_len}"
+            )
+        return condition
+    return _slice_factorized_asset_condition(
+        getattr(bundle, "factorized_asset_condition", None),
+        start,
+        end,
+    )
+
+
+def _factorized_asset_kind_for_window(
+    condition: FactorizedAssetCondition | None,
+    base_kind: Any,
+    batch_size: int,
+) -> Any:
+    if condition is None:
+        return base_kind
+    rows = (
+        condition.appearance_mask.any(dim=(1, 2))
+        & condition.track_valid.any(dim=(1, 2))
+    ).detach().cpu().tolist()
+    return _condition_kind_with_null_rows(
+        base_kind,
+        rows,
+        batch_size=int(batch_size),
+        default="factorized_asset",
+        null_kind="asset_uncond",
+    )
+
+
 def _validation_sliding_params(args: argparse.Namespace, seq_len: int) -> tuple[int, int] | None:
     window = int(getattr(args, "val_sliding_window", 0) or 0)
     if window <= 0 or int(seq_len) <= window:
@@ -3241,7 +3403,6 @@ def _cfg_sample_pretrain_latents_sliding(
         or abs(asset_control_scale - 1.0) > 1e-6
         or abs(camera_scale - 1.0) > 1e-6
     )
-    drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
     asset_null_kind = optional_cfg.asset_null_kind
     camera_null_kind = optional_cfg.camera_null_kind
     full_asset_kind = optional_cfg.full_asset_kind
@@ -3284,6 +3445,14 @@ def _cfg_sample_pretrain_latents_sliding(
             camera_anchor_w = _slice_time(
                 getattr(bundle, "camera_gen_anchor_mask", None), start, end, seq_len
             )
+            factorized_condition_w = _factorized_asset_condition_for_window(
+                bundle, start, end
+            )
+            full_asset_kind_w = _factorized_asset_kind_for_window(
+                factorized_condition_w,
+                full_asset_kind,
+                batch_size,
+            )
 
             def _run_branch(
                 *,
@@ -3305,6 +3474,7 @@ def _cfg_sample_pretrain_latents_sliding(
                     M_dest_w,
                     _slice_asset_time(F_asset_tokens, start, end, seq_len),
                     encoder_attention_mask=_slice_asset_time(asset_mask, start, end, seq_len),
+                    factorized_asset_condition=factorized_condition_w,
                     text_tokens=branch_text_tokens,
                     text_attention_mask=branch_text_mask,
                     camera_condition_tokens=camera_tokens_w,
@@ -3320,7 +3490,7 @@ def _cfg_sample_pretrain_latents_sliding(
                     asset_condition_kind=asset_kind,
                     control_drop_mask=control_drop_mask,
                     frame_ids=frame_ids_w,
-                    fps=None,
+                    fps=getattr(bundle, "fps", None),
                 )
                 if not isinstance(out, dict):
                     raise RuntimeError("SceneFlow return_dict=True must return dicts in pretrain sliding sampling.")
@@ -3329,7 +3499,7 @@ def _cfg_sample_pretrain_latents_sliding(
             out_full = _run_branch(
                 F_asset_tokens=bundle.F_asset_tokens,
                 asset_mask=bundle.encoder_attention_mask,
-                asset_kind=full_asset_kind,
+                asset_kind=full_asset_kind_w,
                 branch_text_tokens=text_tokens,
                 branch_text_mask=text_mask,
                 camera_kind=full_camera_kind,
@@ -3347,7 +3517,7 @@ def _cfg_sample_pretrain_latents_sliding(
                     out_no_text_full = _run_branch(
                         F_asset_tokens=bundle.F_asset_tokens,
                         asset_mask=bundle.encoder_attention_mask,
-                        asset_kind=full_asset_kind,
+                        asset_kind=full_asset_kind_w,
                         branch_text_tokens=text_null,
                         branch_text_mask=text_null_mask,
                         camera_kind=full_camera_kind,
@@ -3360,12 +3530,11 @@ def _cfg_sample_pretrain_latents_sliding(
                         branch_text_tokens=text_tokens,
                         branch_text_mask=text_mask,
                         camera_kind=camera_null_kind,
-                        control_drop_mask=drop_all_control,
                     )
                     out_text_asset = _run_branch(
                         F_asset_tokens=bundle.F_asset_tokens,
                         asset_mask=bundle.encoder_attention_mask,
-                        asset_kind=full_asset_kind,
+                        asset_kind=full_asset_kind_w,
                         branch_text_tokens=text_tokens,
                         branch_text_mask=text_mask,
                         camera_kind=camera_null_kind,
@@ -3374,37 +3543,24 @@ def _cfg_sample_pretrain_latents_sliding(
                     out_text_asset = _run_branch(
                         F_asset_tokens=bundle.F_asset_tokens,
                         asset_mask=bundle.encoder_attention_mask,
-                        asset_kind=full_asset_kind,
+                        asset_kind=full_asset_kind_w,
                         branch_text_tokens=text_tokens,
                         branch_text_mask=text_mask,
                         camera_kind=camera_null_kind,
                     )
 
                 def _combine_cfg(key: str) -> torch.Tensor | None:
-                    full = out_full.get(key)
-                    if full is None:
-                        return None
-                    guided = full
                     text_guidance = camera_text_scale if key == "camera" else scale
-                    if out_no_text_full is not None and abs(text_guidance - 1.0) > 1e-6:
-                        no_text_full = out_no_text_full.get(key)
-                        if no_text_full is None:
-                            raise RuntimeError(f"Text-CFG branch is missing `{key}` predictions.")
-                        guided = guided + (text_guidance - 1.0) * (full - no_text_full)
-                    if abs(asset_control_scale - 1.0) > 1e-6:
-                        assert out_text is not None and out_text_asset is not None
-                        text = out_text.get(key)
-                        text_asset = out_text_asset.get(key)
-                        if text is None or text_asset is None:
-                            raise RuntimeError(f"Asset-CFG branch is missing `{key}` predictions.")
-                        guided = guided + (asset_control_scale - 1.0) * (text_asset - text)
-                    if abs(camera_scale - 1.0) > 1e-6:
-                        assert out_text_asset is not None
-                        text_asset = out_text_asset.get(key)
-                        if text_asset is None:
-                            raise RuntimeError(f"Camera-CFG branch is missing `{key}` predictions.")
-                        guided = guided + (camera_scale - 1.0) * (full - text_asset)
-                    return guided
+                    return combine_pretrain_cfg_prediction(
+                        key,
+                        full=out_full,
+                        no_text_full=out_no_text_full,
+                        text_only=out_text,
+                        text_asset=out_text_asset,
+                        text_scale=text_guidance,
+                        asset_scale=asset_control_scale,
+                        camera_scale=camera_scale,
+                    )
 
                 v = _combine_cfg("video")
                 if v is None:
@@ -3453,6 +3609,14 @@ def _cfg_sample_pretrain_latents_sliding(
             weight_w = cosine_window(actual, device=device, dtype=z.dtype).view(1, actual, 1, 1)
             camera_tokens_w = _slice_time(full_camera_tokens, start, end, seq_len)
             camera_mask_w = _slice_time(full_camera_mask, start, end, seq_len)
+            factorized_condition_w = _factorized_asset_condition_for_window(
+                bundle, start, end
+            )
+            full_asset_kind_w = _factorized_asset_kind_for_window(
+                factorized_condition_w,
+                full_asset_kind,
+                batch_size,
+            )
 
             def endpoint_branch(
                 asset_tokens: torch.Tensor,
@@ -3468,6 +3632,7 @@ def _cfg_sample_pretrain_latents_sliding(
                     bundle.M_preserve[:, start:end], bundle.M_source[:, start:end], bundle.M_dest[:, start:end],
                     _slice_asset_time(asset_tokens, start, end, seq_len),
                     encoder_attention_mask=_slice_asset_time(asset_mask, start, end, seq_len),
+                    factorized_asset_condition=factorized_condition_w,
                     text_tokens=branch_text, text_attention_mask=branch_text_mask,
                     camera_condition_tokens=camera_tokens_w, camera_attention_mask=camera_mask_w,
                     camera_condition_kind=camera_kind,
@@ -3475,37 +3640,46 @@ def _cfg_sample_pretrain_latents_sliding(
                     camera_gen_anchor_mask=_slice_time(getattr(bundle, "camera_gen_anchor_mask", None), start, end, seq_len),
                     sky_gen_tokens=sky_z, return_dict=True, return_sky_mask=True,
                     asset_condition_kind=asset_kind, control_drop_mask=control_drop,
-                    frame_ids=frame_ids_full[:, start:end], fps=None,
+                    frame_ids=frame_ids_full[:, start:end], fps=getattr(bundle, "fps", None),
                 )
                 if not isinstance(result, dict):
                     raise RuntimeError("SceneFlow sliding endpoint mask forward must return a dict")
                 return result
 
-            full = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask, full_asset_kind,
+            full = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask, full_asset_kind_w,
                                    text_tokens, text_mask, full_camera_kind)
             no_text = text_only = text_asset = None
             if do_cfg and (abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6):
                 no_text = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
-                                          full_asset_kind, text_null, text_null_mask, full_camera_kind)
+                                          full_asset_kind_w, text_null, text_null_mask, full_camera_kind)
             if do_cfg and abs(asset_control_scale - 1.0) > 1e-6:
-                text_only = endpoint_branch(F_uncond, uncond_asset_mask, asset_null_kind,
-                                            text_tokens, text_mask, camera_null_kind, drop_all_control)
+                text_only = endpoint_branch(
+                    F_uncond,
+                    uncond_asset_mask,
+                    asset_null_kind,
+                    text_tokens,
+                    text_mask,
+                    camera_null_kind,
+                )
                 text_asset = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
-                                             full_asset_kind, text_tokens, text_mask, camera_null_kind)
+                                             full_asset_kind_w, text_tokens, text_mask, camera_null_kind)
             elif do_cfg and abs(camera_scale - 1.0) > 1e-6:
                 text_asset = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
-                                             full_asset_kind, text_tokens, text_mask, camera_null_kind)
+                                             full_asset_kind_w, text_tokens, text_mask, camera_null_kind)
 
             def combine(key: str) -> torch.Tensor:
-                value = full[key]
-                if no_text is not None and abs(scale - 1.0) > 1e-6:
-                    value = value + (scale - 1.0) * (full[key] - no_text[key])
-                if abs(asset_control_scale - 1.0) > 1e-6:
-                    assert text_only is not None and text_asset is not None
-                    value = value + (asset_control_scale - 1.0) * (text_asset[key] - text_only[key])
-                if abs(camera_scale - 1.0) > 1e-6:
-                    assert text_asset is not None
-                    value = value + (camera_scale - 1.0) * (full[key] - text_asset[key])
+                value = combine_pretrain_cfg_prediction(
+                    key,
+                    full=full,
+                    no_text_full=no_text,
+                    text_only=text_only,
+                    text_asset=text_asset,
+                    text_scale=scale,
+                    asset_scale=asset_control_scale,
+                    camera_scale=camera_scale,
+                )
+                if value is None:
+                    raise RuntimeError(f"CFG branch is missing `{key}` predictions.")
                 return value
 
             patch_w = combine("sky_mask_logits")
@@ -3650,7 +3824,6 @@ def cfg_sample_pretrain_latents(
         or abs(asset_control_scale - 1.0) > 1e-6
         or abs(camera_scale - 1.0) > 1e-6
     )
-    drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
     asset_null_kind = optional_cfg.asset_null_kind
     camera_null_kind = optional_cfg.camera_null_kind
     full_asset_kind = optional_cfg.full_asset_kind
@@ -3687,6 +3860,7 @@ def cfg_sample_pretrain_latents(
                 bundle.M_dest,
                 F_asset_tokens,
                 encoder_attention_mask=asset_mask,
+                factorized_asset_condition=getattr(bundle, "factorized_asset_condition", None),
                 text_tokens=branch_text_tokens,
                 text_attention_mask=branch_text_mask,
                 camera_condition_tokens=full_camera_tokens,
@@ -3702,7 +3876,7 @@ def cfg_sample_pretrain_latents(
                 asset_condition_kind=asset_kind,
                 control_drop_mask=control_drop_mask,
                 frame_ids=frame_ids,
-                fps=None,
+                fps=getattr(bundle, "fps", None),
             )
             if not isinstance(out, dict):
                 raise RuntimeError("SceneFlow return_dict=True must return dicts in pretrain sampling.")
@@ -3742,7 +3916,6 @@ def cfg_sample_pretrain_latents(
                     branch_text_tokens=text_tokens,
                     branch_text_mask=text_mask,
                     camera_kind=camera_null_kind,
-                    control_drop_mask=drop_all_control,
                 )
                 out_text_asset = _run_branch(
                     F_asset_tokens=bundle.F_asset_tokens,
@@ -3763,30 +3936,17 @@ def cfg_sample_pretrain_latents(
                 )
 
             def _combine_cfg(key: str) -> torch.Tensor | None:
-                full = out_full.get(key)
-                if full is None:
-                    return None
-                guided = full
                 text_guidance = camera_text_scale if key == "camera" else scale
-                if out_no_text_full is not None and abs(text_guidance - 1.0) > 1e-6:
-                    no_text_full = out_no_text_full.get(key)
-                    if no_text_full is None:
-                        raise RuntimeError(f"Text-CFG branch is missing `{key}` predictions.")
-                    guided = guided + (text_guidance - 1.0) * (full - no_text_full)
-                if abs(asset_control_scale - 1.0) > 1e-6:
-                    assert out_text is not None and out_text_asset is not None
-                    text = out_text.get(key)
-                    text_asset = out_text_asset.get(key)
-                    if text is None or text_asset is None:
-                        raise RuntimeError(f"Asset-CFG branch is missing `{key}` predictions.")
-                    guided = guided + (asset_control_scale - 1.0) * (text_asset - text)
-                if abs(camera_scale - 1.0) > 1e-6:
-                    assert out_text_asset is not None
-                    text_asset = out_text_asset.get(key)
-                    if text_asset is None:
-                        raise RuntimeError(f"Camera-CFG branch is missing `{key}` predictions.")
-                    guided = guided + (camera_scale - 1.0) * (full - text_asset)
-                return guided
+                return combine_pretrain_cfg_prediction(
+                    key,
+                    full=out_full,
+                    no_text_full=out_no_text_full,
+                    text_only=out_text,
+                    text_asset=out_text_asset,
+                    text_scale=text_guidance,
+                    asset_scale=asset_control_scale,
+                    camera_scale=camera_scale,
+                )
 
             v = _combine_cfg("video")
             if v is None:
@@ -3840,7 +4000,6 @@ def cfg_sample_pretrain_latents(
                 branch_text_tokens=text_tokens,
                 branch_text_mask=text_mask,
                 camera_kind=camera_null_kind,
-                control_drop_mask=drop_all_control,
                 request_sky_mask=True,
             )
             endpoint_text_asset = _run_branch(
@@ -3864,18 +4023,18 @@ def cfg_sample_pretrain_latents(
             )
 
         def combine_endpoint(key: str) -> torch.Tensor:
-            full = endpoint_full[key]
-            value = full
-            if endpoint_no_text is not None and abs(scale - 1.0) > 1e-6:
-                value = value + (scale - 1.0) * (full - endpoint_no_text[key])
-            if abs(asset_control_scale - 1.0) > 1e-6:
-                assert endpoint_text is not None and endpoint_text_asset is not None
-                value = value + (asset_control_scale - 1.0) * (
-                    endpoint_text_asset[key] - endpoint_text[key]
-                )
-            if abs(camera_scale - 1.0) > 1e-6:
-                assert endpoint_text_asset is not None
-                value = value + (camera_scale - 1.0) * (full - endpoint_text_asset[key])
+            value = combine_pretrain_cfg_prediction(
+                key,
+                full=endpoint_full,
+                no_text_full=endpoint_no_text,
+                text_only=endpoint_text,
+                text_asset=endpoint_text_asset,
+                text_scale=scale,
+                asset_scale=asset_control_scale,
+                camera_scale=camera_scale,
+            )
+            if value is None:
+                raise RuntimeError(f"CFG branch is missing `{key}` predictions.")
             return value
 
         final_sky_mask_logits = combine_endpoint("sky_mask_logits")
@@ -3951,6 +4110,7 @@ def build_full_scene_bundle(
         M_dest=torch.ones_like(mask),
         F_asset_tokens=asset_tokens,
         encoder_attention_mask=asset_mask,
+        factorized_asset_condition=None,
         camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
         camera_condition_kind=camera_condition_kind,
@@ -4094,16 +4254,18 @@ def train_step(
         legacy_drop_prob if getattr(args, "camera_uncond_drop_prob", None) is None else args.camera_uncond_drop_prob
     )
     all_drop_prob = float(getattr(args, "all_cond_drop_prob", 0.0))
-    # CFG training prerequisite: independently hide text, asset/control, and
+    # CFG training prerequisite: independently hide text, asset, and
     # camera condition tokens per sample. Camera generation targets/losses stay
-    # present; only the input camera condition is replaced by a learned null.
+    # present; only the selected input modality is replaced by its learned
+    # null. Asset dropout must not also remove edit-control tokens, otherwise
+    # the asset-CFG delta changes two modalities at once.
     text_drop_mask = sample_uncond_drop_mask(
         int(bundle.z_clean_n.shape[0]),
         text_drop_prob,
         device=bundle.z_clean_n.device,
         training=is_training,
     )
-    asset_control_drop_mask = sample_uncond_drop_mask(
+    asset_drop_mask = sample_uncond_drop_mask(
         int(bundle.z_clean_n.shape[0]),
         asset_drop_prob,
         device=bundle.z_clean_n.device,
@@ -4123,12 +4285,12 @@ def train_step(
     )
     if all_drop_mask is not None:
         text_drop_mask = all_drop_mask if text_drop_mask is None else (text_drop_mask | all_drop_mask)
-        asset_control_drop_mask = (
-            all_drop_mask if asset_control_drop_mask is None else (asset_control_drop_mask | all_drop_mask)
+        asset_drop_mask = (
+            all_drop_mask if asset_drop_mask is None else (asset_drop_mask | all_drop_mask)
         )
         camera_drop_mask = all_drop_mask if camera_drop_mask is None else (camera_drop_mask | all_drop_mask)
-    if asset_control_drop_mask is not None:
-        bundle = apply_asset_uncond_drop(bundle, asset_control_drop_mask)
+    if asset_drop_mask is not None:
+        bundle = apply_asset_uncond_drop(bundle, asset_drop_mask)
     if camera_drop_mask is not None:
         bundle = apply_camera_uncond_drop(bundle, camera_drop_mask)
 
@@ -4202,6 +4364,7 @@ def train_step(
             bundle.M_dest,
             bundle.F_asset_tokens,
             encoder_attention_mask=bundle.encoder_attention_mask,
+            factorized_asset_condition=getattr(bundle, "factorized_asset_condition", None),
             text_tokens=text_tokens,
             text_attention_mask=text_mask,
             camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
@@ -4217,9 +4380,9 @@ def train_step(
             return_sky_mask=True,
             return_base=float(args.base_model_coeff) != 0.0,
             asset_condition_kind=getattr(bundle, "asset_condition_kind", None),
-            control_drop_mask=asset_control_drop_mask,
+            control_drop_mask=None,
             frame_ids=getattr(bundle, "frame_ids", None),
-            fps=None,
+            fps=getattr(bundle, "fps", None),
         )
         if not isinstance(out, dict):
             raise RuntimeError("SceneFlow return_dict=True must return a dict in pretrain train_step.")
@@ -4389,6 +4552,7 @@ def train_step(
                 bundle.M_dest,
                 bundle.F_asset_tokens,
                 encoder_attention_mask=bundle.encoder_attention_mask,
+                factorized_asset_condition=getattr(bundle, "factorized_asset_condition", None),
                 text_tokens=text_tokens,
                 text_attention_mask=text_mask,
                 camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
@@ -4403,9 +4567,9 @@ def train_step(
                 return_dict=True,
                 return_sky_mask=True,
                 asset_condition_kind=getattr(bundle, "asset_condition_kind", None),
-                control_drop_mask=asset_control_drop_mask,
+                control_drop_mask=None,
                 frame_ids=getattr(bundle, "frame_ids", None),
-                fps=None,
+                fps=getattr(bundle, "fps", None),
             )
             if not isinstance(endpoint_out, dict):
                 raise RuntimeError("sigma=0 sky-mask endpoint forward must return a dict")
@@ -4676,9 +4840,8 @@ def train_step(
         source_values = [str(v) for v in (asset_source_kinds if not isinstance(asset_source_kinds, str) else [asset_source_kinds])]
         denom = max(1, len(source_values))
         logs["asset_source_instances_projected_frac"] = sum(v == "instances_projected" for v in source_values) / float(denom)
-        logs["asset_source_legacy_dynamic_mask_frac"] = sum(v == "legacy_dynamic_mask" for v in source_values) / float(denom)
         logs["asset_source_empty_frac"] = sum(
-            v not in ("instances_projected", "legacy_dynamic_mask") for v in source_values
+            v != "instances_projected" for v in source_values
         ) / float(denom)
     sky_weight = getattr(bundle, "sky_gen_loss_weight", None)
     logs["sky_token_loss_weight_mean"] = (
@@ -4689,6 +4852,7 @@ def train_step(
         sf_root,
         bundle.F_asset_tokens,
         bundle.encoder_attention_mask,
+        getattr(bundle, "factorized_asset_condition", None),
     )
     logs["control_token_count"] = estimate_control_token_count(
         sf_root,
@@ -4700,7 +4864,7 @@ def train_step(
     logs["edit_frac"] = float(M_edit.float().mean().item())
     logs["sigma_mean"] = float(target.sigmas.float().mean().item())
     logs["text_uncond_drop_frac"] = _mask_frac(text_drop_mask)
-    logs["asset_uncond_drop_frac"] = _mask_frac(asset_control_drop_mask)
+    logs["asset_uncond_drop_frac"] = _mask_frac(asset_drop_mask)
     logs["camera_uncond_drop_frac"] = _mask_frac(camera_drop_mask)
     logs["all_cond_drop_frac"] = _mask_frac(all_drop_mask)
     logs["loss"] = float(loss.detach().item())
@@ -4718,6 +4882,160 @@ def train_step(
     logs["cfg_camera_text_scale"] = float(getattr(args, "camera_text_guidance_scale", 1.0))
     logs["cfg_camera_condition_scale"] = float(getattr(args, "camera_guidance_scale", 1.0))
     return loss, logs
+
+
+def build_factorized_asset_condition_from_batch(
+    batch: dict[str, Any],
+    vggt_model: VGGT,
+    scene_flow: nn.Module,
+    device: torch.device,
+    *,
+    patch_grid: tuple[int, int],
+    frame_ids: torch.Tensor,
+    intrinsics: torch.Tensor,
+    image_size_hw: torch.Tensor | tuple[int, int],
+) -> SimpleNamespace:
+    """Encode one outside-window reference and attach explicit target geometry.
+
+    Both training and raw-video inference call this boundary.  Its signature
+    deliberately has no target RGB, target latent, or target dynamic mask.
+    """
+    sf_root = unwrap_ddp(scene_flow)
+    frame_ids = torch.as_tensor(frame_ids, device=device, dtype=torch.long)
+    if frame_ids.ndim == 1:
+        frame_ids = frame_ids.unsqueeze(0)
+    batch_size = int(frame_ids.shape[0])
+    protocol = batch.get("pretrain_asset_condition_version")
+    protocol_values = (
+        [str(protocol)] * batch_size
+        if isinstance(protocol, str)
+        else [str(value) for value in list(protocol)]
+        if protocol is not None and not torch.is_tensor(protocol)
+        else []
+    )
+    if not protocol_values or len(protocol_values) != batch_size or any(
+        value != FACTORIZED_ASSET_CONDITION_VERSION for value in protocol_values
+    ):
+        raise RuntimeError(
+            "Raw SceneFlow pretraining/inference requires leak-free factorized "
+            "asset metadata; legacy target-token copy/dynamic-mask batches are rejected."
+        )
+    source_kind_raw = batch.get("pretrain_asset_source_kind")
+    if isinstance(source_kind_raw, str):
+        source_kinds = [source_kind_raw] * batch_size
+    elif source_kind_raw is None or torch.is_tensor(source_kind_raw):
+        source_kinds = ["unknown"] * batch_size
+    else:
+        source_kinds = [str(value) for value in list(source_kind_raw)]
+        if len(source_kinds) != batch_size:
+            source_kinds = ["unknown"] * batch_size
+
+    required = (
+        "pretrain_reference_rgb",
+        "pretrain_reference_alpha",
+        "pretrain_object_obj_to_anchor",
+        "pretrain_object_center_anchor",
+        "pretrain_object_box_size",
+        "pretrain_object_yaw",
+        "pretrain_object_velocity_anchor",
+        "pretrain_object_track_valid",
+        "pretrain_camera_to_anchor",
+        "pretrain_reference_frame_id",
+    )
+    missing = [name for name in required if not torch.is_tensor(batch.get(name))]
+    if missing:
+        raise RuntimeError(
+            f"factorized pretrain batch is missing fields: {', '.join(missing)}"
+        )
+    reference_rgb = batch["pretrain_reference_rgb"].to(
+        device=device, non_blocking=True
+    )
+    reference_alpha = batch["pretrain_reference_alpha"].to(
+        device=device, non_blocking=True
+    )
+    if reference_rgb.ndim != 5 or reference_alpha.ndim != 5:
+        raise ValueError("pretrain references must be [B,K,3/1,H,W]")
+    if int(reference_rgb.shape[0]) != batch_size:
+        raise ValueError(
+            f"reference batch {reference_rgb.shape[0]} != frame-id batch {batch_size}"
+        )
+    num_assets = int(reference_rgb.shape[1])
+    encoder = CanonicalAssetEncoder(
+        vggt_model.aggregator,
+        vggt_model.scene_tokenizer,
+        sf_root,
+        patch_grid=patch_grid,
+        max_tokens=32,
+    ).to(device)
+    appearance = encoder(
+        reference_rgb.reshape(
+            batch_size * num_assets, 1, 3, *reference_rgb.shape[-2:]
+        ),
+        reference_alpha.reshape(
+            batch_size * num_assets, 1, 1, *reference_alpha.shape[-2:]
+        ),
+        batch_size=batch_size,
+        num_assets=num_assets,
+    )
+    reference_frame_id = batch["pretrain_reference_frame_id"].to(
+        device=device, dtype=torch.long, non_blocking=True
+    )
+    for row in range(batch_size):
+        target_ids = set(
+            int(value) for value in frame_ids[row].detach().cpu().tolist()
+        )
+        for slot in range(num_assets):
+            if bool(appearance.appearance_mask[row, slot].any().item()):
+                reference_id = int(reference_frame_id[row, slot].item())
+                if reference_id < 0 or reference_id in target_ids:
+                    raise RuntimeError(
+                        f"asset reference frame {reference_id} must lie outside "
+                        f"target window {sorted(target_ids)}"
+                    )
+
+    condition = build_factorized_asset_condition(
+        appearance_tokens=appearance.appearance_tokens,
+        appearance_mask=appearance.appearance_mask,
+        canonical_uv=appearance.canonical_uv,
+        object_to_anchor=batch["pretrain_object_obj_to_anchor"].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        ),
+        center_anchor=batch["pretrain_object_center_anchor"].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        ),
+        box_size_lwh=batch["pretrain_object_box_size"].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        ),
+        yaw=batch["pretrain_object_yaw"].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        ),
+        velocity_anchor=batch["pretrain_object_velocity_anchor"].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        ),
+        track_valid=batch["pretrain_object_track_valid"].to(
+            device=device, dtype=torch.bool, non_blocking=True
+        ),
+        camera_to_anchor=batch["pretrain_camera_to_anchor"].to(
+            device=device, dtype=torch.float32, non_blocking=True
+        ),
+        intrinsics=torch.as_tensor(
+            intrinsics, device=device, dtype=torch.float32
+        ),
+        image_size_hw=torch.as_tensor(image_size_hw, device=device),
+        patch_grid=patch_grid,
+        reference_frame_id=reference_frame_id,
+    )
+    lengths = condition.appearance_mask.any(dim=-1).sum(dim=-1).long()
+    kinds = [
+        "factorized_asset" if int(value) > 0 else "none"
+        for value in lengths.detach().cpu().tolist()
+    ]
+    return SimpleNamespace(
+        condition=condition,
+        lengths=lengths,
+        kinds=kinds,
+        source_kinds=source_kinds,
+    )
 
 
 def build_pretrain_bundle_from_batch(
@@ -4951,73 +5269,33 @@ def build_pretrain_bundle_from_batch(
     bundle.sky_atlas_clean = sky_atlas_clean
     bundle.sky_atlas_observation_mask = sky_atlas_observation_mask
     bundle.camera_previous_c2w_dggt = camera_previous_c2w_dggt
-    # Corrupt copied target latents only while optimizing.  Validation and
-    # offline inference keep deterministic, clean asset conditions so their
-    # outputs remain reproducible and comparable across runs.
-    asset_corruption_noise_std = 0.0
-    if sf_root.training:
-        asset_corruption_noise_std = float(
-            getattr(args, "pretrain_asset_corruption_noise_std", 0.01)
-        )
-        if asset_corruption_noise_std < 0.0:
-            raise ValueError(
-                "pretrain_asset_corruption_noise_std must be non-negative, got "
-                f"{asset_corruption_noise_std}"
-            )
-    object_patch_mask = batch.get("pretrain_object_patch_mask")
-    source_kind_raw = batch.get("pretrain_asset_source_kind")
-    if isinstance(source_kind_raw, str):
-        asset_source_kinds = [source_kind_raw] * int(z_clean_n.shape[0])
-    elif source_kind_raw is None or torch.is_tensor(source_kind_raw):
-        asset_source_kinds = ["unknown"] * int(z_clean_n.shape[0])
-    else:
-        asset_source_kinds = [str(v) for v in list(source_kind_raw)]
-        if len(asset_source_kinds) != int(z_clean_n.shape[0]):
-            asset_source_kinds = ["unknown"] * int(z_clean_n.shape[0])
-
-    if torch.is_tensor(object_patch_mask):
-        asset_tokens, asset_mask, asset_lengths, asset_kinds = build_pretrain_asset_slots_from_object_patch_mask(
-            z_clean_n,
-            object_patch_mask,
-            max_assets=5,
-            corruption_noise_std=asset_corruption_noise_std,
-        )
-        for row, length in enumerate(asset_lengths.detach().cpu().tolist()):
-            if int(length) > 0:
-                asset_source_kinds[row] = "instances_projected"
-    else:
-        asset_tokens, asset_mask, asset_lengths, asset_kinds = build_pretrain_asset_slots_from_object_patch_mask(
-            z_clean_n,
-            None,
-            max_assets=5,
-            corruption_noise_std=0.0,
-        )
-
-    dynamic_mask = batch.get("dynamic_mask")
-    needs_legacy = asset_lengths.detach().to(device=z_clean_n.device).eq(0)
-    if torch.is_tensor(dynamic_mask) and bool(needs_legacy.any().item()):
-        legacy_tokens, legacy_mask, legacy_lengths, legacy_kinds = build_pretrain_asset_slots_from_dynamic_mask(
-            z_clean_n,
-            dynamic_mask,
-            args.patch_grid,
-            max_assets=5,
-            corruption_noise_std=asset_corruption_noise_std,
-        )
-        for row, needs_row in enumerate(needs_legacy.detach().cpu().tolist()):
-            if not needs_row:
-                continue
-            asset_tokens[row] = legacy_tokens[row]
-            asset_mask[row] = legacy_mask[row]
-            asset_lengths[row] = legacy_lengths[row]
-            asset_kinds[row] = legacy_kinds[row]
-            if int(legacy_lengths[row].detach().cpu().item()) > 0:
-                asset_source_kinds[row] = "legacy_dynamic_mask"
-
-    bundle.F_asset_tokens = asset_tokens
-    bundle.encoder_attention_mask = asset_mask
-    bundle.F_asset_lengths = asset_lengths
-    bundle.asset_condition_kind = asset_kinds
-    bundle.asset_condition_source_kind = asset_source_kinds
+    factorized = build_factorized_asset_condition_from_batch(
+        batch,
+        vggt_model,
+        scene_flow,
+        device,
+        patch_grid=args.patch_grid,
+        frame_ids=frame_ids,
+        intrinsics=intrinsics_all,
+        image_size_hw=raw_hw_front,
+    )
+    batch_size = int(z_clean_n.shape[0])
+    bundle.F_asset_tokens = z_clean_n.new_zeros(
+        (batch_size, 0, int(z_clean_n.shape[-1]))
+    )
+    bundle.encoder_attention_mask = None
+    bundle.factorized_asset_condition = factorized.condition
+    bundle.F_asset_lengths = factorized.lengths
+    bundle.asset_condition_kind = factorized.kinds
+    bundle.asset_condition_source_kind = factorized.source_kinds
+    fps_raw = batch.get("pretrain_fps", 10.0)
+    bundle.fps = torch.as_tensor(
+        fps_raw, device=device, dtype=torch.float32
+    ).reshape(-1)
+    if int(bundle.fps.numel()) == 1 and batch_size > 1:
+        bundle.fps = bundle.fps.expand(batch_size)
+    if tuple(bundle.fps.shape) != (batch_size,):
+        raise ValueError(f"pretrain_fps must be scalar or [B], got {tuple(bundle.fps.shape)}")
     bundle.captions = captions_from_pretrain_batch(batch, int(z_clean_n.shape[0]))
     if bool(include_rgb_render_context):
         timestamps = batch.get("timestamps")
@@ -5820,16 +6098,6 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
-    parser.add_argument(
-        "--pretrain_asset_corruption_noise_std",
-        type=float,
-        default=0.01,
-        help=(
-            "Std of the small Gaussian perturbation applied to valid copied asset latents "
-            "during training only. Latents are normalized to roughly unit scale; validation "
-            "and inference always use 0 for deterministic conditioning."
-        ),
-    )
     parser.add_argument("--uncond_drop_prob", type=float, default=0.1,
                         help="Legacy fallback per-sample condition dropout probability for text/asset/camera.")
     parser.add_argument(
@@ -6046,6 +6314,7 @@ def main() -> None:
         camera_gen_dim=camera_gen_dim,
         camera_generation_representation=CAMERA_GENERATION_REPRESENTATION,
         asset_position_mode=str(args.asset_position_mode),
+        asset_condition_protocol="factorized_v1",
         sky_token_dim=SKY_TOKEN_DIM,
         sky_grid=args.sky_grid,
         max_sky_tokens=int(args.sky_grid[0] * args.sky_grid[1]),

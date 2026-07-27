@@ -194,15 +194,30 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
     full_fov = torch.full((batch_size, context_frames, 2), 1.0)
     full_pose = _dggt_pose(full_c2w, full_fov)
 
-    class _Tokenizer:
+    class _Tokenizer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+
         @staticmethod
         def encode(levels, patch_grid):
             assert patch_grid == (1, 2)
             return levels[0]
 
+    class _Aggregator(torch.nn.Module):
+        patch_start_idx = 0
+
+        @staticmethod
+        def forward(reference_images):
+            count = int(reference_images.shape[0])
+            tokens = torch.ones(count, 1, patches, channels)
+            levels = [tokens.clone() for _ in range(24)]
+            return levels, levels, levels, None, 0
+
     class _Vggt:
         def __init__(self) -> None:
             self.scene_tokenizer = _Tokenizer()
+            self.aggregator = _Aggregator()
             self.camera_head = lambda _levels: [full_pose]
 
         def get_aggregator_token_outputs(self, context_images):
@@ -239,6 +254,10 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
     intrinsics[..., 1, 1] = 500.0
     intrinsics[..., 0, 2] = 1.0
     intrinsics[..., 1, 2] = 1.0
+    object_to_anchor = torch.eye(4).view(1, 1, 1, 4, 4).repeat(
+        batch_size, 1, window_frames, 1, 1
+    )
+    object_to_anchor[..., 2, 3] = 10.0
     batch = {
         "images": torch.zeros(batch_size, window_frames, 3, 2, 2),
         "dggt_context_images": torch.zeros(batch_size, context_frames, 3, 2, 2),
@@ -251,16 +270,35 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
         "raw_image_size_hw": torch.tensor([[2, 2], [2, 2]]),
         "camera_trajectory_anchor_to_world_corrected": full_c2w[:, :1],
         "camera_previous_to_world_corrected": previous_c2w,
-        "pretrain_object_patch_mask": torch.ones(
-            batch_size, 1, window_frames, patches, dtype=torch.bool
+        "pretrain_asset_condition_version": ["factorized_asset_v1"] * batch_size,
+        "pretrain_asset_source_kind": ["instances_projected"] * batch_size,
+        "pretrain_reference_rgb": torch.ones(batch_size, 1, 3, 2, 2),
+        "pretrain_reference_alpha": torch.ones(batch_size, 1, 1, 2, 2),
+        "pretrain_reference_frame_id": torch.tensor([[10], [17]]),
+        "pretrain_object_obj_to_anchor": object_to_anchor,
+        "pretrain_object_center_anchor": torch.tensor([0.0, 0.0, 10.0])
+        .view(1, 1, 1, 3)
+        .repeat(batch_size, 1, window_frames, 1),
+        "pretrain_object_box_size": torch.tensor([1.0, 1.0, 1.0])
+        .view(1, 1, 1, 3)
+        .repeat(batch_size, 1, window_frames, 1),
+        "pretrain_object_yaw": torch.full(
+            (batch_size, 1, window_frames), torch.pi / 2
         ),
+        "pretrain_object_velocity_anchor": torch.zeros(batch_size, 1, window_frames, 3),
+        "pretrain_object_track_valid": torch.ones(
+            batch_size, 1, window_frames, dtype=torch.bool
+        ),
+        "pretrain_camera_to_anchor": torch.eye(4)
+        .view(1, 1, 4, 4)
+        .repeat(batch_size, window_frames, 1, 1),
+        "pretrain_fps": torch.full((batch_size,), 10.0),
     }
     args = SimpleNamespace(
         patch_grid=(1, 2),
         precision="fp32",
         no_sky_generation=True,
         sky_mask_refine_scale=2,
-        pretrain_asset_corruption_noise_std=0.01,
     )
     scene_flow = _SceneFlow()
     torch.manual_seed(123)
@@ -277,7 +315,8 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
         [False] * 10,
     ]
     assert torch.equal(bundle.z_clean_n[:, :, 0, 0], window_indices.float())
-    assert not torch.equal(bundle.F_asset_tokens[:, 0], bundle.z_clean_n)
+    assert bundle.F_asset_tokens.shape == (batch_size, 0, channels)
+    assert bundle.factorized_asset_condition.appearance_mask.any(dim=-1).all()
 
     scene_flow.eval()
     eval_bundle = build_pretrain_bundle_from_batch(
@@ -287,7 +326,10 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
         torch.device("cpu"),
         args,
     )
-    assert torch.equal(eval_bundle.F_asset_tokens[:, 0], eval_bundle.z_clean_n)
+    assert torch.equal(
+        eval_bundle.factorized_asset_condition.appearance_tokens,
+        bundle.factorized_asset_condition.appearance_tokens,
+    )
     assert torch.allclose(bundle.camera_previous_c2w_dggt[1], full_c2w[1, 6])
     decoded = decode_camera_trajectory(
         bundle.camera_target_state_dggt[1:2],

@@ -52,8 +52,10 @@ import types
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -86,14 +88,23 @@ except ModuleNotFoundError:
 
 from datasets.dataset import WaymoOpenDataset
 from dggt.models.scene_flow import WanSceneFlow
+from dggt.models.canonical_asset_encoder import CanonicalAssetEncoder
 from dggt.losses.rgb_render_loss import decode_generated_dggt_geometry
 from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers, load_into_buffers
 from dggt.utils.camera_generation import CAMERA_GENERATION_DIM, CAMERA_GENERATION_REPRESENTATION
+from dggt.utils.camera_condition import camera_summary_from_waymo_gt
 from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.flow_schedule import resolve_inference_flow_schedule
 from dggt.utils.gaussian_edit import CleanSceneState, build_clean_scene_state
 from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
-from dggt.utils.sliding_window import resolve_offline_window
+from dggt.utils.sliding_window import resolve_offline_window, window_slices
+from dggt.utils.factorized_asset_condition import (
+    FACTORIZED_ASSET_CONDITION_VERSION,
+    FactorizedAssetCondition,
+    build_factorized_asset_condition,
+    canonicalize_asset_reference,
+    interpolate_box_keyframes,
+)
 from train_scene_flow_pretrain import (
     DEFAULT_SKY_GRID,
     SKY_TOKEN_DIM,
@@ -109,7 +120,9 @@ from train_scene_flow_pretrain import (
     _sky_mask_patch_to_image,
     _timestamps_for_generated_render,
     autocast_context,
+    build_factorized_asset_condition_from_batch,
     build_pretrain_bundle_from_batch,
+    build_full_scene_bundle,
     cfg_sample_pretrain_latents,
     decode_pose_from_camera_features,
     decode_sky_patch_tokens,
@@ -179,6 +192,23 @@ def apply_condition_mode(bundle: Any, mode: str) -> Any:
         if torch.is_tensor(getattr(bundle, "F_asset_lengths", None)):
             bundle.F_asset_lengths = torch.zeros_like(bundle.F_asset_lengths)
         bundle.asset_condition_kind = ["asset_uncond"] * batch_size
+        factorized = getattr(bundle, "factorized_asset_condition", None)
+        if isinstance(factorized, FactorizedAssetCondition):
+            bundle.factorized_asset_condition = factorized.drop_rows(
+                torch.ones((batch_size,), device=factorized.appearance_mask.device, dtype=torch.bool)
+            )
+        by_window = getattr(bundle, "factorized_asset_conditions_by_window", None)
+        if by_window is not None:
+            bundle.factorized_asset_conditions_by_window = {
+                key: condition.drop_rows(
+                    torch.ones(
+                        (batch_size,),
+                        device=condition.appearance_mask.device,
+                        dtype=torch.bool,
+                    )
+                )
+                for key, condition in by_window.items()
+            }
 
     if not use_camera:
         # Do not pass GT-derived pose summaries at all.  The sampler inserts one
@@ -199,7 +229,30 @@ def _row_has_any(mask: torch.Tensor | None, batch_size: int) -> list[bool]:
 
 def actual_condition_rows(bundle: Any) -> dict[str, list[bool]]:
     batch_size = _batch_size_from_bundle(bundle)
-    asset_rows = _row_has_any(getattr(bundle, "encoder_attention_mask", None), batch_size)
+    factorized = getattr(bundle, "factorized_asset_condition", None)
+    if isinstance(factorized, FactorizedAssetCondition):
+        asset_rows = (
+            factorized.appearance_mask.any(dim=(1, 2))
+            & factorized.track_valid.any(dim=(1, 2))
+        ).detach().cpu().tolist()
+    else:
+        asset_rows = _row_has_any(getattr(bundle, "encoder_attention_mask", None), batch_size)
+    by_window = getattr(bundle, "factorized_asset_conditions_by_window", None)
+    if by_window:
+        window_rows = [False] * batch_size
+        for condition in by_window.values():
+            rows = (
+                condition.appearance_mask.any(dim=(1, 2))
+                & condition.track_valid.any(dim=(1, 2))
+            ).detach().cpu().tolist()
+            window_rows = [
+                bool(window_rows[row]) or bool(rows[row])
+                for row in range(batch_size)
+            ]
+        asset_rows = [
+            bool(asset_rows[row]) or bool(window_rows[row])
+            for row in range(batch_size)
+        ]
     asset_kinds = getattr(bundle, "asset_condition_kind", None)
     if isinstance(asset_kinds, str):
         asset_kinds = [asset_kinds] * batch_size
@@ -223,6 +276,427 @@ def actual_condition_rows(bundle: Any) -> dict[str, list[bool]]:
             for idx, row in enumerate(camera_rows)
         ]
     return {"asset": asset_rows, "camera": camera_rows}
+
+
+def _load_external_rgba(
+    image_path: Path,
+    mask_path: Path | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    image = Image.open(image_path)
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.float32) / 255.0
+    rgb = torch.from_numpy(rgba[..., :3]).permute(2, 0, 1).contiguous()
+    embedded_alpha = torch.from_numpy(rgba[..., 3]).unsqueeze(0).contiguous()
+    if mask_path is not None:
+        mask_array = np.asarray(Image.open(mask_path).convert("L"), dtype=np.float32) / 255.0
+        alpha = torch.from_numpy(mask_array).unsqueeze(0).contiguous()
+    elif image.mode in ("RGBA", "LA") or "transparency" in image.info:
+        alpha = embedded_alpha
+    else:
+        raise ValueError(
+            f"RGB asset {image_path} requires an explicit `mask`; "
+            "automatic foreground extraction is outside the model protocol."
+        )
+    if tuple(alpha.shape[-2:]) != tuple(rgb.shape[-2:]):
+        raise ValueError(f"asset mask {mask_path} does not match image {image_path}")
+    return rgb, alpha
+
+
+def _object_to_anchor_from_center_yaw(
+    centers: torch.Tensor,
+    yaws: torch.Tensor,
+) -> torch.Tensor:
+    if centers.ndim != 3 or yaws.shape != centers.shape[:-1]:
+        raise ValueError("centers/yaws must be [K,S,3] and [K,S]")
+    k, s = int(centers.shape[0]), int(centers.shape[1])
+    result = torch.eye(4, dtype=centers.dtype).view(1, 1, 4, 4).repeat(k, s, 1, 1)
+    cosine, sine = torch.cos(yaws), torch.sin(yaws)
+    # Match training metadata: yaw is atan2(local-x heading_x,
+    # local-x heading_z), so yaw=0 points the object's length axis along
+    # anchor +z and positive yaw turns it toward anchor +x.
+    result[..., 0, 0] = sine
+    result[..., 2, 0] = cosine
+    result[..., 0, 2] = -cosine
+    result[..., 2, 2] = sine
+    result[..., :3, 3] = centers
+    return result
+
+
+def build_external_factorized_pretrain_bundle(
+    manifest_path: str | Path,
+    *,
+    vggt_model: nn.Module,
+    scene_flow: nn.Module,
+    device: torch.device,
+    patch_grid: tuple[int, int],
+) -> tuple[Any, dict[str, Any]]:
+    """Build an open-inference bundle without a target video or target mask."""
+    path = Path(manifest_path)
+    payload = json.loads(path.read_text())
+    if payload.get("coordinate_frame") != "camera_anchor":
+        raise ValueError("external asset manifest coordinate_frame must be 'camera_anchor'")
+    fps = float(payload.get("fps", 10.0))
+    if not math.isfinite(fps) or fps <= 0.0:
+        raise ValueError("manifest fps must be finite and positive")
+    camera = payload.get("camera")
+    if not isinstance(camera, dict):
+        raise ValueError("manifest requires a camera object")
+    camera_to_anchor = torch.as_tensor(camera.get("camera_to_anchor"), dtype=torch.float32)
+    if camera_to_anchor.ndim != 3 or camera_to_anchor.shape[-2:] != (4, 4):
+        raise ValueError("camera.camera_to_anchor must be [S,4,4]")
+    seq_len = int(camera_to_anchor.shape[0])
+    intrinsics = torch.as_tensor(camera.get("intrinsics"), dtype=torch.float32)
+    if intrinsics.ndim == 2:
+        intrinsics = intrinsics.unsqueeze(0)
+    if intrinsics.ndim != 3 or intrinsics.shape[-2:] != (3, 3):
+        raise ValueError("camera.intrinsics must be [1/S,3,3]")
+    if int(intrinsics.shape[0]) == 1:
+        intrinsics = intrinsics.expand(seq_len, -1, -1).contiguous()
+    if int(intrinsics.shape[0]) != seq_len:
+        raise ValueError("camera intrinsics length must be one or match camera_to_anchor")
+    image_size_hw = torch.as_tensor(camera.get("image_size_hw"), dtype=torch.long)
+    if tuple(image_size_hw.shape) != (2,) or bool((image_size_hw <= 0).any()):
+        raise ValueError("camera.image_size_hw must contain positive [height,width]")
+
+    sf = unwrap_ddp(scene_flow)
+    if str(getattr(sf.config, "asset_condition_protocol", "")) != "factorized_v1":
+        raise RuntimeError(
+            "External factorized asset inference requires a checkpoint trained with "
+            "asset_condition_protocol='factorized_v1'; legacy checkpoints do not "
+            "contain trained placement-adapter weights."
+        )
+    max_assets = int(sf.config.max_assets)
+    canvas_hw = (int(patch_grid[0]) * 14, int(patch_grid[1]) * 14)
+    reference_rgb = torch.zeros((max_assets, 3, *canvas_hw), dtype=torch.float32)
+    reference_alpha = torch.zeros((max_assets, 1, *canvas_hw), dtype=torch.float32)
+    centers = torch.zeros((max_assets, seq_len, 3), dtype=torch.float32)
+    sizes = torch.ones((max_assets, seq_len, 3), dtype=torch.float32)
+    yaws = torch.zeros((max_assets, seq_len), dtype=torch.float32)
+    velocities = torch.zeros((max_assets, seq_len, 3), dtype=torch.float32)
+    track_valid = torch.zeros((max_assets, seq_len), dtype=torch.bool)
+    objects = payload.get("objects", [])
+    if not isinstance(objects, list):
+        raise ValueError("manifest objects must be a list")
+    if len(objects) > max_assets:
+        raise ValueError(f"manifest has {len(objects)} objects, model supports {max_assets}")
+    object_ids = []
+    for slot, item in enumerate(objects):
+        if not isinstance(item, dict):
+            raise ValueError("each manifest object must be a JSON object")
+        image_value = item.get("image")
+        if not image_value:
+            raise ValueError("each manifest object requires `image`")
+        image_path = (path.parent / str(image_value)).resolve()
+        mask_value = item.get("mask")
+        mask_path = None if not mask_value else (path.parent / str(mask_value)).resolve()
+        rgb, alpha = _load_external_rgba(image_path, mask_path)
+        reference_rgb[slot], reference_alpha[slot] = canonicalize_asset_reference(
+            rgb, alpha, canvas_hw
+        )
+        center, size, yaw, velocity, valid = interpolate_box_keyframes(
+            item.get("keyframes", []),
+            seq_len,
+            fps,
+        )
+        centers[slot] = center
+        sizes[slot] = size
+        yaws[slot] = yaw
+        velocities[slot] = velocity
+        track_valid[slot] = valid
+        object_ids.append(str(item.get("id", f"asset_{slot}")))
+
+    encoder = CanonicalAssetEncoder(
+        vggt_model.aggregator,
+        vggt_model.scene_tokenizer,
+        sf,
+        patch_grid=patch_grid,
+        max_tokens=32,
+    ).to(device)
+    appearance = encoder(
+        reference_rgb.to(device).reshape(max_assets, 1, 3, *canvas_hw),
+        reference_alpha.to(device).reshape(max_assets, 1, 1, *canvas_hw),
+        batch_size=1,
+        num_assets=max_assets,
+    )
+    object_to_anchor = _object_to_anchor_from_center_yaw(centers, yaws).unsqueeze(0).to(device)
+    reference_frame_id = torch.full((1, max_assets), -1, device=device, dtype=torch.long)
+    condition = build_factorized_asset_condition(
+        appearance_tokens=appearance.appearance_tokens,
+        appearance_mask=appearance.appearance_mask,
+        canonical_uv=appearance.canonical_uv,
+        object_to_anchor=object_to_anchor,
+        center_anchor=centers.unsqueeze(0).to(device),
+        box_size_lwh=sizes.unsqueeze(0).to(device),
+        yaw=yaws.unsqueeze(0).to(device),
+        velocity_anchor=velocities.unsqueeze(0).to(device),
+        track_valid=track_valid.unsqueeze(0).to(device),
+        camera_to_anchor=camera_to_anchor.unsqueeze(0).to(device),
+        intrinsics=intrinsics.unsqueeze(0).to(device),
+        image_size_hw=image_size_hw.to(device),
+        patch_grid=patch_grid,
+        reference_frame_id=reference_frame_id,
+    )
+    # Anchor coordinates are a valid "world" for the shared camera summary.
+    camera_tokens, camera_mask = camera_summary_from_waymo_gt(
+        camera_to_anchor.unsqueeze(0).to(device),
+        intrinsics.unsqueeze(0).to(device),
+        image_hw=tuple(int(value) for value in image_size_hw.tolist()),
+        trajectory_anchor_to_world=torch.eye(4, device=device).view(1, 1, 4, 4),
+    )
+    latent_dim = int(sf.config.out_channels)
+    dummy_endpoint = torch.zeros(
+        (1, seq_len, int(patch_grid[0]) * int(patch_grid[1]), latent_dim),
+        device=device,
+    )
+    frame_ids = torch.arange(seq_len, device=device, dtype=torch.long).view(1, -1)
+    bundle = build_full_scene_bundle(
+        dummy_endpoint,
+        kv_dim=latent_dim,
+        camera_condition_tokens=camera_tokens,
+        camera_attention_mask=camera_mask,
+        camera_condition_kind=["camera"],
+        frame_ids=frame_ids,
+    )
+    bundle.F_asset_tokens = dummy_endpoint.new_zeros((1, 0, latent_dim))
+    bundle.encoder_attention_mask = None
+    bundle.factorized_asset_condition = condition
+    bundle.F_asset_lengths = condition.appearance_mask.any(dim=-1).sum(dim=-1).long()
+    bundle.asset_condition_kind = [
+        "factorized_asset" if bool(condition.appearance_mask.any()) else "none"
+    ]
+    bundle.asset_condition_source_kind = ["external_manifest"]
+    bundle.captions = [str(payload.get("text", ""))]
+    bundle.fps = torch.tensor([fps], device=device)
+    bundle.camera_gen_anchor_mask = frame_ids.eq(0)
+    return bundle, {
+        "manifest": str(path),
+        "condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
+        "object_ids": object_ids,
+        "num_frames": seq_len,
+        "fps": fps,
+        "image_size_hw": image_size_hw.tolist(),
+    }
+
+
+def _align_sliding_asset_payload_slots(
+    payloads: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Give the same object the same slot in every inference window."""
+    if not payloads:
+        return [], []
+    max_assets = len(payloads[0].get("pretrain_object_ids", []))
+    if max_assets <= 0:
+        return payloads, []
+    scores: dict[str, float] = {}
+    for payload in payloads:
+        ids = [str(value) for value in payload["pretrain_object_ids"]]
+        values = torch.as_tensor(payload["pretrain_object_scores"]).reshape(-1)
+        if len(ids) != max_assets or int(values.numel()) != max_assets:
+            raise ValueError("sliding asset payload slot counts disagree")
+        for slot, object_id in enumerate(ids):
+            if object_id:
+                scores[object_id] = scores.get(object_id, 0.0) + float(
+                    values[slot].item()
+                )
+    global_ids = [
+        object_id
+        for object_id, _ in sorted(
+            scores.items(), key=lambda item: (-item[1], item[0])
+        )[:max_assets]
+    ]
+    global_ids.extend([""] * (max_assets - len(global_ids)))
+
+    aligned = []
+    for payload in payloads:
+        source_ids = [str(value) for value in payload["pretrain_object_ids"]]
+        source_lookup = {
+            object_id: slot
+            for slot, object_id in enumerate(source_ids)
+            if object_id
+        }
+        result = dict(payload)
+        result["pretrain_object_ids"] = [""] * max_assets
+        result["pretrain_object_class_names"] = [""] * max_assets
+        slot_tensor_keys = [
+            key
+            for key, value in payload.items()
+            if torch.is_tensor(value)
+            and value.ndim >= 1
+            and int(value.shape[0]) == max_assets
+            and (
+                key.startswith("pretrain_object_")
+                or key.startswith("pretrain_reference_")
+            )
+        ]
+        for key in slot_tensor_keys:
+            value = payload[key]
+            if key == "pretrain_object_obj_to_anchor":
+                reset = torch.eye(4, dtype=value.dtype, device=value.device)
+                reset = reset.view(1, 1, 4, 4).repeat(
+                    max_assets, int(value.shape[1]), 1, 1
+                )
+            elif key in (
+                "pretrain_object_bbox_patch",
+                "pretrain_reference_frame_id",
+            ):
+                reset = torch.full_like(value, -1)
+            else:
+                reset = torch.zeros_like(value)
+            result[key] = reset
+        for destination, object_id in enumerate(global_ids):
+            source = source_lookup.get(object_id)
+            if source is None:
+                continue
+            result["pretrain_object_ids"][destination] = object_id
+            result["pretrain_object_class_names"][destination] = payload[
+                "pretrain_object_class_names"
+            ][source]
+            for key in slot_tensor_keys:
+                result[key][destination] = payload[key][source]
+        aligned.append(result)
+    return aligned, global_ids
+
+
+def attach_training_equivalent_sliding_asset_conditions(
+    bundle: Any,
+    *,
+    dataset: WaymoOpenDataset,
+    dataset_index: int,
+    batch: dict[str, Any],
+    vggt_model: nn.Module,
+    scene_flow: nn.Module,
+    device: torch.device,
+    patch_grid: tuple[int, int],
+    window: int,
+    stride: int,
+) -> dict[str, Any]:
+    """Attach per-window references for raw target-video inference.
+
+    A complete 29-frame rollout has no frame outside the *whole* rollout, but
+    each model forward sees only one sliding window.  For target-informed
+    evaluation we therefore rebuild the asset condition for every actual model
+    window with the dataset's training projector.  Its reference is guaranteed
+    to come from the same trunk but outside that window.
+    """
+    seq_len = int(bundle.z_clean_n.shape[1])
+    windows = window_slices(seq_len, int(window), int(stride))
+    if len(windows) <= 1:
+        return {"active": False, "windows": []}
+    if int(bundle.z_clean_n.shape[0]) != 1:
+        raise ValueError(
+            "window-specific raw inference asset extraction currently requires batch size 1"
+        )
+    intrinsics = batch.get("intrinsics")
+    if not torch.is_tensor(intrinsics):
+        raise RuntimeError("raw sliding inference requires batch intrinsics")
+    intrinsics = intrinsics.to(device=device, dtype=torch.float32)
+    raw_hw = torch.as_tensor(batch.get("raw_image_size_hw"), device=device)
+    if raw_hw.ndim >= 3 and int(raw_hw.shape[-1]) == 2:
+        raw_hw = raw_hw[:, 0]
+    frame_ids = torch.as_tensor(bundle.frame_ids, device=device, dtype=torch.long)
+    if frame_ids.ndim == 1:
+        frame_ids = frame_ids.unsqueeze(0)
+
+    raw_payloads = [
+        dataset.build_pretrain_asset_payload_for_sample_window(
+            int(dataset_index), int(start), int(end)
+        )
+        for start, end in windows
+    ]
+    aligned_payloads, global_object_ids = _align_sliding_asset_payload_slots(
+        raw_payloads
+    )
+    conditions: dict[tuple[int, int], FactorizedAssetCondition] = {}
+    diagnostics = []
+    max_lengths = torch.zeros_like(bundle.F_asset_lengths)
+    any_asset = False
+    for (start, end), payload in zip(windows, aligned_payloads):
+        payload_batch: dict[str, Any] = {}
+        for key, value in payload.items():
+            payload_batch[key] = value.unsqueeze(0) if torch.is_tensor(value) else value
+        built = build_factorized_asset_condition_from_batch(
+            payload_batch,
+            vggt_model,
+            scene_flow,
+            device,
+            patch_grid=patch_grid,
+            frame_ids=frame_ids[:, start:end],
+            intrinsics=intrinsics[:, start:end],
+            image_size_hw=raw_hw,
+        )
+        condition = built.condition.validate()
+        if condition.seq_len != int(end - start):
+            raise RuntimeError(
+                f"window [{start},{end}) condition has S={condition.seq_len}"
+            )
+        conditions[(int(start), int(end))] = condition
+        max_lengths = torch.maximum(max_lengths, built.lengths)
+        has_asset = bool(
+            (
+                condition.appearance_mask.any(dim=(1, 2))
+                & condition.track_valid.any(dim=(1, 2))
+            ).any()
+        )
+        any_asset |= has_asset
+        refs = condition.reference_frame_id.detach().cpu().tolist()
+        target_ids = frame_ids[:, start:end].detach().cpu().tolist()
+        for row_refs, row_targets in zip(refs, target_ids):
+            target_set = set(int(value) for value in row_targets)
+            for reference_id in row_refs:
+                if int(reference_id) >= 0 and int(reference_id) in target_set:
+                    raise RuntimeError(
+                        f"sliding inference reference {reference_id} lies inside "
+                        f"window target frames {sorted(target_set)}"
+                    )
+        diagnostics.append(
+            {
+                "window": [int(start), int(end)],
+                "target_frame_ids": target_ids,
+                "reference_frame_ids": refs,
+                "source_kinds": built.source_kinds,
+                "has_asset": has_asset,
+            }
+        )
+    for left_index, (left_start, left_end) in enumerate(windows):
+        left = conditions[(left_start, left_end)]
+        for right_start, right_end in windows[left_index + 1 :]:
+            overlap_start = max(left_start, right_start)
+            overlap_end = min(left_end, right_end)
+            if overlap_start >= overlap_end:
+                continue
+            right = conditions[(right_start, right_end)]
+            left_slice = left.slice_time(
+                overlap_start - left_start, overlap_end - left_start
+            )
+            right_slice = right.slice_time(
+                overlap_start - right_start, overlap_end - right_start
+            )
+            shared = left_slice.track_valid & right_slice.track_valid
+            if bool(shared.any()):
+                placement_error = (
+                    left_slice.placement_state - right_slice.placement_state
+                ).abs().amax(dim=-1)
+                bbox_error = (
+                    left_slice.target_bbox_patch - right_slice.target_bbox_patch
+                ).abs().amax(dim=-1)
+                if bool((placement_error[shared] > 1.0e-4).any()) or bool(
+                    (bbox_error[shared] > 1.0e-4).any()
+                ):
+                    raise RuntimeError(
+                        "overlapping inference windows disagree on shared-object "
+                        f"placement/bbox for frames [{overlap_start},{overlap_end})"
+                    )
+    bundle.factorized_asset_conditions_by_window = conditions
+    bundle.F_asset_lengths = max_lengths
+    bundle.asset_condition_kind = [
+        "factorized_asset" if any_asset else "none"
+    ]
+    bundle.asset_condition_source_kind = ["sliding_outside_window_reference"]
+    return {
+        "active": True,
+        "global_object_ids": global_object_ids,
+        "overlap_geometry_verified": True,
+        "windows": diagnostics,
+    }
 
 
 def _strip_module_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -703,6 +1177,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--text_max_length", type=int, default=256)
     parser.add_argument("--no_text_condition", action="store_true")
     parser.add_argument("--output_dir", default="runs/scene_flow_pretrain_inference")
+    parser.add_argument(
+        "--asset_manifest",
+        default=None,
+        help=(
+            "External factorized asset manifest (RGBA or RGB+mask, box keyframes, "
+            "camera_to_anchor, intrinsics and FPS). This mode does not read a target video."
+        ),
+    )
 
     parser.add_argument("--val_scene_start", type=int, default=0)
     parser.add_argument("--val_scene_end", type=int, default=100)
@@ -897,6 +1379,71 @@ def main() -> None:
         )
     text_encoder = setup_text_encoder(args, device)
 
+    if args.asset_manifest:
+        bundle, manifest_info = build_external_factorized_pretrain_bundle(
+            args.asset_manifest,
+            vggt_model=vggt_model,
+            scene_flow=scene_flow,
+            device=device,
+            patch_grid=args.patch_grid,
+        )
+        args.num_frames = int(bundle.z_clean_n.shape[1])
+        args.val_log_images = int(args.num_frames)
+        args.val_sliding_window, args.val_sliding_stride, offline_sliding = resolve_offline_window(
+            int(args.num_frames),
+            int(args.val_sliding_window),
+            int(args.val_sliding_stride),
+        )
+        apply_condition_mode(bundle, "asset_cam")
+        output_root = Path(args.output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        results = []
+        for scale in cfg_scales:
+            args.guidance_scale = float(scale)
+            generated = cfg_sample_pretrain_latents(
+                scene_flow,
+                bundle,
+                args,
+                step=0,
+                device=device,
+                guidance_scale=float(scale),
+                text_encoder=text_encoder,
+                return_camera=False,
+                return_sky=sky_generation_enabled(args),
+                return_sky_mask=True,
+            )
+            output_path = output_root / f"external_factorized__cfg{cfg_tag(scale)}.pt"
+            torch.save(
+                {
+                    "video_latent_normalized": generated.video.detach().cpu(),
+                    "sky_tokens": None if generated.sky is None else generated.sky.detach().cpu(),
+                    "sky_mask_patch": None
+                    if generated.sky_mask_patch is None
+                    else generated.sky_mask_patch.detach().cpu(),
+                    "frame_ids": bundle.frame_ids.detach().cpu(),
+                    "fps": bundle.fps.detach().cpu(),
+                    "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
+                },
+                output_path,
+            )
+            results.append({"cfg": float(scale), "output": str(output_path)})
+        summary = {
+            "mode": "external_factorized_asset",
+            "target_video_read": False,
+            "target_dynamic_mask_read": False,
+            "manifest": manifest_info,
+            "checkpoint": checkpoint_info,
+            "window": int(args.val_sliding_window),
+            "window_stride": int(args.val_sliding_stride),
+            "sliding_window_active": bool(offline_sliding),
+            "results": results,
+        }
+        (output_root / "external_factorized_summary.json").write_text(
+            json.dumps(summary, indent=2, default=str)
+        )
+        print(f"[done] wrote external factorized outputs under {output_root}", flush=True)
+        return
+
     scene_names = discover_scene_names(args.val_image_dir, args.val_scene_start, args.val_scene_end)
     dataset = WaymoOpenDataset(
         image_dir=args.val_image_dir,
@@ -969,6 +1516,20 @@ def main() -> None:
         sample_dir.mkdir(parents=True, exist_ok=True)
 
         bundle = build_pretrain_bundle_from_batch(batch, vggt_model, scene_flow, device, args)
+        sliding_asset_info = {"active": False, "windows": []}
+        if offline_sliding:
+            sliding_asset_info = attach_training_equivalent_sliding_asset_conditions(
+                bundle,
+                dataset=dataset,
+                dataset_index=dataset_index,
+                batch=batch,
+                vggt_model=vggt_model,
+                scene_flow=scene_flow,
+                device=device,
+                patch_grid=args.patch_grid,
+                window=int(args.val_sliding_window),
+                stride=int(args.val_sliding_stride),
+            )
         apply_condition_mode(bundle, mode)
         condition_rows = actual_condition_rows(bundle)
         common_paths = save_common_validation_images(bundle, batch, sample_dir, args)
@@ -1041,6 +1602,7 @@ def main() -> None:
             "window": int(args.val_sliding_window),
             "window_stride": int(args.val_sliding_stride),
             "sliding_window_active": bool(offline_sliding),
+            "sliding_asset_reference_policy": sliding_asset_info,
             "sample_steps": int(args.val_sample_steps),
             "shift": float(args.shift),
             "checkpoint": checkpoint_info,

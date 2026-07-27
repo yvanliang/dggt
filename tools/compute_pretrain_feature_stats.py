@@ -36,6 +36,7 @@ from dggt.utils.feature_stats import (
     save_feature_stats,
 )
 from dggt.utils.tokens import batched_gather_frames, select_patch_pyramid
+from dggt.utils.factorized_asset_condition import PLACEMENT_STATE_DIM
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
@@ -230,6 +231,9 @@ def compute_dggt_stats_single_pass(
     camera_sums = {role: torch.zeros(CAMERA_GENERATION_DIM, dtype=torch.float64) for role in ("anchor", "delta")}
     camera_sums2 = {role: value.clone() for role, value in camera_sums.items()}
     camera_counts = {"anchor": 0, "delta": 0}
+    placement_sum = torch.zeros(PLACEMENT_STATE_DIM, dtype=torch.float64)
+    placement_sum2 = torch.zeros_like(placement_sum)
+    placement_count = 0
     yielded = 0
     for batch_idx, batch in enumerate(loader):
         if args.max_batches is not None and batch_idx >= args.max_batches:
@@ -239,6 +243,29 @@ def compute_dggt_stats_single_pass(
                 "Batch is missing dynamic_mask. Check fine_dynamic_masks/all coverage for selected scenes."
             )
         images = batch["images"].to(device, non_blocking=True)
+        center = batch.get("pretrain_object_center_anchor")
+        size = batch.get("pretrain_object_box_size")
+        yaw = batch.get("pretrain_object_yaw")
+        velocity = batch.get("pretrain_object_velocity_anchor")
+        valid_track = batch.get("pretrain_object_track_valid")
+        in_frustum = batch.get("pretrain_object_in_frustum")
+        if all(torch.is_tensor(value) for value in (center, size, yaw, velocity, valid_track, in_frustum)):
+            placement = torch.cat(
+                (
+                    center.float(),
+                    size.float().clamp_min(1.0e-6).log(),
+                    torch.sin(yaw.float()).unsqueeze(-1),
+                    torch.cos(yaw.float()).unsqueeze(-1),
+                    velocity.float(),
+                    in_frustum.float().unsqueeze(-1),
+                ),
+                dim=-1,
+            )
+            selected = placement[valid_track.bool()].double()
+            if selected.numel():
+                placement_count += int(selected.shape[0])
+                placement_sum += selected.sum(dim=0)
+                placement_sum2 += selected.square().sum(dim=0)
         context_raw = batch.get("dggt_context_images")
         if not torch.is_tensor(context_raw):
             raise RuntimeError(
@@ -307,6 +334,24 @@ def compute_dggt_stats_single_pass(
         camera_stats[f"camera_{role}_mean"] = mean.float()
         camera_stats[f"camera_{role}_std"] = variance.sqrt().float().clamp_min(CAMERA_STATS_STD_FLOOR)
         camera_stats[f"camera_{role}_count"] = torch.tensor(count, dtype=torch.long)
+    if placement_count <= 0:
+        if bool(getattr(args, "require_factorized_placement", False)):
+            raise ValueError(
+                "factorized placement stats require at least one valid external-reference track"
+            )
+    else:
+        placement_mean = placement_sum / float(placement_count)
+        placement_var = (
+            placement_sum2 / float(placement_count) - placement_mean.square()
+        ).clamp_min(1.0e-6)
+        # Yaw sin/cos and in_frustum are deliberately not standardized.
+        placement_mean[6:8] = 0.0
+        placement_mean[11] = 0.0
+        placement_var[6:8] = 1.0
+        placement_var[11] = 1.0
+        camera_stats["placement_mean"] = placement_mean.float()
+        camera_stats["placement_std"] = placement_var.sqrt().float()
+        camera_stats["placement_count"] = torch.tensor(placement_count, dtype=torch.long)
     if not compute_latents:
         return None, camera_stats
     if latent_total == 0:
@@ -372,6 +417,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    args.require_factorized_placement = True
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

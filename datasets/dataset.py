@@ -13,6 +13,13 @@ import numpy as np
 import json
 
 from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
+from dggt.utils.factorized_asset_condition import (
+    FACTORIZED_ASSET_CONDITION_VERSION,
+    alpha_to_patch_mask,
+    bbox_patch_mask,
+    canonicalize_asset_reference,
+    project_anchor_boxes_to_patch_bboxes,
+)
 
 
 WAYMO_OPENCV2DATASET = np.array(
@@ -1088,7 +1095,8 @@ class WaymoOpenDataset(Dataset):
             return 25.0
         return 0.0
 
-    def _project_pretrain_object_slots(self, idx, indices, image_seq):
+    def _project_pretrain_object_slots_legacy_leaky(self, idx, indices, image_seq):
+        """Legacy target-dynamic-mask oracle retained for offline ablations only."""
         max_objects = max(0, int(self.pretrain_max_objects))
         gh, gw = self.pretrain_patch_grid
         empty = {
@@ -1298,6 +1306,443 @@ class WaymoOpenDataset(Dataset):
             "pretrain_object_scores": torch.tensor(scores.tolist(), dtype=torch.float32),
             "pretrain_asset_source_kind": "instances_projected",
         }
+
+    def _project_pretrain_object_slots(self, idx, indices, image_seq):
+        """Build leak-free references and target placement from raw Waymo metadata.
+
+        Target boxes, validity and patch support below use only 3D tracks and
+        cameras. Dynamic masks are loaded exclusively for the one source
+        reference frame selected outside ``indices``.
+        """
+        del image_seq
+        max_objects = max(0, int(self.pretrain_max_objects))
+        seq_len = len(indices)
+        gh, gw = self.pretrain_patch_grid
+        canvas_hw = (gh * 14, gw * 14)
+
+        def empty_payload(source_kind="factorized_empty"):
+            eye = torch.eye(4, dtype=torch.float32)
+            return {
+                "pretrain_object_ids": [""] * max_objects,
+                "pretrain_object_class_names": [""] * max_objects,
+                "pretrain_object_obj_to_anchor": eye.view(1, 1, 4, 4).repeat(max_objects, seq_len, 1, 1),
+                "pretrain_object_center_anchor": torch.zeros((max_objects, seq_len, 3), dtype=torch.float32),
+                "pretrain_object_box_size": torch.zeros((max_objects, seq_len, 3), dtype=torch.float32),
+                "pretrain_object_yaw": torch.zeros((max_objects, seq_len), dtype=torch.float32),
+                "pretrain_object_yaw_sincos": torch.zeros((max_objects, seq_len, 2), dtype=torch.float32),
+                "pretrain_object_velocity_anchor": torch.zeros((max_objects, seq_len, 3), dtype=torch.float32),
+                "pretrain_object_track_valid": torch.zeros((max_objects, seq_len), dtype=torch.bool),
+                "pretrain_object_in_frustum": torch.zeros((max_objects, seq_len), dtype=torch.bool),
+                "pretrain_object_bbox_model": torch.zeros((max_objects, seq_len, 4), dtype=torch.float32),
+                "pretrain_object_bbox_patch": torch.full((max_objects, seq_len, 4), -1.0, dtype=torch.float32),
+                "pretrain_object_patch_mask": torch.zeros((max_objects, seq_len, gh * gw), dtype=torch.bool),
+                "pretrain_object_valid_mask": torch.zeros((max_objects, seq_len), dtype=torch.bool),
+                "pretrain_object_scores": torch.zeros((max_objects,), dtype=torch.float32),
+                "pretrain_reference_rgb": torch.zeros((max_objects, 3, *canvas_hw), dtype=torch.float32),
+                "pretrain_reference_alpha": torch.zeros((max_objects, 1, *canvas_hw), dtype=torch.float32),
+                "pretrain_reference_patch_mask": torch.zeros((max_objects, gh * gw), dtype=torch.bool),
+                "pretrain_reference_frame_id": torch.full((max_objects,), -1, dtype=torch.long),
+                "pretrain_camera_to_anchor": eye.view(1, 4, 4).repeat(seq_len, 1, 1),
+                "pretrain_asset_source_kind": source_kind,
+                "pretrain_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
+                "pretrain_fps": torch.tensor(10.0, dtype=torch.float32),
+            }
+
+        empty = empty_payload()
+        if max_objects <= 0 or self.views != 1:
+            return empty
+        metadata = self._load_instance_metadata(idx)
+        if metadata is None or not metadata.get("instances_info"):
+            return empty_payload("factorized_instances_missing")
+        ego_pose_paths = self.extrinsic_paths[idx]
+        if not ego_pose_paths:
+            return empty_payload("factorized_camera_missing")
+        camera_extrinsic_path = self.ego_paths[idx] if idx < len(self.ego_paths) else ""
+        intrinsic_path = self.intrinsic_paths[idx]
+        if isinstance(intrinsic_path, (list, tuple)):
+            intrinsic_path = intrinsic_path[0] if intrinsic_path else ""
+        try:
+            camera_to_ego = _load_waymo_matrix4(camera_extrinsic_path, "front camera extrinsics")
+            intrinsics = _load_waymo_intrinsics_matrix(intrinsic_path)
+        except Exception:
+            return empty_payload("factorized_camera_missing")
+
+        total_frames = len(self.image_paths[idx])
+        trunk_base = (int(indices[0]) // int(self.trunk_frames)) * int(self.trunk_frames)
+        trunk_end = min(trunk_base + int(self.trunk_frames), total_frames)
+        trunk_indices = list(range(trunk_base, trunk_end))
+        target_set = {int(value) for value in indices}
+        reference_indices = [value for value in trunk_indices if value not in target_set]
+        if not reference_indices:
+            # In particular, a complete 29-frame target window cannot source a
+            # reference from itself.
+            return empty_payload("factorized_no_external_reference")
+
+        try:
+            anchor_ego_to_world = _load_waymo_matrix4(ego_pose_paths[trunk_base], "anchor ego pose")
+            anchor_to_world = (
+                anchor_ego_to_world @ camera_to_ego @ WAYMO_OPENCV2DATASET
+            ).astype(np.float32)
+            world_to_anchor = np.linalg.inv(anchor_to_world).astype(np.float32)
+        except Exception:
+            return empty_payload("factorized_anchor_missing")
+
+        camera_to_anchor = []
+        camera_to_world = {}
+        for frame_idx in trunk_indices:
+            try:
+                ego_to_world = _load_waymo_matrix4(ego_pose_paths[frame_idx], "ego pose")
+            except Exception:
+                return empty_payload("factorized_camera_missing")
+            c2w = (ego_to_world @ camera_to_ego @ WAYMO_OPENCV2DATASET).astype(np.float32)
+            camera_to_world[frame_idx] = c2w
+            if frame_idx in target_set:
+                camera_to_anchor.append((world_to_anchor @ c2w).astype(np.float32))
+        empty["pretrain_camera_to_anchor"] = torch.tensor(
+            np.stack(camera_to_anchor, axis=0).tolist(), dtype=torch.float32
+        )
+
+        with Image.open(self.image_paths[idx][trunk_base]) as image:
+            raw_hw = (int(image.height), int(image.width))
+        model_hw = _waymo_resize_geometry(raw_hw, target_width=518)["out_hw"]
+        if tuple(model_hw) != tuple(canvas_hw):
+            # The tokenizer patch grid must describe the actual DGGT canvas.
+            canvas_hw = tuple(int(value) for value in model_hw)
+            empty["pretrain_reference_rgb"] = torch.zeros((max_objects, 3, *canvas_hw), dtype=torch.float32)
+            empty["pretrain_reference_alpha"] = torch.zeros((max_objects, 1, *canvas_hw), dtype=torch.float32)
+
+        dynamic_paths = self.dynamic_mask_path[idx] if idx < len(self.dynamic_mask_path) else []
+        instances_info = metadata["instances_info"]
+        frame_instances = metadata.get("frame_instances", {})
+
+        def reference_overlap_is_acceptable(frame_idx, current_key, current_box, current_depth):
+            current = np.asarray(current_box, dtype=np.float32)
+            current_area = max(0.0, float(current[2] - current[0])) * max(
+                0.0, float(current[3] - current[1])
+            )
+            if current_area <= 0.0:
+                return False
+            for other_id in frame_instances.get(str(int(frame_idx)), []):
+                other_key = str(other_id)
+                if other_key == str(current_key):
+                    continue
+                other = instances_info.get(other_key)
+                if not isinstance(other, dict):
+                    continue
+                other_ann = other.get("frame_annotations", {})
+                other_frames = [int(value) for value in other_ann.get("frame_idx", [])]
+                try:
+                    other_pos = other_frames.index(int(frame_idx))
+                    other_o2w = np.asarray(
+                        other_ann["obj_to_world"][other_pos], dtype=np.float32
+                    ).reshape(4, 4)
+                    other_size = np.asarray(
+                        other_ann["box_size"][other_pos], dtype=np.float32
+                    ).reshape(3)
+                except (ValueError, IndexError, KeyError, TypeError):
+                    continue
+                other_raw, other_points_cam = _project_world_points_to_raw(
+                    _build_waymo_box_corners_world(other_o2w, other_size),
+                    camera_to_world[frame_idx],
+                    intrinsics,
+                    raw_hw,
+                )
+                if other_raw is None:
+                    continue
+                other_box, _ = _transform_waymo_box_to_model(
+                    other_raw, raw_hw, target_width=518
+                )
+                ix0 = max(float(current[0]), float(other_box[0]))
+                iy0 = max(float(current[1]), float(other_box[1]))
+                ix1 = min(float(current[2]), float(other_box[2]))
+                iy1 = min(float(current[3]), float(other_box[3]))
+                intersection = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+                if intersection <= 0.0:
+                    continue
+                other_area = max(0.0, float(other_box[2] - other_box[0])) * max(
+                    0.0, float(other_box[3] - other_box[1])
+                )
+                union = max(current_area + other_area - intersection, 1.0e-6)
+                iou = intersection / union
+                positive_depth = other_points_cam[:, 2][other_points_cam[:, 2] > 1.0e-6]
+                other_depth = (
+                    float(np.median(positive_depth))
+                    if positive_depth.size > 0
+                    else float("inf")
+                )
+                if iou > 0.5 or (
+                    other_depth < float(current_depth)
+                    and intersection / current_area > 0.25
+                ):
+                    return False
+            return True
+
+        projected = []
+        for object_id in self._candidate_instance_ids_for_clip(metadata, trunk_indices):
+            info = instances_info.get(str(object_id))
+            if not isinstance(info, dict):
+                continue
+            annotations = info.get("frame_annotations", {})
+            frame_seq = [int(value) for value in annotations.get("frame_idx", [])]
+            poses = annotations.get("obj_to_world", [])
+            sizes = annotations.get("box_size", [])
+            lookup = {frame: pos for pos, frame in enumerate(frame_seq)}
+            if not lookup:
+                continue
+
+            per_frame = {}
+            for frame_idx in trunk_indices:
+                pos = lookup.get(int(frame_idx))
+                if pos is None or pos >= len(poses) or pos >= len(sizes):
+                    continue
+                try:
+                    o2w = np.asarray(poses[pos], dtype=np.float32).reshape(4, 4)
+                    size = np.asarray(sizes[pos], dtype=np.float32).reshape(3)
+                except Exception:
+                    continue
+                if not np.isfinite(o2w).all() or not np.isfinite(size).all() or np.any(size <= 0.0):
+                    continue
+                raw_box, points_cam = _project_world_points_to_raw(
+                    _build_waymo_box_corners_world(o2w, size),
+                    camera_to_world[frame_idx],
+                    intrinsics,
+                    raw_hw,
+                )
+                in_frustum = raw_box is not None
+                model_box = np.zeros((4,), dtype=np.float32)
+                patch_mask = np.zeros((gh * gw,), dtype=np.bool_)
+                bbox_patch = np.full((4,), -1.0, dtype=np.float32)
+                if raw_box is not None:
+                    model_box, _ = _transform_waymo_box_to_model(raw_box, raw_hw, target_width=518)
+                    patch_mask, _ = _model_box_to_patch_mask(model_box, model_hw, (gh, gw))
+                    bbox_patch = np.array(
+                        [
+                            model_box[0] / float(model_hw[1]) * gw,
+                            model_box[1] / float(model_hw[0]) * gh,
+                            model_box[2] / float(model_hw[1]) * gw,
+                            model_box[3] / float(model_hw[0]) * gh,
+                        ],
+                        dtype=np.float32,
+                    )
+                o2a = (world_to_anchor @ o2w).astype(np.float32)
+                heading = o2a[:3, 0]
+                yaw = float(np.arctan2(float(heading[0]), float(heading[2]) + 1.0e-8))
+                per_frame[frame_idx] = {
+                    "o2a": o2a,
+                    "center": o2a[:3, 3].copy(),
+                    "size": size,
+                    "yaw": yaw,
+                    "model_box": model_box,
+                    "bbox_patch": bbox_patch,
+                    "patch_mask": patch_mask,
+                    "in_frustum": bool(in_frustum and np.any(points_cam[:, 2] > 1.0e-6)),
+                    "depth": float(
+                        np.median(points_cam[:, 2][points_cam[:, 2] > 1.0e-6])
+                    )
+                    if np.any(points_cam[:, 2] > 1.0e-6)
+                    else float("inf"),
+                }
+
+            reference_candidates = []
+            for frame_idx in reference_indices:
+                geom = per_frame.get(frame_idx)
+                if geom is None or not geom["in_frustum"]:
+                    continue
+                if not reference_overlap_is_acceptable(
+                    frame_idx,
+                    object_id,
+                    geom["model_box"],
+                    geom["depth"],
+                ):
+                    continue
+                if not isinstance(dynamic_paths, list) or frame_idx >= len(dynamic_paths):
+                    continue
+                dynamic = _load_waymo_dynamic_mask_model(dynamic_paths[frame_idx], target_width=518)
+                if dynamic is None:
+                    continue
+                x0, y0, x1, y1 = [int(round(value)) for value in geom["model_box"]]
+                x0, x1 = max(0, x0), min(int(model_hw[1]), x1)
+                y0, y1 = max(0, y0), min(int(model_hw[0]), y1)
+                alpha_np = np.zeros(model_hw, dtype=np.float32)
+                if x1 > x0 and y1 > y0:
+                    alpha_np[y0:y1, x0:x1] = dynamic[y0:y1, x0:x1].astype(np.float32)
+                alpha = torch.tensor(alpha_np.tolist(), dtype=torch.float32).unsqueeze(0)
+                if int(alpha_to_patch_mask(alpha, (gh, gw)).sum().item()) < 4:
+                    continue
+                reference_candidates.append((frame_idx, alpha))
+            if not reference_candidates:
+                continue
+            reference_frame, reference_alpha = random.choice(reference_candidates)
+            reference_rgb = load_and_preprocess_images([self.image_paths[idx][reference_frame]])[0]
+            canonical_rgb, canonical_alpha = canonicalize_asset_reference(
+                reference_rgb,
+                reference_alpha,
+                canvas_hw,
+            )
+            canonical_patch_mask = alpha_to_patch_mask(canonical_alpha, (gh, gw))
+            if int(canonical_patch_mask.sum().item()) < 4:
+                continue
+
+            target_valid = np.array([frame in per_frame for frame in indices], dtype=np.bool_)
+            target_centers = np.zeros((seq_len, 3), dtype=np.float32)
+            target_sizes = np.zeros((seq_len, 3), dtype=np.float32)
+            target_yaw = np.zeros((seq_len,), dtype=np.float32)
+            target_o2a = np.tile(np.eye(4, dtype=np.float32), (seq_len, 1, 1))
+            target_box_model = np.zeros((seq_len, 4), dtype=np.float32)
+            target_bbox_patch = np.full((seq_len, 4), -1.0, dtype=np.float32)
+            target_patch_mask = np.zeros((seq_len, gh * gw), dtype=np.bool_)
+            target_in_frustum = np.zeros((seq_len,), dtype=np.bool_)
+            for local_idx, frame_idx in enumerate(indices):
+                geom = per_frame.get(frame_idx)
+                if geom is None:
+                    continue
+                target_o2a[local_idx] = geom["o2a"]
+                target_centers[local_idx] = geom["center"]
+                target_sizes[local_idx] = geom["size"]
+                target_yaw[local_idx] = geom["yaw"]
+                target_box_model[local_idx] = geom["model_box"]
+                target_bbox_patch[local_idx] = geom["bbox_patch"]
+                target_patch_mask[local_idx] = geom["patch_mask"]
+                target_in_frustum[local_idx] = geom["in_frustum"]
+            velocity = np.zeros_like(target_centers)
+            valid_frames = sorted(int(frame) for frame in per_frame)
+            valid_rank = {frame: rank for rank, frame in enumerate(valid_frames)}
+            for local_idx, frame_idx in enumerate(indices):
+                if not target_valid[local_idx] or len(valid_frames) < 2:
+                    continue
+                rank = valid_rank[int(frame_idx)]
+                left_frame = valid_frames[max(0, rank - 1)]
+                right_frame = valid_frames[min(len(valid_frames) - 1, rank + 1)]
+                if left_frame == right_frame:
+                    continue
+                dt = float(right_frame - left_frame) / 10.0
+                velocity[local_idx] = (
+                    per_frame[right_frame]["center"]
+                    - per_frame[left_frame]["center"]
+                ) / max(dt, 1.0e-6)
+            coverage = int(target_valid.sum())
+            area = float(target_patch_mask.sum())
+            score = coverage * 1000.0 + area + self._class_priority_bonus(info.get("class_name", ""))
+            projected.append(
+                {
+                    "object_id": str(info.get("raw_object_id", info.get("id", object_id))),
+                    "class_name": str(info.get("class_name", "")),
+                    "o2a": target_o2a,
+                    "center": target_centers,
+                    "size": target_sizes,
+                    "yaw": target_yaw,
+                    "velocity": velocity,
+                    "track_valid": target_valid,
+                    "in_frustum": target_in_frustum,
+                    "bbox_model": target_box_model,
+                    "bbox_patch": target_bbox_patch,
+                    "patch_mask": target_patch_mask,
+                    "reference_rgb": canonical_rgb,
+                    "reference_alpha": canonical_alpha,
+                    "reference_patch_mask": canonical_patch_mask,
+                    "reference_frame": int(reference_frame - trunk_base),
+                    "score": score,
+                }
+            )
+
+        if not projected:
+            return empty_payload("factorized_no_external_reference")
+        projected.sort(key=lambda item: item["score"], reverse=True)
+        selected = projected[:max_objects]
+        for slot, item in enumerate(selected):
+            empty["pretrain_object_ids"][slot] = item["object_id"]
+            empty["pretrain_object_class_names"][slot] = item["class_name"]
+            empty["pretrain_object_obj_to_anchor"][slot] = torch.tensor(item["o2a"].tolist(), dtype=torch.float32)
+            empty["pretrain_object_center_anchor"][slot] = torch.tensor(item["center"].tolist(), dtype=torch.float32)
+            empty["pretrain_object_box_size"][slot] = torch.tensor(item["size"].tolist(), dtype=torch.float32)
+            empty["pretrain_object_yaw"][slot] = torch.tensor(item["yaw"].tolist(), dtype=torch.float32)
+            empty["pretrain_object_yaw_sincos"][slot, :, 0] = torch.sin(empty["pretrain_object_yaw"][slot])
+            empty["pretrain_object_yaw_sincos"][slot, :, 1] = torch.cos(empty["pretrain_object_yaw"][slot])
+            empty["pretrain_object_velocity_anchor"][slot] = torch.tensor(item["velocity"].tolist(), dtype=torch.float32)
+            empty["pretrain_object_track_valid"][slot] = torch.tensor(item["track_valid"].tolist(), dtype=torch.bool)
+            empty["pretrain_object_in_frustum"][slot] = torch.tensor(item["in_frustum"].tolist(), dtype=torch.bool)
+            empty["pretrain_object_bbox_model"][slot] = torch.tensor(item["bbox_model"].tolist(), dtype=torch.float32)
+            empty["pretrain_object_bbox_patch"][slot] = torch.tensor(item["bbox_patch"].tolist(), dtype=torch.float32)
+            empty["pretrain_object_patch_mask"][slot] = torch.tensor(item["patch_mask"].tolist(), dtype=torch.bool)
+            empty["pretrain_object_valid_mask"][slot] = torch.tensor(item["in_frustum"].tolist(), dtype=torch.bool)
+            empty["pretrain_object_scores"][slot] = float(item["score"])
+            empty["pretrain_reference_rgb"][slot] = item["reference_rgb"]
+            empty["pretrain_reference_alpha"][slot] = item["reference_alpha"]
+            empty["pretrain_reference_patch_mask"][slot] = item["reference_patch_mask"]
+            empty["pretrain_reference_frame_id"][slot] = int(item["reference_frame"])
+        projected_bbox, projected_in_frustum = project_anchor_boxes_to_patch_bboxes(
+            empty["pretrain_object_obj_to_anchor"].unsqueeze(0),
+            empty["pretrain_object_box_size"].unsqueeze(0),
+            empty["pretrain_object_track_valid"].unsqueeze(0),
+            empty["pretrain_camera_to_anchor"].unsqueeze(0),
+            torch.tensor(intrinsics.tolist(), dtype=torch.float32)
+            .view(1, 1, 3, 3)
+            .repeat(1, seq_len, 1, 1),
+            raw_hw,
+            (gh, gw),
+        )
+        empty["pretrain_object_bbox_patch"] = projected_bbox[0]
+        empty["pretrain_object_in_frustum"] = projected_in_frustum[0]
+        empty["pretrain_object_valid_mask"] = projected_in_frustum[0].clone()
+        empty["pretrain_object_patch_mask"] = bbox_patch_mask(
+            projected_bbox,
+            projected_in_frustum,
+            (gh, gw),
+        )[0]
+        empty["pretrain_asset_source_kind"] = "instances_projected"
+        return empty
+
+    def build_pretrain_asset_payload_for_sample_window(
+        self,
+        sample_index,
+        window_start,
+        window_end,
+    ):
+        """Build training-equivalent asset metadata for one inference window.
+
+        This is intentionally a thin public wrapper around the same projector
+        used by ``__getitem__``.  It is used only when raw-video inference
+        generates a long trunk through sliding windows: each window must obtain
+        its reference from the frames outside that window, exactly as training
+        does, instead of treating the complete long rollout as one target
+        window and silently closing every asset slot.
+        """
+        if not self.trunk_major_samples:
+            raise RuntimeError(
+                "window-specific pretrain asset payloads require trunk_major_samples=True"
+            )
+        sample_index = int(sample_index)
+        if sample_index < 0 or sample_index >= len(self.trunk_major_index):
+            raise IndexError(
+                f"sample index {sample_index} is outside [0,{len(self.trunk_major_index)})"
+            )
+        window_start, window_end = int(window_start), int(window_end)
+        if window_start < 0 or window_end <= window_start:
+            raise ValueError(
+                f"invalid local inference window [{window_start},{window_end})"
+            )
+        entry = self.trunk_major_index[sample_index]
+        scene_idx, trunk_idx = int(entry[0]), int(entry[1])
+        paths = self.image_paths[scene_idx]
+        total_frames = len(paths[0] if self.views == 3 else paths)
+        if len(entry) == 3:
+            sample_start = self._fixed_start_in_trunk(
+                total_frames,
+                trunk_idx,
+                window_offset=int(entry[2]),
+            )
+        else:
+            sample_start = self._fixed_start_in_trunk(total_frames, trunk_idx)
+        if window_end > int(self.sequence_length):
+            raise ValueError(
+                f"local inference window [{window_start},{window_end}) exceeds "
+                f"sample sequence length {self.sequence_length}"
+            )
+        indices = list(
+            range(sample_start + window_start, sample_start + window_end)
+        )
+        image_seq = [paths[index] for index in indices]
+        return self._project_pretrain_object_slots(scene_idx, indices, image_seq)
 
     def __getitem__(self, idx):
         trunk_idx = None
