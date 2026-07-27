@@ -67,13 +67,13 @@ WAYMO_DGGT_ROOT="${DATASET_ROOT}/training"
 WAYMO_DGGT_VAL_ROOT="${DATASET_ROOT}/validation"
 DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
 TOKENIZER_CKPT="${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
-FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v2.pt"
+FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v3.pt"
 SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${LIANGYY_ROOT}/model/Qwen/Qwen3-0.6B}"
 
 # 四机训练使用独立目录，避免覆盖单机/两机训练的 checkpoint、验证结果和状态文件。
-LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_two_nodes"
+LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_v3"
 LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/distributed_launch_four_nodes"
 
 # 以下变量在原脚本中定义，但当前训练命令没有使用。
@@ -88,7 +88,7 @@ SCENE_FLOW_VAL_MANIFEST="${DATASET_ROOT}/waymo_edit_cache/manifests/validation/v
 # ============================================================
 BATCH_SIZE_PER_GPU=1
 GRAD_ACCUM_STEPS=2
-NUM_WORKERS=4
+NUM_WORKERS=8
 PREFETCH_FACTOR=2
 
 UNCOND_DROP_PROB=0.1
@@ -102,7 +102,7 @@ ASSET_CONTROL_GUIDANCE_SCALE=1.0
 CAMERA_GUIDANCE_SCALE=1.0
 VAL_GUIDANCE_SCALES="1.0,2.0,4.0"
 
-WANDB_NAME="scene_flow_pretrain_waymo_2node_16gpu_b4_gb64_lr1e4_optcond"
+WANDB_NAME="scene_flow_pretrain_waymo_gb64_lr1e4_v3"
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
 
 # ============================================================
@@ -772,6 +772,7 @@ build_train_args() {
         --val_batches 1
         --val_log_images 10
         --val_sample_steps 35
+        --rgb_render_every 2
         --grad_clip_norm 1.0
         --seed 0
         --precision bf16

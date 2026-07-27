@@ -12,7 +12,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
+from dggt.losses.reconstruction_feedback_loss import (
+    compute_reconstruction_feedback_losses,
+)
+import dggt.losses.rgb_render_loss as rgb_render_module
 from dggt.losses.rgb_render_loss import (
+    RGBRenderLossResult,
     _masked_lpips,
     _render_one_sample,
     compute_rgb_render_loss,
@@ -41,18 +46,23 @@ from train_scene_flow_pretrain import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRETRAIN_LAUNCH_SCRIPTS = (
+    "pretrain_four_nodes.sh",
     "pretrain_half_node_p6000.sh",
+    "pretrain_ppu.sh",
     "pretrain_single_node.sh",
-    "pretrain_single_node_test.sh",
-    "pretrain_two_nodes.sh",
+    "pretrain_single_node30.sh",
+    "pretrain_three_nodes.sh",
+    "pretrain_two_nodes26.sh",
+    "pretrain_two_nodes31.sh",
 )
 
 
 class _Tokenizer(nn.Module):
     def decode(self, z: torch.Tensor, patch_grid):
         del patch_grid
-        base = z.mean(dim=-1, keepdim=True)
-        return [base.expand(*base.shape[:-1], 3072) for _ in range(4)]
+        repeats = (3072 + int(z.shape[-1]) - 1) // int(z.shape[-1])
+        base = z.repeat(*([1] * (z.ndim - 1)), repeats)[..., :3072]
+        return [base * (1.0 + 0.05 * level) for level in range(4)]
 
 
 class _DepthHead(nn.Module):
@@ -63,7 +73,9 @@ class _DepthHead(nn.Module):
         h, w = image_hw
         source = tokens[4][:, :, patch_start_idx:, 0].mean(dim=-1, keepdim=True)
         depth = (2.0 + 0.05 * source).view(*source.shape[:2], 1, 1, 1).expand(-1, -1, h, w, 1)
-        return depth, torch.ones_like(depth)
+        # DPTHead's scalar prediction keeps a channel dimension, but its
+        # confidence output does not: depth=[B,S,H,W,1], conf=[B,S,H,W].
+        return depth, torch.ones_like(depth[..., 0])
 
 
 class _GaussianHead(nn.Module):
@@ -365,6 +377,10 @@ def test_rgb_render_sigma_weight_smoothly_attenuates_high_noise():
         torch.tensor([1.0, 0.75**2, 0.5**2, 0.1**2, 0.0]),
     )
     torch.testing.assert_close(
+        rgb_render_sigma_weight(sigmas),
+        torch.tensor([1.0, 0.75**2, 0.5**2, 0.1**2, 0.0]),
+    )
+    torch.testing.assert_close(
         rgb_render_sigma_weight(sigmas, power=0.0),
         torch.ones_like(sigmas),
     )
@@ -408,10 +424,35 @@ def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
         ]
     )
     assert args.rgb_render_start_step == 5000
-    assert args.rgb_render_every == 2
+    assert args.rgb_render_every == 1
     assert args.rgb_render_max_frames == 0  # 0 means every frame in the clip.
     assert args.rgb_render_stride == 1
-    assert args.rgb_render_sigma_power == 1.0
+    assert args.rgb_render_sigma_power == 2.0
+    assert args.lambda_rgb_render == pytest.approx(0.1)
+    assert args.lambda_level_consistency == pytest.approx(0.1)
+    assert args.lambda_head_consistency == pytest.approx(0.1)
+
+
+def test_formal_rgb_defaults_match_pretrain_feedback_schedule():
+    from train_scene_flow import build_argparser
+
+    args = build_argparser().parse_args(
+        [
+            "--ckpt_path",
+            "/tmp/dggt.pt",
+            "--log_dir",
+            "/tmp/logs",
+        ]
+    )
+    assert args.rgb_render_start_step == 5000
+    assert args.rgb_render_every == 1
+    assert args.rgb_render_max_samples == 1
+    assert args.rgb_render_max_frames == 0
+    assert args.rgb_render_stride == 1
+    assert args.rgb_render_sigma_power == 2.0
+    assert args.lambda_rgb_render == pytest.approx(0.1)
+    assert args.lambda_level_consistency == pytest.approx(0.1)
+    assert args.lambda_head_consistency == pytest.approx(0.1)
 
 
 def test_pretrain_launch_scripts_do_not_override_rgb_coverage_defaults():
@@ -501,6 +542,198 @@ def test_generated_depth_head_is_differentiable_on_cpu():
     geometry.depth.mean().backward()
     assert z.grad is not None
     assert float(z.grad.abs().sum()) > 0.0
+
+
+def _feedback_geometry(z: torch.Tensor, *, image_hw: tuple[int, int] = (8, 8)):
+    return decode_generated_dggt_geometry(
+        vggt_model=_VGGT(),
+        scene_flow_root=_SceneFlow(),
+        z_clean_pred_n=z,
+        patch_grid=(1, 1),
+        patch_start_idx=1,
+        image_hw=image_hw,
+    )
+
+
+def test_reconstruction_feedback_is_zero_at_clean_target():
+    z = torch.tensor([[[[0.2, -0.4, 0.6, 0.1]], [[-0.1, 0.3, 0.7, -0.5]]]])
+    student = _feedback_geometry(z)
+    with torch.no_grad():
+        teacher = _feedback_geometry(z.detach())
+    result = compute_reconstruction_feedback_losses(
+        student_geometry=student,
+        teacher_geometry=teacher,
+        patch_grid=(1, 1),
+        patch_weight_mask=torch.ones((1, 2, 1, 1)),
+        loss_sky_mask_gt=torch.zeros((1, 2, 1, 8, 8)),
+        sky_weight=0.0,
+        max_frames=0,
+        render_stride=1,
+        sample_weight=torch.ones(1),
+    )
+    assert torch.isfinite(result.level_loss)
+    assert torch.isfinite(result.head_loss)
+    assert float(result.level_loss.abs()) < 1.0e-6
+    assert float(result.head_loss.abs()) < 1.0e-6
+
+
+def test_reconstruction_feedback_sigma_weight_attenuates_whole_sample():
+    target_row = torch.tensor([[[[0.2, -0.4, 0.6, 0.1]], [[-0.1, 0.3, 0.7, -0.5]]]])
+    target = target_row.expand(2, -1, -1, -1).clone()
+    prediction = target.clone()
+    prediction[..., 0] += 0.25
+    student = _feedback_geometry(prediction)
+    with torch.no_grad():
+        teacher = _feedback_geometry(target)
+    result = compute_reconstruction_feedback_losses(
+        student_geometry=student,
+        teacher_geometry=teacher,
+        patch_grid=(1, 1),
+        patch_weight_mask=torch.ones((2, 2, 1, 1)),
+        loss_sky_mask_gt=torch.zeros((2, 2, 1, 8, 8)),
+        sky_weight=0.0,
+        max_frames=0,
+        render_stride=1,
+        sample_weight=torch.tensor([1.0, 0.0]),
+    )
+    assert result.logs["loss_level_consistency_unweighted"] > 0.0
+    assert result.logs["loss_head_consistency_unweighted"] > 0.0
+    assert result.logs["loss_level_consistency"] == pytest.approx(
+        0.5 * result.logs["loss_level_consistency_unweighted"], rel=1.0e-5
+    )
+    assert result.logs["loss_head_consistency"] == pytest.approx(
+        0.5 * result.logs["loss_head_consistency_unweighted"], rel=1.0e-5
+    )
+
+
+def test_rgb_feedback_teacher_is_stop_grad_and_student_reuses_render_heads(monkeypatch):
+    calls = {"decode": 0}
+    original_decode = rgb_render_module.decode_generated_dggt_geometry
+
+    def counted_decode(**kwargs):
+        calls["decode"] += 1
+        return original_decode(**kwargs)
+
+    def fake_render_one_sample(**kwargs):
+        images = kwargs["images"]
+        frames = (
+            int(images.shape[0])
+            if int(kwargs["max_frames"]) <= 0
+            else min(int(kwargs["max_frames"]), int(images.shape[0]))
+        )
+        stride = max(1, int(kwargs["stride"]))
+        height = (int(images.shape[-2]) + stride - 1) // stride
+        width = (int(images.shape[-1]) + stride - 1) // stride
+        rendered = images.new_zeros((frames, 3, height, width))
+        alpha = images.new_zeros((frames, 1, height, width))
+        return rendered, alpha
+
+    monkeypatch.setattr(rgb_render_module, "decode_generated_dggt_geometry", counted_decode)
+    monkeypatch.setattr(rgb_render_module, "_render_one_sample", fake_render_one_sample)
+
+    z_target = torch.tensor(
+        [[[[0.2, -0.4, 0.6, 0.1]], [[-0.1, 0.3, 0.7, -0.5]]]],
+        requires_grad=True,
+    )
+    z_prediction = (z_target.detach() + torch.tensor([0.25, 0.0, 0.0, 0.0])).requires_grad_()
+    images = torch.zeros((1, 2, 3, 8, 8))
+    pose = torch.tensor(
+        [[[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]]
+    )
+    result = compute_rgb_render_loss(
+        vggt_model=_VGGT(),
+        scene_flow_root=_SceneFlow(),
+        z_clean_pred_n=z_prediction,
+        z_clean_target_n=z_target,
+        images=images,
+        timestamps=torch.tensor([[0.0, 1.0]]),
+        render_pose_enc_dggt=pose,
+        render_sky_probability=torch.zeros((1, 2, 1, 8, 8)),
+        loss_sky_mask_gt=torch.zeros((1, 2, 1, 8, 8)),
+        patch_grid=(1, 1),
+        patch_start_idx=1,
+        max_samples=1,
+        max_frames=0,
+        render_stride=1,
+        background_mode="black",
+        patch_weight_mask=torch.ones((1, 2, 1, 1)),
+        loss_sample_weight=torch.tensor([0.5]),
+    )
+    assert calls["decode"] == 2  # one shared student decode + one no-grad teacher decode
+    assert float(result.level_loss.detach()) > 0.0
+    assert float(result.head_loss.detach()) > 0.0
+    (result.level_loss + result.head_loss).backward()
+    assert z_prediction.grad is not None
+    assert torch.isfinite(z_prediction.grad).all()
+    assert float(z_prediction.grad.abs().sum()) > 0.0
+    assert z_target.grad is None
+
+
+def test_formal_training_adds_weighted_render_level_and_head_losses(monkeypatch):
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_rgb_loss(**kwargs):
+        captured["target"] = kwargs["z_clean_target_n"]
+        reference = kwargs["z_clean_pred_n"]
+        return RGBRenderLossResult(
+            loss=reference.sum() * 0.0 + 2.0,
+            level_loss=reference.sum() * 0.0 + 3.0,
+            head_loss=reference.sum() * 0.0 + 4.0,
+            logs={
+                "loss_rgb_render": 2.0,
+                "loss_level_consistency": 3.0,
+                "loss_head_consistency": 4.0,
+            },
+        )
+
+    monkeypatch.setattr(formal_train, "compute_rgb_render_loss", fake_rgb_loss)
+    z_pred = torch.zeros((1, 2, 1, 4), requires_grad=True)
+    z_clean = torch.ones_like(z_pred)
+    bundle = SimpleNamespace(
+        z_clean_n=z_clean,
+        rgb_render_images=torch.zeros((1, 2, 3, 8, 8)),
+        rgb_render_masks=torch.zeros((1, 2, 1, 8, 8)),
+        rgb_render_pose_enc_dggt=torch.zeros((1, 2, 9)),
+        rgb_render_timestamps=torch.tensor([[0.0, 1.0]]),
+        patch_grid=(1, 1),
+        patch_start_idx=1,
+    )
+    target = SimpleNamespace(
+        sigmas=torch.tensor([0.5]),
+        M_edit=torch.ones((1, 2, 1, 1)),
+    )
+    args = SimpleNamespace(
+        rgb_render_max_samples=1,
+        rgb_render_sigma_power=1.0,
+        rgb_render_max_frames=0,
+        rgb_render_stride=1,
+        sky_grid=(4, 8),
+        rgb_render_lpips_weight=0.0,
+        rgb_render_start_step=0,
+        rgb_render_warmup_steps=0,
+        lambda_rgb_render=0.01,
+        lambda_level_consistency=0.02,
+        lambda_head_consistency=0.03,
+    )
+    metrics: dict[str, float] = {}
+    result = formal_train._add_formal_rgb_render_loss(
+        z_pred.sum() * 0.0,
+        metrics,
+        args=args,
+        global_step=1,
+        active=True,
+        render_vggt_model=_VGGT(),
+        scene_flow_root=_SceneFlow(),
+        z_pred=z_pred,
+        bundle=bundle,
+        target=target,
+        lpips_model=None,
+    )
+    torch.testing.assert_close(captured["target"], z_clean)
+    assert float(result.detach()) == pytest.approx(0.01 * 2.0 + 0.02 * 3.0 + 0.03 * 4.0)
+    assert metrics["loss_level_consistency_weighted"] == pytest.approx(0.06)
+    assert metrics["loss_head_consistency_weighted"] == pytest.approx(0.12)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="gsplat CUDA gradient test")

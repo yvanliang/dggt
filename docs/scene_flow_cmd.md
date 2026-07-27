@@ -105,10 +105,13 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow_pretrain.p
     --lambda_camera_pose 1.0 \
     --camera_anchor_context_dropout 0.0 \
     --lambda_sky_flow 0.1 \
-    --lambda_rgb_render 0.01 \
+    --lambda_rgb_render 0.1 \
+    --lambda_level_consistency 0.1 \
+    --lambda_head_consistency 0.1 \
     --rgb_render_every 1 \
     --rgb_render_start_step 5000 \
     --rgb_render_warmup_steps 5000 \
+    --rgb_render_sigma_power 2.0 \
     --rgb_render_max_samples 1 \
     --rgb_render_max_frames 0 \
     --rgb_render_stride 1 \
@@ -269,13 +272,16 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
     --lambda_identity 1.0 \
     --edit_domain_threshold 1e-4 \
     --edit_domain_dilation 1 \
-    --lambda_rgb_render 0.01 \
-    --rgb_render_every 4 \
+    --lambda_rgb_render 0.1 \
+    --lambda_level_consistency 0.1 \
+    --lambda_head_consistency 0.1 \
+    --rgb_render_every 1 \
     --rgb_render_start_step 5000 \
     --rgb_render_warmup_steps 5000 \
+    --rgb_render_sigma_power 2.0 \
     --rgb_render_max_samples 1 \
-    --rgb_render_max_frames 4 \
-    --rgb_render_stride 2 \
+    --rgb_render_max_frames 0 \
+    --rgb_render_stride 1 \
     --rgb_render_lpips_weight 0.01 \
     --uncond_drop_prob 0.1 \
     --guidance_scale 1.0 \
@@ -305,7 +311,7 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 train_scene_flow.py \
 | micro-batch 执行 | 默认将 `batch_size>1` 的 bundle 合并后一次 forward/backward | 如需回退旧路径可加 `--no_batch_scene_flow` |
 | asset/cache 输入 | cache 读取所有可用 asset LUT levels，并使用 cached `pass2_splatted_tok_low` | 不再 live splat/blend；cache 字段缺失会在 DataLoader/assembler 阶段报错 |
 | camera 输入/渲染 | SceneFlow 条件输入使用 Waymo `camera_to_world_corrected + intrinsics` 摘要；RGB render 固定使用 cache 中完整 29 帧上下文预测的 DGGT camera，窗口渲染只切片对应 `pose_enc` | Waymo camera 只作为条件，不直接给 renderer；正式训练/离线推理不启用 camera generation token，也不让 edited latent 或局部窗口 CameraHead 重新定义相机 |
-| RGB 几何链 | generated video latent 经 frozen tokenizer decoder + DGGT depth/GS/instance heads 后可微渲染；GT sky mask 同时用于渲染和 masked LPIPS | teacher depth 不进入主 RGB renderer；正式阶段固定 input-DGGT camera，pretrain 才生成 camera/sky |
+| Reconstruction feedback / RGB 几何链 | generated video latent 经 frozen tokenizer decoder + DGGT depth/GS/instance heads 后，计算四层 feature consistency、frozen-head consistency 并可微渲染；三者共享 `every/start/max_samples/max_frames/stride`、warmup 和连续 sigma 权重 | teacher 为 `stopgrad(D(z_clean)) → H`，不读取额外 cache head；正式阶段固定 input-DGGT camera，pretrain 才生成 camera/sky |
 | sky handling | T1 不启用 pretrain sky generation 参数 | 正式训练、训练内 validation 和 offline inference 均执行 `GT_sky_mask * input_GT_RGB + (1-GT_sky_mask) * rendered_edit`，不调用 sky model 或做 min-max |
 | DataLoader | `--num_workers 4 --prefetch_factor 1`，默认不启用 `pin_memory` | 每个 cache 文件平均约 651MB，低 prefetch 避免 8 workers × 2 prefetch × batch_size 2 造成几十个大文件并发读；GB 级 batch 走 pin-memory 线程容易触发 `received 0 items of ancdata` |
 | worker tensor sharing | 默认 `--mp_sharing_strategy file_system` | 减少 multiprocessing 通过大量 fd 传递超大 tensor 时的稳定性问题；若系统 `/dev/shm`/临时目录策略特殊，可显式改回 `file_descriptor` |

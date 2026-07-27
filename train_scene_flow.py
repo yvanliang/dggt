@@ -909,24 +909,36 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda_rgb_render",
         type=float,
-        default=0.01,
+        default=0.1,
         help="Deployment-aligned RGB loss with generated depth and fixed input-DGGT camera.",
     )
-    parser.add_argument("--rgb_render_every", type=int, default=4)
+    parser.add_argument(
+        "--lambda_level_consistency",
+        type=float,
+        default=0.1,
+        help="Four-level tokenizer-decoder consistency weight, evaluated on RGB render steps.",
+    )
+    parser.add_argument(
+        "--lambda_head_consistency",
+        type=float,
+        default=0.1,
+        help="Frozen depth/GS/dynamic-head consistency weight, evaluated on RGB render steps.",
+    )
+    parser.add_argument("--rgb_render_every", type=int, default=1)
     parser.add_argument("--rgb_render_start_step", type=int, default=5000)
     parser.add_argument("--rgb_render_warmup_steps", type=int, default=5000)
     parser.add_argument(
         "--rgb_render_sigma_power",
         type=float,
-        default=1.0,
+        default=2.0,
         help=(
             "Continuously attenuate RGB reconstruction at noisy timesteps with "
             "w(sigma)=(1-sigma)^power; 0 disables sigma weighting."
         ),
     )
     parser.add_argument("--rgb_render_max_samples", type=int, default=1)
-    parser.add_argument("--rgb_render_max_frames", type=int, default=4)
-    parser.add_argument("--rgb_render_stride", type=int, default=2)
+    parser.add_argument("--rgb_render_max_frames", type=int, default=0)
+    parser.add_argument("--rgb_render_stride", type=int, default=1)
     parser.add_argument("--rgb_render_lpips_weight", type=float, default=0.01)
     parser.add_argument("--rgb_render_lpips_net", type=str, default="alex")
     parser.add_argument(
@@ -1998,6 +2010,10 @@ def _add_formal_rgb_render_loss(
 ) -> torch.Tensor:
     if not active:
         metrics["rgb_render_active"] = 0.0
+        metrics["loss_level_consistency"] = 0.0
+        metrics["loss_head_consistency"] = 0.0
+        metrics["loss_level_consistency_weighted"] = 0.0
+        metrics["loss_head_consistency_weighted"] = 0.0
         return loss
     if render_vggt_model is None:
         raise RuntimeError("Formal RGB loss requires the frozen DGGT decode/render model.")
@@ -2019,12 +2035,13 @@ def _add_formal_rgb_render_loss(
     sigma = target.sigmas[:render_samples]
     sigma_weights = rgb_render_sigma_weight(
         sigma,
-        float(getattr(args, "rgb_render_sigma_power", 1.0)),
+        float(getattr(args, "rgb_render_sigma_power", 2.0)),
     )
     result = compute_rgb_render_loss(
         vggt_model=unwrap_ddp(render_vggt_model),
         scene_flow_root=scene_flow_root,
         z_clean_pred_n=z_pred,
+        z_clean_target_n=getattr(bundle, "z_clean_n", None),
         images=images,
         timestamps=timestamps,
         render_pose_enc_dggt=pose,
@@ -2050,14 +2067,28 @@ def _add_formal_rgb_render_loss(
     )
     ramp = rgb_render_loss_ramp(args, global_step)
     weighted = float(args.lambda_rgb_render) * float(ramp) * result.loss
+    result_level_loss = getattr(result, "level_loss", result.loss * 0.0)
+    result_head_loss = getattr(result, "head_loss", result.loss * 0.0)
+    weighted_level = (
+        float(getattr(args, "lambda_level_consistency", 0.0))
+        * float(ramp)
+        * result_level_loss
+    )
+    weighted_head = (
+        float(getattr(args, "lambda_head_consistency", 0.0))
+        * float(ramp)
+        * result_head_loss
+    )
     metrics.update(result.logs)
     metrics["rgb_render_sigma_mean"] = float(sigma.float().mean().detach().item())
     metrics["rgb_render_sigma_weight_mean"] = float(sigma_weights.mean().detach().item())
     metrics["loss_rgb_render_sigma_weighted"] = float(result.loss.detach().item())
     metrics["loss_rgb_render_weighted"] = float(weighted.detach().item())
+    metrics["loss_level_consistency_weighted"] = float(weighted_level.detach().item())
+    metrics["loss_head_consistency_weighted"] = float(weighted_head.detach().item())
     metrics["rgb_render_ramp"] = float(ramp)
     metrics["rgb_render_active"] = 1.0
-    return loss + weighted
+    return loss + weighted + weighted_level + weighted_head
 
 
 def train_step(
@@ -3583,6 +3614,19 @@ def main() -> None:
     args.sky_grid = sky_grid_shape(args)
     if float(args.lambda_rgb_render) < 0.0:
         raise ValueError("--lambda_rgb_render must be non-negative.")
+    if float(args.lambda_level_consistency) < 0.0:
+        raise ValueError("--lambda_level_consistency must be non-negative.")
+    if float(args.lambda_head_consistency) < 0.0:
+        raise ValueError("--lambda_head_consistency must be non-negative.")
+    if (
+        float(args.lambda_level_consistency) > 0.0
+        or float(args.lambda_head_consistency) > 0.0
+    ) and not rgb_render_loss_enabled(args):
+        raise ValueError(
+            "Reconstruction feedback shares the RGB render schedule and requires "
+            "--lambda_rgb_render > 0 with --rgb_render_every > 0. Set both feedback "
+            "weights to zero when disabling the render path."
+        )
     if int(args.rgb_render_every) < 0:
         raise ValueError("--rgb_render_every must be non-negative.")
     if int(args.rgb_render_start_step) < 0 or int(args.rgb_render_warmup_steps) < 0:

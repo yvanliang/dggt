@@ -4675,7 +4675,7 @@ def train_step(
                 sky_view_sigma = target.sigmas[:sky_view_samples]
                 sky_view_sigma_weights = rgb_render_sigma_weight(
                     sky_view_sigma,
-                    float(getattr(args, "rgb_render_sigma_power", 1.0)),
+                    float(getattr(args, "rgb_render_sigma_power", 2.0)),
                 )
                 sky_view_loss, sky_view_logs = generated_sky_view_reconstruction_loss(
                     vggt_model=vggt_model,
@@ -4740,6 +4740,10 @@ def train_step(
                 # anchor must not be silently restored for this loss.
                 logs["loss_rgb_render"] = 0.0
                 logs["loss_rgb_render_weighted"] = 0.0
+                logs["loss_level_consistency"] = 0.0
+                logs["loss_head_consistency"] = 0.0
+                logs["loss_level_consistency_weighted"] = 0.0
+                logs["loss_head_consistency_weighted"] = 0.0
                 logs["rgb_render_active"] = 0.0
             else:
                 batch_size = int(pred_camera_state.shape[0])
@@ -4779,12 +4783,13 @@ def train_step(
                 selected_sigma = select_rows(target.sigmas, "sigmas")
                 sigma_weights = rgb_render_sigma_weight(
                     selected_sigma,
-                    float(getattr(args, "rgb_render_sigma_power", 1.0)),
+                    float(getattr(args, "rgb_render_sigma_power", 2.0)),
                 )
                 rgb_result = compute_rgb_render_loss(
                     vggt_model=vggt_model,
                     scene_flow_root=unwrap_ddp(scene_flow),
                     z_clean_pred_n=select_rows(z_pred, "z_pred"),
+                    z_clean_target_n=select_rows(bundle.z_clean_n, "z_clean_n"),
                     images=select_rows(bundle.rgb_render_images, "rgb_render_images"),
                     timestamps=rgb_timestamps,
                     render_pose_enc_dggt=generated_pose,
@@ -4818,7 +4823,23 @@ def train_step(
                     * float(ramp)
                     * rgb_result.loss
                 )
-                loss = loss + weighted
+                result_level_loss = getattr(
+                    rgb_result, "level_loss", rgb_result.loss * 0.0
+                )
+                result_head_loss = getattr(
+                    rgb_result, "head_loss", rgb_result.loss * 0.0
+                )
+                weighted_level = (
+                    float(getattr(args, "lambda_level_consistency", 0.0))
+                    * float(ramp)
+                    * result_level_loss
+                )
+                weighted_head = (
+                    float(getattr(args, "lambda_head_consistency", 0.0))
+                    * float(ramp)
+                    * result_head_loss
+                )
+                loss = loss + weighted + weighted_level + weighted_head
                 logs.update(rgb_result.logs)
                 logs["rgb_render_sigma_mean"] = float(
                     selected_sigma.float().mean().detach().item()
@@ -4830,9 +4851,19 @@ def train_step(
                     rgb_result.loss.detach().item()
                 )
                 logs["loss_rgb_render_weighted"] = float(weighted.detach().item())
+                logs["loss_level_consistency_weighted"] = float(
+                    weighted_level.detach().item()
+                )
+                logs["loss_head_consistency_weighted"] = float(
+                    weighted_head.detach().item()
+                )
                 logs["rgb_render_active"] = 1.0
         else:
             logs["rgb_render_active"] = 0.0
+            logs["loss_level_consistency"] = 0.0
+            logs["loss_head_consistency"] = 0.0
+            logs["loss_level_consistency_weighted"] = 0.0
+            logs["loss_head_consistency_weighted"] = 0.0
 
     logs["kv_tokens_mean"] = float(bundle.F_asset_lengths.float().mean().item())
     asset_source_kinds = getattr(bundle, "asset_condition_source_kind", None)
@@ -6009,8 +6040,20 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda_rgb_render",
         type=float,
-        default=0.01,
+        default=0.1,
         help="Deployment-aligned differentiable RGB loss using generated camera/depth/GS.",
+    )
+    parser.add_argument(
+        "--lambda_level_consistency",
+        type=float,
+        default=0.1,
+        help="Four-level tokenizer-decoder consistency weight, evaluated on RGB render steps.",
+    )
+    parser.add_argument(
+        "--lambda_head_consistency",
+        type=float,
+        default=0.1,
+        help="Frozen depth/GS/dynamic-head consistency weight, evaluated on RGB render steps.",
     )
     parser.add_argument("--rgb_render_every", type=int, default=2)
     parser.add_argument(
@@ -6023,7 +6066,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rgb_render_sigma_power",
         type=float,
-        default=1.0,
+        default=2.0,
         help=(
             "Continuously attenuate render/view reconstruction at noisy timesteps "
             "with w(sigma)=(1-sigma)^power; 0 disables sigma weighting."
@@ -6227,6 +6270,19 @@ def main() -> None:
         raise ValueError("--pretrain_instance_cache_size must be non-negative.")
     if float(args.lambda_rgb_render) < 0.0:
         raise ValueError("--lambda_rgb_render must be non-negative.")
+    if float(args.lambda_level_consistency) < 0.0:
+        raise ValueError("--lambda_level_consistency must be non-negative.")
+    if float(args.lambda_head_consistency) < 0.0:
+        raise ValueError("--lambda_head_consistency must be non-negative.")
+    if (
+        float(args.lambda_level_consistency) > 0.0
+        or float(args.lambda_head_consistency) > 0.0
+    ) and not rgb_render_loss_enabled(args):
+        raise ValueError(
+            "Reconstruction feedback shares the RGB render schedule and requires "
+            "--lambda_rgb_render > 0 with --rgb_render_every > 0. Set both feedback "
+            "weights to zero when disabling the render path."
+        )
     if int(args.rgb_render_every) < 0:
         raise ValueError("--rgb_render_every must be >= 0.")
     if int(args.rgb_render_max_samples) < 0 or int(args.rgb_render_max_frames) < 0:

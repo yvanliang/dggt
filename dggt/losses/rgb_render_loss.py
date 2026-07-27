@@ -24,12 +24,13 @@ import math
 import torch
 import torch.nn.functional as F
 
+from dggt.losses.reconstruction_feedback_loss import (
+    TOKENIZER_LEVELS,
+    compute_reconstruction_feedback_losses,
+)
 from dggt.utils.gaussian_render import composite_gsplat_rgb, composite_original_sky
 from dggt.utils.gs import get_split_gs
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
-
-
-TOKENIZER_LEVELS = (4, 11, 17, 23)
 
 
 @dataclass
@@ -47,6 +48,8 @@ class DecodedGeneratedGeometry:
 @dataclass
 class RGBRenderLossResult:
     loss: torch.Tensor
+    level_loss: torch.Tensor
+    head_loss: torch.Tensor
     logs: dict[str, float]
     rendered: torch.Tensor | None = None
     generated_depth: torch.Tensor | None = None
@@ -54,14 +57,14 @@ class RGBRenderLossResult:
 
 def rgb_render_loss_enabled(args: Any) -> bool:
     return float(getattr(args, "lambda_rgb_render", 0.0)) > 0.0 and int(
-        getattr(args, "rgb_render_every", 1)
+        getattr(args, "rgb_render_every", 2)
     ) > 0
 
 
 def should_apply_rgb_render_loss(args: Any, step: int | None, *, training: bool) -> bool:
     if not bool(training) or not rgb_render_loss_enabled(args):
         return False
-    every = max(1, int(getattr(args, "rgb_render_every", 1)))
+    every = max(1, int(getattr(args, "rgb_render_every", 2)))
     if step is not None and int(step) < max(0, int(getattr(args, "rgb_render_start_step", 0))):
         return False
     return step is None or int(step) % every == 0
@@ -80,7 +83,7 @@ def rgb_render_loss_ramp(args: Any, step: int | None) -> float:
     return max(0.0, min(1.0, float(int(step) - start) / float(warmup)))
 
 
-def rgb_render_sigma_weight(sigmas: torch.Tensor, power: float = 1.0) -> torch.Tensor:
+def rgb_render_sigma_weight(sigmas: torch.Tensor, power: float = 2.0) -> torch.Tensor:
     """Return per-sample clean-confidence weights ``(1 - sigma) ** power``.
 
     SceneFlow uses the noise-progress convention where sigma=0 is clean and
@@ -593,6 +596,7 @@ def compute_rgb_render_loss(
     vggt_model: torch.nn.Module,
     scene_flow_root: torch.nn.Module,
     z_clean_pred_n: torch.Tensor,
+    z_clean_target_n: torch.Tensor | None = None,
     images: torch.Tensor,
     timestamps: torch.Tensor,
     render_pose_enc_dggt: torch.Tensor,
@@ -626,7 +630,17 @@ def compute_rgb_render_loss(
     available = min(int(images.shape[0]), int(z_clean_pred_n.shape[0]))
     batch_size = available if int(max_samples) <= 0 else min(int(max_samples), available)
     if batch_size <= 0:
-        return RGBRenderLossResult(z_clean_pred_n.sum() * 0.0, {"loss_rgb_render": 0.0})
+        zero = z_clean_pred_n.sum() * 0.0
+        return RGBRenderLossResult(
+            loss=zero,
+            level_loss=zero,
+            head_loss=zero,
+            logs={
+                "loss_rgb_render": 0.0,
+                "loss_level_consistency": 0.0,
+                "loss_head_consistency": 0.0,
+            },
+        )
     if loss_sample_weight is None:
         sample_weight = torch.ones(
             (batch_size,),
@@ -670,6 +684,36 @@ def compute_rgb_render_loss(
     depth = _depth_to_bshw(geometry.depth)
     if not bool(torch.isfinite(depth).all()):
         raise FloatingPointError("generated DGGT depth contains non-finite values")
+    feedback = None
+    if z_clean_target_n is not None:
+        if int(z_clean_target_n.shape[0]) < batch_size:
+            raise ValueError(
+                f"z_clean_target_n has B={z_clean_target_n.shape[0]}, expected at least {batch_size}"
+            )
+        # Teacher decoding is the self-consistent frozen target D(z_clean).
+        # It must not build a graph; the student decode above remains fully
+        # differentiable with respect to z_clean_pred_n.
+        with torch.no_grad():
+            teacher_geometry = decode_generated_dggt_geometry(
+                vggt_model=vggt_model,
+                scene_flow_root=scene_flow_root,
+                z_clean_pred_n=z_clean_target_n[:batch_size].detach(),
+                patch_grid=patch_grid,
+                patch_start_idx=int(patch_start_idx),
+                image_hw=(height, width),
+            )
+        feedback = compute_reconstruction_feedback_losses(
+            student_geometry=geometry,
+            teacher_geometry=teacher_geometry,
+            patch_grid=patch_grid,
+            patch_weight_mask=patch_weight_mask,
+            loss_sky_mask_gt=loss_sky_mask_gt,
+            sky_weight=float(sky_weight),
+            max_frames=int(max_frames),
+            render_stride=int(render_stride),
+            sample_weight=sample_weight,
+        )
+        del teacher_geometry
 
     renders: list[torch.Tensor] = []
     alphas: list[torch.Tensor] = []
@@ -741,6 +785,14 @@ def compute_rgb_render_loss(
         "rgb_render_frames": float(frames),
         "rgb_render_samples": float(batch_size),
     }
+    zero = z_clean_pred_n.sum() * 0.0
+    level_loss = zero if feedback is None else feedback.level_loss
+    head_loss = zero if feedback is None else feedback.head_loss
+    if feedback is None:
+        logs["loss_level_consistency"] = 0.0
+        logs["loss_head_consistency"] = 0.0
+    else:
+        logs.update(feedback.logs)
     if lpips_model is not None and float(lpips_weight) > 0.0:
         pred_flat = rendered_b.reshape(batch_size * frames, 3, *rendered_b.shape[-2:]).clamp(0.0, 1.0)
         target_flat = target.reshape(batch_size * frames, 3, *target.shape[-2:]).clamp(0.0, 1.0)
@@ -757,6 +809,8 @@ def compute_rgb_render_loss(
         logs["loss_rgb_render_lpips"] = float(lpips_value.detach().item())
     return RGBRenderLossResult(
         loss=loss,
+        level_loss=level_loss,
+        head_loss=head_loss,
         logs=logs,
         rendered=rendered_b if return_debug_tensors else None,
         generated_depth=geometry.depth if return_debug_tensors else None,

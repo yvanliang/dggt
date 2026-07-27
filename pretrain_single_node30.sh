@@ -18,8 +18,10 @@ NPROC_PER_NODE=8
 # ============================================================
 PROJECT_ROOT="${PROJECT_ROOT:-/mnt/data4/liangyy_workspace/dggt}"
 DATASET_ROOT="${DATASET_ROOT:-/mnt/data4/liangyy_workspace/waymo_processed_dggt}"
-CONDA_SH="${CONDA_SH:-/home/wuzn/miniconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-dggt}"
+CONDA_ROOT="${CONDA_ROOT:-/mnt/data4/liangyy_workspace/miniconda3}"
+CONDA_SH="${CONDA_SH:-${CONDA_ROOT}/etc/profile.d/conda.sh}"
+CONDA_ENV="${CONDA_ENV:-${CONDA_ROOT}/envs/dggt}"
+PYTHON_BIN="${PYTHON_BIN:-${CONDA_ENV}/bin/python}"
 
 # ============================================================
 # Data and model paths. These match pretrain_two_nodes.sh.
@@ -28,12 +30,12 @@ WAYMO_DGGT_ROOT="${DATASET_ROOT}/training"
 WAYMO_DGGT_VAL_ROOT="${DATASET_ROOT}/validation"
 DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
 TOKENIZER_CKPT="${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
-FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v2.pt"
+FEATURE_STATS="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v3.pt"
 SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-/mnt/data4/liangyy_workspace/model/Qwen/Qwen3-0.6B}"
 
-LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_two_nodes"
+LOG_DIR="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_v3"
 LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/single_node_launch"
 
 # ============================================================
@@ -42,7 +44,7 @@ LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/single_node_launch"
 # ============================================================
 BATCH_SIZE_PER_GPU=1
 GRAD_ACCUM_STEPS=8
-NUM_WORKERS=4
+NUM_WORKERS=8
 PREFETCH_FACTOR=2
 
 UNCOND_DROP_PROB=0.1
@@ -56,7 +58,7 @@ ASSET_CONTROL_GUIDANCE_SCALE=1.0
 CAMERA_GUIDANCE_SCALE=1.0
 VAL_GUIDANCE_SCALES="1.0,2.0,4.0"
 
-WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_2node_16gpu_b4_gb64_lr1e4_optcond}"
+WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v3}"
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
 
 cuda_visible_devices() {
@@ -117,7 +119,7 @@ check_file() {
 }
 
 check_python_and_gpu() {
-    EXPECTED_GPU_COUNT="${NPROC_PER_NODE}" python - <<'PY'
+    EXPECTED_GPU_COUNT="${NPROC_PER_NODE}" "${PYTHON_BIN}" - <<'PY'
 import os
 import sys
 import torch
@@ -137,7 +139,7 @@ if count != expected:
     raise RuntimeError(f"Expected {expected} GPUs, got {count}")
 PY
 
-    python -m torch.distributed.run --help >/dev/null
+    "${PYTHON_BIN}" -m torch.distributed.run --help >/dev/null
 }
 
 build_train_args() {
@@ -149,7 +151,6 @@ build_train_args() {
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
         --log_dir "${LOG_DIR}"
-        --resume_path "${LOG_DIR}/ckpt/pretrain_step016000.pt"
         --caption_root "${SCENE_CAPTION_ROOT}"
         --val_caption_root "${SCENE_CAPTION_VAL_ROOT}"
         --text_encoder_path "${QWEN_TEXT_ENCODER}"
@@ -173,7 +174,7 @@ build_train_args() {
         --ema_decay 0.9995
         --warmup_steps 4000
         --max_steps 200000
-        --save_every 1000
+        --save_every 2000
         --shift 10.0
         --weighting_scheme waver
         --mode_scale 1.29
@@ -200,6 +201,7 @@ build_train_args() {
         --val_batches 1
         --val_log_images 10
         --val_sample_steps 35
+        --rgb_render_every 2
         --grad_clip_norm 1.0
         --seed 0
         --precision bf16
@@ -207,8 +209,6 @@ build_train_args() {
         --wandb
         --wandb_project dggt-flow
         --wandb_name "${WANDB_NAME}"
-        --wandb_run_id "0bmu7zky"
-        --wandb_resume must
     )
 }
 
@@ -222,6 +222,7 @@ echo "Checking local files..."
 check_dir "PROJECT_ROOT" "${PROJECT_ROOT}"
 check_file "train_scene_flow_pretrain.py" "${PROJECT_ROOT}/train_scene_flow_pretrain.py"
 check_file "CONDA_SH" "${CONDA_SH}"
+check_file "PYTHON_BIN" "${PYTHON_BIN}"
 check_dir "WAYMO_DGGT_ROOT" "${WAYMO_DGGT_ROOT}"
 check_dir "WAYMO_DGGT_VAL_ROOT" "${WAYMO_DGGT_VAL_ROOT}"
 check_file "DGGT_CKPT" "${DGGT_CKPT}"
@@ -236,12 +237,13 @@ cd "${PROJECT_ROOT}"
 build_train_args
 
 echo "=== Starting single-node 8-GPU pretraining ==="
+echo "PYTHON_BIN=${PYTHON_BIN}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${NNODES} node x ${NPROC_PER_NODE} gpu/node x ${BATCH_SIZE_PER_GPU} batch/gpu x ${GRAD_ACCUM_STEPS} accum"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG_DIR}/single_node.log"
 
-torchrun \
+"${PYTHON_BIN}" -m torch.distributed.run \
     --nnodes="${NNODES}" \
     --nproc_per_node="${NPROC_PER_NODE}" \
     --master_addr="${MASTER_ADDR}" \
