@@ -80,6 +80,28 @@ def rgb_render_loss_ramp(args: Any, step: int | None) -> float:
     return max(0.0, min(1.0, float(int(step) - start) / float(warmup)))
 
 
+def rgb_render_sigma_weight(sigmas: torch.Tensor, power: float = 1.0) -> torch.Tensor:
+    """Return per-sample clean-confidence weights ``(1 - sigma) ** power``.
+
+    SceneFlow uses the noise-progress convention where sigma=0 is clean and
+    sigma=1 is pure noise.  Keeping this weight outside the renderer's
+    pixel-mask normalization makes it attenuate the whole reconstruction
+    gradient instead of cancelling out in the normalized image loss.
+    ``power=0`` explicitly disables sigma weighting.
+    """
+    exponent = float(power)
+    if not math.isfinite(exponent) or exponent < 0.0:
+        raise ValueError(f"RGB render sigma power must be finite and non-negative, got {power}")
+    if not torch.is_tensor(sigmas):
+        raise TypeError("sigmas must be a torch.Tensor")
+    if sigmas.ndim != 1:
+        raise ValueError(f"sigmas must be a per-sample vector [B], got {tuple(sigmas.shape)}")
+    sigma = sigmas.detach().to(dtype=torch.float32).clamp(0.0, 1.0)
+    if exponent == 0.0:
+        return torch.ones_like(sigma)
+    return (1.0 - sigma).pow(exponent)
+
+
 def setup_lpips_for_rgb_loss(args: Any, device: torch.device):
     if not rgb_render_loss_enabled(args):
         return None
@@ -534,18 +556,36 @@ def _masked_lpips(
     prediction: torch.Tensor,
     target: torch.Tensor,
     weight: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Give both images the same neutral value outside the supervised support.
     prediction_masked = weight * prediction + (1.0 - weight) * 0.5
     target_masked = weight * target + (1.0 - weight) * 0.5
     value = lpips_model(prediction_masked * 2.0 - 1.0, target_masked * 2.0 - 1.0)
+    if sample_weight is None:
+        sample_scale = torch.ones(
+            (int(prediction.shape[0]),),
+            device=prediction.device,
+            dtype=torch.float32,
+        )
+    else:
+        if sample_weight.ndim != 1 or int(sample_weight.shape[0]) != int(prediction.shape[0]):
+            raise ValueError(
+                "LPIPS sample_weight must be [N] aligned with prediction, got "
+                f"{tuple(sample_weight.shape)} for N={int(prediction.shape[0])}"
+            )
+        sample_scale = sample_weight.to(device=prediction.device, dtype=torch.float32)
     if value.ndim >= 4 and tuple(value.shape[-2:]) != (1, 1):
         resized_weight = F.interpolate(weight, size=value.shape[-2:], mode="area")
-        return (value * resized_weight).sum() / resized_weight.sum().clamp_min(1.0e-6)
+        return (
+            value * resized_weight * sample_scale.view(-1, 1, 1, 1)
+        ).sum() / resized_weight.sum().clamp_min(1.0e-6)
     # Compatibility fallback for externally supplied non-spatial LPIPS models.
     valid = weight.mean(dim=(-3, -2, -1)).gt(0).to(value.dtype)
     per_image = value.reshape(value.shape[0], -1).mean(dim=-1)
-    return (per_image * valid).sum() / valid.sum().clamp_min(1.0)
+    return (
+        per_image * valid * sample_scale.to(device=value.device, dtype=value.dtype)
+    ).sum() / valid.sum().clamp_min(1.0)
 
 
 def compute_rgb_render_loss(
@@ -572,6 +612,7 @@ def compute_rgb_render_loss(
     sky_mask_grad_scale: float = 0.0,
     lpips_model: torch.nn.Module | None = None,
     lpips_weight: float = 0.0,
+    loss_sample_weight: torch.Tensor | None = None,
     return_debug_tensors: bool = False,
 ) -> RGBRenderLossResult:
     if images.ndim != 5 or int(images.shape[2]) != 3:
@@ -586,6 +627,24 @@ def compute_rgb_render_loss(
     batch_size = available if int(max_samples) <= 0 else min(int(max_samples), available)
     if batch_size <= 0:
         return RGBRenderLossResult(z_clean_pred_n.sum() * 0.0, {"loss_rgb_render": 0.0})
+    if loss_sample_weight is None:
+        sample_weight = torch.ones(
+            (batch_size,),
+            device=z_clean_pred_n.device,
+            dtype=torch.float32,
+        )
+    else:
+        if loss_sample_weight.ndim != 1 or int(loss_sample_weight.shape[0]) < batch_size:
+            raise ValueError(
+                "loss_sample_weight must be [B] with at least the rendered batch size, got "
+                f"{tuple(loss_sample_weight.shape)} for B={batch_size}"
+            )
+        sample_weight = loss_sample_weight[:batch_size].to(
+            device=z_clean_pred_n.device,
+            dtype=torch.float32,
+        )
+        if not bool(torch.isfinite(sample_weight).all()) or bool((sample_weight < 0.0).any()):
+            raise ValueError("loss_sample_weight must contain finite non-negative values")
     images = images[:batch_size].to(device=z_clean_pred_n.device, dtype=torch.float32)
     pose = scale_gradient(
         render_pose_enc_dggt[:batch_size].to(z_clean_pred_n.device, torch.float32),
@@ -661,11 +720,19 @@ def compute_rgb_render_loss(
         weight = weight * patch_image
     difference = rendered_b.float() - target.float()
     denominator = weight.sum().clamp_min(1.0e-6) * 3.0
-    charbonnier = (torch.sqrt(difference.square() + 1.0e-6) * weight).sum() / denominator
+    sample_scale = sample_weight.view(batch_size, 1, 1, 1, 1)
+    charbonnier_map = torch.sqrt(difference.square() + 1.0e-6)
+    charbonnier_unweighted = (charbonnier_map * weight).sum() / denominator
+    charbonnier = (charbonnier_map * weight * sample_scale).sum() / denominator
+    l1_unweighted = (difference.abs() * weight).sum() / denominator
+    l1 = (difference.abs() * weight * sample_scale).sum() / denominator
     loss = charbonnier
     logs = {
         "loss_rgb_render": float(charbonnier.detach().item()),
-        "loss_rgb_render_l1": float(((difference.abs() * weight).sum() / denominator).detach().item()),
+        "loss_rgb_render_unweighted": float(charbonnier_unweighted.detach().item()),
+        "loss_rgb_render_l1": float(l1.detach().item()),
+        "loss_rgb_render_l1_unweighted": float(l1_unweighted.detach().item()),
+        "rgb_render_sample_weight_mean": float(sample_weight.detach().mean().item()),
         "rgb_render_weight_mean": float(weight.detach().mean().item()),
         "rgb_render_alpha_mean": float(alpha_b.detach().mean().item()),
         "rgb_render_depth_mean": float(depth.detach().mean().item()),
@@ -678,7 +745,14 @@ def compute_rgb_render_loss(
         pred_flat = rendered_b.reshape(batch_size * frames, 3, *rendered_b.shape[-2:]).clamp(0.0, 1.0)
         target_flat = target.reshape(batch_size * frames, 3, *target.shape[-2:]).clamp(0.0, 1.0)
         weight_flat = weight.reshape(batch_size * frames, 1, *weight.shape[-2:]).clamp(0.0, 1.0)
-        lpips_value = _masked_lpips(lpips_model, pred_flat, target_flat, weight_flat)
+        lpips_sample_weight = sample_weight.view(batch_size, 1).expand(-1, frames).reshape(-1)
+        lpips_value = _masked_lpips(
+            lpips_model,
+            pred_flat,
+            target_flat,
+            weight_flat,
+            sample_weight=lpips_sample_weight,
+        )
         loss = loss + float(lpips_weight) * lpips_value
         logs["loss_rgb_render_lpips"] = float(lpips_value.detach().item())
     return RGBRenderLossResult(

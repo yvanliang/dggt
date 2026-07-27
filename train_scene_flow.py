@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import random
 import time
@@ -42,6 +43,7 @@ from dggt.losses.rgb_render_loss import (
     decode_generated_dggt_geometry,
     rgb_render_loss_enabled,
     rgb_render_loss_ramp,
+    rgb_render_sigma_weight,
     setup_lpips_for_rgb_loss,
     should_apply_rgb_render_loss,
 )
@@ -913,6 +915,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb_render_every", type=int, default=4)
     parser.add_argument("--rgb_render_start_step", type=int, default=5000)
     parser.add_argument("--rgb_render_warmup_steps", type=int, default=5000)
+    parser.add_argument(
+        "--rgb_render_sigma_power",
+        type=float,
+        default=1.0,
+        help=(
+            "Continuously attenuate RGB reconstruction at noisy timesteps with "
+            "w(sigma)=(1-sigma)^power; 0 disables sigma weighting."
+        ),
+    )
     parser.add_argument("--rgb_render_max_samples", type=int, default=1)
     parser.add_argument("--rgb_render_max_frames", type=int, default=4)
     parser.add_argument("--rgb_render_stride", type=int, default=2)
@@ -1999,6 +2010,17 @@ def _add_formal_rgb_render_loss(
             "Formal RGB loss requires RGB, GT sky mask, timestamps, and input-DGGT pose; "
             "teacher depth is deliberately not part of this contract."
         )
+    available = min(int(images.shape[0]), int(z_pred.shape[0]), int(target.sigmas.shape[0]))
+    render_samples = (
+        available
+        if int(args.rgb_render_max_samples) <= 0
+        else min(int(args.rgb_render_max_samples), available)
+    )
+    sigma = target.sigmas[:render_samples]
+    sigma_weights = rgb_render_sigma_weight(
+        sigma,
+        float(getattr(args, "rgb_render_sigma_power", 1.0)),
+    )
     result = compute_rgb_render_loss(
         vggt_model=unwrap_ddp(render_vggt_model),
         scene_flow_root=scene_flow_root,
@@ -2024,10 +2046,14 @@ def _add_formal_rgb_render_loss(
         sky_mask_grad_scale=0.0,
         lpips_model=lpips_model,
         lpips_weight=float(args.rgb_render_lpips_weight),
+        loss_sample_weight=sigma_weights,
     )
     ramp = rgb_render_loss_ramp(args, global_step)
     weighted = float(args.lambda_rgb_render) * float(ramp) * result.loss
     metrics.update(result.logs)
+    metrics["rgb_render_sigma_mean"] = float(sigma.float().mean().detach().item())
+    metrics["rgb_render_sigma_weight_mean"] = float(sigma_weights.mean().detach().item())
+    metrics["loss_rgb_render_sigma_weighted"] = float(result.loss.detach().item())
     metrics["loss_rgb_render_weighted"] = float(weighted.detach().item())
     metrics["rgb_render_ramp"] = float(ramp)
     metrics["rgb_render_active"] = 1.0
@@ -3561,6 +3587,8 @@ def main() -> None:
         raise ValueError("--rgb_render_every must be non-negative.")
     if int(args.rgb_render_start_step) < 0 or int(args.rgb_render_warmup_steps) < 0:
         raise ValueError("RGB render start/warmup steps must be non-negative.")
+    if not math.isfinite(float(args.rgb_render_sigma_power)) or float(args.rgb_render_sigma_power) < 0.0:
+        raise ValueError("--rgb_render_sigma_power must be finite and non-negative.")
     if int(args.rgb_render_max_samples) < 0 or int(args.rgb_render_max_frames) < 0:
         raise ValueError("RGB render sample/frame limits must be non-negative.")
     if int(args.rgb_render_stride) <= 0:

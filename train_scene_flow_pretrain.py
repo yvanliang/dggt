@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from contextlib import nullcontext
@@ -48,6 +49,7 @@ from dggt.losses.rgb_render_loss import (
     decode_generated_dggt_geometry,
     rgb_render_loss_enabled,
     rgb_render_loss_ramp,
+    rgb_render_sigma_weight,
     setup_lpips_for_rgb_loss,
     should_apply_rgb_render_loss,
 )
@@ -2321,6 +2323,7 @@ def generated_sky_view_reconstruction_loss(
     lpips_model: nn.Module | None = None,
     lpips_weight: float = 0.01,
     high_frequency_weight: float = 0.25,
+    loss_sample_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Reproject generated sky with the frozen GT DGGT camera."""
     del vggt_model
@@ -2331,6 +2334,24 @@ def generated_sky_view_reconstruction_loss(
     charbonnier_total = 0.0
     high_total = 0.0
     lpips_total = 0.0
+    if loss_sample_weight is None:
+        sample_weight = torch.ones(
+            (int(images.shape[0]),),
+            device=sky_latent.device,
+            dtype=torch.float32,
+        )
+    else:
+        if (
+            loss_sample_weight.ndim != 1
+            or int(loss_sample_weight.shape[0]) != int(images.shape[0])
+        ):
+            raise ValueError(
+                "sky-view loss_sample_weight must be [B], got "
+                f"{tuple(loss_sample_weight.shape)} for B={int(images.shape[0])}"
+            )
+        sample_weight = loss_sample_weight.to(device=sky_latent.device, dtype=torch.float32)
+        if not bool(torch.isfinite(sample_weight).all()) or bool((sample_weight < 0.0).any()):
+            raise ValueError("sky-view loss_sample_weight must contain finite non-negative values")
     for row in range(int(images.shape[0])):
         extrinsics, intrinsics = pose_encoding_to_extri_intri(
             gt_pose_enc_dggt[row : row + 1].float(),
@@ -2363,7 +2384,7 @@ def generated_sky_view_reconstruction_loss(
             target_masked = weight * target + (1.0 - weight) * 0.5
             lpips_value = lpips_model(pred_masked * 2.0 - 1.0, target_masked * 2.0 - 1.0).mean()
             row_loss = row_loss + float(lpips_weight) * lpips_value
-        total = total + row_loss / float(images.shape[0])
+        total = total + sample_weight[row] * row_loss / float(images.shape[0])
         charbonnier_total += float(charb.detach().item()) / float(images.shape[0])
         high_total += float(high.detach().item()) / float(images.shape[0])
         lpips_total += float(lpips_value.detach().item()) / float(images.shape[0])
@@ -2371,6 +2392,7 @@ def generated_sky_view_reconstruction_loss(
         "loss_sky_view_charbonnier": charbonnier_total,
         "loss_sky_view_high_frequency": high_total,
         "loss_sky_view_lpips": lpips_total,
+        "sky_view_sample_weight_mean": float(sample_weight.detach().mean().item()),
     }
 
 
@@ -4486,6 +4508,11 @@ def train_step(
                     if sky_view_frames <= 0
                     else min(sky_view_frames, int(bundle.rgb_render_images.shape[1]))
                 )
+                sky_view_sigma = target.sigmas[:sky_view_samples]
+                sky_view_sigma_weights = rgb_render_sigma_weight(
+                    sky_view_sigma,
+                    float(getattr(args, "rgb_render_sigma_power", 1.0)),
+                )
                 sky_view_loss, sky_view_logs = generated_sky_view_reconstruction_loss(
                     vggt_model=vggt_model,
                     sky_latent=sky_latent_for_rgb[:sky_view_samples],
@@ -4495,11 +4522,25 @@ def train_step(
                     lpips_model=lpips_model,
                     lpips_weight=float(getattr(args, "sky_view_lpips_weight", 0.01)),
                     high_frequency_weight=float(getattr(args, "sky_view_high_frequency_weight", 0.25)),
+                    loss_sample_weight=sky_view_sigma_weights,
                 )
-                loss = loss + float(getattr(args, "lambda_sky_view_reconstruction", 0.1)) * sky_view_loss
+                weighted_sky_view_loss = (
+                    float(getattr(args, "lambda_sky_view_reconstruction", 0.1))
+                    * sky_view_loss
+                )
+                loss = loss + weighted_sky_view_loss
                 logs.update(sky_view_logs)
+                logs["sky_view_sigma_mean"] = float(
+                    sky_view_sigma.float().mean().detach().item()
+                )
+                logs["sky_view_sigma_weight_mean"] = float(
+                    sky_view_sigma_weights.mean().detach().item()
+                )
+                logs["loss_sky_view_sigma_weighted"] = float(
+                    sky_view_loss.detach().item()
+                )
                 logs["loss_sky_view_weighted"] = float(
-                    (float(getattr(args, "lambda_sky_view_reconstruction", 0.1)) * sky_view_loss).detach().item()
+                    weighted_sky_view_loss.detach().item()
                 )
             endpoint_refined_logits = None if endpoint_out is None else endpoint_out.get("sky_mask_refined_logits")
             endpoint_patch_logits = None if endpoint_out is None else endpoint_out.get("sky_mask_logits")
@@ -4571,6 +4612,11 @@ def train_step(
                     if sky_tokens_for_rgb is None
                     else select_rows(sky_tokens_for_rgb, "sky_tokens_for_rgb")
                 )
+                selected_sigma = select_rows(target.sigmas, "sigmas")
+                sigma_weights = rgb_render_sigma_weight(
+                    selected_sigma,
+                    float(getattr(args, "rgb_render_sigma_power", 1.0)),
+                )
                 rgb_result = compute_rgb_render_loss(
                     vggt_model=vggt_model,
                     scene_flow_root=unwrap_ddp(scene_flow),
@@ -4601,10 +4647,24 @@ def train_step(
                     ),
                     lpips_model=lpips_model,
                     lpips_weight=float(args.rgb_render_lpips_weight),
+                    loss_sample_weight=sigma_weights,
                 )
-                weighted = float(args.lambda_rgb_render) * float(ramp) * rgb_result.loss
+                weighted = (
+                    float(args.lambda_rgb_render)
+                    * float(ramp)
+                    * rgb_result.loss
+                )
                 loss = loss + weighted
                 logs.update(rgb_result.logs)
+                logs["rgb_render_sigma_mean"] = float(
+                    selected_sigma.float().mean().detach().item()
+                )
+                logs["rgb_render_sigma_weight_mean"] = float(
+                    sigma_weights.mean().detach().item()
+                )
+                logs["loss_rgb_render_sigma_weighted"] = float(
+                    rgb_result.loss.detach().item()
+                )
                 logs["loss_rgb_render_weighted"] = float(weighted.detach().item())
                 logs["rgb_render_active"] = 1.0
         else:
@@ -5682,6 +5742,15 @@ def build_argparser() -> argparse.ArgumentParser:
         help="First optimizer step eligible for RGB supervision.",
     )
     parser.add_argument("--rgb_render_warmup_steps", type=int, default=5000)
+    parser.add_argument(
+        "--rgb_render_sigma_power",
+        type=float,
+        default=1.0,
+        help=(
+            "Continuously attenuate render/view reconstruction at noisy timesteps "
+            "with w(sigma)=(1-sigma)^power; 0 disables sigma weighting."
+        ),
+    )
     parser.add_argument("--rgb_render_max_samples", type=int, default=1)
     parser.add_argument(
         "--rgb_render_max_frames",
@@ -5898,6 +5967,8 @@ def main() -> None:
         raise ValueError("--rgb_render_stride must be positive.")
     if int(args.rgb_render_start_step) < 0 or int(args.rgb_render_warmup_steps) < 0:
         raise ValueError("RGB render start/warmup steps must be non-negative.")
+    if not math.isfinite(float(args.rgb_render_sigma_power)) or float(args.rgb_render_sigma_power) < 0.0:
+        raise ValueError("--rgb_render_sigma_power must be finite and non-negative.")
     if not 0.0 <= float(args.rgb_render_sky_weight) <= 1.0:
         raise ValueError("--rgb_render_sky_weight must be in [0,1].")
     if float(args.rgb_render_camera_grad_scale) < 0.0:

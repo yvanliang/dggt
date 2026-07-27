@@ -18,6 +18,7 @@ from dggt.losses.rgb_render_loss import (
     compute_rgb_render_loss,
     decode_generated_dggt_geometry,
     rgb_render_loss_ramp,
+    rgb_render_sigma_weight,
     scale_gradient,
     should_apply_rgb_render_loss,
     sky_tokens_to_background,
@@ -191,6 +192,23 @@ def test_masked_lpips_excludes_sky_and_keeps_foreground_signal():
     assert float(loss_foreground) > 0.5
 
 
+def test_masked_lpips_applies_sigma_weight_per_sample():
+    prediction = torch.ones((2, 3, 4, 4), requires_grad=True)
+    target = torch.zeros_like(prediction)
+    foreground = torch.ones((2, 1, 4, 4))
+    loss = _masked_lpips(
+        _SpatialLPIPS(),
+        prediction,
+        target,
+        foreground,
+        sample_weight=torch.tensor([1.0, 0.0]),
+    )
+    loss.backward()
+    assert prediction.grad is not None
+    assert float(prediction.grad[0].abs().sum()) > 0.0
+    torch.testing.assert_close(prediction.grad[1], torch.zeros_like(prediction.grad[1]))
+
+
 def test_gsplat_compositing_does_not_multiply_alpha_twice():
     premultiplied = torch.tensor([[[[0.5, 0.25, 0.125]]]])
     alpha = torch.tensor([[[[0.5]]]])
@@ -336,6 +354,28 @@ def test_rgb_schedule_has_true_delay_and_period():
     assert rgb_render_loss_ramp(args, 30) == 1.0
 
 
+def test_rgb_render_sigma_weight_smoothly_attenuates_high_noise():
+    sigmas = torch.tensor([0.0, 0.25, 0.5, 0.9, 1.0])
+    torch.testing.assert_close(
+        rgb_render_sigma_weight(sigmas, power=1.0),
+        torch.tensor([1.0, 0.75, 0.5, 0.1, 0.0]),
+    )
+    torch.testing.assert_close(
+        rgb_render_sigma_weight(sigmas, power=2.0),
+        torch.tensor([1.0, 0.75**2, 0.5**2, 0.1**2, 0.0]),
+    )
+    torch.testing.assert_close(
+        rgb_render_sigma_weight(sigmas, power=0.0),
+        torch.ones_like(sigmas),
+    )
+
+
+@pytest.mark.parametrize("power", [-1.0, float("nan"), float("inf")])
+def test_rgb_render_sigma_weight_rejects_invalid_power(power):
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        rgb_render_sigma_weight(torch.tensor([0.5]), power=power)
+
+
 def test_sky_mask_endpoint_supervision_has_independent_delay_and_period():
     args = SimpleNamespace(
         sky_mask_endpoint_start_step=5000,
@@ -371,6 +411,7 @@ def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
     assert args.rgb_render_every == 2
     assert args.rgb_render_max_frames == 0  # 0 means every frame in the clip.
     assert args.rgb_render_stride == 1
+    assert args.rgb_render_sigma_power == 1.0
 
 
 def test_pretrain_launch_scripts_do_not_override_rgb_coverage_defaults():
@@ -491,9 +532,15 @@ def test_full_rgb_loss_backpropagates_through_generated_depth_and_gs():
         render_stride=2,
         background_mode="black",
         patch_weight_mask=torch.ones((1, 2, 1, 1), device=device),
+        loss_sample_weight=torch.tensor([0.25], device=device),
         return_debug_tensors=True,
     )
     assert result.generated_depth is not None
+    assert result.logs["loss_rgb_render"] == pytest.approx(
+        0.25 * result.logs["loss_rgb_render_unweighted"],
+        rel=1.0e-5,
+        abs=1.0e-7,
+    )
     result.generated_depth.retain_grad()
     result.loss.backward()
     assert result.generated_depth.grad is not None
