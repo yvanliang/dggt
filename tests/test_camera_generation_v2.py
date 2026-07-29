@@ -31,6 +31,9 @@ from dggt.utils.feature_stats import (
     validate_camera_stats_provenance,
     validate_stats_sequence_length,
 )
+from dggt.utils.factorized_asset_condition import (
+    object_to_anchor_from_center_yaw,
+)
 from train_scene_flow_pretrain import (
     build_camera_anchor_context_dropout,
     build_pretrain_bundle_from_batch,
@@ -254,10 +257,11 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
     intrinsics[..., 1, 1] = 500.0
     intrinsics[..., 0, 2] = 1.0
     intrinsics[..., 1, 2] = 1.0
-    object_to_anchor = torch.eye(4).view(1, 1, 1, 4, 4).repeat(
-        batch_size, 1, window_frames, 1, 1
+    object_center = torch.tensor([0.0, 0.0, 10.0]).view(1, 1, 1, 3).repeat(
+        batch_size, 1, window_frames, 1
     )
-    object_to_anchor[..., 2, 3] = 10.0
+    object_yaw = torch.full((batch_size, 1, window_frames), torch.pi / 2)
+    object_to_anchor = object_to_anchor_from_center_yaw(object_center, object_yaw)
     batch = {
         "images": torch.zeros(batch_size, window_frames, 3, 2, 2),
         "dggt_context_images": torch.zeros(batch_size, context_frames, 3, 2, 2),
@@ -276,15 +280,11 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
         "pretrain_reference_alpha": torch.ones(batch_size, 1, 1, 2, 2),
         "pretrain_reference_frame_id": torch.tensor([[10], [17]]),
         "pretrain_object_obj_to_anchor": object_to_anchor,
-        "pretrain_object_center_anchor": torch.tensor([0.0, 0.0, 10.0])
-        .view(1, 1, 1, 3)
-        .repeat(batch_size, 1, window_frames, 1),
+        "pretrain_object_center_anchor": object_center,
         "pretrain_object_box_size": torch.tensor([1.0, 1.0, 1.0])
         .view(1, 1, 1, 3)
         .repeat(batch_size, 1, window_frames, 1),
-        "pretrain_object_yaw": torch.full(
-            (batch_size, 1, window_frames), torch.pi / 2
-        ),
+        "pretrain_object_yaw": object_yaw,
         "pretrain_object_velocity_anchor": torch.zeros(batch_size, 1, window_frames, 3),
         "pretrain_object_track_valid": torch.ones(
             batch_size, 1, window_frames, dtype=torch.bool

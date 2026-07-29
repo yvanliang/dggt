@@ -103,6 +103,9 @@ from train_scene_flow_pretrain import (
 
 
 FORMAL_FLOW_DOMAIN_VERSION = "hard_binary_edit_domain_v1"
+# All formal caches currently come from the 10 Hz Waymo camera stream. Keep
+# mRoPE time coordinates identical to the factorized pretraining stage.
+FORMAL_SCENE_FPS = 10.0
 
 
 def _asset_condition_kind_from_item(item: dict[str, Any], mode_kind: str) -> str:
@@ -2203,7 +2206,7 @@ def train_step(
                 asset_condition_kind=_asset_condition_kind_for_model(bundle, int(z_clean_n.shape[0])),
                 control_drop_mask=asset_control_drop_mask,
                 frame_ids=getattr(bundle, "frame_ids", None),
-                fps=None,
+                fps=FORMAL_SCENE_FPS,
                 flow_edit_mask=M_edit,
             )
             if use_repa:
@@ -2376,7 +2379,7 @@ def train_step(
         asset_condition_kind=_asset_condition_kind_for_model(bundle, int(z_clean_n.shape[0])),
         control_drop_mask=asset_control_drop_mask,
         frame_ids=getattr(bundle, "frame_ids", None),
-        fps=None,
+        fps=FORMAL_SCENE_FPS,
         flow_edit_mask=M_edit,
     )
     if use_repa:
@@ -2661,7 +2664,7 @@ def _cfg_sample_edit_latents_sliding(
                 asset_condition_kind=asset_kinds,
                 return_mid=False,
                 frame_ids=frame_ids_w,
-                fps=None,
+                fps=FORMAL_SCENE_FPS,
                 flow_edit_mask=M_edit_w,
             )
             if do_cfg:
@@ -2683,7 +2686,7 @@ def _cfg_sample_edit_latents_sliding(
                     return_mid=False,
                     control_drop_mask=drop_all_control,
                     frame_ids=frame_ids_w,
-                    fps=None,
+                    fps=FORMAL_SCENE_FPS,
                     flow_edit_mask=M_edit_w,
                 )
                 v_uncond = sf(
@@ -2704,7 +2707,7 @@ def _cfg_sample_edit_latents_sliding(
                     return_mid=False,
                     control_drop_mask=drop_all_control,
                     frame_ids=frame_ids_w,
-                    fps=None,
+                    fps=FORMAL_SCENE_FPS,
                     flow_edit_mask=M_edit_w,
                 )
                 v_pred = (
@@ -2808,7 +2811,7 @@ def cfg_sample_edit_latents(
             asset_condition_kind=asset_kinds,
             return_mid=False,
             frame_ids=frame_ids,
-            fps=None,
+            fps=FORMAL_SCENE_FPS,
             flow_edit_mask=M_edit,
         )
         if do_cfg:
@@ -2830,7 +2833,7 @@ def cfg_sample_edit_latents(
                 return_mid=False,
                 control_drop_mask=drop_all_control,
                 frame_ids=frame_ids,
-                fps=None,
+                fps=FORMAL_SCENE_FPS,
                 flow_edit_mask=M_edit,
             )
             v_uncond = sf(
@@ -2851,7 +2854,7 @@ def cfg_sample_edit_latents(
                 return_mid=False,
                 control_drop_mask=drop_all_control,
                 frame_ids=frame_ids,
-                fps=None,
+                fps=FORMAL_SCENE_FPS,
                 flow_edit_mask=M_edit,
             )
             v = (

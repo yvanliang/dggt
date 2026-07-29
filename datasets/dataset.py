@@ -19,6 +19,7 @@ from dggt.utils.factorized_asset_condition import (
     bbox_patch_mask,
     canonicalize_asset_reference,
     project_anchor_boxes_to_patch_bboxes,
+    resize_crop_intrinsics_to_model_canvas,
 )
 
 
@@ -359,6 +360,48 @@ def _load_waymo_dynamic_mask_model(mask_path, target_width=518, threshold=0.5):
         mask = mask.crop((0, start_y, new_width, start_y + target_width))
     arr = np.asarray(mask, dtype=np.float32) / 255.0
     return arr > float(threshold)
+
+
+def _waymo_semantic_values_for_class(class_name):
+    name = str(class_name).lower()
+    if any(value in name for value in ("vehicle", "car", "truck", "bus")):
+        return (40,)
+    if any(value in name for value in ("pedestrian", "person")):
+        return (50,)
+    if any(value in name for value in ("cyclist", "bicycle", "motorcycle", "rider")):
+        return (60,)
+    return ()
+
+
+def _load_waymo_semantic_foreground_model(mask_path, class_name, target_width=518):
+    """Load class-matched semantic foreground on the DGGT model canvas."""
+    semantic_values = _waymo_semantic_values_for_class(class_name)
+    if not semantic_values or not mask_path or not os.path.exists(mask_path):
+        return None
+    mask = Image.open(mask_path).convert("L")
+    width, height = mask.size
+    new_width = int(target_width)
+    new_height = round(height * (new_width / width) / 14) * 14
+    mask = mask.resize((new_width, new_height), Image.Resampling.NEAREST)
+    if new_height > target_width:
+        start_y = (new_height - target_width) // 2
+        mask = mask.crop((0, start_y, new_width, start_y + target_width))
+    return np.isin(np.asarray(mask, dtype=np.uint8), semantic_values)
+
+
+def _select_pretrain_reference_candidate(reference_candidates, deterministic=False):
+    if not reference_candidates:
+        raise ValueError("reference_candidates must be non-empty")
+    if not deterministic:
+        return random.choice(reference_candidates)
+    # All candidates already pass the same geometry, occlusion and minimum
+    # patch-support gates. Prefer the cleanest/largest visible foreground, then
+    # use frame id as a stable tie-breaker. This order is shared by every
+    # sliding window, so a legal candidate stays canonical across windows.
+    return max(
+        reference_candidates,
+        key=lambda item: (int(item[2]), float(item[3]), -int(item[0])),
+    )
 
 
 def _largest_connected_component_4n(mask_grid):
@@ -1307,12 +1350,19 @@ class WaymoOpenDataset(Dataset):
             "pretrain_asset_source_kind": "instances_projected",
         }
 
-    def _project_pretrain_object_slots(self, idx, indices, image_seq):
+    def _project_pretrain_object_slots(
+        self,
+        idx,
+        indices,
+        image_seq,
+        *,
+        deterministic_reference=False,
+    ):
         """Build leak-free references and target placement from raw Waymo metadata.
 
         Target boxes, validity and patch support below use only 3D tracks and
-        cameras. Dynamic masks are loaded exclusively for the one source
-        reference frame selected outside ``indices``.
+        cameras. Class-matched semantic foreground is loaded exclusively for
+        the one source reference frame selected outside ``indices``.
         """
         del image_seq
         max_objects = max(0, int(self.pretrain_max_objects))
@@ -1411,7 +1461,7 @@ class WaymoOpenDataset(Dataset):
             empty["pretrain_reference_rgb"] = torch.zeros((max_objects, 3, *canvas_hw), dtype=torch.float32)
             empty["pretrain_reference_alpha"] = torch.zeros((max_objects, 1, *canvas_hw), dtype=torch.float32)
 
-        dynamic_paths = self.dynamic_mask_path[idx] if idx < len(self.dynamic_mask_path) else []
+        semantic_paths = self.semantic_mask_path[idx] if idx < len(self.semantic_mask_path) else []
         instances_info = metadata["instances_info"]
         frame_instances = metadata.get("frame_instances", {})
 
@@ -1555,24 +1605,36 @@ class WaymoOpenDataset(Dataset):
                     geom["depth"],
                 ):
                     continue
-                if not isinstance(dynamic_paths, list) or frame_idx >= len(dynamic_paths):
+                if not isinstance(semantic_paths, list) or frame_idx >= len(semantic_paths):
                     continue
-                dynamic = _load_waymo_dynamic_mask_model(dynamic_paths[frame_idx], target_width=518)
-                if dynamic is None:
+                semantic = _load_waymo_semantic_foreground_model(
+                    semantic_paths[frame_idx],
+                    info.get("class_name", ""),
+                    target_width=518,
+                )
+                if semantic is None:
                     continue
                 x0, y0, x1, y1 = [int(round(value)) for value in geom["model_box"]]
                 x0, x1 = max(0, x0), min(int(model_hw[1]), x1)
                 y0, y1 = max(0, y0), min(int(model_hw[0]), y1)
                 alpha_np = np.zeros(model_hw, dtype=np.float32)
                 if x1 > x0 and y1 > y0:
-                    alpha_np[y0:y1, x0:x1] = dynamic[y0:y1, x0:x1].astype(np.float32)
+                    alpha_np[y0:y1, x0:x1] = semantic[y0:y1, x0:x1].astype(np.float32)
                 alpha = torch.tensor(alpha_np.tolist(), dtype=torch.float32).unsqueeze(0)
-                if int(alpha_to_patch_mask(alpha, (gh, gw)).sum().item()) < 4:
+                patch_count = int(alpha_to_patch_mask(alpha, (gh, gw)).sum().item())
+                if patch_count < 4:
                     continue
-                reference_candidates.append((frame_idx, alpha))
+                reference_candidates.append(
+                    (frame_idx, alpha, patch_count, float(alpha_np.sum()))
+                )
             if not reference_candidates:
                 continue
-            reference_frame, reference_alpha = random.choice(reference_candidates)
+            reference_frame, reference_alpha, _, _ = (
+                _select_pretrain_reference_candidate(
+                    reference_candidates,
+                    deterministic=bool(deterministic_reference),
+                )
+            )
             reference_rgb = load_and_preprocess_images([self.image_paths[idx][reference_frame]])[0]
             canonical_rgb, canonical_alpha = canonicalize_asset_reference(
                 reference_rgb,
@@ -1670,15 +1732,23 @@ class WaymoOpenDataset(Dataset):
             empty["pretrain_reference_alpha"][slot] = item["reference_alpha"]
             empty["pretrain_reference_patch_mask"][slot] = item["reference_patch_mask"]
             empty["pretrain_reference_frame_id"][slot] = int(item["reference_frame"])
+        projection_intrinsics, projection_image_hw = (
+            resize_crop_intrinsics_to_model_canvas(
+                torch.tensor(intrinsics.tolist(), dtype=torch.float32),
+                raw_hw,
+                target_width=518,
+                patch_size=14,
+            )
+        )
         projected_bbox, projected_in_frustum = project_anchor_boxes_to_patch_bboxes(
             empty["pretrain_object_obj_to_anchor"].unsqueeze(0),
             empty["pretrain_object_box_size"].unsqueeze(0),
             empty["pretrain_object_track_valid"].unsqueeze(0),
             empty["pretrain_camera_to_anchor"].unsqueeze(0),
-            torch.tensor(intrinsics.tolist(), dtype=torch.float32)
+            projection_intrinsics
             .view(1, 1, 3, 3)
             .repeat(1, seq_len, 1, 1),
-            raw_hw,
+            projection_image_hw,
             (gh, gw),
         )
         empty["pretrain_object_bbox_patch"] = projected_bbox[0]
@@ -1698,14 +1768,15 @@ class WaymoOpenDataset(Dataset):
         window_start,
         window_end,
     ):
-        """Build training-equivalent asset metadata for one inference window.
+        """Build leak-free asset metadata for one inference window.
 
         This is intentionally a thin public wrapper around the same projector
         used by ``__getitem__``.  It is used only when raw-video inference
         generates a long trunk through sliding windows: each window must obtain
         its reference from the frames outside that window, exactly as training
-        does, instead of treating the complete long rollout as one target
-        window and silently closing every asset slot.
+        does. Unlike training augmentation, inference deterministically prefers
+        the highest-quality legal reference so overlapping windows reuse the
+        same appearance whenever possible.
         """
         if not self.trunk_major_samples:
             raise RuntimeError(
@@ -1742,7 +1813,12 @@ class WaymoOpenDataset(Dataset):
             range(sample_start + window_start, sample_start + window_end)
         )
         image_seq = [paths[index] for index in indices]
-        return self._project_pretrain_object_slots(scene_idx, indices, image_seq)
+        return self._project_pretrain_object_slots(
+            scene_idx,
+            indices,
+            image_seq,
+            deterministic_reference=True,
+        )
 
     def __getitem__(self, idx):
         trunk_idx = None

@@ -14,8 +14,13 @@ from dggt.utils.factorized_asset_condition import (
     build_factorized_asset_condition,
     canonicalize_asset_reference,
     interpolate_box_keyframes,
+    object_to_anchor_from_center_yaw,
+    project_anchor_boxes_to_patch_bboxes,
+    resize_crop_intrinsics_to_model_canvas,
+    sample_canonical_tokens,
 )
 from train_scene_flow_pretrain import combine_pretrain_cfg_prediction
+from train_scene_flow import FORMAL_SCENE_FPS
 
 
 def _geometry(
@@ -25,14 +30,12 @@ def _geometry(
     frames: int = 3,
     depth: float = 10.0,
 ):
-    object_to_anchor = torch.eye(4).view(1, 1, 1, 4, 4).repeat(batch, assets, frames, 1, 1)
-    object_to_anchor[..., 2, 3] = depth
-    object_to_anchor[:, 1:, :, 0, 3] = 2.0
-    center = object_to_anchor[..., :3, 3].clone()
+    center = torch.zeros(batch, assets, frames, 3)
+    center[..., 2] = depth
+    center[:, 1:, :, 0] = 2.0
     size = torch.ones(batch, assets, frames, 3) * torch.tensor([4.0, 2.0, 2.0])
-    # Identity transform has local-x heading along anchor +x, which is yaw=pi/2
-    # under the shared training convention yaw=atan2(heading_x, heading_z).
     yaw = torch.full((batch, assets, frames), torch.pi / 2)
+    object_to_anchor = object_to_anchor_from_center_yaw(center, yaw)
     velocity = torch.zeros(batch, assets, frames, 3)
     track = torch.ones(batch, assets, frames, dtype=torch.bool)
     camera = torch.eye(4).view(1, 1, 4, 4).repeat(batch, frames, 1, 1)
@@ -124,6 +127,159 @@ def test_canonicalization_does_not_multiply_soft_alpha_twice():
     )
 
 
+@pytest.mark.parametrize("source_hw", [(60, 200), (160, 200), (200, 60)])
+def test_sampled_canonical_uv_is_relative_to_occupied_alpha_extent(source_hw):
+    height, width = source_hw
+    rgb = torch.ones(3, height, width)
+    alpha = torch.ones(1, height, width)
+    _, canonical_alpha = canonicalize_asset_reference(rgb, alpha, (350, 518))
+    patch_grid = (25, 37)
+    patch_mask = alpha_to_patch_mask(canonical_alpha, patch_grid).unsqueeze(0)
+    tokens = torch.zeros(1, patch_grid[0] * patch_grid[1], 1)
+
+    _, sampled_mask, sampled_uv = sample_canonical_tokens(
+        tokens,
+        patch_mask,
+        patch_grid,
+        max_tokens=32,
+    )
+
+    valid_uv = sampled_uv[0, sampled_mask[0]]
+    torch.testing.assert_close(valid_uv.amin(dim=0), torch.zeros(2))
+    torch.testing.assert_close(valid_uv.amax(dim=0), torch.ones(2))
+
+
+def test_near_plane_crossing_box_returns_clipped_finite_canvas_bbox():
+    center = torch.tensor([[[[0.0, 0.0, 0.3]]]])
+    yaw = torch.zeros(1, 1, 1)
+    object_to_anchor = object_to_anchor_from_center_yaw(center, yaw)
+    size = torch.tensor([[[[5.0, 2.0, 1.6]]]])
+    track = torch.ones(1, 1, 1, dtype=torch.bool)
+    camera = torch.eye(4).view(1, 1, 4, 4)
+    intrinsics = torch.tensor(
+        [[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]]
+    ).view(1, 1, 3, 3)
+
+    bbox, visible = project_anchor_boxes_to_patch_bboxes(
+        object_to_anchor,
+        size,
+        track,
+        camera,
+        intrinsics,
+        (100, 100),
+        (25, 37),
+    )
+
+    assert bool(visible.item())
+    assert bool(torch.isfinite(bbox).all())
+    assert 0.0 <= float(bbox[..., 0].item()) <= float(bbox[..., 2].item()) <= 37.0
+    assert 0.0 <= float(bbox[..., 1].item()) <= float(bbox[..., 3].item()) <= 25.0
+
+
+def test_box_projection_preserves_front_box_and_rejects_box_behind_camera():
+    centers = torch.tensor([[[[0.0, 0.0, 10.0], [0.0, 0.0, -10.0]]]])
+    yaws = torch.zeros(1, 1, 2)
+    object_to_anchor = object_to_anchor_from_center_yaw(centers, yaws)
+    size = torch.tensor([4.0, 2.0, 2.0]).view(1, 1, 1, 3).expand(1, 1, 2, 3)
+    track = torch.ones(1, 1, 2, dtype=torch.bool)
+    camera = torch.eye(4).view(1, 1, 4, 4).expand(1, 2, 4, 4)
+    intrinsics = torch.tensor(
+        [[100.0, 0.0, 50.0], [0.0, 100.0, 50.0], [0.0, 0.0, 1.0]]
+    ).view(1, 1, 3, 3).expand(1, 2, 3, 3)
+
+    bbox, visible = project_anchor_boxes_to_patch_bboxes(
+        object_to_anchor,
+        size,
+        track,
+        camera,
+        intrinsics,
+        (100, 100),
+        (25, 37),
+    )
+
+    torch.testing.assert_close(
+        bbox[0, 0, 0],
+        torch.tensor([13.875, 9.375, 23.125, 15.625]),
+    )
+    assert visible[0, 0].tolist() == [True, False]
+    torch.testing.assert_close(bbox[0, 0, 1], torch.full((4,), -1.0))
+
+
+def test_resize_crop_intrinsics_matches_model_canvas_projection():
+    center = torch.tensor([[[[0.0, 0.0, 10.0]]]])
+    yaw = torch.zeros(1, 1, 1)
+    object_to_anchor = object_to_anchor_from_center_yaw(center, yaw)
+    size = torch.tensor([[[[4.0, 2.0, 2.0]]]])
+    track = torch.ones(1, 1, 1, dtype=torch.bool)
+    camera = torch.eye(4).view(1, 1, 4, 4)
+    raw_intrinsics = torch.tensor(
+        [[100.0, 0.0, 50.0], [0.0, 100.0, 100.0], [0.0, 0.0, 1.0]]
+    )
+
+    model_intrinsics, model_hw = resize_crop_intrinsics_to_model_canvas(
+        raw_intrinsics,
+        (200, 100),
+        target_width=518,
+        patch_size=14,
+    )
+    bbox, visible = project_anchor_boxes_to_patch_bboxes(
+        object_to_anchor,
+        size,
+        track,
+        camera,
+        model_intrinsics.view(1, 1, 3, 3),
+        model_hw,
+        (37, 37),
+    )
+
+    assert model_hw.tolist() == [518, 518]
+    assert bool(visible.item())
+    torch.testing.assert_close(
+        bbox[0, 0, 0],
+        torch.tensor([13.875, 13.875, 23.125, 23.125]),
+    )
+
+
+def test_resize_crop_intrinsics_broadcasts_batch_sizes_over_time():
+    intrinsics = torch.eye(3).view(1, 1, 3, 3).expand(2, 1, 3, 3)
+    raw_hw = torch.tensor([[1280, 1920], [200, 100]])
+
+    model_intrinsics, model_hw = resize_crop_intrinsics_to_model_canvas(
+        intrinsics,
+        raw_hw,
+    )
+
+    assert model_intrinsics.shape == (2, 1, 3, 3)
+    assert model_hw.shape == (2, 1, 2)
+    assert model_hw[:, 0].tolist() == [[350, 518], [518, 518]]
+
+
+def test_formal_training_uses_pretraining_waymo_fps():
+    assert FORMAL_SCENE_FPS == 10.0
+
+    model = _tiny_model()
+    frame_ids = torch.arange(4).view(1, 4)
+    pretrain_positions = model._target_position_ids(
+        batch_size=1,
+        seq_len=4,
+        num_patches=16,
+        patch_grid=(4, 4),
+        device=torch.device("cpu"),
+        frame_ids=frame_ids,
+        fps=10.0,
+    )
+    formal_positions = model._target_position_ids(
+        batch_size=1,
+        seq_len=4,
+        num_patches=16,
+        patch_grid=(4, 4),
+        device=torch.device("cpu"),
+        frame_ids=frame_ids,
+        fps=FORMAL_SCENE_FPS,
+    )
+    torch.testing.assert_close(formal_positions, pretrain_positions)
+
+
 def test_condition_api_has_no_target_latent_or_target_dynamic_mask_inputs():
     parameters = inspect.signature(build_factorized_asset_condition).parameters
     forbidden = {"z_clean", "z_clean_n", "dynamic_mask", "target_dynamic_mask"}
@@ -155,6 +311,30 @@ def test_training_dataset_and_external_inference_share_condition_implementation(
     assert inference_module.canonicalize_asset_reference is canonicalize_asset_reference
     assert train_module.CanonicalAssetEncoder is CanonicalAssetEncoder
     assert inference_module.CanonicalAssetEncoder is CanonicalAssetEncoder
+
+
+def test_condition_rejects_non_waymo_height_axis() -> None:
+    values = list(_geometry())
+    values[0] = values[0].clone()
+    values[0][..., :3, 2] = torch.tensor([-1.0, 0.0, 0.0])
+    object_to_anchor, center, size, yaw, velocity, track, camera, intrinsics = values
+
+    with pytest.raises(ValueError, match="local-z height axis"):
+        build_factorized_asset_condition(
+            appearance_tokens=torch.ones(1, 2, 4, 8),
+            appearance_mask=torch.ones(1, 2, 4, dtype=torch.bool),
+            canonical_uv=torch.zeros(1, 2, 4, 2),
+            object_to_anchor=object_to_anchor,
+            center_anchor=center,
+            box_size_lwh=size,
+            yaw=yaw,
+            velocity_anchor=velocity,
+            track_valid=track,
+            camera_to_anchor=camera,
+            intrinsics=intrinsics,
+            image_size_hw=(100, 100),
+            patch_grid=(4, 4),
+        )
 
 
 def test_independent_cfg_algebra_matches_closed_form():

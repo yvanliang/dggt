@@ -97,30 +97,34 @@ from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.flow_schedule import resolve_inference_flow_schedule
 from dggt.utils.gaussian_edit import CleanSceneState, build_clean_scene_state
 from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
-from dggt.utils.sliding_window import resolve_offline_window, window_slices
+from dggt.utils.sliding_window import resolve_offline_window
 from dggt.utils.factorized_asset_condition import (
     FACTORIZED_ASSET_CONDITION_VERSION,
     FactorizedAssetCondition,
     build_factorized_asset_condition,
     canonicalize_asset_reference,
     interpolate_box_keyframes,
+    object_to_anchor_from_center_yaw,
+    resize_crop_intrinsics_to_model_canvas,
 )
 from train_scene_flow_pretrain import (
     DEFAULT_SKY_GRID,
     SKY_TOKEN_DIM,
     CyclicSequentialSampler,
+    _align_sliding_asset_payload_slots,
     _fixed_render_hw,
     _image_grid,
     _latent_pca_grid,
     _mask_grid,
     _predict_camera_mats,
     _render_gs_map_rgb,
+    _sliding_intrinsics_window,
     _sky_background_image_grid,
     _sky_mask_image_grid,
     _sky_mask_patch_to_image,
     _timestamps_for_generated_render,
+    attach_training_equivalent_sliding_asset_conditions,
     autocast_context,
-    build_factorized_asset_condition_from_batch,
     build_pretrain_bundle_from_batch,
     build_full_scene_bundle,
     cfg_sample_pretrain_latents,
@@ -305,20 +309,10 @@ def _object_to_anchor_from_center_yaw(
     centers: torch.Tensor,
     yaws: torch.Tensor,
 ) -> torch.Tensor:
-    if centers.ndim != 3 or yaws.shape != centers.shape[:-1]:
+    """Compatibility wrapper around the shared training-coordinate builder."""
+    if centers.ndim != 3:
         raise ValueError("centers/yaws must be [K,S,3] and [K,S]")
-    k, s = int(centers.shape[0]), int(centers.shape[1])
-    result = torch.eye(4, dtype=centers.dtype).view(1, 1, 4, 4).repeat(k, s, 1, 1)
-    cosine, sine = torch.cos(yaws), torch.sin(yaws)
-    # Match training metadata: yaw is atan2(local-x heading_x,
-    # local-x heading_z), so yaw=0 points the object's length axis along
-    # anchor +z and positive yaw turns it toward anchor +x.
-    result[..., 0, 0] = sine
-    result[..., 2, 0] = cosine
-    result[..., 0, 2] = -cosine
-    result[..., 2, 2] = sine
-    result[..., :3, 3] = centers
-    return result
+    return object_to_anchor_from_center_yaw(centers, yaws)
 
 
 def build_external_factorized_pretrain_bundle(
@@ -419,6 +413,14 @@ def build_external_factorized_pretrain_bundle(
     )
     object_to_anchor = _object_to_anchor_from_center_yaw(centers, yaws).unsqueeze(0).to(device)
     reference_frame_id = torch.full((1, max_assets), -1, device=device, dtype=torch.long)
+    projection_intrinsics, projection_image_hw = (
+        resize_crop_intrinsics_to_model_canvas(
+            intrinsics.to(device),
+            image_size_hw.to(device),
+            target_width=int(patch_grid[1]) * 14,
+            patch_size=14,
+        )
+    )
     condition = build_factorized_asset_condition(
         appearance_tokens=appearance.appearance_tokens,
         appearance_mask=appearance.appearance_mask,
@@ -430,8 +432,8 @@ def build_external_factorized_pretrain_bundle(
         velocity_anchor=velocities.unsqueeze(0).to(device),
         track_valid=track_valid.unsqueeze(0).to(device),
         camera_to_anchor=camera_to_anchor.unsqueeze(0).to(device),
-        intrinsics=intrinsics.unsqueeze(0).to(device),
-        image_size_hw=image_size_hw.to(device),
+        intrinsics=projection_intrinsics.unsqueeze(0),
+        image_size_hw=projection_image_hw,
         patch_grid=patch_grid,
         reference_frame_id=reference_frame_id,
     )
@@ -474,228 +476,6 @@ def build_external_factorized_pretrain_bundle(
         "num_frames": seq_len,
         "fps": fps,
         "image_size_hw": image_size_hw.tolist(),
-    }
-
-
-def _align_sliding_asset_payload_slots(
-    payloads: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Give the same object the same slot in every inference window."""
-    if not payloads:
-        return [], []
-    max_assets = len(payloads[0].get("pretrain_object_ids", []))
-    if max_assets <= 0:
-        return payloads, []
-    scores: dict[str, float] = {}
-    for payload in payloads:
-        ids = [str(value) for value in payload["pretrain_object_ids"]]
-        values = torch.as_tensor(payload["pretrain_object_scores"]).reshape(-1)
-        if len(ids) != max_assets or int(values.numel()) != max_assets:
-            raise ValueError("sliding asset payload slot counts disagree")
-        for slot, object_id in enumerate(ids):
-            if object_id:
-                scores[object_id] = scores.get(object_id, 0.0) + float(
-                    values[slot].item()
-                )
-    global_ids = [
-        object_id
-        for object_id, _ in sorted(
-            scores.items(), key=lambda item: (-item[1], item[0])
-        )[:max_assets]
-    ]
-    global_ids.extend([""] * (max_assets - len(global_ids)))
-
-    aligned = []
-    for payload in payloads:
-        source_ids = [str(value) for value in payload["pretrain_object_ids"]]
-        source_lookup = {
-            object_id: slot
-            for slot, object_id in enumerate(source_ids)
-            if object_id
-        }
-        result = dict(payload)
-        result["pretrain_object_ids"] = [""] * max_assets
-        result["pretrain_object_class_names"] = [""] * max_assets
-        slot_tensor_keys = [
-            key
-            for key, value in payload.items()
-            if torch.is_tensor(value)
-            and value.ndim >= 1
-            and int(value.shape[0]) == max_assets
-            and (
-                key.startswith("pretrain_object_")
-                or key.startswith("pretrain_reference_")
-            )
-        ]
-        for key in slot_tensor_keys:
-            value = payload[key]
-            if key == "pretrain_object_obj_to_anchor":
-                reset = torch.eye(4, dtype=value.dtype, device=value.device)
-                reset = reset.view(1, 1, 4, 4).repeat(
-                    max_assets, int(value.shape[1]), 1, 1
-                )
-            elif key in (
-                "pretrain_object_bbox_patch",
-                "pretrain_reference_frame_id",
-            ):
-                reset = torch.full_like(value, -1)
-            else:
-                reset = torch.zeros_like(value)
-            result[key] = reset
-        for destination, object_id in enumerate(global_ids):
-            source = source_lookup.get(object_id)
-            if source is None:
-                continue
-            result["pretrain_object_ids"][destination] = object_id
-            result["pretrain_object_class_names"][destination] = payload[
-                "pretrain_object_class_names"
-            ][source]
-            for key in slot_tensor_keys:
-                result[key][destination] = payload[key][source]
-        aligned.append(result)
-    return aligned, global_ids
-
-
-def attach_training_equivalent_sliding_asset_conditions(
-    bundle: Any,
-    *,
-    dataset: WaymoOpenDataset,
-    dataset_index: int,
-    batch: dict[str, Any],
-    vggt_model: nn.Module,
-    scene_flow: nn.Module,
-    device: torch.device,
-    patch_grid: tuple[int, int],
-    window: int,
-    stride: int,
-) -> dict[str, Any]:
-    """Attach per-window references for raw target-video inference.
-
-    A complete 29-frame rollout has no frame outside the *whole* rollout, but
-    each model forward sees only one sliding window.  For target-informed
-    evaluation we therefore rebuild the asset condition for every actual model
-    window with the dataset's training projector.  Its reference is guaranteed
-    to come from the same trunk but outside that window.
-    """
-    seq_len = int(bundle.z_clean_n.shape[1])
-    windows = window_slices(seq_len, int(window), int(stride))
-    if len(windows) <= 1:
-        return {"active": False, "windows": []}
-    if int(bundle.z_clean_n.shape[0]) != 1:
-        raise ValueError(
-            "window-specific raw inference asset extraction currently requires batch size 1"
-        )
-    intrinsics = batch.get("intrinsics")
-    if not torch.is_tensor(intrinsics):
-        raise RuntimeError("raw sliding inference requires batch intrinsics")
-    intrinsics = intrinsics.to(device=device, dtype=torch.float32)
-    raw_hw = torch.as_tensor(batch.get("raw_image_size_hw"), device=device)
-    if raw_hw.ndim >= 3 and int(raw_hw.shape[-1]) == 2:
-        raw_hw = raw_hw[:, 0]
-    frame_ids = torch.as_tensor(bundle.frame_ids, device=device, dtype=torch.long)
-    if frame_ids.ndim == 1:
-        frame_ids = frame_ids.unsqueeze(0)
-
-    raw_payloads = [
-        dataset.build_pretrain_asset_payload_for_sample_window(
-            int(dataset_index), int(start), int(end)
-        )
-        for start, end in windows
-    ]
-    aligned_payloads, global_object_ids = _align_sliding_asset_payload_slots(
-        raw_payloads
-    )
-    conditions: dict[tuple[int, int], FactorizedAssetCondition] = {}
-    diagnostics = []
-    max_lengths = torch.zeros_like(bundle.F_asset_lengths)
-    any_asset = False
-    for (start, end), payload in zip(windows, aligned_payloads):
-        payload_batch: dict[str, Any] = {}
-        for key, value in payload.items():
-            payload_batch[key] = value.unsqueeze(0) if torch.is_tensor(value) else value
-        built = build_factorized_asset_condition_from_batch(
-            payload_batch,
-            vggt_model,
-            scene_flow,
-            device,
-            patch_grid=patch_grid,
-            frame_ids=frame_ids[:, start:end],
-            intrinsics=intrinsics[:, start:end],
-            image_size_hw=raw_hw,
-        )
-        condition = built.condition.validate()
-        if condition.seq_len != int(end - start):
-            raise RuntimeError(
-                f"window [{start},{end}) condition has S={condition.seq_len}"
-            )
-        conditions[(int(start), int(end))] = condition
-        max_lengths = torch.maximum(max_lengths, built.lengths)
-        has_asset = bool(
-            (
-                condition.appearance_mask.any(dim=(1, 2))
-                & condition.track_valid.any(dim=(1, 2))
-            ).any()
-        )
-        any_asset |= has_asset
-        refs = condition.reference_frame_id.detach().cpu().tolist()
-        target_ids = frame_ids[:, start:end].detach().cpu().tolist()
-        for row_refs, row_targets in zip(refs, target_ids):
-            target_set = set(int(value) for value in row_targets)
-            for reference_id in row_refs:
-                if int(reference_id) >= 0 and int(reference_id) in target_set:
-                    raise RuntimeError(
-                        f"sliding inference reference {reference_id} lies inside "
-                        f"window target frames {sorted(target_set)}"
-                    )
-        diagnostics.append(
-            {
-                "window": [int(start), int(end)],
-                "target_frame_ids": target_ids,
-                "reference_frame_ids": refs,
-                "source_kinds": built.source_kinds,
-                "has_asset": has_asset,
-            }
-        )
-    for left_index, (left_start, left_end) in enumerate(windows):
-        left = conditions[(left_start, left_end)]
-        for right_start, right_end in windows[left_index + 1 :]:
-            overlap_start = max(left_start, right_start)
-            overlap_end = min(left_end, right_end)
-            if overlap_start >= overlap_end:
-                continue
-            right = conditions[(right_start, right_end)]
-            left_slice = left.slice_time(
-                overlap_start - left_start, overlap_end - left_start
-            )
-            right_slice = right.slice_time(
-                overlap_start - right_start, overlap_end - right_start
-            )
-            shared = left_slice.track_valid & right_slice.track_valid
-            if bool(shared.any()):
-                placement_error = (
-                    left_slice.placement_state - right_slice.placement_state
-                ).abs().amax(dim=-1)
-                bbox_error = (
-                    left_slice.target_bbox_patch - right_slice.target_bbox_patch
-                ).abs().amax(dim=-1)
-                if bool((placement_error[shared] > 1.0e-4).any()) or bool(
-                    (bbox_error[shared] > 1.0e-4).any()
-                ):
-                    raise RuntimeError(
-                        "overlapping inference windows disagree on shared-object "
-                        f"placement/bbox for frames [{overlap_start},{overlap_end})"
-                    )
-    bundle.factorized_asset_conditions_by_window = conditions
-    bundle.F_asset_lengths = max_lengths
-    bundle.asset_condition_kind = [
-        "factorized_asset" if any_asset else "none"
-    ]
-    bundle.asset_condition_source_kind = ["sliding_outside_window_reference"]
-    return {
-        "active": True,
-        "global_object_ids": global_object_ids,
-        "overlap_geometry_verified": True,
-        "windows": diagnostics,
     }
 
 

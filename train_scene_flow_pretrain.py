@@ -91,6 +91,7 @@ from dggt.utils.factorized_asset_condition import (
     FACTORIZED_ASSET_CONDITION_VERSION,
     FactorizedAssetCondition,
     build_factorized_asset_condition,
+    resize_crop_intrinsics_to_model_canvas,
 )
 from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
 from dggt.utils.sliding_window import (
@@ -3265,13 +3266,30 @@ def _factorized_asset_kind_for_window(
         condition.appearance_mask.any(dim=(1, 2))
         & condition.track_valid.any(dim=(1, 2))
     ).detach().cpu().tolist()
-    return _condition_kind_with_null_rows(
+    kinds = _kind_list(
         base_kind,
-        rows,
-        batch_size=int(batch_size),
+        int(batch_size),
         default="factorized_asset",
-        null_kind="asset_uncond",
     )
+    result = []
+    explicitly_conditioned_empty = (
+        _ASSET_NATURAL_EMPTY_KINDS | _ASSET_EXPLICIT_EMPTY_KINDS
+    )
+    for idx, kind in enumerate(kinds):
+        normalized = str(kind).lower()
+        if (
+            bool(rows[idx])
+            or normalized in explicitly_conditioned_empty
+            or normalized in _ASSET_NULL_OR_MISSING_KINDS
+        ):
+            result.append(kind)
+        else:
+            # A REAL base condition with no usable tokens in this particular
+            # window is missing for that window. Natural/explicit empty
+            # conditions above remain provided and must not be inferred as
+            # NULL merely from an all-false mask.
+            result.append("asset_uncond")
+    return result
 
 
 def _validation_sliding_params(args: argparse.Namespace, seq_len: int) -> tuple[int, int] | None:
@@ -5024,6 +5042,18 @@ def build_factorized_asset_condition_from_batch(
                         f"target window {sorted(target_ids)}"
                     )
 
+    projection_intrinsics, projection_image_hw = (
+        resize_crop_intrinsics_to_model_canvas(
+            torch.as_tensor(
+                intrinsics,
+                device=device,
+                dtype=torch.float32,
+            ),
+            torch.as_tensor(image_size_hw, device=device),
+            target_width=int(patch_grid[1]) * 14,
+            patch_size=14,
+        )
+    )
     condition = build_factorized_asset_condition(
         appearance_tokens=appearance.appearance_tokens,
         appearance_mask=appearance.appearance_mask,
@@ -5049,10 +5079,8 @@ def build_factorized_asset_condition_from_batch(
         camera_to_anchor=batch["pretrain_camera_to_anchor"].to(
             device=device, dtype=torch.float32, non_blocking=True
         ),
-        intrinsics=torch.as_tensor(
-            intrinsics, device=device, dtype=torch.float32
-        ),
-        image_size_hw=torch.as_tensor(image_size_hw, device=device),
+        intrinsics=projection_intrinsics,
+        image_size_hw=projection_image_hw,
         patch_grid=patch_grid,
         reference_frame_id=reference_frame_id,
     )
@@ -5067,6 +5095,261 @@ def build_factorized_asset_condition_from_batch(
         kinds=kinds,
         source_kinds=source_kinds,
     )
+
+
+def _sliding_intrinsics_window(
+    intrinsics: torch.Tensor,
+    *,
+    start: int,
+    end: int,
+    seq_len: int,
+) -> torch.Tensor:
+    """Slice time-varying intrinsics or preserve one matrix for broadcasting."""
+    if intrinsics.ndim != 4 or tuple(intrinsics.shape[-2:]) != (3, 3):
+        raise ValueError(
+            f"raw sliding intrinsics must be [B,1/S,3,3], got {tuple(intrinsics.shape)}"
+        )
+    time_len = int(intrinsics.shape[1])
+    if time_len == 1:
+        return intrinsics
+    if time_len != int(seq_len):
+        raise ValueError(
+            f"raw sliding intrinsics time length must be 1 or {seq_len}, got {time_len}"
+        )
+    return intrinsics[:, int(start) : int(end)]
+
+
+def _align_sliding_asset_payload_slots(
+    payloads: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Give the same object the same slot in every sliding window."""
+    if not payloads:
+        return [], []
+    max_assets = len(payloads[0].get("pretrain_object_ids", []))
+    if max_assets <= 0:
+        return payloads, []
+    scores: dict[str, float] = {}
+    for payload in payloads:
+        ids = [str(value) for value in payload["pretrain_object_ids"]]
+        values = torch.as_tensor(payload["pretrain_object_scores"]).reshape(-1)
+        if len(ids) != max_assets or int(values.numel()) != max_assets:
+            raise ValueError("sliding asset payload slot counts disagree")
+        for slot, object_id in enumerate(ids):
+            if object_id:
+                scores[object_id] = scores.get(object_id, 0.0) + float(
+                    values[slot].item()
+                )
+    global_ids = [
+        object_id
+        for object_id, _ in sorted(
+            scores.items(), key=lambda item: (-item[1], item[0])
+        )[:max_assets]
+    ]
+    global_ids.extend([""] * (max_assets - len(global_ids)))
+
+    aligned = []
+    for payload in payloads:
+        source_ids = [str(value) for value in payload["pretrain_object_ids"]]
+        source_lookup = {
+            object_id: slot
+            for slot, object_id in enumerate(source_ids)
+            if object_id
+        }
+        result = dict(payload)
+        result["pretrain_object_ids"] = [""] * max_assets
+        result["pretrain_object_class_names"] = [""] * max_assets
+        slot_tensor_keys = [
+            key
+            for key, value in payload.items()
+            if torch.is_tensor(value)
+            and value.ndim >= 1
+            and int(value.shape[0]) == max_assets
+            and (
+                key.startswith("pretrain_object_")
+                or key.startswith("pretrain_reference_")
+            )
+        ]
+        for key in slot_tensor_keys:
+            value = payload[key]
+            if key == "pretrain_object_obj_to_anchor":
+                reset = torch.eye(4, dtype=value.dtype, device=value.device)
+                reset = reset.view(1, 1, 4, 4).repeat(
+                    max_assets, int(value.shape[1]), 1, 1
+                )
+            elif key in (
+                "pretrain_object_bbox_patch",
+                "pretrain_reference_frame_id",
+            ):
+                reset = torch.full_like(value, -1)
+            else:
+                reset = torch.zeros_like(value)
+            result[key] = reset
+        for destination, object_id in enumerate(global_ids):
+            source = source_lookup.get(object_id)
+            if source is None:
+                continue
+            result["pretrain_object_ids"][destination] = object_id
+            result["pretrain_object_class_names"][destination] = payload[
+                "pretrain_object_class_names"
+            ][source]
+            for key in slot_tensor_keys:
+                result[key][destination] = payload[key][source]
+        aligned.append(result)
+    return aligned, global_ids
+
+
+def attach_training_equivalent_sliding_asset_conditions(
+    bundle: Any,
+    *,
+    dataset: WaymoOpenDataset,
+    dataset_index: int,
+    batch: dict[str, Any],
+    vggt_model: nn.Module,
+    scene_flow: nn.Module,
+    device: torch.device,
+    patch_grid: tuple[int, int],
+    window: int,
+    stride: int,
+) -> dict[str, Any]:
+    """Attach one training-equivalent asset condition per model window.
+
+    A complete 29-frame target occupies its whole trunk and therefore has no
+    legal outside-window reference as a single dataset sample. Long-form
+    validation and raw-video inference both call this helper so every actual
+    model window obtains its reference from the rest of the same trunk.
+    """
+    seq_len = int(bundle.z_clean_n.shape[1])
+    windows = window_slices(seq_len, int(window), int(stride))
+    if len(windows) <= 1:
+        return {"active": False, "windows": []}
+    if int(bundle.z_clean_n.shape[0]) != 1:
+        raise ValueError(
+            "window-specific raw asset extraction currently requires batch size 1"
+        )
+    intrinsics = batch.get("intrinsics")
+    if not torch.is_tensor(intrinsics):
+        raise RuntimeError("raw sliding asset extraction requires batch intrinsics")
+    intrinsics = intrinsics.to(device=device, dtype=torch.float32)
+    raw_hw_value = batch.get("raw_image_size_hw")
+    if raw_hw_value is None:
+        raise RuntimeError(
+            "raw sliding asset extraction requires raw_image_size_hw"
+        )
+    raw_hw = torch.as_tensor(raw_hw_value, device=device)
+    if raw_hw.ndim >= 3 and int(raw_hw.shape[-1]) == 2:
+        raw_hw = raw_hw[:, 0]
+    frame_ids = torch.as_tensor(bundle.frame_ids, device=device, dtype=torch.long)
+    if frame_ids.ndim == 1:
+        frame_ids = frame_ids.unsqueeze(0)
+
+    raw_payloads = [
+        dataset.build_pretrain_asset_payload_for_sample_window(
+            int(dataset_index), int(start), int(end)
+        )
+        for start, end in windows
+    ]
+    aligned_payloads, global_object_ids = _align_sliding_asset_payload_slots(
+        raw_payloads
+    )
+    conditions: dict[tuple[int, int], FactorizedAssetCondition] = {}
+    diagnostics = []
+    max_lengths = torch.zeros_like(bundle.F_asset_lengths)
+    any_asset = False
+    for (start, end), payload in zip(windows, aligned_payloads):
+        payload_batch: dict[str, Any] = {}
+        for key, value in payload.items():
+            payload_batch[key] = (
+                value.unsqueeze(0) if torch.is_tensor(value) else value
+            )
+        built = build_factorized_asset_condition_from_batch(
+            payload_batch,
+            vggt_model,
+            scene_flow,
+            device,
+            patch_grid=patch_grid,
+            frame_ids=frame_ids[:, start:end],
+            intrinsics=_sliding_intrinsics_window(
+                intrinsics,
+                start=start,
+                end=end,
+                seq_len=seq_len,
+            ),
+            image_size_hw=raw_hw,
+        )
+        condition = built.condition.validate()
+        if condition.seq_len != int(end - start):
+            raise RuntimeError(
+                f"window [{start},{end}) condition has S={condition.seq_len}"
+            )
+        conditions[(int(start), int(end))] = condition
+        max_lengths = torch.maximum(max_lengths, built.lengths)
+        has_asset = bool(
+            (
+                condition.appearance_mask.any(dim=(1, 2))
+                & condition.track_valid.any(dim=(1, 2))
+            ).any()
+        )
+        any_asset |= has_asset
+        refs = condition.reference_frame_id.detach().cpu().tolist()
+        target_ids = frame_ids[:, start:end].detach().cpu().tolist()
+        for row_refs, row_targets in zip(refs, target_ids):
+            target_set = set(int(value) for value in row_targets)
+            for reference_id in row_refs:
+                if int(reference_id) >= 0 and int(reference_id) in target_set:
+                    raise RuntimeError(
+                        f"sliding asset reference {reference_id} lies inside "
+                        f"window target frames {sorted(target_set)}"
+                    )
+        diagnostics.append(
+            {
+                "window": [int(start), int(end)],
+                "target_frame_ids": target_ids,
+                "reference_frame_ids": refs,
+                "source_kinds": built.source_kinds,
+                "has_asset": has_asset,
+            }
+        )
+    for left_index, (left_start, left_end) in enumerate(windows):
+        left = conditions[(left_start, left_end)]
+        for right_start, right_end in windows[left_index + 1 :]:
+            overlap_start = max(left_start, right_start)
+            overlap_end = min(left_end, right_end)
+            if overlap_start >= overlap_end:
+                continue
+            right = conditions[(right_start, right_end)]
+            left_slice = left.slice_time(
+                overlap_start - left_start, overlap_end - left_start
+            )
+            right_slice = right.slice_time(
+                overlap_start - right_start, overlap_end - right_start
+            )
+            shared = left_slice.track_valid & right_slice.track_valid
+            if bool(shared.any()):
+                placement_error = (
+                    left_slice.placement_state - right_slice.placement_state
+                ).abs().amax(dim=-1)
+                bbox_error = (
+                    left_slice.target_bbox_patch - right_slice.target_bbox_patch
+                ).abs().amax(dim=-1)
+                if bool((placement_error[shared] > 1.0e-4).any()) or bool(
+                    (bbox_error[shared] > 1.0e-4).any()
+                ):
+                    raise RuntimeError(
+                        "overlapping sliding windows disagree on shared-object "
+                        f"placement/bbox for frames [{overlap_start},{overlap_end})"
+                    )
+    bundle.factorized_asset_conditions_by_window = conditions
+    bundle.F_asset_lengths = max_lengths
+    bundle.asset_condition_kind = [
+        "factorized_asset" if any_asset else "none"
+    ]
+    bundle.asset_condition_source_kind = ["sliding_outside_window_reference"]
+    return {
+        "active": True,
+        "global_object_ids": global_object_ids,
+        "overlap_geometry_verified": True,
+        "windows": diagnostics,
+    }
 
 
 def build_pretrain_bundle_from_batch(
@@ -5442,7 +5725,21 @@ def _run_validation_impl(
     metrics["batches"] = float(count)
 
     sampling_args = args
+    long_asset_dataset = None
+    long_asset_dataset_index = None
     if is_main_process() and long_loader is not None:
+        long_sampler = getattr(long_loader, "sampler", None)
+        if not isinstance(long_sampler, CyclicSequentialSampler):
+            raise TypeError(
+                "long-form pretrain validation requires CyclicSequentialSampler "
+                "so its dataset row can be reused for per-window asset extraction"
+            )
+        long_asset_dataset = getattr(long_loader, "dataset", None)
+        if not isinstance(long_asset_dataset, WaymoOpenDataset):
+            raise TypeError(
+                "long-form pretrain validation requires WaymoOpenDataset"
+            )
+        long_asset_dataset_index = int(long_sampler.offset)
         try:
             long_batch = next(iter(long_loader))
         except StopIteration:
@@ -5475,6 +5772,34 @@ def _run_validation_impl(
                 device,
                 args,
             )
+            if (
+                long_asset_dataset is not None
+                and long_asset_dataset_index is not None
+            ):
+                sliding_asset_info = (
+                    attach_training_equivalent_sliding_asset_conditions(
+                        first_bundle,
+                        dataset=long_asset_dataset,
+                        dataset_index=long_asset_dataset_index,
+                        batch=first_batch,
+                        vggt_model=vggt_model,
+                        scene_flow=scene_flow,
+                        device=device,
+                        patch_grid=args.patch_grid,
+                        window=int(sampling_args.val_sliding_window),
+                        stride=int(sampling_args.val_sliding_stride),
+                    )
+                )
+                window_diagnostics = sliding_asset_info["windows"]
+                metrics["long_sliding_asset_windows"] = float(
+                    len(window_diagnostics)
+                )
+                metrics["long_sliding_asset_active_windows"] = float(
+                    sum(bool(item["has_asset"]) for item in window_diagnostics)
+                )
+                metrics["long_sliding_asset_any"] = float(
+                    any(bool(item["has_asset"]) for item in window_diagnostics)
+                )
 
             # Primary scale samples drive latent PCA / abs_error. Extra scales
             # only contribute additional RGB grids for side-by-side CFG comparison.
