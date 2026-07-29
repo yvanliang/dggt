@@ -121,42 +121,66 @@ def load_and_preprocess_flow(flow_path_list, extrinsic_paths, intrinsic_path, he
     return torch.stack(flows)
 
 
-def load_and_preprocess_images(image_path_list, mode="crop"):
+def load_and_preprocess_images(
+    image_path_list,
+    mode="crop",
+    *,
+    output_dtype="float32",
+):
     # Check for empty list
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
     
     images = []
     shapes = set()
-    to_tensor = TF.ToTensor()
     target_size = 518
 
     # First process all images and collect their shapes
     for image_path in image_path_list:
 
         # Open image
-        img = Image.open(image_path)
+        with Image.open(image_path) as source:
+            # If there's an alpha channel, blend onto white background.
+            if source.mode == "RGBA":
+                background = Image.new(
+                    "RGBA",
+                    source.size,
+                    (255, 255, 255, 255),
+                )
+                img = Image.alpha_composite(background, source)
+            else:
+                img = source
+            img = img.convert("RGB")
+            width, height = img.size
 
-        # If there's an alpha channel, blend onto white background:
-        if img.mode == "RGBA":
-            # Create white background
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            # Alpha composite onto the white background
-            img = Image.alpha_composite(background, img)
-
-        # Now convert to "RGB" (this step assigns white for transparent areas)
-        img = img.convert("RGB")
-
-        width, height = img.size
-        
-        # Original behavior: set width to 518px
-        new_width = target_size
-        # Calculate height maintaining aspect ratio, divisible by 14
-        new_height = round(height * (new_width / width) / 14) * 14
-
-        # Resize with new dimensions (width, height)
-        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
-        img = to_tensor(img)  # Convert to tensor (0, 1)
+            # Original behavior: set width to 518px.
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+            img = img.resize(
+                (new_width, new_height),
+                Image.Resampling.BICUBIC,
+            )
+            # NumPy performs this bulk conversion substantially faster than
+            # torchvision's per-image ToTensor path in DataLoader workers.
+            if str(output_dtype) == "uint8":
+                image_array = np.ascontiguousarray(
+                    np.asarray(img, dtype=np.uint8).transpose(2, 0, 1)
+                )
+            elif str(output_dtype) == "float32":
+                image_array = np.ascontiguousarray(
+                    np.asarray(img, dtype=np.uint8).transpose(2, 0, 1)
+                )
+            else:
+                raise ValueError(
+                    "output_dtype must be 'float32' or 'uint8', got "
+                    f"{output_dtype!r}"
+                )
+            img = torch.from_numpy(image_array)
+            if str(output_dtype) == "float32":
+                # Preserve torchvision ToTensor's exact arithmetic order:
+                # uint8 -> float32 followed by division, rather than a NumPy
+                # float multiply that differs by one ULP for many pixel values.
+                img = img.to(dtype=torch.float32).div(255.0)
 
         if new_height > target_size:
             start_y = (new_height - target_size) // 2
@@ -186,7 +210,10 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
                 pad_right = w_padding - pad_left
 
                 img = torch.nn.functional.pad(
-                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+                    img,
+                    (pad_left, pad_right, pad_top, pad_bottom),
+                    mode="constant",
+                    value=255 if img.dtype == torch.uint8 else 1.0,
                 )
             padded_images.append(img)
         images = padded_images
@@ -200,32 +227,44 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     return images
 
 
-def load_and_preprocess_binary_masks(mask_path_list, mode="crop", threshold=0.5):
+def load_and_preprocess_binary_masks(
+    mask_path_list,
+    mode="crop",
+    threshold=0.5,
+    *,
+    channels=3,
+):
     # Check for empty list
     if len(mask_path_list) == 0:
         raise ValueError("At least 1 mask is required")
 
     masks = []
     shapes = set()
-    to_tensor = TF.ToTensor()
     target_size = 518
 
     for mask_path in mask_path_list:
-        mask = Image.open(mask_path).convert("L")
-
-        width, height = mask.size
-        new_width = target_size
-        new_height = round(height * (new_width / width) / 14) * 14
-
-        mask = mask.resize((new_width, new_height), Image.Resampling.NEAREST)
-        mask = to_tensor(mask)
+        with Image.open(mask_path) as source:
+            mask = source.convert("L")
+            width, height = mask.size
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+            mask = mask.resize(
+                (new_width, new_height),
+                Image.Resampling.NEAREST,
+            )
+            mask_array = np.asarray(mask, dtype=np.uint8).copy()
+        mask = torch.from_numpy(mask_array).unsqueeze(0)
 
         if new_height > target_size:
             start_y = (new_height - target_size) // 2
             mask = mask[:, start_y : start_y + target_size, :]
 
-        mask = mask.gt(float(threshold)).to(torch.float32)
-        mask = mask.expand(3, -1, -1).contiguous()
+        mask = mask.gt(float(threshold) * 255.0).to(torch.float32)
+        channels = int(channels)
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+        if channels > 1:
+            mask = mask.expand(channels, -1, -1).contiguous()
 
         shapes.add((mask.shape[1], mask.shape[2]))
         masks.append(mask)
@@ -302,9 +341,22 @@ def _build_waymo_box_corners_world(obj_to_world, box_size):
     return (np.asarray(obj_to_world, dtype=np.float32) @ local.T).T[:, :3].astype(np.float32)
 
 
-def _project_world_points_to_raw(points_world, camera_to_world, intrinsics, image_hw, eps=1e-6):
+def _project_world_points_to_raw(
+    points_world,
+    camera_to_world,
+    intrinsics,
+    image_hw,
+    eps=1e-6,
+    *,
+    world_to_camera=None,
+):
     points_world = np.asarray(points_world, dtype=np.float32)
-    world_to_camera = np.linalg.inv(np.asarray(camera_to_world, dtype=np.float32))
+    if world_to_camera is None:
+        world_to_camera = np.linalg.inv(
+            np.asarray(camera_to_world, dtype=np.float32)
+        )
+    else:
+        world_to_camera = np.asarray(world_to_camera, dtype=np.float32)
     points_h = np.concatenate(
         [points_world, np.ones((points_world.shape[0], 1), dtype=np.float32)],
         axis=1,
@@ -373,20 +425,107 @@ def _waymo_semantic_values_for_class(class_name):
     return ()
 
 
+def _load_waymo_semantic_labels_model(mask_path, target_width=518):
+    """Decode one semantic label image on the DGGT model canvas."""
+    if not mask_path or not os.path.exists(mask_path):
+        return None
+    with Image.open(mask_path) as source:
+        mask = source.convert("L")
+        width, height = mask.size
+        new_width = int(target_width)
+        new_height = round(height * (new_width / width) / 14) * 14
+        mask = mask.resize((new_width, new_height), Image.Resampling.NEAREST)
+        if new_height > target_width:
+            start_y = (new_height - target_width) // 2
+            mask = mask.crop((0, start_y, new_width, start_y + target_width))
+        return np.asarray(mask, dtype=np.uint8).copy()
+
+
 def _load_waymo_semantic_foreground_model(mask_path, class_name, target_width=518):
     """Load class-matched semantic foreground on the DGGT model canvas."""
     semantic_values = _waymo_semantic_values_for_class(class_name)
-    if not semantic_values or not mask_path or not os.path.exists(mask_path):
+    if not semantic_values:
         return None
-    mask = Image.open(mask_path).convert("L")
-    width, height = mask.size
-    new_width = int(target_width)
-    new_height = round(height * (new_width / width) / 14) * 14
-    mask = mask.resize((new_width, new_height), Image.Resampling.NEAREST)
-    if new_height > target_width:
-        start_y = (new_height - target_width) // 2
-        mask = mask.crop((0, start_y, new_width, start_y + target_width))
-    return np.isin(np.asarray(mask, dtype=np.uint8), semantic_values)
+    labels = _load_waymo_semantic_labels_model(
+        mask_path,
+        target_width=target_width,
+    )
+    if labels is None:
+        return None
+    return np.isin(labels, semantic_values)
+
+
+def _boxed_binary_mask_patch_support(
+    foreground,
+    box_xyxy,
+    patch_grid,
+    *,
+    coverage_threshold=0.05,
+    integral=None,
+):
+    """Pool ``foreground ∩ box`` with adaptive-average-pool bin semantics.
+
+    An integral image makes this O(patches) without allocating a full-resolution
+    alpha tensor or crossing the NumPy/Torch boundary for every candidate.
+    """
+    foreground = np.asarray(foreground, dtype=np.bool_)
+    if foreground.ndim != 2:
+        raise ValueError(
+            f"foreground must be a 2D binary mask, got {foreground.shape}"
+        )
+    height, width = foreground.shape
+    gh, gw = int(patch_grid[0]), int(patch_grid[1])
+    empty = np.zeros((gh * gw,), dtype=np.bool_)
+    if height <= 0 or width <= 0 or gh <= 0 or gw <= 0:
+        return empty, 0
+
+    x0, y0, x1, y1 = [
+        int(round(float(value)))
+        for value in np.asarray(box_xyxy, dtype=np.float32).reshape(4)
+    ]
+    x0, x1 = max(0, x0), min(width, x1)
+    y0, y1 = max(0, y0), min(height, y1)
+    if x1 <= x0 or y1 <= y0:
+        return empty, 0
+
+    if integral is None:
+        integral = np.pad(
+            foreground.astype(np.int32, copy=False).cumsum(0).cumsum(1),
+            ((1, 0), (1, 0)),
+        )
+    else:
+        integral = np.asarray(integral)
+        if integral.shape != (height + 1, width + 1):
+            raise ValueError(
+                f"integral shape {integral.shape} != {(height + 1, width + 1)}"
+            )
+    pool_y0 = np.floor(np.arange(gh) * height / gh).astype(np.int64)
+    pool_y1 = np.ceil((np.arange(gh) + 1) * height / gh).astype(np.int64)
+    pool_x0 = np.floor(np.arange(gw) * width / gw).astype(np.int64)
+    pool_x1 = np.ceil((np.arange(gw) + 1) * width / gw).astype(np.int64)
+    iy0 = np.maximum(pool_y0, y0)
+    iy1 = np.minimum(pool_y1, y1)
+    ix0 = np.maximum(pool_x0, x0)
+    ix1 = np.minimum(pool_x1, x1)
+    valid_y = iy1 > iy0
+    valid_x = ix1 > ix0
+    counts = (
+        integral[iy1[:, None], ix1[None, :]]
+        - integral[iy0[:, None], ix1[None, :]]
+        - integral[iy1[:, None], ix0[None, :]]
+        + integral[iy0[:, None], ix0[None, :]]
+    )
+    counts *= valid_y[:, None] & valid_x[None, :]
+    pool_area = (
+        (pool_y1 - pool_y0)[:, None]
+        * (pool_x1 - pool_x0)[None, :]
+    )
+    support = counts >= float(coverage_threshold) * pool_area
+    foreground_area = int(
+        integral[y1, x1] - integral[y0, x1]
+        - integral[y1, x0] + integral[y0, x0]
+    )
+    return support.reshape(gh * gw), foreground_area
 
 
 def _select_pretrain_reference_candidate(reference_candidates, deterministic=False):
@@ -573,6 +712,9 @@ class WaymoOpenDataset(Dataset):
         camera_anchor_window_probability=0.0,
         return_full_dggt_context=False,
         trunk_major_window_offsets=None,
+        load_dynamic_masks=True,
+        binary_mask_channels=3,
+        image_output_dtype="float32",
     ):
         #mode 1 : train
         #mode 2 : pure reconstruction
@@ -624,6 +766,19 @@ class WaymoOpenDataset(Dataset):
                 f"{camera_anchor_window_probability}"
             )
         self.return_full_dggt_context = bool(return_full_dggt_context)
+        self.load_dynamic_masks = bool(load_dynamic_masks)
+        self.binary_mask_channels = int(binary_mask_channels)
+        if self.binary_mask_channels <= 0:
+            raise ValueError(
+                "binary_mask_channels must be positive, got "
+                f"{binary_mask_channels}"
+            )
+        self.image_output_dtype = str(image_output_dtype)
+        if self.image_output_dtype not in ("float32", "uint8"):
+            raise ValueError(
+                "image_output_dtype must be 'float32' or 'uint8', got "
+                f"{image_output_dtype!r}"
+            )
         if self.return_full_dggt_context and self.views != 1:
             raise ValueError("Full DGGT context is currently supported only for views=1.")
         if trunk_major_window_offsets is None:
@@ -661,6 +816,7 @@ class WaymoOpenDataset(Dataset):
         self.ego_paths = []
         self.scene_roots = []
         self._instance_metadata_cache = {}
+        self._camera_metadata_cache = {}
 
         self.start_idx = start_idx
 
@@ -1016,14 +1172,56 @@ class WaymoOpenDataset(Dataset):
             start = trunk_end - sequence_length
         return min(max(trunk_base, start), max_start)
 
+    def _load_waymo_camera_metadata(self, idx, frame_indices=()):
+        """Load calibration once and lazily cache requested ego poses per worker."""
+        scene_name = str(self.scenes[idx])
+        cache = self._camera_metadata_cache
+        if scene_name in cache:
+            payload = cache.pop(scene_name)
+            cache[scene_name] = payload
+        else:
+            camera_extrinsic_path = (
+                self.ego_paths[idx] if idx < len(self.ego_paths) else ""
+            )
+            intrinsic_path = self.intrinsic_paths[idx]
+            if isinstance(intrinsic_path, (list, tuple)):
+                intrinsic_path = intrinsic_path[0] if intrinsic_path else ""
+            camera_to_ego = _load_waymo_matrix4(
+                camera_extrinsic_path,
+                "front camera extrinsics",
+            )
+            intrinsics = _load_waymo_intrinsics_matrix(intrinsic_path)
+            with Image.open(self.image_paths[idx][0]) as image:
+                raw_hw = (int(image.height), int(image.width))
+            payload = {
+                "camera_to_ego": camera_to_ego,
+                "camera_to_ego_dataset": (
+                    camera_to_ego @ WAYMO_OPENCV2DATASET
+                ).astype(np.float32),
+                "intrinsics": intrinsics,
+                "raw_hw": raw_hw,
+                "ego_to_world": {},
+            }
+            if self.pretrain_instance_cache_size > 0:
+                cache[scene_name] = payload
+                while len(cache) > self.pretrain_instance_cache_size:
+                    oldest_scene = next(iter(cache))
+                    del cache[oldest_scene]
+
+        ego_pose_paths = self.extrinsic_paths[idx]
+        poses = payload["ego_to_world"]
+        for frame_idx in dict.fromkeys(int(value) for value in frame_indices):
+            if frame_idx not in poses:
+                poses[frame_idx] = _load_waymo_matrix4(
+                    ego_pose_paths[frame_idx],
+                    "ego pose",
+                )
+        return payload
+
     def _load_front_waymo_camera_gt(self, idx, indices, image_seq):
         if self.views != 1:
             raise ValueError("Raw Waymo camera GT loading currently expects front-camera views=1 clips.")
         ego_pose_paths = self.extrinsic_paths[idx]
-        camera_extrinsic_path = self.ego_paths[idx] if idx < len(self.ego_paths) else ""
-        intrinsic_path = self.intrinsic_paths[idx]
-        if isinstance(intrinsic_path, (list, tuple)):
-            intrinsic_path = intrinsic_path[0] if len(intrinsic_path) > 0 else ""
         if len(ego_pose_paths) == 0:
             raise RuntimeError(f"Scene {self.scenes[idx]} is missing ego_pose/*.txt files.")
         if max(indices) >= len(ego_pose_paths):
@@ -1032,19 +1230,27 @@ class WaymoOpenDataset(Dataset):
                 f"but clip needs frame {max(indices)}."
             )
 
-        cam_to_ego = _load_waymo_matrix4(camera_extrinsic_path, "front camera extrinsics")
-        cam_to_ego = (cam_to_ego @ WAYMO_OPENCV2DATASET).astype(np.float32)
         # Keep every sampled window in one clip-global Waymo coordinate frame.
         # Sliding inference constructs the full trajectory before slicing; using
         # the sampled window start here would give training a different camera
         # condition representation.
         clip_start = int(indices[0] // 29) * 29
-        ego_to_world_start = _load_waymo_matrix4(ego_pose_paths[clip_start], "ego pose")
+        context_indices = sorted(set(
+            [clip_start]
+            + [max(clip_start, int(frame_idx) - 1) for frame_idx in indices]
+            + list(indices)
+        ))
+        camera_metadata = self._load_waymo_camera_metadata(
+            idx,
+            context_indices,
+        )
+        cam_to_ego = camera_metadata["camera_to_ego_dataset"]
+        ego_to_world_by_frame = camera_metadata["ego_to_world"]
+        ego_to_world_start = ego_to_world_by_frame[clip_start]
         ego_start_inv = np.linalg.inv(ego_to_world_start).astype(np.float32)
-        context_indices = sorted(set([clip_start] + [max(clip_start, int(frame_idx) - 1) for frame_idx in indices] + list(indices)))
         camera_by_frame = {}
         for frame_idx in context_indices:
-            ego_to_world = _load_waymo_matrix4(ego_pose_paths[frame_idx], "ego pose")
+            ego_to_world = ego_to_world_by_frame[frame_idx]
             camera_by_frame[int(frame_idx)] = (ego_start_inv @ ego_to_world @ cam_to_ego).astype(np.float32)
         camera_to_world = [camera_by_frame[int(frame_idx)] for frame_idx in indices]
         camera_to_world = np.stack(camera_to_world, axis=0)[:, None]
@@ -1053,16 +1259,15 @@ class WaymoOpenDataset(Dataset):
             [camera_by_frame[max(clip_start, int(frame_idx) - 1)] for frame_idx in indices], axis=0
         )
 
-        intrinsics = _load_waymo_intrinsics_matrix(intrinsic_path)[None]
-        with Image.open(image_seq[0]) as img:
-            raw_width, raw_height = img.size
+        intrinsics = camera_metadata["intrinsics"][None]
+        raw_height, raw_width = camera_metadata["raw_hw"]
         raw_image_size_hw = torch.tensor([int(raw_height), int(raw_width)], dtype=torch.long)
         return (
-            torch.tensor(camera_to_world.tolist(), dtype=torch.float32),
-            torch.tensor(intrinsics.tolist(), dtype=torch.float32),
+            torch.from_numpy(camera_to_world),
+            torch.from_numpy(intrinsics),
             raw_image_size_hw,
-            torch.tensor(camera_anchor_to_world.tolist(), dtype=torch.float32),
-            torch.tensor(previous_camera_to_world.tolist(), dtype=torch.float32),
+            torch.from_numpy(camera_anchor_to_world),
+            torch.from_numpy(previous_camera_to_world),
         )
 
     def _load_instance_metadata(self, idx):
@@ -1407,13 +1612,10 @@ class WaymoOpenDataset(Dataset):
         ego_pose_paths = self.extrinsic_paths[idx]
         if not ego_pose_paths:
             return empty_payload("factorized_camera_missing")
-        camera_extrinsic_path = self.ego_paths[idx] if idx < len(self.ego_paths) else ""
-        intrinsic_path = self.intrinsic_paths[idx]
-        if isinstance(intrinsic_path, (list, tuple)):
-            intrinsic_path = intrinsic_path[0] if intrinsic_path else ""
         try:
-            camera_to_ego = _load_waymo_matrix4(camera_extrinsic_path, "front camera extrinsics")
-            intrinsics = _load_waymo_intrinsics_matrix(intrinsic_path)
+            camera_metadata = self._load_waymo_camera_metadata(idx)
+            camera_to_ego = camera_metadata["camera_to_ego"]
+            intrinsics = camera_metadata["intrinsics"]
         except Exception:
             return empty_payload("factorized_camera_missing")
 
@@ -1429,7 +1631,12 @@ class WaymoOpenDataset(Dataset):
             return empty_payload("factorized_no_external_reference")
 
         try:
-            anchor_ego_to_world = _load_waymo_matrix4(ego_pose_paths[trunk_base], "anchor ego pose")
+            camera_metadata = self._load_waymo_camera_metadata(
+                idx,
+                trunk_indices,
+            )
+            ego_to_world_by_frame = camera_metadata["ego_to_world"]
+            anchor_ego_to_world = ego_to_world_by_frame[trunk_base]
             anchor_to_world = (
                 anchor_ego_to_world @ camera_to_ego @ WAYMO_OPENCV2DATASET
             ).astype(np.float32)
@@ -1439,21 +1646,19 @@ class WaymoOpenDataset(Dataset):
 
         camera_to_anchor = []
         camera_to_world = {}
+        world_to_camera = {}
         for frame_idx in trunk_indices:
-            try:
-                ego_to_world = _load_waymo_matrix4(ego_pose_paths[frame_idx], "ego pose")
-            except Exception:
-                return empty_payload("factorized_camera_missing")
+            ego_to_world = ego_to_world_by_frame[frame_idx]
             c2w = (ego_to_world @ camera_to_ego @ WAYMO_OPENCV2DATASET).astype(np.float32)
             camera_to_world[frame_idx] = c2w
+            world_to_camera[frame_idx] = np.linalg.inv(c2w).astype(np.float32)
             if frame_idx in target_set:
                 camera_to_anchor.append((world_to_anchor @ c2w).astype(np.float32))
-        empty["pretrain_camera_to_anchor"] = torch.tensor(
-            np.stack(camera_to_anchor, axis=0).tolist(), dtype=torch.float32
+        empty["pretrain_camera_to_anchor"] = torch.from_numpy(
+            np.stack(camera_to_anchor, axis=0)
         )
 
-        with Image.open(self.image_paths[idx][trunk_base]) as image:
-            raw_hw = (int(image.height), int(image.width))
+        raw_hw = camera_metadata["raw_hw"]
         model_hw = _waymo_resize_geometry(raw_hw, target_width=518)["out_hw"]
         if tuple(model_hw) != tuple(canvas_hw):
             # The tokenizer patch grid must describe the actual DGGT canvas.
@@ -1465,75 +1670,20 @@ class WaymoOpenDataset(Dataset):
         instances_info = metadata["instances_info"]
         frame_instances = metadata.get("frame_instances", {})
 
-        def reference_overlap_is_acceptable(frame_idx, current_key, current_box, current_depth):
-            current = np.asarray(current_box, dtype=np.float32)
-            current_area = max(0.0, float(current[2] - current[0])) * max(
-                0.0, float(current[3] - current[1])
-            )
-            if current_area <= 0.0:
-                return False
-            for other_id in frame_instances.get(str(int(frame_idx)), []):
-                other_key = str(other_id)
-                if other_key == str(current_key):
-                    continue
-                other = instances_info.get(other_key)
-                if not isinstance(other, dict):
-                    continue
-                other_ann = other.get("frame_annotations", {})
-                other_frames = [int(value) for value in other_ann.get("frame_idx", [])]
-                try:
-                    other_pos = other_frames.index(int(frame_idx))
-                    other_o2w = np.asarray(
-                        other_ann["obj_to_world"][other_pos], dtype=np.float32
-                    ).reshape(4, 4)
-                    other_size = np.asarray(
-                        other_ann["box_size"][other_pos], dtype=np.float32
-                    ).reshape(3)
-                except (ValueError, IndexError, KeyError, TypeError):
-                    continue
-                other_raw, other_points_cam = _project_world_points_to_raw(
-                    _build_waymo_box_corners_world(other_o2w, other_size),
-                    camera_to_world[frame_idx],
-                    intrinsics,
-                    raw_hw,
-                )
-                if other_raw is None:
-                    continue
-                other_box, _ = _transform_waymo_box_to_model(
-                    other_raw, raw_hw, target_width=518
-                )
-                ix0 = max(float(current[0]), float(other_box[0]))
-                iy0 = max(float(current[1]), float(other_box[1]))
-                ix1 = min(float(current[2]), float(other_box[2]))
-                iy1 = min(float(current[3]), float(other_box[3]))
-                intersection = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
-                if intersection <= 0.0:
-                    continue
-                other_area = max(0.0, float(other_box[2] - other_box[0])) * max(
-                    0.0, float(other_box[3] - other_box[1])
-                )
-                union = max(current_area + other_area - intersection, 1.0e-6)
-                iou = intersection / union
-                positive_depth = other_points_cam[:, 2][other_points_cam[:, 2] > 1.0e-6]
-                other_depth = (
-                    float(np.median(positive_depth))
-                    if positive_depth.size > 0
-                    else float("inf")
-                )
-                if iou > 0.5 or (
-                    other_depth < float(current_depth)
-                    and intersection / current_area > 0.25
-                ):
-                    return False
-            return True
-
-        projected = []
-        for object_id in self._candidate_instance_ids_for_clip(metadata, trunk_indices):
-            info = instances_info.get(str(object_id))
+        geometry_by_object = {}
+        object_records = []
+        for object_id in self._candidate_instance_ids_for_clip(
+            metadata,
+            trunk_indices,
+        ):
+            object_key = str(object_id)
+            info = instances_info.get(object_key)
             if not isinstance(info, dict):
                 continue
             annotations = info.get("frame_annotations", {})
-            frame_seq = [int(value) for value in annotations.get("frame_idx", [])]
+            frame_seq = [
+                int(value) for value in annotations.get("frame_idx", [])
+            ]
             poses = annotations.get("obj_to_world", [])
             sizes = annotations.get("box_size", [])
             lookup = {frame: pos for pos, frame in enumerate(frame_seq)}
@@ -1546,25 +1696,44 @@ class WaymoOpenDataset(Dataset):
                 if pos is None or pos >= len(poses) or pos >= len(sizes):
                     continue
                 try:
-                    o2w = np.asarray(poses[pos], dtype=np.float32).reshape(4, 4)
-                    size = np.asarray(sizes[pos], dtype=np.float32).reshape(3)
+                    o2w = np.asarray(
+                        poses[pos],
+                        dtype=np.float32,
+                    ).reshape(4, 4)
+                    size = np.asarray(
+                        sizes[pos],
+                        dtype=np.float32,
+                    ).reshape(3)
                 except Exception:
                     continue
-                if not np.isfinite(o2w).all() or not np.isfinite(size).all() or np.any(size <= 0.0):
+                if (
+                    not np.isfinite(o2w).all()
+                    or not np.isfinite(size).all()
+                    or np.any(size <= 0.0)
+                ):
                     continue
                 raw_box, points_cam = _project_world_points_to_raw(
                     _build_waymo_box_corners_world(o2w, size),
                     camera_to_world[frame_idx],
                     intrinsics,
                     raw_hw,
+                    world_to_camera=world_to_camera[frame_idx],
                 )
                 in_frustum = raw_box is not None
                 model_box = np.zeros((4,), dtype=np.float32)
                 patch_mask = np.zeros((gh * gw,), dtype=np.bool_)
                 bbox_patch = np.full((4,), -1.0, dtype=np.float32)
                 if raw_box is not None:
-                    model_box, _ = _transform_waymo_box_to_model(raw_box, raw_hw, target_width=518)
-                    patch_mask, _ = _model_box_to_patch_mask(model_box, model_hw, (gh, gw))
+                    model_box, _ = _transform_waymo_box_to_model(
+                        raw_box,
+                        raw_hw,
+                        target_width=518,
+                    )
+                    patch_mask, _ = _model_box_to_patch_mask(
+                        model_box,
+                        model_hw,
+                        (gh, gw),
+                    )
                     bbox_patch = np.array(
                         [
                             model_box[0] / float(model_hw[1]) * gw,
@@ -1576,7 +1745,15 @@ class WaymoOpenDataset(Dataset):
                     )
                 o2a = (world_to_anchor @ o2w).astype(np.float32)
                 heading = o2a[:3, 0]
-                yaw = float(np.arctan2(float(heading[0]), float(heading[2]) + 1.0e-8))
+                yaw = float(
+                    np.arctan2(
+                        float(heading[0]),
+                        float(heading[2]) + 1.0e-8,
+                    )
+                )
+                positive_depth = points_cam[:, 2][
+                    points_cam[:, 2] > 1.0e-6
+                ]
                 per_frame[frame_idx] = {
                     "o2a": o2a,
                     "center": o2a[:3, 3].copy(),
@@ -1585,14 +1762,108 @@ class WaymoOpenDataset(Dataset):
                     "model_box": model_box,
                     "bbox_patch": bbox_patch,
                     "patch_mask": patch_mask,
-                    "in_frustum": bool(in_frustum and np.any(points_cam[:, 2] > 1.0e-6)),
-                    "depth": float(
-                        np.median(points_cam[:, 2][points_cam[:, 2] > 1.0e-6])
-                    )
-                    if np.any(points_cam[:, 2] > 1.0e-6)
-                    else float("inf"),
+                    "in_frustum": bool(
+                        in_frustum and positive_depth.size > 0
+                    ),
+                    "depth": (
+                        float(np.median(positive_depth))
+                        if positive_depth.size > 0
+                        else float("inf")
+                    ),
                 }
+            geometry_by_object[object_key] = per_frame
+            object_records.append((object_key, info, per_frame))
 
+        def reference_overlap_is_acceptable(
+            frame_idx,
+            current_key,
+            current_box,
+            current_depth,
+        ):
+            current = np.asarray(current_box, dtype=np.float32)
+            current_area = max(0.0, float(current[2] - current[0])) * max(
+                0.0, float(current[3] - current[1])
+            )
+            if current_area <= 0.0:
+                return False
+            for other_id in frame_instances.get(str(int(frame_idx)), []):
+                other_key = str(other_id)
+                if other_key == str(current_key):
+                    continue
+                other_geom = geometry_by_object.get(other_key, {}).get(
+                    int(frame_idx)
+                )
+                if other_geom is None or not other_geom["in_frustum"]:
+                    continue
+                other_box = other_geom["model_box"]
+                ix0 = max(float(current[0]), float(other_box[0]))
+                iy0 = max(float(current[1]), float(other_box[1]))
+                ix1 = min(float(current[2]), float(other_box[2]))
+                iy1 = min(float(current[3]), float(other_box[3]))
+                intersection = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+                if intersection <= 0.0:
+                    continue
+                other_area = max(0.0, float(other_box[2] - other_box[0])) * max(
+                    0.0, float(other_box[3] - other_box[1])
+                )
+                union = max(current_area + other_area - intersection, 1.0e-6)
+                iou = intersection / union
+                other_depth = float(other_geom["depth"])
+                if iou > 0.5 or (
+                    other_depth < float(current_depth)
+                    and intersection / current_area > 0.25
+                ):
+                    return False
+            return True
+
+        semantic_labels_by_frame = {}
+        semantic_foreground_cache = {}
+        semantic_integral_cache = {}
+
+        def semantic_foreground(frame_idx, class_name):
+            semantic_values = _waymo_semantic_values_for_class(class_name)
+            if (
+                not semantic_values
+                or not isinstance(semantic_paths, list)
+                or frame_idx >= len(semantic_paths)
+            ):
+                return None
+            key = (int(frame_idx), semantic_values)
+            if key in semantic_foreground_cache:
+                return semantic_foreground_cache[key]
+            if frame_idx not in semantic_labels_by_frame:
+                semantic_labels_by_frame[frame_idx] = (
+                    _load_waymo_semantic_labels_model(
+                        semantic_paths[frame_idx],
+                        target_width=518,
+                    )
+                )
+            labels = semantic_labels_by_frame[frame_idx]
+            foreground = (
+                None
+                if labels is None
+                else np.isin(labels, semantic_values)
+            )
+            semantic_foreground_cache[key] = foreground
+            return foreground
+
+        def semantic_integral(frame_idx, class_name, foreground):
+            key = (
+                int(frame_idx),
+                _waymo_semantic_values_for_class(class_name),
+            )
+            if key not in semantic_integral_cache:
+                semantic_integral_cache[key] = np.pad(
+                    foreground.astype(
+                        np.int32,
+                        copy=False,
+                    ).cumsum(0).cumsum(1),
+                    ((1, 0), (1, 0)),
+                )
+            return semantic_integral_cache[key]
+
+        projected = []
+        for object_id, info, per_frame in object_records:
             reference_candidates = []
             for frame_idx in reference_indices:
                 geom = per_frame.get(frame_idx)
@@ -1605,45 +1876,43 @@ class WaymoOpenDataset(Dataset):
                     geom["depth"],
                 ):
                     continue
-                if not isinstance(semantic_paths, list) or frame_idx >= len(semantic_paths):
-                    continue
-                semantic = _load_waymo_semantic_foreground_model(
-                    semantic_paths[frame_idx],
+                semantic = semantic_foreground(
+                    frame_idx,
                     info.get("class_name", ""),
-                    target_width=518,
                 )
                 if semantic is None:
                     continue
-                x0, y0, x1, y1 = [int(round(value)) for value in geom["model_box"]]
-                x0, x1 = max(0, x0), min(int(model_hw[1]), x1)
-                y0, y1 = max(0, y0), min(int(model_hw[0]), y1)
-                alpha_np = np.zeros(model_hw, dtype=np.float32)
-                if x1 > x0 and y1 > y0:
-                    alpha_np[y0:y1, x0:x1] = semantic[y0:y1, x0:x1].astype(np.float32)
-                alpha = torch.tensor(alpha_np.tolist(), dtype=torch.float32).unsqueeze(0)
-                patch_count = int(alpha_to_patch_mask(alpha, (gh, gw)).sum().item())
+                reference_patch_mask, foreground_area = (
+                    _boxed_binary_mask_patch_support(
+                        semantic,
+                        geom["model_box"],
+                        (gh, gw),
+                        integral=semantic_integral(
+                            frame_idx,
+                            info.get("class_name", ""),
+                            semantic,
+                        ),
+                    )
+                )
+                patch_count = int(reference_patch_mask.sum())
                 if patch_count < 4:
                     continue
                 reference_candidates.append(
-                    (frame_idx, alpha, patch_count, float(alpha_np.sum()))
+                    (
+                        frame_idx,
+                        reference_patch_mask,
+                        patch_count,
+                        float(foreground_area),
+                    )
                 )
             if not reference_candidates:
                 continue
-            reference_frame, reference_alpha, _, _ = (
+            reference_frame, _, _, _ = (
                 _select_pretrain_reference_candidate(
                     reference_candidates,
                     deterministic=bool(deterministic_reference),
                 )
             )
-            reference_rgb = load_and_preprocess_images([self.image_paths[idx][reference_frame]])[0]
-            canonical_rgb, canonical_alpha = canonicalize_asset_reference(
-                reference_rgb,
-                reference_alpha,
-                canvas_hw,
-            )
-            canonical_patch_mask = alpha_to_patch_mask(canonical_alpha, (gh, gw))
-            if int(canonical_patch_mask.sum().item()) < 4:
-                continue
 
             target_valid = np.array([frame in per_frame for frame in indices], dtype=np.bool_)
             target_centers = np.zeros((seq_len, 3), dtype=np.float32)
@@ -1699,10 +1968,11 @@ class WaymoOpenDataset(Dataset):
                     "bbox_model": target_box_model,
                     "bbox_patch": target_bbox_patch,
                     "patch_mask": target_patch_mask,
-                    "reference_rgb": canonical_rgb,
-                    "reference_alpha": canonical_alpha,
-                    "reference_patch_mask": canonical_patch_mask,
                     "reference_frame": int(reference_frame - trunk_base),
+                    "reference_frame_absolute": int(reference_frame),
+                    "reference_box_model": per_frame[reference_frame][
+                        "model_box"
+                    ],
                     "score": score,
                 }
             )
@@ -1710,23 +1980,72 @@ class WaymoOpenDataset(Dataset):
         if not projected:
             return empty_payload("factorized_no_external_reference")
         projected.sort(key=lambda item: item["score"], reverse=True)
-        selected = projected[:max_objects]
+        selected = []
+        reference_rgb_cache = {}
+        for item in projected:
+            reference_frame = item["reference_frame_absolute"]
+            semantic = semantic_foreground(
+                reference_frame,
+                item["class_name"],
+            )
+            if semantic is None:
+                continue
+            x0, y0, x1, y1 = [
+                int(round(float(value)))
+                for value in item["reference_box_model"]
+            ]
+            x0, x1 = max(0, x0), min(int(model_hw[1]), x1)
+            y0, y1 = max(0, y0), min(int(model_hw[0]), y1)
+            reference_alpha_np = np.zeros(model_hw, dtype=np.float32)
+            if x1 > x0 and y1 > y0:
+                reference_alpha_np[y0:y1, x0:x1] = semantic[
+                    y0:y1,
+                    x0:x1,
+                ]
+            reference_alpha = torch.from_numpy(
+                reference_alpha_np
+            ).unsqueeze(0)
+            if reference_frame not in reference_rgb_cache:
+                reference_rgb_cache[reference_frame] = (
+                    load_and_preprocess_images(
+                        [self.image_paths[idx][reference_frame]]
+                    )[0]
+                )
+            canonical_rgb, canonical_alpha = canonicalize_asset_reference(
+                reference_rgb_cache[reference_frame],
+                reference_alpha,
+                canvas_hw,
+            )
+            canonical_patch_mask = alpha_to_patch_mask(
+                canonical_alpha,
+                (gh, gw),
+            )
+            if int(canonical_patch_mask.sum().item()) < 4:
+                continue
+            item["reference_rgb"] = canonical_rgb
+            item["reference_alpha"] = canonical_alpha
+            item["reference_patch_mask"] = canonical_patch_mask
+            selected.append(item)
+            if len(selected) >= max_objects:
+                break
+        if not selected:
+            return empty_payload("factorized_no_external_reference")
         for slot, item in enumerate(selected):
             empty["pretrain_object_ids"][slot] = item["object_id"]
             empty["pretrain_object_class_names"][slot] = item["class_name"]
-            empty["pretrain_object_obj_to_anchor"][slot] = torch.tensor(item["o2a"].tolist(), dtype=torch.float32)
-            empty["pretrain_object_center_anchor"][slot] = torch.tensor(item["center"].tolist(), dtype=torch.float32)
-            empty["pretrain_object_box_size"][slot] = torch.tensor(item["size"].tolist(), dtype=torch.float32)
-            empty["pretrain_object_yaw"][slot] = torch.tensor(item["yaw"].tolist(), dtype=torch.float32)
+            empty["pretrain_object_obj_to_anchor"][slot] = torch.from_numpy(item["o2a"])
+            empty["pretrain_object_center_anchor"][slot] = torch.from_numpy(item["center"])
+            empty["pretrain_object_box_size"][slot] = torch.from_numpy(item["size"])
+            empty["pretrain_object_yaw"][slot] = torch.from_numpy(item["yaw"])
             empty["pretrain_object_yaw_sincos"][slot, :, 0] = torch.sin(empty["pretrain_object_yaw"][slot])
             empty["pretrain_object_yaw_sincos"][slot, :, 1] = torch.cos(empty["pretrain_object_yaw"][slot])
-            empty["pretrain_object_velocity_anchor"][slot] = torch.tensor(item["velocity"].tolist(), dtype=torch.float32)
-            empty["pretrain_object_track_valid"][slot] = torch.tensor(item["track_valid"].tolist(), dtype=torch.bool)
-            empty["pretrain_object_in_frustum"][slot] = torch.tensor(item["in_frustum"].tolist(), dtype=torch.bool)
-            empty["pretrain_object_bbox_model"][slot] = torch.tensor(item["bbox_model"].tolist(), dtype=torch.float32)
-            empty["pretrain_object_bbox_patch"][slot] = torch.tensor(item["bbox_patch"].tolist(), dtype=torch.float32)
-            empty["pretrain_object_patch_mask"][slot] = torch.tensor(item["patch_mask"].tolist(), dtype=torch.bool)
-            empty["pretrain_object_valid_mask"][slot] = torch.tensor(item["in_frustum"].tolist(), dtype=torch.bool)
+            empty["pretrain_object_velocity_anchor"][slot] = torch.from_numpy(item["velocity"])
+            empty["pretrain_object_track_valid"][slot] = torch.from_numpy(item["track_valid"])
+            empty["pretrain_object_in_frustum"][slot] = torch.from_numpy(item["in_frustum"])
+            empty["pretrain_object_bbox_model"][slot] = torch.from_numpy(item["bbox_model"])
+            empty["pretrain_object_bbox_patch"][slot] = torch.from_numpy(item["bbox_patch"])
+            empty["pretrain_object_patch_mask"][slot] = torch.from_numpy(item["patch_mask"])
+            empty["pretrain_object_valid_mask"][slot] = torch.from_numpy(item["in_frustum"])
             empty["pretrain_object_scores"][slot] = float(item["score"])
             empty["pretrain_reference_rgb"][slot] = item["reference_rgb"]
             empty["pretrain_reference_alpha"][slot] = item["reference_alpha"]
@@ -1734,7 +2053,7 @@ class WaymoOpenDataset(Dataset):
             empty["pretrain_reference_frame_id"][slot] = int(item["reference_frame"])
         projection_intrinsics, projection_image_hw = (
             resize_crop_intrinsics_to_model_canvas(
-                torch.tensor(intrinsics.tolist(), dtype=torch.float32),
+                torch.from_numpy(intrinsics),
                 raw_hw,
                 target_width=518,
                 patch_size=14,
@@ -1868,7 +2187,10 @@ class WaymoOpenDataset(Dataset):
                         )
                     context_indices = list(range(context_base, context_end))
                     context_seq = [image_paths[i] for i in context_indices]
-                    dggt_context_images = load_and_preprocess_images(context_seq)
+                    dggt_context_images = load_and_preprocess_images(
+                        context_seq,
+                        output_dtype=self.image_output_dtype,
+                    )
                     window_context_indices = torch.tensor(
                         [i - context_base for i in indices], dtype=torch.long
                     )
@@ -1876,24 +2198,36 @@ class WaymoOpenDataset(Dataset):
                 else:
                     dggt_context_images = None
                     window_context_indices = None
-                    images = load_and_preprocess_images(seq)  # [S, C, H, W]
+                    images = load_and_preprocess_images(
+                        seq,
+                        output_dtype=self.image_output_dtype,
+                    )  # [S, C, H, W]
             elif self.views == 3:
                 seq = []
                 for i in indices:
                     for v in range(3):
                         seq.append(image_paths[v][i])
-                images = load_and_preprocess_images(seq)  # [S*3, C, H, W]
+                images = load_and_preprocess_images(
+                    seq,
+                    output_dtype=self.image_output_dtype,
+                )  # [S*3, C, H, W]
 
             #sky masks
             if self.views == 1:
                 mask_seq = [sky_mask_paths[i] for i in indices]
-                masks = load_and_preprocess_binary_masks(mask_seq)  # [S, C, H, W]
+                masks = load_and_preprocess_binary_masks(
+                    mask_seq,
+                    channels=self.binary_mask_channels,
+                )  # [S, C, H, W]
             elif self.views == 3:
                 mask_seq = []
                 for i in indices:
                     for v in range(3):
                         mask_seq.append(sky_mask_paths[v][i])
-                masks = load_and_preprocess_binary_masks(mask_seq)  # [S*3, C, H, W]
+                masks = load_and_preprocess_binary_masks(
+                    mask_seq,
+                    channels=self.binary_mask_channels,
+                )  # [S*3, C, H, W]
 
             frame_ids = np.array(indices, dtype=np.int64) - int(start_idx // 29) * 29
             timestamps = gaussian_timestamps_from_frame_ids(frame_ids)
@@ -1940,16 +2274,22 @@ class WaymoOpenDataset(Dataset):
                 input_dict["camera_trajectory_anchor_to_world_corrected"] = camera_anchor_to_world
                 input_dict["camera_previous_to_world_corrected"] = previous_camera_to_world
         
-            if len(dynamic_mask_paths) > 0:
+            if self.load_dynamic_masks and len(dynamic_mask_paths) > 0:
                 if self.views == 1:
                     dy_mask_seq = [dynamic_mask_paths[i] for i in indices]
-                    dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)  # [S, C, H, W]
+                    dynamic_mask = load_and_preprocess_binary_masks(
+                        dy_mask_seq,
+                        channels=self.binary_mask_channels,
+                    )  # [S, C, H, W]
                 elif self.views == 3:
                     dy_mask_seq = []
                     for i in indices:
                         for v in range(3):
                             dy_mask_seq.append(dynamic_mask_paths[v][i])
-                    dynamic_mask = load_and_preprocess_binary_masks(dy_mask_seq)  # [S*3, C, H, W]
+                    dynamic_mask = load_and_preprocess_binary_masks(
+                        dy_mask_seq,
+                        channels=self.binary_mask_channels,
+                    )  # [S*3, C, H, W]
                 input_dict["dynamic_mask"] = dynamic_mask
 
             if self.views == 1:

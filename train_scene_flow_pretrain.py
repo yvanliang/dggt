@@ -1516,7 +1516,27 @@ def _normalized_mask_grid(mask: torch.Tensor, patch_grid: tuple[int, int], max_f
 
 
 def _image_grid(images: torch.Tensor, max_frames: int) -> torch.Tensor:
-    return images[:1, :max_frames].detach().float().cpu().reshape(-1, *images.shape[2:]).clamp(0.0, 1.0)
+    selected = images[:1, :max_frames].detach().cpu()
+    if selected.dtype == torch.uint8:
+        selected = selected.float().div_(255.0)
+    else:
+        selected = selected.float()
+    return selected.reshape(
+        -1,
+        *images.shape[2:],
+    ).clamp(0.0, 1.0)
+
+
+def _images_to_device(
+    images: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    images = images.to(device, non_blocking=True)
+    if images.dtype == torch.uint8:
+        # Match torchvision ToTensor exactly so uint8 IPC is representation
+        # only and cannot perturb the frozen DGGT input by one ULP.
+        return images.float().div_(255.0)
+    return images
 
 
 def _slice_batch_for_visualization(batch: dict[str, Any], max_samples: int = 1) -> dict[str, Any]:
@@ -2910,7 +2930,7 @@ def render_validation_rgb(
         raise RuntimeError("Pretrain generated RGB validation requires generated_camera_features from SceneFlow.")
     if generated_sky_mask_patch is None:
         raise RuntimeError("Pretrain generated RGB validation requires generated_sky_mask_patch from SceneFlow.")
-    images = batch["images"].to(device, non_blocking=True)
+    images = _images_to_device(batch["images"], device)
     masks = batch.get("masks")
     if masks is not None:
         masks = masks.to(device, non_blocking=True)
@@ -4933,6 +4953,88 @@ def train_step(
     return loss, logs
 
 
+def _canonical_asset_encoder_for_model(
+    vggt_model: VGGT,
+    scene_flow: nn.Module,
+    device: torch.device,
+    patch_grid: tuple[int, int],
+) -> CanonicalAssetEncoder:
+    """Reuse the frozen adapter and its bounded appearance-token LRU."""
+    cache = vggt_model.__dict__.setdefault(
+        "_scene_flow_canonical_asset_encoders",
+        {},
+    )
+    key = (
+        id(unwrap_ddp(scene_flow)),
+        int(patch_grid[0]),
+        int(patch_grid[1]),
+        str(device),
+    )
+    encoder = cache.get(key)
+    if encoder is None:
+        encoder = CanonicalAssetEncoder(
+            vggt_model.aggregator,
+            vggt_model.scene_tokenizer,
+            unwrap_ddp(scene_flow),
+            patch_grid=patch_grid,
+            max_tokens=32,
+            cache_size=1024,
+        ).to(device)
+        cache[key] = encoder
+    return encoder
+
+
+def _canonical_asset_cache_keys(
+    batch: dict[str, Any],
+    *,
+    batch_size: int,
+    num_assets: int,
+) -> list[tuple[str, str, int] | None]:
+    scene_names = batch.get("scene_name")
+    if isinstance(scene_names, str):
+        scene_names = [scene_names] * batch_size
+    elif not isinstance(scene_names, (list, tuple)):
+        scene_names = [""] * batch_size
+    object_ids = batch.get("pretrain_object_ids")
+    reference_ids = batch.get("pretrain_reference_frame_id")
+    if not torch.is_tensor(reference_ids):
+        return [None] * (batch_size * num_assets)
+    reference_ids_cpu = reference_ids.detach().cpu()
+
+    def object_id_at(row: int, slot: int) -> str:
+        if not isinstance(object_ids, (list, tuple)):
+            return ""
+        # default_collate transposes List[B][List[K][str]] to List[K][Tuple[B]]
+        if len(object_ids) == num_assets:
+            column = object_ids[slot]
+            if isinstance(column, (list, tuple)) and len(column) == batch_size:
+                return str(column[row])
+            if batch_size == 1:
+                return str(column)
+        if len(object_ids) == batch_size:
+            row_values = object_ids[row]
+            if isinstance(row_values, (list, tuple)) and len(row_values) > slot:
+                return str(row_values[slot])
+        return ""
+
+    keys = []
+    for row in range(batch_size):
+        scene_name = (
+            str(scene_names[row])
+            if row < len(scene_names)
+            else ""
+        )
+        for slot in range(num_assets):
+            object_id = object_id_at(row, slot)
+            reference_id = int(reference_ids_cpu[row, slot])
+            keys.append(
+                None
+                if not scene_name or not object_id or reference_id < 0
+                else (scene_name, object_id, reference_id)
+            )
+    return keys
+
+
 def build_factorized_asset_condition_from_batch(
     batch: dict[str, Any],
     vggt_model: VGGT,
@@ -5009,13 +5111,12 @@ def build_factorized_asset_condition_from_batch(
             f"reference batch {reference_rgb.shape[0]} != frame-id batch {batch_size}"
         )
     num_assets = int(reference_rgb.shape[1])
-    encoder = CanonicalAssetEncoder(
-        vggt_model.aggregator,
-        vggt_model.scene_tokenizer,
-        sf_root,
-        patch_grid=patch_grid,
-        max_tokens=32,
-    ).to(device)
+    encoder = _canonical_asset_encoder_for_model(
+        vggt_model,
+        scene_flow,
+        device,
+        patch_grid,
+    )
     appearance = encoder(
         reference_rgb.reshape(
             batch_size * num_assets, 1, 3, *reference_rgb.shape[-2:]
@@ -5025,22 +5126,36 @@ def build_factorized_asset_condition_from_batch(
         ),
         batch_size=batch_size,
         num_assets=num_assets,
+        cache_keys=_canonical_asset_cache_keys(
+            batch,
+            batch_size=batch_size,
+            num_assets=num_assets,
+        ),
     )
     reference_frame_id = batch["pretrain_reference_frame_id"].to(
         device=device, dtype=torch.long, non_blocking=True
     )
-    for row in range(batch_size):
-        target_ids = set(
-            int(value) for value in frame_ids[row].detach().cpu().tolist()
+    active_reference = appearance.appearance_mask.any(dim=-1)
+    reference_in_target = (
+        reference_frame_id.unsqueeze(-1) == frame_ids.unsqueeze(1)
+    ).any(dim=-1)
+    invalid_reference = active_reference & (
+        reference_frame_id.lt(0) | reference_in_target
+    )
+    if bool(invalid_reference.any()):
+        row, slot = torch.nonzero(
+            invalid_reference,
+            as_tuple=False,
+        )[0].detach().cpu().tolist()
+        target_ids = sorted(
+            int(value)
+            for value in frame_ids[row].detach().cpu().tolist()
         )
-        for slot in range(num_assets):
-            if bool(appearance.appearance_mask[row, slot].any().item()):
-                reference_id = int(reference_frame_id[row, slot].item())
-                if reference_id < 0 or reference_id in target_ids:
-                    raise RuntimeError(
-                        f"asset reference frame {reference_id} must lie outside "
-                        f"target window {sorted(target_ids)}"
-                    )
+        reference_id = int(reference_frame_id[row, slot])
+        raise RuntimeError(
+            f"asset reference frame {reference_id} must lie outside "
+            f"target window {target_ids}"
+        )
 
     projection_intrinsics, projection_image_hw = (
         resize_crop_intrinsics_to_model_canvas(
@@ -5361,7 +5476,7 @@ def build_pretrain_bundle_from_batch(
     *,
     include_rgb_render_context: bool = False,
 ):
-    images = batch["images"].to(device, non_blocking=True)
+    images = _images_to_device(batch["images"], device)
     if images.ndim != 5:
         raise ValueError(f"Expected images [B,S,3,H,W], got {tuple(images.shape)}")
     _, seq_len = images.shape[:2]
@@ -5377,7 +5492,10 @@ def build_pretrain_bundle_from_batch(
                     "Raw SceneFlow pretraining requires dggt_context_images so DGGT camera/latent "
                     "targets are computed in the complete 29-frame clip context."
                 )
-            dggt_context_images = dggt_context_raw.to(device, non_blocking=True)
+            dggt_context_images = _images_to_device(
+                dggt_context_raw,
+                device,
+            )
             if dggt_context_images.ndim != 5 or int(dggt_context_images.shape[0]) != int(images.shape[0]):
                 raise ValueError(
                     "dggt_context_images must be [B,T,3,H,W], got "
@@ -6729,6 +6847,9 @@ def main() -> None:
         trunk_frames=29,
         camera_anchor_window_probability=float(args.camera_anchor_window_probability),
         return_full_dggt_context=True,
+        load_dynamic_masks=False,
+        binary_mask_channels=1,
+        image_output_dtype="uint8",
     )
     sampler = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
     loader = DataLoader(
@@ -6767,6 +6888,9 @@ def main() -> None:
             trunk_frames=29,
             return_full_dggt_context=True,
             trunk_major_window_offsets=validation_offsets,
+            load_dynamic_masks=False,
+            binary_mask_channels=1,
+            image_output_dtype="uint8",
         )
         val_sampler = CyclicSequentialSampler(val_dataset)
         val_loader = DataLoader(
@@ -6791,6 +6915,9 @@ def main() -> None:
             trunk_major_samples=True,
             trunk_frames=29,
             return_full_dggt_context=True,
+            load_dynamic_masks=False,
+            binary_mask_channels=1,
+            image_output_dtype="uint8",
         )
         val_long_sampler = CyclicSequentialSampler(val_long_dataset)
         val_long_loader = DataLoader(

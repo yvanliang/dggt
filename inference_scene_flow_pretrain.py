@@ -1237,6 +1237,9 @@ def main() -> None:
         trunk_major_samples=True,
         trunk_frames=29,
         return_full_dggt_context=True,
+        load_dynamic_masks=False,
+        binary_mask_channels=1,
+        image_output_dtype="uint8",
     )
     if len(dataset) == 0:
         raise RuntimeError("The selected validation dataset has no full caption-trunk samples.")

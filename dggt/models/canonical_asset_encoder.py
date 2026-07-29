@@ -1,8 +1,9 @@
 """Frozen single-reference appearance encoder for factorized asset control."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Hashable, Sequence
 
 import torch
 import torch.nn as nn
@@ -41,6 +42,7 @@ class CanonicalAssetEncoder(nn.Module):
         patch_grid: tuple[int, int],
         levels: Sequence[int] = CANONICAL_ASSET_ENCODER_LEVELS,
         max_tokens: int = MAX_CANONICAL_APPEARANCE_TOKENS,
+        cache_size: int = 1024,
     ) -> None:
         super().__init__()
         self.aggregator = aggregator
@@ -49,10 +51,24 @@ class CanonicalAssetEncoder(nn.Module):
         self.patch_grid = (int(patch_grid[0]), int(patch_grid[1]))
         self.levels = tuple(int(value) for value in levels)
         self.max_tokens = int(max_tokens)
+        self.cache_size = int(cache_size)
+        self._appearance_cache: OrderedDict[
+            Hashable,
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = OrderedDict()
+        normalizer_config = getattr(scene_flow_normalizer, "config", None)
+        configured_asset_dim = getattr(normalizer_config, "asset_dim", None)
+        self._asset_dim = (
+            None
+            if configured_asset_dim is None
+            else int(configured_asset_dim)
+        )
         if len(self.levels) != 4:
             raise ValueError(f"CanonicalAssetEncoder requires four tokenizer levels, got {self.levels}")
         if self.max_tokens <= 0:
             raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        if self.cache_size < 0:
+            raise ValueError(f"cache_size must be non-negative, got {cache_size}")
         for module in (self.aggregator, self.scene_tokenizer):
             module.eval()
             for parameter in module.parameters():
@@ -73,6 +89,7 @@ class CanonicalAssetEncoder(nn.Module):
         *,
         batch_size: int,
         num_assets: int,
+        cache_keys: Sequence[Hashable | None] | None = None,
     ) -> CanonicalAppearanceEncoding:
         if canonical_rgb.ndim != 5 or int(canonical_rgb.shape[1]) != 1 or int(canonical_rgb.shape[2]) != 3:
             raise ValueError(
@@ -95,30 +112,146 @@ class CanonicalAssetEncoder(nn.Module):
                 f"canonical reference count {n} != batch_size*num_assets "
                 f"{int(batch_size) * int(num_assets)}"
             )
-        with torch.no_grad():
-            _, image_tokens, _, _, patch_start_idx = self.aggregator(canonical_rgb)
-            levels = select_patch_pyramid(image_tokens, self.levels, int(patch_start_idx))
-            encoded = self.scene_tokenizer.encode(levels, patch_grid=self.patch_grid)
-            if encoded.ndim != 4 or tuple(encoded.shape[:2]) != (n, 1):
-                raise ValueError(
-                    "single-reference tokenizer output must be [B*K,1,P,Ca], got "
-                    f"{tuple(encoded.shape)}"
-                )
-            normalized = self._normalize_fn(encoded.float())[:, 0]
-
+        if cache_keys is not None and len(cache_keys) != n:
+            raise ValueError(
+                f"cache_keys length {len(cache_keys)} != canonical references {n}"
+            )
         patch_mask = alpha_to_patch_mask(
             canonical_alpha[:, 0],
             self.patch_grid,
-        ).to(device=normalized.device)
-        tokens, mask, uv = sample_canonical_tokens(
-            normalized,
-            patch_mask,
-            self.patch_grid,
-            max_tokens=self.max_tokens,
         )
-        q, channels = int(tokens.shape[1]), int(tokens.shape[2])
+        active_indices = torch.nonzero(
+            patch_mask.any(dim=-1),
+            as_tuple=False,
+        ).flatten().detach().cpu().tolist()
+        cached_rows = {}
+        missing_indices = []
+        for row in active_indices:
+            key = None if cache_keys is None else cache_keys[row]
+            if (
+                key is not None
+                and self.cache_size > 0
+                and key in self._appearance_cache
+            ):
+                value = self._appearance_cache.pop(key)
+                self._appearance_cache[key] = value
+                cached_rows[row] = value
+            else:
+                missing_indices.append(row)
+
+        encoded_rows = {}
+        if missing_indices:
+            selected = torch.tensor(
+                missing_indices,
+                device=canonical_rgb.device,
+                dtype=torch.long,
+            )
+            with torch.no_grad():
+                _, image_tokens, _, _, patch_start_idx = self.aggregator(
+                    canonical_rgb.index_select(0, selected)
+                )
+                levels = select_patch_pyramid(
+                    image_tokens,
+                    self.levels,
+                    int(patch_start_idx),
+                )
+                encoded = self.scene_tokenizer.encode(
+                    levels,
+                    patch_grid=self.patch_grid,
+                )
+                expected_prefix = (len(missing_indices), 1)
+                if (
+                    encoded.ndim != 4
+                    or tuple(encoded.shape[:2]) != expected_prefix
+                ):
+                    raise ValueError(
+                        "single-reference tokenizer output must be "
+                        "[N_active,1,P,Ca], got "
+                        f"{tuple(encoded.shape)}"
+                    )
+                normalized = self._normalize_fn(encoded.float())[:, 0]
+            selected_patch_mask = patch_mask.index_select(
+                0,
+                selected.to(device=patch_mask.device),
+            ).to(device=normalized.device)
+            tokens, mask, uv = sample_canonical_tokens(
+                normalized,
+                selected_patch_mask,
+                self.patch_grid,
+                max_tokens=self.max_tokens,
+            )
+            self._asset_dim = int(tokens.shape[-1])
+            for local_row, original_row in enumerate(missing_indices):
+                value = (
+                    tokens[local_row],
+                    mask[local_row],
+                    uv[local_row],
+                )
+                encoded_rows[original_row] = value
+                key = (
+                    None
+                    if cache_keys is None
+                    else cache_keys[original_row]
+                )
+                if key is not None and self.cache_size > 0:
+                    self._appearance_cache[key] = tuple(
+                        tensor.detach().cpu()
+                        for tensor in value
+                    )
+                    while len(self._appearance_cache) > self.cache_size:
+                        self._appearance_cache.popitem(last=False)
+
+        asset_dim = self._asset_dim
+        if asset_dim is None:
+            raise RuntimeError(
+                "Cannot infer canonical asset width from an all-empty batch; "
+                "the SceneFlow normalizer must expose config.asset_dim."
+            )
+        output_tokens = torch.zeros(
+            (n, self.max_tokens, asset_dim),
+            device=canonical_rgb.device,
+            dtype=torch.float32,
+        )
+        output_mask = torch.zeros(
+            (n, self.max_tokens),
+            device=canonical_rgb.device,
+            dtype=torch.bool,
+        )
+        output_uv = torch.zeros(
+            (n, self.max_tokens, 2),
+            device=canonical_rgb.device,
+            dtype=torch.float32,
+        )
+        for row, value in {**cached_rows, **encoded_rows}.items():
+            row_tokens, row_mask, row_uv = value
+            output_tokens[row] = row_tokens.to(
+                device=canonical_rgb.device,
+                dtype=torch.float32,
+            )
+            output_mask[row] = row_mask.to(
+                device=canonical_rgb.device,
+                dtype=torch.bool,
+            )
+            output_uv[row] = row_uv.to(
+                device=canonical_rgb.device,
+                dtype=torch.float32,
+            )
         return CanonicalAppearanceEncoding(
-            appearance_tokens=tokens.reshape(int(batch_size), int(num_assets), q, channels),
-            appearance_mask=mask.reshape(int(batch_size), int(num_assets), q),
-            canonical_uv=uv.reshape(int(batch_size), int(num_assets), q, 2),
+            appearance_tokens=output_tokens.reshape(
+                int(batch_size),
+                int(num_assets),
+                self.max_tokens,
+                asset_dim,
+            ),
+            appearance_mask=output_mask.reshape(
+                int(batch_size),
+                int(num_assets),
+                self.max_tokens,
+            ),
+            canonical_uv=output_uv.reshape(
+                int(batch_size),
+                int(num_assets),
+                self.max_tokens,
+                2,
+            ),
         )

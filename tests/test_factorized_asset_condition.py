@@ -493,6 +493,36 @@ def test_factorized_token_budget_rejects_truncating_late_frames_or_slots():
         )
 
 
+def test_factorized_sparse_packing_handles_mixed_row_controls():
+    condition = _condition(9, batch=4, assets=2, frames=3)
+    model = _tiny_model(max_asset_tokens=64)
+
+    tokens, mask, positions = model._build_factorized_asset_condition(
+        condition,
+        seq_len=3,
+        num_patches=16,
+        patch_grid=(4, 4),
+        asset_condition_kind=[
+            "factorized_asset",
+            "asset_uncond",
+            "empty",
+            "mode_a_with_empty",
+        ],
+        frame_ids=torch.tensor([[0, 1, 2]] * 4),
+        fps=10.0,
+    )
+
+    assert mask.sum(dim=1).tolist() == [30, 1, 1, 31]
+    assert tokens.shape == (4, 31, model.config.hidden_size)
+    assert positions.shape == (4, 31, 3)
+    assert torch.equal(
+        tokens[1, 0],
+        model.asset_null_condition_embed.reshape(-1),
+    )
+    assert torch.equal(tokens[2, 0], model.empty_asset_embed.reshape(-1))
+    assert torch.equal(tokens[3, 30], model.empty_asset_embed.reshape(-1))
+
+
 def test_legacy_checkpoint_state_loads_with_new_factorized_parameters_initialized():
     source = _tiny_model(asset_condition_protocol="legacy_compatible")
     state = source.state_dict()
@@ -508,8 +538,13 @@ def test_legacy_checkpoint_state_loads_with_new_factorized_parameters_initialize
 class _FakeAggregator(nn.Module):
     patch_start_idx = 1
 
+    def __init__(self):
+        super().__init__()
+        self.batch_sizes = []
+
     def forward(self, images):
         n = int(images.shape[0])
+        self.batch_sizes.append(n)
         levels = []
         for level in range(24):
             value = torch.arange(n * 1 * 7 * 8, dtype=images.dtype, device=images.device).reshape(n, 1, 7, 8)
@@ -547,3 +582,40 @@ def test_canonical_encoder_runs_s1_once_and_reuses_sampled_values():
     assert result.appearance_mask.all()
     # No target-frame dimension exists in the encoder output.
     assert result.canonical_uv.shape == (1, 2, 4, 2)
+
+
+def test_canonical_encoder_skips_empty_slots_and_reuses_cached_appearance():
+    aggregator = _FakeAggregator()
+    encoder = CanonicalAssetEncoder(
+        aggregator,
+        _FakeTokenizer(),
+        _FakeNormalizer(),
+        patch_grid=(2, 3),
+        max_tokens=4,
+        cache_size=8,
+    )
+    rgb = torch.rand(3, 1, 3, 28, 42)
+    alpha = torch.zeros(3, 1, 1, 28, 42)
+    alpha[0] = 1.0
+    keys = [("scene", "object", 7), None, None]
+
+    first = encoder(
+        rgb,
+        alpha,
+        batch_size=1,
+        num_assets=3,
+        cache_keys=keys,
+    )
+    second = encoder(
+        rgb,
+        alpha,
+        batch_size=1,
+        num_assets=3,
+        cache_keys=keys,
+    )
+
+    assert aggregator.batch_sizes == [1]
+    assert first.appearance_mask[0, 0].all()
+    assert not first.appearance_mask[0, 1:].any()
+    assert torch.equal(first.appearance_tokens, second.appearance_tokens)
+    assert torch.equal(first.canonical_uv, second.canonical_uv)

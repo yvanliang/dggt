@@ -1998,60 +1998,140 @@ class RAEVideoSceneFlow(nn.Module):
         replace_rows, append_rows = self._empty_asset_rows(asset_condition_kind, b, device)
         null_rows = self._asset_null_rows(asset_condition_kind, b, device)
         max_tokens = int(self.config.max_asset_tokens)
-        token_rows: list[torch.Tensor] = []
-        pos_rows: list[torch.Tensor] = []
-        for row in range(b):
-            row_tokens = block_tokens[row, block_mask[row]]
-            row_pos = block_pos[row, block_mask[row]]
-            real_token_count = int(row_tokens.shape[0])
-            reserves_empty_token = (
-                append_rows is not None and bool(append_rows[row].item())
+        false_rows = torch.zeros((b,), device=device, dtype=torch.bool)
+        append_flags = (
+            false_rows
+            if append_rows is None
+            else append_rows.to(device=device, dtype=torch.bool)
+        )
+        replace_flags = (
+            false_rows
+            if replace_rows is None
+            else replace_rows.to(device=device, dtype=torch.bool)
+        )
+        null_flags = (
+            false_rows
+            if null_rows is None
+            else null_rows.to(device=device, dtype=torch.bool)
+        )
+        real_counts = block_mask.sum(dim=1).to(dtype=torch.long)
+        required_counts = real_counts + append_flags.to(dtype=torch.long)
+        over_budget = required_counts.gt(max_tokens)
+        if bool(over_budget.any()):
+            row = int(
+                torch.nonzero(over_budget, as_tuple=False)[0, 0]
+                .detach()
+                .cpu()
             )
-            required_token_count = real_token_count + int(reserves_empty_token)
-            if required_token_count > max_tokens:
-                raise RuntimeError(
-                    "factorized asset token budget is too small: "
-                    f"row={row} requires {required_token_count} tokens "
-                    f"({real_token_count} real"
-                    f"{' + 1 explicit-empty' if reserves_empty_token else ''}), "
-                    f"but max_asset_tokens={max_tokens}. Increase the configured "
-                    "budget; legal frames or later object slots must not be "
-                    "silently truncated."
-                )
-            if null_rows is not None and bool(null_rows[row].item()):
-                row_tokens = self.asset_null_condition_embed.to(
-                    device=device, dtype=appearance.dtype
-                ).reshape(1, -1)
-                row_pos = torch.zeros((1, 3), device=device, dtype=torch.float32)
-            elif replace_rows is not None and bool(replace_rows[row].item()):
-                row_tokens = self.empty_asset_embed.to(
-                    device=device, dtype=appearance.dtype
-                ).reshape(1, -1)
-                row_pos = torch.zeros((1, 3), device=device, dtype=torch.float32)
-            elif append_rows is not None and bool(append_rows[row].item()):
-                real_budget = max(0, max_tokens - 1)
-                row_tokens = torch.cat(
-                    (
-                        row_tokens[:real_budget],
-                        self.empty_asset_embed.to(
-                            device=device, dtype=appearance.dtype
-                        ).reshape(1, -1),
-                    ),
-                    dim=0,
-                )
-                row_pos = torch.cat(
-                    (row_pos[:real_budget], torch.zeros((1, 3), device=device)),
-                    dim=0,
-                )
-            token_rows.append(row_tokens)
-            pos_rows.append(row_pos)
-        return self._pad_sparse_condition(
-            token_rows,
-            pos_rows,
+            real_token_count = int(real_counts[row].detach().cpu())
+            reserves_empty_token = bool(
+                append_flags[row].detach().cpu()
+            )
+            required_token_count = int(
+                required_counts[row].detach().cpu()
+            )
+            raise RuntimeError(
+                "factorized asset token budget is too small: "
+                f"row={row} requires {required_token_count} tokens "
+                f"({real_token_count} real"
+                f"{' + 1 explicit-empty' if reserves_empty_token else ''}), "
+                f"but max_asset_tokens={max_tokens}. Increase the configured "
+                "budget; legal frames or later object slots must not be "
+                "silently truncated."
+            )
+
+        # Control precedence matches the former row loop: NULL, replace with
+        # EMPTY, then append EMPTY. Pack every row with one batched cumsum so
+        # normal forwards incur only one scalar synchronization for output size.
+        replace_flags = replace_flags & ~null_flags
+        append_flags = append_flags & ~null_flags & ~replace_flags
+        control_rows = null_flags | replace_flags
+        final_counts = torch.where(
+            control_rows,
+            torch.ones_like(real_counts),
+            real_counts + append_flags.to(dtype=torch.long),
+        )
+        max_len = (
+            int(final_counts.max().detach().cpu())
+            if b > 0
+            else 0
+        )
+        if max_len <= 0:
+            return (
+                torch.zeros(
+                    (b, 0, int(self.config.hidden_size)),
+                    device=device,
+                    dtype=appearance.dtype,
+                ),
+                None,
+                torch.zeros(
+                    (b, 0, 3),
+                    device=device,
+                    dtype=torch.float32,
+                ),
+            )
+
+        packed_tokens = torch.zeros(
+            (b, max_len, int(self.config.hidden_size)),
             device=device,
             dtype=appearance.dtype,
-            max_tokens=max_tokens,
         )
+        packed_mask = torch.zeros(
+            (b, max_len),
+            device=device,
+            dtype=torch.bool,
+        )
+        packed_pos = torch.zeros(
+            (b, max_len, 3),
+            device=device,
+            dtype=torch.float32,
+        )
+        ranks = block_mask.long().cumsum(dim=1).sub(1)
+        pack = block_mask & ~control_rows.unsqueeze(1)
+        row_ids = (
+            torch.arange(b, device=device, dtype=torch.long)
+            .unsqueeze(1)
+            .expand_as(block_mask)
+        )
+        packed_tokens[row_ids[pack], ranks[pack]] = block_tokens[pack]
+        packed_pos[row_ids[pack], ranks[pack]] = block_pos[pack].to(
+            dtype=torch.float32
+        )
+        packed_mask[row_ids[pack], ranks[pack]] = True
+
+        append_row_ids = torch.nonzero(
+            append_flags,
+            as_tuple=False,
+        ).flatten()
+        append_slots = real_counts.index_select(0, append_row_ids)
+        packed_tokens[append_row_ids, append_slots] = (
+            self.empty_asset_embed.to(
+                device=device,
+                dtype=appearance.dtype,
+            )
+        )
+        packed_mask[append_row_ids, append_slots] = True
+        null_row_ids = torch.nonzero(
+            null_flags,
+            as_tuple=False,
+        ).flatten()
+        packed_tokens[null_row_ids, 0] = (
+            self.asset_null_condition_embed.to(
+                device=device,
+                dtype=appearance.dtype,
+            )
+        )
+        packed_mask[null_row_ids, 0] = True
+        replace_row_ids = torch.nonzero(
+            replace_flags,
+            as_tuple=False,
+        ).flatten()
+        packed_tokens[replace_row_ids, 0] = self.empty_asset_embed.to(
+            device=device,
+            dtype=appearance.dtype,
+        )
+        packed_mask[replace_row_ids, 0] = True
+        return packed_tokens, packed_mask, packed_pos
 
     def _build_sparse_asset_condition(
         self,
