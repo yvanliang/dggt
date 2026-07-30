@@ -750,6 +750,8 @@ def _checkpoint_prediction_type(payload: Any) -> str | None:
 SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "rope_layout_version",
     "rope_theta",
+    "encoder_rope_theta",
+    "ddt_rope_theta",
     "encoder_mrope_section",
     "ddt_mrope_section",
     "patch_grid",

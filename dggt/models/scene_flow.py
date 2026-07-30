@@ -72,6 +72,9 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
 
 
 COSMOS_MROPE_SECTION = (24, 20, 20)
+DEFAULT_ENCODER_MROPE_SECTION = (14, 11, 11)
+DEFAULT_ENCODER_ROPE_THETA = 50000.0
+DEFAULT_DDT_ROPE_THETA = 10000.0
 VIDEO_STATE_DIM = 6
 ROPE_LAYOUT_VERSION = "a3_camera_center_spherical_sky15000"
 SKY_MROPE_TEMPORAL_OFFSET = 15000
@@ -789,7 +792,9 @@ class RAEVideoSceneFlow(nn.Module):
         sky_mask_head_version: str = "patch_mlp_refine_v1",
         sky_mask_refine_scale: int = 4,
         sky_mask_refine_channels: int = 256,
-        rope_theta: float = 5000000.0,
+        rope_theta: float | None = None,
+        encoder_rope_theta: float | None = None,
+        ddt_rope_theta: float | None = None,
         encoder_mrope_section: tuple[int, int, int] | list[int] | None = None,
         ddt_mrope_section: tuple[int, int, int] | list[int] | None = None,
         timestep_scale: float = 1.0,
@@ -819,6 +824,24 @@ class RAEVideoSceneFlow(nn.Module):
             head_dim=int(ddt_head_dim) // int(ddt_head_heads),
             name="ddt_mrope_section",
         )
+        legacy_rope_theta = None if rope_theta is None else float(rope_theta)
+        if encoder_rope_theta is None:
+            encoder_rope_theta_i = (
+                legacy_rope_theta if legacy_rope_theta is not None else DEFAULT_ENCODER_ROPE_THETA
+            )
+        else:
+            encoder_rope_theta_i = float(encoder_rope_theta)
+        if ddt_rope_theta is None:
+            ddt_rope_theta_i = legacy_rope_theta if legacy_rope_theta is not None else DEFAULT_DDT_ROPE_THETA
+        else:
+            ddt_rope_theta_i = float(ddt_rope_theta)
+        for name, value in (
+            ("rope_theta", legacy_rope_theta),
+            ("encoder_rope_theta", encoder_rope_theta_i),
+            ("ddt_rope_theta", ddt_rope_theta_i),
+        ):
+            if value is not None and (not math.isfinite(value) or value <= 0.0):
+                raise ValueError(f"{name} must be finite and positive, got {value}")
         if prediction_type not in ("x", "v"):
             raise ValueError("prediction_type must be 'x' or 'v'")
         if str(camera_condition_representation) != CAMERA_CONDITION_REPRESENTATION:
@@ -999,7 +1022,13 @@ class RAEVideoSceneFlow(nn.Module):
             rope_layout_version=ROPE_LAYOUT_VERSION,
             sky_rope_temporal_offset=SKY_MROPE_TEMPORAL_OFFSET,
             camera_rope_spatial_mode=CAMERA_ROPE_SPATIAL_MODE,
-            rope_theta=float(rope_theta),
+            # ``rope_theta`` is retained as a checkpoint/config compatibility
+            # alias. New models use independent encoder and DDT spectra because
+            # the encoder spans heterogeneous condition coordinates while the
+            # DDT sees only the local target video grid.
+            rope_theta=legacy_rope_theta,
+            encoder_rope_theta=encoder_rope_theta_i,
+            ddt_rope_theta=ddt_rope_theta_i,
             encoder_mrope_section=encoder_mrope_section_i,
             ddt_mrope_section=ddt_mrope_section_i,
             t_eps=float(t_eps),
@@ -1329,7 +1358,7 @@ class RAEVideoSceneFlow(nn.Module):
             defaults = {
                 "num_attention_heads": 20,
                 "attention_head_dim": 72,
-                "encoder_mrope_section": (12, 12, 12),
+                "encoder_mrope_section": DEFAULT_ENCODER_MROPE_SECTION,
                 "ddt_mrope_section": COSMOS_MROPE_SECTION,
                 "num_layers": 28,
                 "ddt_head_dim": 2048,
@@ -3241,7 +3270,7 @@ class RAEVideoSceneFlow(nn.Module):
             head_dim=int(self.config.attention_head_dim),
             device=full_seq.device,
             dtype=full_seq.dtype,
-            theta=float(self.config.rope_theta),
+            theta=float(self.config.encoder_rope_theta),
             position_ids=full_pos,
             mrope_section=self.config.encoder_mrope_section,
         )
@@ -3287,7 +3316,7 @@ class RAEVideoSceneFlow(nn.Module):
             head_dim=int(self.config.ddt_head_dim) // int(self.config.ddt_head_heads),
             device=dec_x.device,
             dtype=dec_x.dtype,
-            theta=float(self.config.rope_theta),
+            theta=float(self.config.ddt_rope_theta),
             position_ids=target_pos,
             mrope_section=self.config.ddt_mrope_section,
         )

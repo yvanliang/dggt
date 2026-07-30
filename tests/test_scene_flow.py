@@ -5,9 +5,13 @@ import inspect
 import pytest
 import torch
 
+import dggt.models.scene_flow as scene_flow_module
 from dggt.losses.flow_losses import preserve_loss
 from dggt.models.scene_flow import (
     AssetFrameCompressor,
+    DEFAULT_DDT_ROPE_THETA,
+    DEFAULT_ENCODER_MROPE_SECTION,
+    DEFAULT_ENCODER_ROPE_THETA,
     DDTEncoderBlock,
     DDTFinalLayer,
     ROPE_LAYOUT_VERSION,
@@ -167,6 +171,107 @@ def test_scene_flow_defaults_to_clean_prediction():
 def test_rope_layout_is_versioned_in_config():
     model = _tiny_model()
     assert model.config.rope_layout_version == ROPE_LAYOUT_VERSION
+
+
+def test_new_rope_frequency_defaults_and_legacy_single_theta_alias():
+    class ConfigCapture:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    formal = WanSceneFlow.from_scene_config.__func__(ConfigCapture, bring_up=False)
+    assert formal.kwargs["encoder_mrope_section"] == DEFAULT_ENCODER_MROPE_SECTION
+    assert formal.kwargs["ddt_mrope_section"] == (24, 20, 20)
+
+    model = _tiny_model()
+    assert model.config.encoder_rope_theta == DEFAULT_ENCODER_ROPE_THETA
+    assert model.config.ddt_rope_theta == DEFAULT_DDT_ROPE_THETA
+    assert model.config.rope_theta is None
+    round_trip = WanSceneFlow(**model.config.to_dict())
+    assert round_trip.config.encoder_rope_theta == DEFAULT_ENCODER_ROPE_THETA
+    assert round_trip.config.ddt_rope_theta == DEFAULT_DDT_ROPE_THETA
+
+    legacy = _tiny_model(rope_theta=5_000_000.0)
+    assert legacy.config.rope_theta == 5_000_000.0
+    assert legacy.config.encoder_rope_theta == 5_000_000.0
+    assert legacy.config.ddt_rope_theta == 5_000_000.0
+    legacy_round_trip = WanSceneFlow(**legacy.config.to_dict())
+    assert legacy_round_trip.config.encoder_rope_theta == 5_000_000.0
+    assert legacy_round_trip.config.ddt_rope_theta == 5_000_000.0
+
+
+def test_split_rope_thetas_preserve_target_text_and_control_position_injection(monkeypatch):
+    calls: list[dict[str, object]] = []
+    original_rope = scene_flow_module.VideoRoPE3D
+
+    class CaptureRoPE(original_rope):
+        def __init__(self, *args, **kwargs):
+            calls.append(
+                {
+                    "theta": float(kwargs["theta"]),
+                    "position_ids": kwargs["position_ids"].detach().clone(),
+                    "mrope_section": tuple(kwargs["mrope_section"]),
+                }
+            )
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(scene_flow_module, "VideoRoPE3D", CaptureRoPE)
+    model = _tiny_model(
+        qwen_dim=10,
+        encoder_rope_theta=50_000.0,
+        ddt_rope_theta=10_000.0,
+    )
+    z_t = torch.randn(1, 2, 4, 8)
+    z_splat = torch.randn_like(z_t)
+    scaffold = torch.randn_like(z_t)
+    source = torch.zeros(1, 2, 4, 1)
+    dest = torch.zeros_like(source)
+    dest[:, :, 0] = 1.0
+    preserve = 1.0 - dest
+    sigma = torch.rand(1)
+    assets = torch.zeros(1, 0, 12)
+    text = torch.randn(1, 3, 10)
+    frame_ids = torch.tensor([5, 7])
+
+    with torch.no_grad():
+        model(
+            z_t,
+            sigma,
+            z_splat,
+            scaffold,
+            preserve,
+            source,
+            dest,
+            assets,
+            text_tokens=text,
+            frame_ids=frame_ids,
+            fps=12.0,
+        )
+
+    assert len(calls) == 2
+    encoder_call, ddt_call = calls
+    target_pos = model._target_position_ids(
+        batch_size=1,
+        seq_len=2,
+        num_patches=4,
+        patch_grid=(2, 2),
+        device=torch.device("cpu"),
+        frame_ids=frame_ids,
+        fps=12.0,
+    )
+    encoder_pos = encoder_call["position_ids"]
+    ddt_pos = ddt_call["position_ids"]
+
+    assert encoder_call["theta"] == 50_000.0
+    assert ddt_call["theta"] == 10_000.0
+    assert encoder_call["mrope_section"] == (2, 1, 1)
+    assert ddt_call["mrope_section"] == (2, 1, 1)
+    assert torch.equal(encoder_pos[:, :8], target_pos)
+    assert torch.equal(ddt_pos, target_pos)
+    # Four timestep tokens and three Qwen text tokens retain zero RoPE.
+    assert not encoder_pos[:, 8:15].any()
+    # Radius-2 support covers this 2x2 grid, so trajectory/edit-control
+    # positions are the same target-grid addresses, not newly encoded indices.
+    assert torch.equal(encoder_pos[:, 15:], target_pos)
 
 
 def test_ddt_visual_embedders_consume_only_noisy_latent_tokens():

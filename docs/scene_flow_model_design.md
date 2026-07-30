@@ -139,8 +139,13 @@ SceneFlow 使用 Cosmos-style 3D mRoPE。当前正式从头训练配置：
 
 | 模块 | head 配置 | mRoPE section | theta |
 |---|---|---|---|
-| encoder full attention | `20 heads x 72 head_dim` | `(12,12,12)` | `5e6` |
-| DDT head | `16 heads x 128 head_dim` | `(24,20,20)` | `5e6` |
+| encoder full attention | `20 heads x 72 head_dim` | `(14,11,11)` | `5e4` |
+| DDT head | `16 heads x 128 head_dim` | `(24,20,20)` | `1e4` |
+
+encoder 和 DDT 使用独立 theta：encoder 同时覆盖局部视频网格、条件位置和 15000 附近的
+天空球面，因此保留较慢的 `5e4` 频谱；DDT 只对目标视频局部网格注入 RoPE，使用 `1e4`
+提高短时空范围内的位置分辨率。`rope_theta` 仅作为旧 checkpoint 的单 theta 兼容入口，
+新 checkpoint 显式记录 `encoder_rope_theta` 和 `ddt_rope_theta`。
 
 位置约定：
 
@@ -164,7 +169,8 @@ SceneFlow 不再暴露全局 `mrope_temporal_margin`。当前写死 A3 坐标设
 - sky 是 scene-level directional atlas，不是 image-plane patch；将上半球方向映射为以 `15000` 为中心的三轴 Cartesian RoPE 坐标。经度首尾方向因此在位置空间天然相邻，不使用 seam loss；同时它仍与 video、asset、edit-control、camera 的 `[0,15000)` 时间轴分离。`rope_max_position=16384` 会对越界位置 fail-fast。
 - 旧 A1/A2 checkpoint 或仍记录全局 `mrope_temporal_margin` 的 checkpoint，其 sky 位置语义与 A3 不一致，不应直接续训、warm-start 或推理。
 
-`frame_ids` 和 `fps` 可让 video/asset/camera temporal position 做 Cosmos 风格的时间缩放；默认路径使用固定 sequence order。
+`frame_ids` 和 `fps` 可让 video/asset/control/camera temporal position 做 Cosmos 风格的
+时间缩放；正式默认训练使用 10 FPS。theta/section 的调整不改变任何 token 的位置坐标语义。
 
 ## 7. Asset Token 设计
 
