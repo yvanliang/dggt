@@ -814,7 +814,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--val_caption_root", type=str, default=None,
                         help="Caption root for an independent validation manifest/cache.")
     parser.add_argument("--val_split", type=str, default="validation")
-    parser.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B/")
+    parser.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B")
     parser.add_argument("--text_max_length", type=int, default=256)
     parser.add_argument("--no_text_condition", action="store_true")
     parser.add_argument("--resume_path", type=str, default=None)

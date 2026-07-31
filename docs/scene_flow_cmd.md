@@ -20,7 +20,7 @@ export SCENE_CAPTION_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/training_
 export SCENE_CAPTION_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions
 export SCENE_FLOW_TRAIN_MANIFEST=/data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl
 export SCENE_FLOW_VAL_MANIFEST=/data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/validation/validation_manifest.jsonl
-export QWEN_TEXT_ENCODER=/home/dancer/model/Qwen/Qwen3-0.6B/
+export QWEN_TEXT_ENCODER=/home/dancer/model/Qwen/Qwen3-0.6B
 ```
 
 注意：

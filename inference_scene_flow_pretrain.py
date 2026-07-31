@@ -147,7 +147,7 @@ DEFAULT_VAL_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt/validation"
 DEFAULT_CAPTION_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions"
 DEFAULT_DGGT_CKPT = "/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt"
 DEFAULT_TOKENIZER_CKPT = "logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
-DEFAULT_TEXT_ENCODER = "/home/dancer/model/Qwen/Qwen3-0.6B/"
+DEFAULT_TEXT_ENCODER = "/home/dancer/model/Qwen/Qwen3-0.6B"
 CONDITION_MODES = ("none", "asset", "cam", "asset_cam")
 
 

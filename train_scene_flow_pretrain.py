@@ -6191,7 +6191,7 @@ def build_argparser() -> argparse.ArgumentParser:
         default="/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions",
         help="Optional caption root for validation; defaults to a sibling validation_captions directory when available.",
     )
-    parser.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B/")
+    parser.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B")
     parser.add_argument("--text_max_length", type=int, default=256)
     parser.add_argument("--no_text_condition", action="store_true")
     parser.add_argument("--resume_path", type=str, default=None)

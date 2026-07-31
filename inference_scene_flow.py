@@ -240,7 +240,7 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
-    p.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B/",
+    p.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B",
                    help="Qwen text encoder path used by RAE-style SceneFlow training.")
     p.add_argument("--text_max_length", type=int, default=256)
     p.add_argument("--caption_root", type=str,
