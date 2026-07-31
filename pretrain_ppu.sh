@@ -37,9 +37,15 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 # ============================================================
 # 项目与 Python 环境
 # ============================================================
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/workspace/code/dggt}"
+PROJECT_ROOT="${PROJECT_ROOT:-/mnt/workspace/dggt}"
 DATASET_ROOT="${DATASET_ROOT:-/mnt/workspace/datasets/waymo_processed_dggt}"
+MODEL_ROOT="${MODEL_ROOT:-/mnt/workspace/model}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+
+# torchvision/lpips 通过 TORCH_HOME 查找 AlexNet backbone。将缓存放到
+# 共享 model 目录后，所有 DLC 节点都会直接读取同一份本地权重。
+TORCH_HOME="${TORCH_HOME:-${MODEL_ROOT}/torch}"
+ALEXNET_CKPT="${TORCH_HOME}/hub/checkpoints/alexnet-owt-7be5be79.pth"
 
 # ============================================================
 # 数据与模型路径
@@ -51,7 +57,7 @@ TOKENIZER_CKPT="${TOKENIZER_CKPT:-${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/
 FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v3.pt}"
 SCENE_CAPTION_ROOT="${SCENE_CAPTION_ROOT:-${DATASET_ROOT}/training_captions}"
 SCENE_CAPTION_VAL_ROOT="${SCENE_CAPTION_VAL_ROOT:-${DATASET_ROOT}/validation_captions}"
-QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-/mnt/workspace/model/Qwen/Qwen3-0.6B/}"
+QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${MODEL_ROOT}/Qwen/Qwen3-0.6B/}"
 
 LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_v3}"
 LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_launch}"
@@ -83,6 +89,7 @@ setup_common_env() {
     export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
     export PYTHONUNBUFFERED=1
     export CUDA_VISIBLE_DEVICES
+    export TORCH_HOME
 
     export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
     export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
@@ -92,7 +99,8 @@ setup_common_env() {
 
     # PPU 官方训练镜像建议 1/2/4/8 卡任务使用 eth0；整机 16 卡可由调用方覆盖为 hpn0。
     export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
-    export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+    # 不继承 PAI 镜像可能预置的 NCCL_DEBUG=INFO，避免打印逐连接日志。
+    export NCCL_DEBUG=WARN
     export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 
     # 保留 PyTorch 默认 SDPA 调度。仅将 LearnedQueryPool 按 batch 分块，
@@ -170,6 +178,13 @@ check_required_paths() {
     check_dir "SCENE_CAPTION_ROOT" "${SCENE_CAPTION_ROOT}"
     check_dir "SCENE_CAPTION_VAL_ROOT" "${SCENE_CAPTION_VAL_ROOT}"
     check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
+    if [[ ! -f "${ALEXNET_CKPT}" ]]; then
+        echo "[错误] 缺少 LPIPS AlexNet 本地权重：" >&2
+        echo "       ${ALEXNET_CKPT}" >&2
+        echo "       请先执行：bash ${PROJECT_ROOT}/download_ppu_model_weights.sh" >&2
+        exit 1
+    fi
+    echo "[OK] ALEXNET_CKPT: ${ALEXNET_CKPT}"
 
     mkdir -p "${LOG_DIR}" "${LAUNCH_LOG_DIR}"
     echo "[OK] LOG_DIR: ${LOG_DIR}"
@@ -252,6 +267,7 @@ build_train_args
 
 echo "=== Starting PPU pretraining ==="
 echo "PROJECT_ROOT=${PROJECT_ROOT}"
+echo "TORCH_HOME=${TORCH_HOME}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
 echo "DGGT_DEVICE_BACKEND=${DGGT_DEVICE_BACKEND}"
