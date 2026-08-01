@@ -891,18 +891,14 @@ class WaymoEditDataset(Dataset):
 
     def _parse_sample_index(self, idx):
         sample_num_frames = self.sequence_length
-        tuple_override = False
 
         if isinstance(idx, tuple):
             if len(idx) != 2:
                 raise ValueError(f"WaymoEditDataset tuple index must be (idx, num_frames), got {idx}")
             idx, sample_num_frames = idx
-            tuple_override = True
 
         sample_index = int(idx)
         sample_num_frames = int(sample_num_frames)
-        if tuple_override and not 4 <= sample_num_frames <= 10:
-            raise ValueError(f"WaymoEditDataset tuple num_frames must be in [4, 10], got {sample_num_frames}")
         if sample_num_frames <= 0:
             raise ValueError(f"WaymoEditDataset num_frames must be positive, got {sample_num_frames}")
         return sample_index, sample_num_frames

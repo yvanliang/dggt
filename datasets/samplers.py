@@ -48,8 +48,8 @@ class DeterministicVariableLengthDistributedSampler(DistributedSampler):
         seen = set()
         for value in num_frames_choices:
             value = int(value)
-            if not 4 <= value <= 10:
-                raise ValueError(f"num_frames choices must stay in [4, 10], got {value}")
+            if value <= 0:
+                raise ValueError(f"num_frames choices must be positive, got {value}")
             if value not in seen:
                 normalized_choices.append(value)
                 seen.add(value)

@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
@@ -31,6 +31,7 @@ from gsplat.rendering import rasterization
 from datasets import WaymoEditDataset
 from datasets.samplers import VariableLengthDistributedSampler
 from dggt.models.vggt import VGGT
+from dggt.utils.gaussian_render import composite_gsplat_rgb
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.tokens import (
     select_patch_pyramid,
@@ -39,6 +40,42 @@ from dggt.utils.tokens import (
 )
 
 '''
+2026-08-01 objective change (affects both stages; old checkpoints are NOT comparable)
+-------------------------------------------------------------------------------------
+Two defects were found by auditing the encode/decode round trip against the frozen
+heads on 90 Waymo trunks (`tools/retest_scene_flow_gaussian_gauge.py`):
+
+  depth_recon / depth_direct            = 1.0307   (CI [1.0208, 1.0421])
+  gaussian scale_recon / scale_direct   = 0.8289
+  paired GS/depth  (must be 1.0)        = 0.7964   (30/30 scenes below 1)
+
+i.e. reconstruction inflates depth ~3% while shrinking every Gaussian radius ~17%,
+so each splat ends up ~20% too small for the depth it sits at.  Downstream this shows
+up as a 3% parallax error in the SceneFlow render loss (~11 px at 20 m) and as
+undersized splats everywhere.
+
+Root causes, both in this file:
+
+  1. `gs_anchor` normalized all 11 gs_map channels by ONE per-sample std.  That std is
+     set by rgb (~0.29) and quats (~0.50), while the three *linear* Gaussian scales are
+     ~1e-4.  A scale-only error was therefore divided by a number ~3700x too large; a
+     20% scale error contributed ~1.2e7x less loss than it should.  The scale channels
+     were, in practice, unsupervised.  Fixed by `gs_channel_group_huber_loss`, which
+     normalizes rgb / opacity / scale / quat each by its own std.
+  2. `gs_anchor` and `geom_anchor` are independent terms, so nothing constrained their
+     RATIO -- which is the only thing the rasterizer cares about geometrically.
+     `render_anchor` does not pin it either: stage-B ran with render on from step 0 at
+     weight 0.5 for 40k steps and the ratio was still 0.796, because a too-small splat
+     with a raised opacity renders almost the same.  Fixed by the new
+     `--lambda_gs_scale_sim` paired same-pixel term.
+
+Watch `gs_scale_sim_ratio` in the logs: it is exp() of the audited quantity and must
+converge to 1.0.  Set `--lambda_gs_scale_sim 0` to reproduce the legacy objective.
+
+Launch scripts: `train_tokenizer_two_nodes.sh` (GPU, SSH-orchestrated) and
+`train_tokenizer_ppu_dlc.sh` (Aliyun PAI-DLC).  Both derive batch/accum from the GPU
+count to hold the global batch at the reference value below.
+
 Stage-A (online training, 2 x 80GB):
 
 NCCL_P2P_DISABLE=1 torchrun \
@@ -76,6 +113,8 @@ NCCL_P2P_DISABLE=1 torchrun \
     --lambda_tok_rec 1.0 \
     --lambda_tok_cos 0.2 \
     --lambda_head_anchor 0.6 \
+    --lambda_gs_scale_sim 0.3 \
+    --gs_scale_sim_opacity 0.05 \
     --lambda_render_anchor 0.3 \
     --gt_render_ratio 1.0 \
     --render_dyn_alpha 6.0 \
@@ -128,6 +167,8 @@ NCCL_P2P_DISABLE=1 torchrun \
     --lambda_tok_rec 0.5 \
     --lambda_tok_cos 0.1 \
     --lambda_head_anchor 0.8 \
+    --lambda_gs_scale_sim 0.5 \
+    --gs_scale_sim_opacity 0.05 \
     --lambda_render_anchor 0.5 \
     --gt_render_ratio 1.5 \
     --render_dyn_alpha 8.0 \
@@ -305,6 +346,32 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--lambda_tok_rec", type=float, default=1.0)
     parser.add_argument("--lambda_tok_cos", type=float, default=0.2)
     parser.add_argument("--lambda_head_anchor", type=float, default=0.5)
+    parser.add_argument(
+        "--lambda_gs_scale_sim",
+        type=float,
+        default=0.3,
+        help=(
+            "Paired same-pixel constraint that encode/decode be a similarity: "
+            "log(scale_s/scale_t) - log(depth_s/depth_t) -> 0. Set 0 to disable "
+            "(reproduces the legacy objective, whose paired ratio measured 0.796)."
+        ),
+    )
+    parser.add_argument(
+        "--lambda_depth_log_bias",
+        type=float,
+        default=0.2,
+        help=(
+            "Penalize the systematic multiplicative depth offset "
+            "|mean(log(d_student/d_teacher))|. Audited at 1.0307 on the shipped "
+            "checkpoint. Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--gs_scale_sim_opacity",
+        type=float,
+        default=0.05,
+        help="Both student and teacher opacity must exceed this to enter the similarity support.",
+    )
     parser.add_argument("--lambda_render_anchor", type=float, default=0.25)
     parser.add_argument("--lambda_noisy", type=float, default=0.1)
     parser.add_argument("--lambda_lat_stat", type=float, default=0.01)
@@ -719,6 +786,62 @@ def build_triplet_grid(
     return make_grid(pil_images, cols=num_frames)
 
 
+def build_stage_a_validation_grid(
+    raw_rgb: torch.Tensor,
+    student_render: torch.Tensor,
+    direct_teacher_render: torch.Tensor,
+    max_frames: int = 8,
+) -> Image.Image:
+    """Build an unambiguous raw Stage-A validation diagnostic.
+
+    The raw RGB observation is the only GT row.  The direct DGGT render is shown
+    separately as the frozen teacher/renderer's ceiling; it must never be
+    reconstructed from ``image_patch`` because those legacy joint tokens do not
+    contain the layer-aligned DINO pyramid required by ``instance_head``.
+    """
+    tensors = [raw_rgb, student_render, direct_teacher_render]
+    if any(tensor.ndim != 4 for tensor in tensors):
+        raise ValueError("Stage-A validation rows must each be [S,C,H,W]")
+    num_frames = min(int(max_frames), *(int(tensor.shape[0]) for tensor in tensors))
+    if num_frames <= 0:
+        raise ValueError("Cannot build a Stage-A validation grid with zero frames")
+
+    raw = raw_rgb[:num_frames].detach().cpu().float().clamp(0.0, 1.0)
+    student = student_render[:num_frames].detach().cpu().float().clamp(0.0, 1.0)
+    direct = direct_teacher_render[:num_frames].detach().cpu().float().clamp(0.0, 1.0)
+    rows = (
+        ("student render", student),
+        ("raw RGB GT", raw),
+        ("direct DGGT render", direct),
+        ("|student - raw|", (student - raw).abs().clamp(0.0, 1.0)),
+    )
+
+    first_image = tensor_to_pil_rgb(rows[0][1][0])
+    cell_width, cell_height = first_image.size
+    label_width = max(160, min(260, cell_width // 2))
+    canvas = Image.new(
+        "RGB",
+        (label_width + num_frames * cell_width, len(rows) * cell_height),
+        color=(18, 18, 18),
+    )
+    draw = ImageDraw.Draw(canvas)
+    font = ImageFont.load_default(size=max(16, min(28, cell_height // 10)))
+    for row_idx, (label, tensor_row) in enumerate(rows):
+        y0 = row_idx * cell_height
+        text_box = draw.textbbox((0, 0), label, font=font)
+        text_height = text_box[3] - text_box[1]
+        draw.text(
+            (12, y0 + (cell_height - text_height) // 2),
+            label,
+            fill=(245, 245, 245),
+            font=font,
+        )
+        for frame_idx in range(num_frames):
+            image = tensor_to_pil_rgb(tensor_row[frame_idx])
+            canvas.paste(image, (label_width + frame_idx * cell_width, y0))
+    return canvas
+
+
 def save_triplet_grid(
     gt: torch.Tensor,
     pred: torch.Tensor,
@@ -842,6 +965,156 @@ def normalized_huber_loss(
     scale = scale.view(target.shape[0], *([1] * (target.ndim - 1)))
     per_element = F.smooth_l1_loss(pred / scale, target / scale, beta=delta, reduction="none")
     return reduce_per_sample(per_element).mean()
+
+
+# ``gs_map`` channel layout, shared with dggt/utils/gs.py::get_split_gs.
+GS_CHANNEL_GROUPS: tuple[tuple[str, int, int], ...] = (
+    ("rgb", 0, 3),
+    ("opacity", 3, 4),
+    ("scale", 4, 7),
+    ("quat", 7, 11),
+)
+
+
+def gs_channel_group_huber_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    delta: float = 1.0,
+    eps: float = 1e-4,
+    group_weights: dict[str, float] | None = None,
+) -> torch.Tensor:
+    """Per-channel-group normalized Huber over ``gs_map``.
+
+    ``normalized_huber_loss`` divides the whole 11-channel tensor by a single
+    per-sample std.  That std is dominated by rgb (in [0,1]) and quats (in
+    [-1,1]), while the three *linear* Gaussian scales are small and partly sit
+    on their floor -- so the scale channels receive a vanishing share of the
+    gradient even though they are exactly what the rasterizer consumes as
+    geometry.  Normalizing each group by its own std removes that dilution.
+    """
+    if int(pred.shape[-1]) != GS_CHANNEL_GROUPS[-1][2]:
+        raise ValueError(
+            f"gs_map must have {GS_CHANNEL_GROUPS[-1][2]} channels, got {tuple(pred.shape)}"
+        )
+    weights = group_weights or {}
+    total = None
+    for name, start, end in GS_CHANNEL_GROUPS:
+        group_loss = normalized_huber_loss(
+            pred[..., start:end], target[..., start:end], delta=delta, eps=eps
+        )
+        scaled = float(weights.get(name, 1.0)) * group_loss
+        total = scaled if total is None else total + scaled
+    return total / float(len(GS_CHANNEL_GROUPS))
+
+
+def gaussian_scale_depth_similarity_loss(
+    student_gs_map: torch.Tensor,
+    teacher_gs_map: torch.Tensor,
+    student_depth: torch.Tensor,
+    teacher_depth: torch.Tensor,
+    *,
+    dynamic_mask: torch.Tensor | None = None,
+    sky_mask: torch.Tensor | None = None,
+    opacity_threshold: float = 0.05,
+    scale_floor: float = 1e-5,
+    depth_floor: float = 1e-3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Paired same-pixel constraint that the encode/decode round trip be a similarity.
+
+    If the round trip only rescaled the world by a common factor ``a``, then at
+    every pixel ``scale_student/scale_teacher == depth_student/depth_teacher``.
+    Measured on the shipped checkpoint the paired ratio is **0.796** (30/30
+    scenes below 1): reconstruction inflates depth ~3% while shrinking the
+    Gaussian radii ~17%, so every splat ends up ~20% too small for the depth it
+    sits at.  Neither ``gs_anchor`` nor ``geom_anchor`` sees this because each
+    is normalized independently, and the render loss does not pin it either --
+    a too-small splat with a raised opacity renders almost the same.
+
+    Returns ``(loss, mean_log_ratio)``; ``mean_log_ratio`` is the diagnostic
+    that should converge to 0 (it starts near ``log(0.796) = -0.228``).
+    """
+    scale_s = student_gs_map[..., 4:7].float().clamp_min(scale_floor)
+    scale_t = teacher_gs_map[..., 4:7].float().clamp_min(scale_floor)
+    log_scale_ratio = (scale_s.log() - scale_t.log()).mean(dim=-1)
+
+    depth_s = student_depth.float()
+    depth_t = teacher_depth.float()
+    if depth_s.shape[-1] == 1:
+        depth_s = depth_s[..., 0]
+    if depth_t.shape[-1] == 1:
+        depth_t = depth_t[..., 0]
+    log_depth_ratio = depth_s.clamp_min(depth_floor).log() - depth_t.clamp_min(depth_floor).log()
+
+    if log_scale_ratio.shape != log_depth_ratio.shape:
+        raise ValueError(
+            "gs_map and depth must agree on [B,S,H,W], got "
+            f"{tuple(log_scale_ratio.shape)} and {tuple(log_depth_ratio.shape)}"
+        )
+
+    residual = log_scale_ratio - log_depth_ratio
+
+    support = (
+        torch.isfinite(residual)
+        & (depth_s > depth_floor)
+        & (depth_t > depth_floor)
+        & (student_gs_map[..., 3].float() > opacity_threshold)
+        & (teacher_gs_map[..., 3].float() > opacity_threshold)
+    )
+    if sky_mask is not None:
+        support = support & (sky_mask[:, :, 0].float() < 0.5)
+    if dynamic_mask is not None:
+        # Dynamic pixels legitimately move between the two decodes; keep the
+        # constraint on the static world where the similarity must hold.
+        support = support & (dynamic_mask[:, :, 0].float() < 0.5)
+
+    residual = torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
+    loss = reduce_masked_per_sample(residual.abs(), support).mean()
+    with torch.no_grad():
+        mean_log_ratio = reduce_masked_per_sample(residual.detach(), support).mean()
+    return loss, mean_log_ratio
+
+
+def depth_log_bias_loss(
+    student_depth: torch.Tensor,
+    teacher_depth: torch.Tensor,
+    *,
+    sky_mask: torch.Tensor | None = None,
+    depth_floor: float = 1e-3,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Penalize only the *systematic multiplicative* depth offset.
+
+    The audit measured ``depth_recon / depth_direct = 1.0307`` (CI [1.0208,
+    1.0421]) -- ``geom_anchor`` converged to a solution carrying a 3% scale
+    bias, because a Huber on raw depth is an absolute-error criterion and is
+    happy to trade a uniform multiplicative offset against per-pixel accuracy.
+    Downstream that bias is not benign: the SceneFlow render loss builds
+    geometry from the reconstruction but takes its camera baseline from the
+    teacher space, so a 3% inflation is a 3% parallax error (~11 px at 20 m).
+
+    This term penalizes ``|mean_pixels(log(d_s / d_t))|`` -- the per-sample
+    *bias*, not the per-pixel error.  Per-pixel accuracy remains ``geom_anchor``'s
+    job; the two do not fight.
+
+    Returns ``(loss, signed_log_bias)``; ``exp(signed_log_bias)`` is the audited
+    ratio and must converge to 1.0.
+    """
+    depth_s = student_depth.float()
+    depth_t = teacher_depth.float()
+    if depth_s.shape[-1] == 1:
+        depth_s = depth_s[..., 0]
+    if depth_t.shape[-1] == 1:
+        depth_t = depth_t[..., 0]
+
+    log_ratio = depth_s.clamp_min(depth_floor).log() - depth_t.clamp_min(depth_floor).log()
+    support = torch.isfinite(log_ratio) & (depth_s > depth_floor) & (depth_t > depth_floor)
+    if sky_mask is not None:
+        # Sky depth is unconstrained/degenerate; it would dominate the mean.
+        support = support & (sky_mask[:, :, 0].float() < 0.5)
+
+    log_ratio = torch.nan_to_num(log_ratio, nan=0.0, posinf=0.0, neginf=0.0)
+    per_sample_bias = reduce_masked_per_sample(log_ratio, support)
+    return per_sample_bias.abs().mean(), per_sample_bias.detach().mean()
 
 
 def masked_huber_loss(
@@ -997,6 +1270,7 @@ def _render_scene_single_from_outputs(
     gs_map: torch.Tensor,
     gs_conf: torch.Tensor,
     dynamic_conf: torch.Tensor,
+    dynamic_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if images.shape[0] != 1:
         raise ValueError(f"Single-scene renderer expects batch dimension 1, got {images.shape[0]}")
@@ -1010,10 +1284,27 @@ def _render_scene_single_from_outputs(
     non_sky_mask = (sky_mask_hw < 0.5).any(dim=-1)
     dynamic_logits = dynamic_conf.float().squeeze(-1)
     dynamic_prob = torch.sigmoid(dynamic_logits)
-
-    # Match DGGT inference: split static/dynamic with the raw dynamic logit,
-    # then use sigmoid(dynamic_logit) as the opacity mixing weight.
+    # Match deployed DGGT inference: split static/dynamic with the raw dynamic
+    # logit, then use sigmoid(dynamic_logit) as the opacity mixing weight.
     static_mask = non_sky_mask & (dynamic_logits < 0.5)
+    if dynamic_mask is not None:
+        if dynamic_mask.ndim != 5 or dynamic_mask.shape[:2] != images.shape[:2]:
+            raise ValueError(
+                "dynamic_mask must be [B,S,C,H,W] and align with images, got "
+                f"{tuple(dynamic_mask.shape)} for images {tuple(images.shape)}"
+            )
+        dynamic_gt = dynamic_mask[:, :, 0:1].float().flatten(0, 1)
+        if dynamic_gt.shape[-2:] != (height, width):
+            dynamic_gt = F.interpolate(dynamic_gt, size=(height, width), mode="nearest")
+        dynamic_gt = dynamic_gt.view(1, images.shape[1], height, width) >= 0.5
+        # Keep calibrated probabilities wherever the head already recognizes
+        # dynamics.  For GT false negatives only, move the complete Gaussian
+        # into the current-frame branch: merely removing its static complement
+        # would create a low-opacity hole, while leaving it static creates a
+        # multi-frame ghost trail.
+        false_negative = dynamic_gt & static_mask
+        dynamic_prob = torch.where(false_negative, torch.ones_like(dynamic_prob), dynamic_prob)
+        static_mask = static_mask & ~dynamic_gt
     static_points = point_map[static_mask].reshape(-1, 3)
     static_rgbs, static_opacity, static_scales, static_rotations = split_gs_with_mask(gs_map.float(), static_mask)
     static_opacity = static_opacity * (1.0 - dynamic_prob[static_mask])
@@ -1062,7 +1353,10 @@ def _render_scene_single_from_outputs(
 
     renders = torch.cat(chunked_renders, dim=0)
     alphas = torch.cat(chunked_alphas, dim=0)
-    composed = alphas * renders + (1.0 - alphas) * bg_render
+    # gsplat returns premultiplied RGB when no rasterizer background is given.
+    # Applying alpha to `renders` again darkens partially covered pixels and
+    # makes moving-object boundaries look like transparent ghost trails.
+    composed = composite_gsplat_rgb(renders, alphas, bg_render)
     return composed.permute(0, 3, 1, 2).contiguous()
 
 
@@ -1076,6 +1370,8 @@ def render_scene_from_outputs(
     gs_map: torch.Tensor,
     gs_conf: torch.Tensor,
     dynamic_conf: torch.Tensor,
+    *,
+    dynamic_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_renders = []
     for batch_idx in range(images.shape[0]):
@@ -1090,6 +1386,7 @@ def render_scene_from_outputs(
                 gs_map[batch_idx : batch_idx + 1],
                 gs_conf[batch_idx : batch_idx + 1],
                 dynamic_conf[batch_idx : batch_idx + 1],
+                None if dynamic_mask is None else dynamic_mask[batch_idx : batch_idx + 1],
             )
         )
     return torch.stack(batch_renders, dim=0)
@@ -1713,13 +2010,17 @@ def compute_losses(
     losses["geom_anchor"] = zero
     losses["dyn_anchor"] = zero
     losses["head_anchor"] = zero
+    losses["gs_scale_sim"] = zero
+    losses["depth_log_bias"] = zero
     losses["dynamic_bce"] = student["z"].new_tensor(0.0)
     losses["gs_lifespan"] = zero
     losses["ghost_static"] = student["z"].new_tensor(0.0)
+    gs_scale_sim_log_ratio = 0.0
+    depth_log_bias_value = 0.0
     if head_targets_valid:
-        gs_anchor = normalized_huber_loss(student["gs_map"], teacher["gs_map"]) + 0.1 * normalized_huber_loss(
-            student["gs_conf"], teacher["gs_conf"]
-        )
+        gs_anchor = gs_channel_group_huber_loss(
+            student["gs_map"], teacher["gs_map"]
+        ) + 0.1 * normalized_huber_loss(student["gs_conf"], teacher["gs_conf"])
         geom_anchor = normalized_huber_loss(student["depth"], teacher["depth"])
         if teacher.get("depth_conf") is not None:
             geom_anchor = geom_anchor + 0.1 * normalized_huber_loss(
@@ -1741,6 +2042,25 @@ def compute_losses(
         losses["geom_anchor"] = geom_anchor
         losses["dyn_anchor"] = dyn_anchor
         losses["head_anchor"] = gs_anchor + geom_anchor + dyn_anchor
+        # Always measured, even when the weight is 0, so an ablation run still
+        # reports the audited ratio instead of a misleading 1.0.
+        gs_scale_sim, gs_scale_sim_ratio = gaussian_scale_depth_similarity_loss(
+            student["gs_map"],
+            teacher["gs_map"],
+            student["depth"],
+            teacher["depth"],
+            dynamic_mask=dynamic_mask,
+            sky_mask=sky_mask,
+            opacity_threshold=float(args.gs_scale_sim_opacity),
+        )
+        losses["gs_scale_sim"] = gs_scale_sim
+        gs_scale_sim_log_ratio = float(gs_scale_sim_ratio.detach().item())
+
+        depth_bias, depth_bias_signed = depth_log_bias_loss(
+            student["depth"], teacher["depth"], sky_mask=sky_mask
+        )
+        losses["depth_log_bias"] = depth_bias
+        depth_log_bias_value = float(depth_bias_signed.item())
         if dynamic_mask is not None:
             losses["dynamic_bce"] = dynamic_mask_bce_loss(student["dynamic_conf"], dynamic_mask)
         losses["gs_lifespan"] = compute_lifespan_loss(
@@ -1779,6 +2099,7 @@ def compute_losses(
             teacher["gs_map"].float(),
             teacher["gs_conf"].float(),
             teacher["dynamic_conf"].float(),
+            dynamic_mask=dynamic_mask,
         )
         render_hat = render_scene_from_outputs(
             model,
@@ -1790,6 +2111,7 @@ def compute_losses(
             student["gs_map"].float(),
             student["gs_conf"].float(),
             student["dynamic_conf"].float(),
+            dynamic_mask=dynamic_mask,
         )
         render_mse_per_sample = reduce_per_sample((render_hat - render_ref) ** 2)
         render_mse = render_mse_per_sample.mean()
@@ -1868,11 +2190,29 @@ def compute_losses(
         args.lambda_render_anchor,
     )
 
+    # The similarity term consumes the same frozen-head tensors as head_anchor,
+    # so it follows the identical start/warmup schedule.
+    gs_scale_sim_weight = scheduled_weight(
+        global_step,
+        args.head_start_step,
+        args.head_warmup_steps,
+        args.lambda_gs_scale_sim,
+    )
+
+    depth_log_bias_weight = scheduled_weight(
+        global_step,
+        args.head_start_step,
+        args.head_warmup_steps,
+        args.lambda_depth_log_bias,
+    )
+
     gt_render_weight = render_weight * float(args.gt_render_ratio)
     total = (
         args.lambda_tok_rec * losses["tok_rec"]
         + args.lambda_tok_cos * losses["tok_cos"]
         + head_weight * losses["head_anchor"]
+        + gs_scale_sim_weight * losses["gs_scale_sim"]
+        + depth_log_bias_weight * losses["depth_log_bias"]
         + dynamic_bce_weight * losses["dynamic_bce"]
         + gs_lifespan_weight * losses["gs_lifespan"]
         + ghost_static_weight * losses["ghost_static"]
@@ -1888,6 +2228,16 @@ def compute_losses(
         "gs_anchor": float(losses["gs_anchor"].detach().item()),
         "geom_anchor": float(losses["geom_anchor"].detach().item()),
         "dyn_anchor": float(losses["dyn_anchor"].detach().item()),
+        "gs_scale_sim": float(losses["gs_scale_sim"].detach().item()),
+        # Should converge to 0. Starts near log(0.796) = -0.228 on the old
+        # checkpoint; exp() of it is the paired GS/depth ratio being audited.
+        "gs_scale_sim_log_ratio": gs_scale_sim_log_ratio,
+        "gs_scale_sim_ratio": float(math.exp(gs_scale_sim_log_ratio)),
+        "gs_scale_sim_weight": float(gs_scale_sim_weight),
+        "depth_log_bias": float(losses["depth_log_bias"].detach().item()),
+        # exp() of this is the audited depth_recon/depth_direct ratio (was 1.0307).
+        "depth_log_bias_signed": depth_log_bias_value,
+        "depth_ratio": float(math.exp(depth_log_bias_value)),
         "dynamic_bce": float(losses["dynamic_bce"].detach().item()),
         "gs_lifespan": float(losses["gs_lifespan"].detach().item()),
         "ghost_static": float(losses["ghost_static"].detach().item()),
@@ -1975,12 +2325,15 @@ def log_wandb_visual(
     *,
     prefix: str = "train",
     sample_index: int | None = None,
+    row_labels: str | None = None,
 ) -> None:
     if wandb_run is None:
         return
     caption = f"step={step}, num_frames={num_frames}"
     if sample_index is not None:
         caption += f", sample_index={sample_index}"
+    if row_labels:
+        caption += f", rows(top-to-bottom)={row_labels}"
     wandb_run.log(
         {
             f"{prefix}/render_triplet": wandb.Image(
@@ -2059,21 +2412,6 @@ def run_visualization_eval(
     if not all(key in student for key in ("depth", "gs_map", "gs_conf", "dynamic_conf")):
         return None, scalar_logs
     with torch.no_grad(), autocast_context(args, device):
-        gt_outputs = build_head_outputs_from_patch_features(
-            model,
-            images,
-            levels,
-            teacher,
-            teacher["image_patch"],
-        )
-        render_gt = render_head_outputs_for_visual(
-            model,
-            images,
-            sample,
-            teacher["pose_enc"],
-            gt_outputs,
-            device,
-        )
         render_pred = render_head_outputs_for_visual(
             model,
             images,
@@ -2082,7 +2420,45 @@ def run_visualization_eval(
             student,
             device,
         )
-    grid = build_triplet_grid(render_gt[0], render_pred[0], max_frames=args.max_frames)
+        render_direct_teacher = render_head_outputs_for_visual(
+            model,
+            images,
+            sample,
+            teacher["pose_enc"],
+            teacher,
+            device,
+        )
+
+    # Report the exact routing quantity that creates multi-frame dynamic
+    # ghosts: GT dynamic pixels whose raw logit falls below DGGT's 0.5 static
+    # threshold.  This makes an early/untrained student distinguishable from a
+    # renderer or frozen-teacher failure without relying on visual judgment.
+    dynamic_mask = unwrap_tensor(sample["dynamic_mask"]).to(device)[:, :, 0].float() >= 0.5
+    for name, logits in (
+        ("student", student["dynamic_conf"]),
+        ("direct_teacher", teacher["dynamic_conf"]),
+    ):
+        predicted_dynamic = logits.float().squeeze(-1) >= 0.5
+        true_positive = (predicted_dynamic & dynamic_mask).sum().float()
+        false_negative = (~predicted_dynamic & dynamic_mask).sum().float()
+        false_positive = (predicted_dynamic & ~dynamic_mask).sum().float()
+        gt_positive = dynamic_mask.sum().float().clamp_min(1.0)
+        union = (predicted_dynamic | dynamic_mask).sum().float().clamp_min(1.0)
+        scalar_logs[f"dynamic_recall_{name}"] = float((true_positive / gt_positive).item())
+        scalar_logs[f"dynamic_iou_{name}"] = float((true_positive / union).item())
+        scalar_logs[f"dynamic_gt_static_route_{name}"] = float((false_negative / gt_positive).item())
+        scalar_logs[f"dynamic_precision_{name}"] = float(
+            (true_positive / (true_positive + false_positive).clamp_min(1.0)).item()
+        )
+
+    # The raw observation is the only GT.  The direct frozen DGGT render is a
+    # separately labelled ceiling diagnostic, never a substitute for GT.
+    grid = build_stage_a_validation_grid(
+        images[0],
+        render_pred[0],
+        render_direct_teacher[0],
+        max_frames=args.max_frames,
+    )
     return grid, scalar_logs
 
 
@@ -2852,6 +3228,11 @@ def main() -> None:
                         vis_num_frames,
                         prefix="validation",
                         sample_index=vis_index,
+                        row_labels=(
+                            "student render / cached teacher render / absolute difference"
+                            if vis_is_cache
+                            else "student render / raw RGB GT / direct DGGT render / absolute difference"
+                        ),
                     )
                 if vis_logs:
                     vis_logs["sample_index"] = float(vis_index)

@@ -275,7 +275,15 @@ class Aggregator(nn.Module):
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
                 
-                #TODO: use dino feature only or not
+                # Checkpoint-compatibility note: `i` is local to this AA group,
+                # so with aa_block_size=1 the frozen DGGT Gaussian head receives
+                # dino_token_list[0] at every joint level.  Existing GS weights
+                # were trained with exactly this layout; changing this to the
+                # global layer index substantially breaks their renders.  The
+                # instance head must continue to consume the separate, genuinely
+                # layer-aligned dino_token_list returned below.  In particular,
+                # do not treat the first 1024 channels of these joint tokens as a
+                # lossless replacement for that DINO pyramid in diagnostics.
                 concat_inter_with_tokens = torch.cat([dino_token_list[i], frame_intermediates[i], global_intermediates[i]], dim=-1)
                 #concat_inter_with_tokens = dino_token_list[i]
                 output_list_with_tokens.append(concat_inter_with_tokens)
