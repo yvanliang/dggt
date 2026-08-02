@@ -181,6 +181,30 @@ def is_main_process() -> bool:
     return get_rank() == 0
 
 
+@torch.no_grad()
+def synchronize_validation_model(scene_flow: nn.Module) -> None:
+    """Make rank 0 the source of truth before rank-local validation sampling.
+
+    DDP keeps the trainable weights synchronized, and every rank maintains its
+    own EMA shadow.  Parallel CFG sampling must not merely rely on those two
+    facts continuing to hold, though: explicitly broadcasting both parameters
+    and buffers after the EMA swap guarantees that every sampling rank starts
+    from the exact same SceneFlow state.
+    """
+    if not is_distributed():
+        return
+
+    model = unwrap_ddp(scene_flow)
+    tensors = list(model.parameters()) + list(model.buffers())
+    for tensor in tensors:
+        if tensor.is_contiguous():
+            dist.broadcast(tensor.detach(), src=0)
+            continue
+        contiguous = tensor.detach().contiguous()
+        dist.broadcast(contiguous, src=0)
+        tensor.copy_(contiguous)
+
+
 def setup_distributed(args: argparse.Namespace | None = None) -> tuple[torch.device, int, int]:
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         if not dist.is_initialized():
@@ -1345,6 +1369,80 @@ def camera_feature_validation_metrics(
 def _cfg_metric_prefix(base: str, guidance_scale: float) -> str:
     scale = f"{float(guidance_scale):g}".replace("-", "m").replace(".", "p")
     return f"{base}_cfg{scale}"
+
+
+def validation_guidance_scales(args: argparse.Namespace) -> list[float]:
+    """Return primary + unique extra CFG scales in their requested order."""
+    scales = [float(getattr(args, "guidance_scale", 1.0))]
+    raw_extra = str(getattr(args, "val_guidance_scales", "") or "")
+    for raw_scale in raw_extra.split(","):
+        raw_scale = raw_scale.strip()
+        if not raw_scale:
+            continue
+        scale = float(raw_scale)
+        if not any(abs(scale - existing) <= 1e-6 for existing in scales):
+            scales.append(scale)
+    return scales
+
+
+def validation_scale_indices_for_rank(
+    num_scales: int,
+    *,
+    rank: int,
+    world_size: int,
+) -> tuple[int, ...]:
+    """Shard validation scales across ranks while retaining small-world fallback.
+
+    With three scales and at least three ranks this maps scale 0/1/2 to rank
+    0/1/2.  With fewer ranks the remaining scales are handled round-robin; with
+    more ranks, surplus ranks wait at the common result-gather collective.
+    """
+    if num_scales < 0:
+        raise ValueError(f"num_scales must be non-negative, got {num_scales}")
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank {rank} is outside world_size={world_size}")
+    return tuple(range(rank, num_scales, world_size))
+
+
+def all_gather_validation_results(
+    payload: dict[str, Any],
+    device: torch.device,
+) -> list[dict[str, Any]]:
+    """Gather small JSON payloads with explicit NCCL-safe tensor collectives.
+
+    PyTorch object collectives stage an internal pickle tensor on CUDA under
+    NCCL and are not reliable on every supported PyTorch/NCCL combination.
+    Explicit UTF-8 byte tensors keep device placement and collective ordering
+    visible and deterministic.
+    """
+    if not is_distributed():
+        return [payload]
+
+    encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
+    local_size = torch.tensor([len(encoded)], dtype=torch.int64, device=device)
+    gathered_sizes = [torch.empty_like(local_size) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered_sizes, local_size)
+    sizes = [int(size.item()) for size in gathered_sizes]
+    max_size = max(sizes)
+
+    local_bytes = torch.zeros((max_size,), dtype=torch.uint8, device=device)
+    if encoded:
+        local_bytes[: len(encoded)] = torch.tensor(
+            list(encoded), dtype=torch.uint8, device=device
+        )
+    gathered_bytes = [torch.empty_like(local_bytes) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered_bytes, local_bytes)
+
+    results: list[dict[str, Any]] = []
+    for byte_tensor, size in zip(gathered_bytes, sizes):
+        raw = bytes(byte_tensor[:size].cpu().tolist())
+        result = json.loads(raw.decode("utf-8"))
+        if not isinstance(result, dict):
+            raise TypeError(f"Validation rank payload must decode to a dict, got {type(result)!r}")
+        results.append(result)
+    return results
 
 
 def sample_uncond_drop_mask(
@@ -6696,6 +6794,17 @@ def _run_validation_impl(
     count = 0
     first_batch: dict[str, Any] | None = None
     validation_generator = make_validation_generator(device, int(args.seed))
+    guidance_scales = validation_guidance_scales(args)
+    sampling_enabled = int(getattr(args, "val_log_images", 0)) > 0
+    assigned_scale_indices = (
+        validation_scale_indices_for_rank(
+            len(guidance_scales),
+            rank=get_rank(),
+            world_size=dist.get_world_size() if is_distributed() else 1,
+        )
+        if sampling_enabled
+        else ()
+    )
 
     iterator = loader
     if is_main_process() and not args.no_tqdm:
@@ -6710,7 +6819,7 @@ def _run_validation_impl(
     for batch in iterator:
         if count >= args.val_batches:
             break
-        if first_batch is None and is_main_process():
+        if first_batch is None and assigned_scale_indices:
             first_batch = _slice_batch_for_visualization(batch, max_samples=1)
         loss, logs = train_step(
             batch,
@@ -6731,10 +6840,33 @@ def _run_validation_impl(
     metrics = {key: value / max(1, count) for key, value in sums.items()}
     metrics["batches"] = float(count)
 
+    # EMA shadows are maintained independently on each rank.  Before assigning
+    # different CFG scales, make rank 0 authoritative for the complete model
+    # state so all parallel samples are directly comparable.
+    if sampling_enabled:
+        synchronize_validation_model(scene_flow)
+        if is_main_process() and is_distributed():
+            world_size = dist.get_world_size()
+            shard_text = ", ".join(
+                f"rank{rank}="
+                + "/".join(
+                    f"{guidance_scales[index]:g}"
+                    for index in validation_scale_indices_for_rank(
+                        len(guidance_scales), rank=rank, world_size=world_size
+                    )
+                )
+                for rank in range(min(world_size, len(guidance_scales)))
+            )
+            print(
+                f"[validation {step:06d}] synchronized EMA SceneFlow parameters "
+                f"and buffers across {world_size} ranks; CFG shards: {shard_text}",
+                flush=True,
+            )
+
     sampling_args = args
     long_asset_dataset = None
     long_asset_dataset_index = None
-    if is_main_process() and long_loader is not None:
+    if assigned_scale_indices and long_loader is not None:
         long_sampler = getattr(long_loader, "sampler", None)
         if not isinstance(long_sampler, CyclicSequentialSampler):
             raise TypeError(
@@ -6766,8 +6898,10 @@ def _run_validation_impl(
             metrics["long_sliding_window"] = float(sampling_args.val_sliding_window)
             metrics["long_sliding_stride"] = float(sampling_args.val_sliding_stride)
 
-    if is_main_process():
-        if first_batch is not None and args.val_log_images > 0:
+    metric_keys_before_sampling = set(metrics)
+    local_image_paths: dict[str, Path] = {}
+    if assigned_scale_indices:
+        if first_batch is not None and sampling_enabled:
             # Free cached CUDA memory from the validation loss loop so the
             # memory-intensive CFG sampling + rendering has maximum headroom.
             torch.cuda.empty_cache()
@@ -6808,18 +6942,16 @@ def _run_validation_impl(
                     any(bool(item["has_asset"]) for item in window_diagnostics)
                 )
 
-            # Primary scale samples drive latent PCA / abs_error. Extra scales
-            # only contribute additional RGB grids for side-by-side CFG comparison.
-            primary_scale = float(args.guidance_scale)
-            extra_scales = []
-            if args.val_guidance_scales:
-                for s in args.val_guidance_scales.split(","):
-                    s = s.strip()
-                    if not s:
-                        continue
-                    s_val = float(s)
-                    if abs(s_val - primary_scale) > 1e-6:
-                        extra_scales.append(s_val)
+            # Each active rank handles its round-robin shard.  With the normal
+            # three-scale/eight-GPU setup, ranks 0, 1, and 2 each execute one
+            # scale concurrently while ranks 3+ proceed directly to gathering.
+            local_first_scale_index = assigned_scale_indices[0]
+            primary_scale = guidance_scales[local_first_scale_index]
+            is_global_primary = local_first_scale_index == 0
+            extra_scales = [
+                (scale_index, guidance_scales[scale_index])
+                for scale_index in assigned_scale_indices[1:]
+            ]
 
             generated_sample = cfg_sample_pretrain_latents(
                 scene_flow,
@@ -6867,14 +6999,22 @@ def _run_validation_impl(
                 metric_camera_validation_metrics(
                     camera_generated_trajectory.camera_to_world,
                     camera_gt_trajectory.camera_to_world,
-                    prefix="sample_camera",
+                    prefix=(
+                        "sample_camera"
+                        if is_global_primary
+                        else _cfg_metric_prefix("sample_camera", primary_scale)
+                    ),
                 )
             )
             metrics.update(
                 camera_feature_validation_metrics(
                     camera_generated_raw,
                     camera_target_state_metric,
-                    prefix="sample_camera_feature",
+                    prefix=(
+                        "sample_camera_feature"
+                        if is_global_primary
+                        else _cfg_metric_prefix("sample_camera_feature", primary_scale)
+                    ),
                 )
             )
             sky_feature_gt = getattr(first_bundle, "sky_gen_clean", None)
@@ -6883,7 +7023,11 @@ def _run_validation_impl(
                     sky_token_validation_metrics(
                         sky_generated_raw,
                         sky_feature_gt,
-                        prefix="sample_sky",
+                        prefix=(
+                            "sample_sky"
+                            if is_global_primary
+                            else _cfg_metric_prefix("sample_sky", primary_scale)
+                        ),
                         loss_weight=getattr(first_bundle, "sky_gen_loss_weight", None),
                     )
                 )
@@ -6891,14 +7035,22 @@ def _run_validation_impl(
                 sky_mask_validation_metrics(
                     sky_mask_generated_patch,
                     getattr(first_bundle, "sky_mask_clean", None),
-                    prefix="sample_sky_mask",
+                    prefix=(
+                        "sample_sky_mask"
+                        if is_global_primary
+                        else _cfg_metric_prefix("sample_sky_mask", primary_scale)
+                    ),
                 )
             )
             metrics.update(
                 sky_mask_validation_metrics(
                     sky_mask_generated_refined,
                     getattr(first_bundle, "sky_mask_refined_clean", None),
-                    prefix="sample_sky_mask_refine",
+                    prefix=(
+                        "sample_sky_mask_refine"
+                        if is_global_primary
+                        else _cfg_metric_prefix("sample_sky_mask_refine", primary_scale)
+                    ),
                 )
             )
             del camera_generated_trajectory
@@ -6930,11 +7082,13 @@ def _run_validation_impl(
                 step,
                 args,
                 scale_suffix=f"cfg{primary_scale:g}",
-                visualization_batch=first_batch,
+                only_generated=not is_global_primary,
+                visualization_batch=first_batch if is_global_primary else None,
             )
+            local_image_paths.update(image_paths)
 
             extra_paths: dict[str, Path] = {}
-            for s_val in extra_scales:
+            for _scale_index, s_val in extra_scales:
                 extra_sample = cfg_sample_pretrain_latents(
                     scene_flow,
                     first_bundle,
@@ -7036,16 +7190,39 @@ def _run_validation_impl(
                         only_generated=True,
                     )
                 )
+            local_image_paths.update(extra_paths)
 
-            if wandb_run is not None:
-                import wandb
+    # All ranks enter the same two tensor all-gathers after their (possibly
+    # empty) scale shard. Generated images are already saved under
+    # scale-specific, collision-free names; only small JSON metadata moves.
+    local_result = {
+        "metrics": {
+            key: value
+            for key, value in metrics.items()
+            if key not in metric_keys_before_sampling
+        },
+        "image_paths": {key: str(path) for key, path in local_image_paths.items()},
+    }
+    gathered_results = all_gather_validation_results(local_result, device)
 
-                image_log: dict[str, Any] = {}
-                for name, path in image_paths.items():
-                    image_log[f"validation/{name}"] = wandb.Image(str(path))
-                for name, path in extra_paths.items():
-                    image_log[f"validation/{name}"] = wandb.Image(str(path))
-                wandb_run.log(image_log, step=step)
+    if is_main_process():
+        gathered_image_paths: dict[str, Path] = {}
+        for rank_result in gathered_results:
+            metrics.update(rank_result["metrics"])
+            gathered_image_paths.update(
+                {
+                    key: Path(path)
+                    for key, path in rank_result["image_paths"].items()
+                }
+            )
+        if wandb_run is not None and gathered_image_paths:
+            import wandb
+
+            image_log = {
+                f"validation/{name}": wandb.Image(str(path))
+                for name, path in gathered_image_paths.items()
+            }
+            wandb_run.log(image_log, step=step)
         metrics_text = " | ".join(f"{key}={value:.4f}" for key, value in metrics.items())
         print(f"[validation {step:06d}] {metrics_text}", flush=True)
         log_wandb(wandb_run, metrics, step, "validation")
@@ -7054,9 +7231,8 @@ def _run_validation_impl(
         ema.restore(ema_params)
     if scene_flow_was_training:
         scene_flow.train()
-    # Rank 0 does CFG sampling + RGB rendering after the metric loop, which
-    # can take seconds. A barrier here keeps all ranks aligned so the next
-    # training iteration's allreduce won't stall on a rank-0 catch-up.
+    # The gather aligns all ranks when sampling is enabled; retain the final
+    # barrier for no-image validation and before the next training allreduce.
     if is_distributed():
         dist.barrier()
     return metrics
