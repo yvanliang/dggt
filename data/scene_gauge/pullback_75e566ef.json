@@ -1,0 +1,128 @@
+{
+  "artifact_role": "production_pullback",
+  "boundaries": {
+    "metric": {
+      "depth": {
+        "a": -0.04057064278196507,
+        "b": 0.014657032919097724,
+        "evaluate_on": "depth_recon_times_exp_log_metric_scale_before_correction",
+        "form": "loglinear",
+        "reference_depth_m": 20.0,
+        "runtime_depth_clamp_m": [
+          0.5,
+          80.0
+        ]
+      },
+      "gaussian_scale": {
+        "c_gs": 1.0,
+        "channels_half_open": [
+          4,
+          7
+        ],
+        "rule": "multiply_channels_4_7_by_same_depth_factor"
+      }
+    },
+    "render": {
+      "depth": {
+        "form": "identity"
+      },
+      "gaussian_scale": {
+        "c_gs": 1.0,
+        "form": "identity"
+      }
+    }
+  },
+  "dggt": {
+    "sha256": "352652738a5480b8d3ee9dd521ce07b528e5a297bd3feca4d07427dac6d87def"
+  },
+  "eligible_for_training": true,
+  "evidence": {
+    "d4_renderer_gate": {
+      "path": "runs/metric_gauge_retest/d4_pullback_300_329_trunks012_cgs250.json",
+      "sha256": "94a33623c2607d88710f9f21f21dad6260114ec29bb9ae500ffb7f58258bcbda"
+    },
+    "fit_scenes": [
+      300,
+      301,
+      302,
+      303,
+      304,
+      305,
+      306,
+      307,
+      308,
+      309,
+      310,
+      311,
+      312,
+      313,
+      314,
+      315,
+      316,
+      317,
+      318,
+      319
+    ],
+    "phase1a_reference": {
+      "path": "runs/metric_gauge_retest/a8_300_329_trunks012_production_path.json",
+      "sha256": "424451a754fbb728f0abb822aa3387d65f8f8c6ffa80f3119a0504c0bb29fd38"
+    },
+    "primary_lidar_gate": {
+      "case_count": 26,
+      "gate_pass": true,
+      "identity_absrel": 0.07567069185897708,
+      "improved_scene_count": 8,
+      "loglinear_absrel": 0.06900615049526096,
+      "relative_improvement": 0.08807295400624099,
+      "scene_count": 10,
+      "scene_delta_bootstrap_95_ci": [
+        0.0005169586301781237,
+        0.012247652024962006
+      ],
+      "scene_delta_mean": 0.006664541363716125
+    },
+    "selection_scenes": [
+      320,
+      321,
+      322,
+      323,
+      324,
+      325,
+      326,
+      327,
+      328,
+      329
+    ],
+    "source_metric_gate": {
+      "path": "runs/metric_gauge_retest/v1_tokenizer_lidar_metric_gate_320_329.json",
+      "result_sha256_excluding_self": "87fc01c4f7bbd5f62fe40711d8fb82125c0e758a8dadce9b3e2e243e00cd6de1",
+      "sha256": "29f91842641c2bfc7565d4edbe0f711223ba6eb006de1ed2ded8d5d72a97ecb9"
+    }
+  },
+  "limitations": {
+    "c_gs": "identity",
+    "paired_gaussian_scale_over_depth_ratio": 0.7962741549941179,
+    "scope": "Tokenizer v1 is formally enabled only with metric-boundary depth calibration. Its Gaussian-scale/depth ratio remains about 0.796; render geometry must not be described as similarity-consistent.",
+    "similarity_consistent": false
+  },
+  "runtime_contract": {
+    "gauge_representation": "dggt_teacher_log_metric_scale_logfov_v1",
+    "log_metric_scale_units": "log_metres_per_dggt_unit",
+    "patch_grid_hw": [
+      25,
+      37
+    ],
+    "version": "metric_depth_gs_same_factor_render_identity_v1",
+    "window_len": 10
+  },
+  "schema": {
+    "name": "dggt_tokenizer_pullback",
+    "strict": true,
+    "version": "1.0.0"
+  },
+  "tokenizer": {
+    "sha256": "75e566efa3b66baa43f82cb9999c2de60a9f3feeb0f714e1caf38d1f6e8137eb",
+    "sha8": "75e566ef"
+  },
+  "tokenizer_generation": "t0_v1"
+}

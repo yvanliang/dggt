@@ -6,7 +6,14 @@
 * `/data/flow_cache_mode_b/{split}/{scene}/{clip:04d}.pt` — Mode B 片段（规划器想象的目标位置 + 场景 Gaussian 伪删除）。
 * `/data/flow_cache/{split}_manifest.jsonl` — 扩散数据加载器使用的合并训练 manifest（每个片段一行，两种模式混合在一起）。
 
-当前 `.pt` 文件使用 `schema_version=9`，物理存储为 **chunked zstd SQLite container**：每个帧/字段独立压缩，训练时只读取随机窗口需要的 chunk。新生成的 cache 还会写入 `pass2_splatted_tok_low.flow_inputs`，其中包含正式训练直接消费的 `M_preserve/M_source/M_dest`、pooled scaffold 输入和 Mode-A asset coverage。Mode-A 额外在每个 asset 的轻量 meta chunk 保存 `[S,P]` 的 `asset_patch_valid_mask`（`asset_patch_mask_version=alpha_max_t005_v1`）；fast loader 只读取 scene/pass2 token、flow inputs、asset LUT 和该轻量 mask，不读取 raw image、dense pass1 heads、asset Gaussian、asset RGB/alpha 或 pointer。
+当前 `.pt` 文件使用 `schema_version=10`，物理存储为 **chunked zstd SQLite container**：每个帧/字段独立压缩，训练时只读取随机窗口需要的 chunk。新生成的 cache 还会写入 `pass2_splatted_tok_low.flow_inputs`，其中包含正式训练直接消费的 `M_preserve/M_source/M_dest`、pooled scaffold 输入和 Mode-A asset coverage。Mode-A 额外在每个 asset 的轻量 meta chunk 保存 `[S,P]` 的 `asset_patch_valid_mask`（`asset_patch_mask_version=alpha_max_t005_v1`）；fast loader 只读取 scene/pass2 token、flow inputs、asset LUT 和该轻量 mask，不读取 raw image、dense pass1 heads、asset Gaussian、asset RGB/alpha 或 pointer。
+
+schema v10 还把 `metric_box_mapping_mode`、`scene_gauge_table_sha256` 和
+`dggt_checkpoint_sha256` 同时写入 payload `meta` 与便宜读取的 SQLite summary。正式
+Waymo cache 必须使用 `metric_gauge_v4`；正式训练/推理会从已验证的 SceneFlow
+checkpoint 和当前进程实际加载的 DGGT checkpoint 取得可信值，在启动前预检
+每个 cache，cache 自述 metadata 只是被比对的证据，不是信任源。**schema v9 及更旧
+cache 必须重新预计算**；不允许通过改版本号、物理格式转换或 backfill 伪装成 v10。
 
 两种缓存共享相同的逻辑 schema。它们只在 payload 顶层的 `mode_kind` 字段以及下面两个 sibling 中哪一个被填充上有所不同：
 
@@ -26,9 +33,9 @@
 
 ## Cache 语义：full-source-Gaussian splat
 
-v9 的 `pass2_splatted_tok_low` 仍缓存 tokenizer 之前的 splat→blend 特征，并新增严格的 formal asset patch mask。mask 由目标位置 isolated `A_asset` 以 `alpha>=0.05` 二值化、按 DGGT patch cell max-pool 得到，不 dilation；训练时再与 `phase1_coverage` 和选中 slot 取交集。旧 Mode-A cache 不做兼容回退，必须重新生成。Mode-B 没有真实 asset condition，不需要该字段。
+v10 的 `pass2_splatted_tok_low` 仍缓存 tokenizer 之前的 splat→blend 特征，并保留严格的 formal asset patch mask。mask 由目标位置 isolated `A_asset` 以 `alpha>=0.05` 二值化、按 DGGT patch cell max-pool 得到，不 dilation；训练时再与 `phase1_coverage` 和选中 slot 取交集。旧 Mode-A cache 不做兼容回退，必须重新生成。Mode-B 没有真实 asset condition，不需要该字段。
 
-chunked v9 包含：
+chunked v10 包含：
 
 * SceneFlow fallback / debug：`raw`、`pass1` heads、由 `semantic_logits` 派生出的 `semantic_vehicle_prob/mask`、scene LUT、`pass2_splatted_tok_low`、Mode-A `phase1_localized`/`asset_pass`、Mode-B planner/delete masks。
 * SceneFlow fast training：scene LUT、`pass2_splatted_tok_low`、`flow_inputs`、Mode-A 完整 4-level asset LUT。训练时 tokenizer.encode 和可训练的 `ScaffoldPacker.mlp` 仍在线运行；FeatureSplatter、SoftMask render、CleanSceneState 构建和 asset Gaussian 读取都会跳过。
@@ -42,7 +49,22 @@ chunked v9 包含：
 
 ```bash
 conda activate dggt
+
+export DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
+export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt
+export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain_v4.pt
+export PULLBACK_CALIBRATION=data/scene_gauge/pullback_75e566ef.json
+export SCENE_FLOW_PRETRAIN_CKPT=logs/scene_flow_pretrain_1024_v4/ckpt/pretrain_step100000.pt
+export TRAIN_SCENE_GAUGE=data/scene_gauge/training.json
+export VALIDATION_SCENE_GAUGE=data/scene_gauge/validation.json
+export DGGT_SHA256="$(sha256sum "$DGGT_CKPT" | awk '{print $1}')"
+export VALIDATION_SCENE_GAUGE_SHA256="$(sha256sum "$VALIDATION_SCENE_GAUGE" | awk '{print $1}')"
 ```
+
+`tools/precompute_flow_features*.py` 会自己 hash `--ckpt_path` 实际指向的文件，
+`--expected_scene_gauge_dggt_sha256` 只是额外断言，不会代替这次实测。scene-gauge
+loader 也会 hash `--scene_gauge_path` 实际文件，并检查它是完整的 29 帧、split 匹配且
+与同一 DGGT SHA 绑定的正式表。
 
 首先构建 Mode A 和 Mode B 的候选项 / manifest JSONL（每个 split 只需执行一次）。这些步骤不会使用 GPU —— 它们只读取 Waymo 标注和 Phase 1 元数据：
 
@@ -68,7 +90,10 @@ Mode B 构建器会排除已经被 Mode A 使用的片段，因此两个 split �
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/precompute_flow_features.py \
     --edit_mode mode_a \
-    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+    --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$TRAIN_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
     --split training \
     --out_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a \
     --manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_mode_a_views1.jsonl \
@@ -79,11 +104,15 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/precompute_flow_features.py \
     --max_save_threads 1
 ```
 
-如果已有旧 cache，只想升级旧文件并保留已生成的当前格式文件，可在预计算命令里加 `--overwrite_v7`。它会读取已存在 `.pt` 的 `schema_version` 和 chunked `format_version`：当前 v9 chunked format 直接跳过，旧 schema、旧 chunked format、非 chunked 或无法读取的文件会重新生成并覆盖。`--force_overwrite` 仍表示无条件重算覆盖。训练和验证只接受 schema v9；Mode-A 与 Mode-B 的旧 cache 都必须重新生成，不提供旧 schema 兼容路径。
+如果已有 cache，只想重建过期文件并保留当前产物，可在预计算命令里加名字为历史兼容的 `--overwrite_v7`。它只会跳过同时满足下列条件的文件：当前 schema v10、当前 chunked format、正确的 Gaussian 时间轴，且 summary 中的 `metric_box_mapping_mode`、scene-gauge 表 SHA 和**实际** DGGT checkpoint SHA 全部相等。任一项不符、schema v9 及更旧、非 chunked 或无法读取的文件都会重新生成。`--force_overwrite` 表示无条件重算覆盖。训练和验证只接受 schema v10，不提供旧 schema 兼容路径。
 
+```bash
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python inference_scene_editor.py \
     --output_dir runs/mode_a_all_vis \
-    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+    --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$TRAIN_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
     --dump_features
 
 # 输出可视化结果：runs/mode_a_smoke/{deleted_render_grid, asset_image_grid,
@@ -101,7 +130,10 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python inference_scene_editor.py \
 ```bash
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python tools/precompute_flow_features.py \
     --edit_mode mode_b \
-    --ckpt_path /home/dancer/liangyiyuan/dggt/model_latest_waymo.pt \
+    --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$TRAIN_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
     --split training \
     --out_root /data/intelssd/liangyiyuan/waymo_processed_dggt/flow_cache_mode_b \
     --views 1 \
@@ -118,7 +150,10 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python tools/precompute_flow_features.py \
 如果要对一个 Mode B 样本做临时可视化（想象框叠加 + 伪删除点云渲染 + D_map）：
 ```bash
 CUDA_VISIBLE_DEVICES=3 python inference_mode_b.py --output_dir runs/mode_b_all_vis \
-    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+    --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$TRAIN_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
     --planner_seed 0 \
     --dump_features
 # 输出：runs/mode_b_all_vis/{imagined_boxes_overlay, deleted_render_grid,
@@ -131,12 +166,32 @@ Mode B 的 `--dump_features` 同样走训练用 `FlowFeatureAssembler(mode_kind=
 `M_preserve/M_source/M_dest` 的 JPG 可视化。注意：非空 imagined 区域会触发一次
 训练同路径的 feature splat，因此比只画框和 `D_map` 慢。
 
+### 2.1 正式 validation cache 预计算
 
-## 2.5 cache 转换为 chunked v9
+validation 必须使用独立的完整 validation gauge 表，不能复用 training 表：
 
-只有已经携带 v9 asset patch mask 的 Mode-A monolithic cache 或 schema v9 Mode-B cache，
-才可只做物理格式转换；转换后逻辑 `schema_version` 不变，路径仍是原来的 `.pt`。所有旧 schema
-cache 都不能通过物理格式转换升级，必须重新运行相应的 Mode-A/Mode-B 预计算：
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/precompute_flow_features_validation.py \
+    --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$VALIDATION_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
+    --split validation \
+    --out_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_validation \
+    --save_compression chunked_zstd --gzip_level 1 \
+    --overwrite_v7 --max_save_threads 1
+```
+
+该入口只接受 `metric_gauge_v4`。已有 validation cache 仅在 schema/format、
+localization policy 以及上述三项 provenance 全部相等时才会跳过，否则原路径重建。
+
+
+## 2.5 schema v10 monolithic cache 转换为 chunked v10
+
+只有已经由当前实现生成、携带完整 v10 geometry provenance 的 monolithic cache，
+才可只做物理格式转换；转换后逻辑 `schema_version` 不变，路径仍是原来的 `.pt`。
+schema v9 及更旧 cache 不能通过物理格式转换升级，必须重新运行相应的
+Mode-A/Mode-B/validation 预计算：
 
 ```bash
 python tools/convert_flow_cache_to_chunked.py \
@@ -153,7 +208,7 @@ python tools/convert_flow_cache_to_chunked.py \
 
 ## 2.6 chunked cache 原地补写 flow_inputs
 
-已有 chunked cache 若缺少 `pass2_splatted_tok_low.flow_inputs`，可以原地追加训练 fast path 所需的小 chunk。该工具不会生成 v9 所要求的 Mode-A asset patch mask，因此不能用它把旧 Mode-A cache 兼容升级到 v9；Mode-A 仍须重新预计算。
+已有 schema v10 chunked cache 若缺少 `pass2_splatted_tok_low.flow_inputs`，可以原地追加训练 fast path 所需的小 chunk。该工具不会生成 asset patch mask、metric gauge 帧级证据或 geometry provenance，因此不能把 schema v9 及更旧 cache 升级到 v10；旧 cache 仍须重新预计算。
 
 先 dry-run 估算新增体积：
 
@@ -214,6 +269,10 @@ python tools/build_flow_train_manifest.py \
 
 `--cache_root` 可以重复指定。可选的 `:mode_a` / `:mode_b` 后缀会固定模式，不需要打开任何 `.pt`（低成本路径）；`:auto` 或不加后缀会强制脚本查看每个文件的 `mode_kind`（更慢，在 NVMe 上约为 1 s/clip）。
 
+注意：manifest builder 不是 provenance 验证器。它在上述带模式后缀的低成本路径下
+不打开 cache；正式训练/推理会在加载模型的 provenance 后对 manifest 指向的每个
+cache 执行完整预检。
+
 输出：
 
 ```
@@ -235,14 +294,25 @@ python tools/build_flow_train_manifest.py \
 
 ```bash
 torchrun --nproc_per_node=8 train_scene_flow.py \
-    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+    --ckpt_path "$DGGT_CKPT" \
+    --tokenizer_ckpt_path "$TOKENIZER_CKPT" \
+    --feature_stats_path "$FEATURE_STATS" \
+    --pullback_calibration_path "$PULLBACK_CALIBRATION" \
+    --scene_flow_pretrain_path "$SCENE_FLOW_PRETRAIN_CKPT" \
+    --scene_flow_pretrain_ema \
     --manifest_path /data/flow_cache/training_manifest.jsonl \
     --val_manifest_path /data/flow_cache/validation_manifest.jsonl \
+    --val_scene_gauge_sha256 "$VALIDATION_SCENE_GAUGE_SHA256" \
     --log_dir runs/flow_t1 \
     --batch_size 1 --grad_accum_steps 2 \
-    --sequence_length 8 \
+    --sequence_length 10 \
     --max_steps 40000 --vis_every 1000
 ```
+
+训练 cache 的 mapping mode 和 gauge SHA 来自已验证的
+`$SCENE_FLOW_PRETRAIN_CKPT.metric_gauge_provenance`，validation cache 则与显式的
+`--val_scene_gauge_sha256` 比对；两者都会与 `$DGGT_CKPT` 现场计算的 SHA 比对。
+完整正式训练参数见 `docs/scene_flow_cmd.md`。
 
 常用选项：
 
@@ -260,8 +330,9 @@ torchrun --nproc_per_node=8 train_scene_flow.py \
 ## 5. 验证
 
 ```bash
-# Sanity：缓存 schema + 规划器集成
-pytest tests/test_offline_cache.py tests/test_mode_b_planner.py \
+# Sanity：缓存 schema/provenance + 规划器集成
+pytest tests/test_flow_cache_metric_provenance.py \
+       tests/test_offline_cache.py tests/test_mode_b_planner.py \
        tests/test_scene_pointers.py tests/test_per_token_noise.py -q
 
 # 转换正确性：SceneFlow + tokenizer Stage-B exact tensor compare
@@ -312,10 +383,16 @@ CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. conda run -n dggt --no-capture-output \
 
 # Smoke：一个 Mode A 片段 + 一个 Mode B 片段端到端测试
 CUDA_VISIBLE_DEVICES=3 python tools/precompute_flow_features.py \
-    --edit_mode mode_a --ckpt_path .../model_latest_waymo.pt \
+    --edit_mode mode_a --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$TRAIN_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
     --out_root /data/flow_cache_mode_a --start_clip_idx 0 --end_clip_idx 1
 CUDA_VISIBLE_DEVICES=3 python tools/precompute_flow_features.py \
-    --edit_mode mode_b --ckpt_path .../model_latest_waymo.pt \
+    --edit_mode mode_b --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$TRAIN_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
     --out_root /data/flow_cache_mode_b --start_clip_idx 0 --end_clip_idx 1 \
     --allow_empty_plan
 
@@ -325,10 +402,13 @@ python tools/build_flow_train_manifest.py \
     --split training --out_path /data/flow_cache/training_manifest_smoke.jsonl
 
 CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node=1 train_scene_flow.py \
-    --ckpt_path .../model_latest_waymo.pt \
+    --ckpt_path "$DGGT_CKPT" --tokenizer_ckpt_path "$TOKENIZER_CKPT" \
+    --feature_stats_path "$FEATURE_STATS" \
+    --pullback_calibration_path "$PULLBACK_CALIBRATION" \
+    --scene_flow_pretrain_path "$SCENE_FLOW_PRETRAIN_CKPT" --scene_flow_pretrain_ema \
     --manifest_path /data/flow_cache/training_manifest_smoke.jsonl \
     --log_dir runs/flow_smoke --batch_size 1 --max_steps 5 \
-    --sequence_length 4 --vis_every 2
+    --sequence_length 10 --vis_every 2
 ```
 
 通过标准：

@@ -38,6 +38,13 @@ import numpy as np
 import torch
 
 from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
+from dggt.utils.scene_gauge import (
+    GENERIC_BOX_MAPPING_MODE,
+    METRIC_BOX_MAPPING_MODE,
+    effective_scene_gauge,
+    load_scene_gauge_lookup,
+    scene_gauge_valid_channel_mean,
+)
 
 from datasets.waymo_edit_dataset import (
     DEFAULT_PROCESSED_ROOT,
@@ -170,6 +177,9 @@ class WaymoValidationEditDataset:
         asset_root: str = DEFAULT_ASSET_ROOT,
         split: str = "validation",
         clip_length: int = CLIP_LENGTH,
+        metric_box_mapping_mode: str | None = None,
+        scene_gauge_path: str | None = None,
+        expected_scene_gauge_dggt_sha256: str | None = None,
     ) -> None:
         self.final_info_path = Path(final_info_path)
         self.processed_root = Path(processed_root)
@@ -185,6 +195,40 @@ class WaymoValidationEditDataset:
         self.asset_root = Path(asset_root)
         self.clip_length = int(clip_length)
         self.camera_ids = [0]  # views=1 only (editor constraint)
+        if metric_box_mapping_mode not in (
+            GENERIC_BOX_MAPPING_MODE,
+            METRIC_BOX_MAPPING_MODE,
+        ):
+            raise ValueError(
+                "metric_box_mapping_mode must be supplied explicitly as "
+                "'metric_gauge_v4' or 'generic_sim3'"
+            )
+        self.metric_box_mapping_mode = str(metric_box_mapping_mode)
+        self.scene_gauge_path = None
+        self.scene_gauge_sha256 = None
+        self.scene_gauge_dggt_sha256 = None
+        self.scene_gauge_valid_channel_mean = None
+        self._scene_gauge_table = None
+        if self.metric_box_mapping_mode == METRIC_BOX_MAPPING_MODE:
+            if scene_gauge_path is None:
+                raise ValueError(
+                    "Formal validation metric_gauge_v4 requires --scene_gauge_path"
+                )
+            (
+                self.scene_gauge_path,
+                self.scene_gauge_sha256,
+                self.scene_gauge_dggt_sha256,
+                self._scene_gauge_table,
+            ) = load_scene_gauge_lookup(
+                scene_gauge_path,
+                expected_checkpoint_sha256=expected_scene_gauge_dggt_sha256,
+                expected_split=self.split,
+            )
+            self.scene_gauge_valid_channel_mean = scene_gauge_valid_channel_mean(
+                self._scene_gauge_table
+            )
+        elif scene_gauge_path is not None:
+            raise ValueError("generic_sim3 validation must not receive scene_gauge_path")
 
         with open(self.final_info_path) as f:
             self.entries: list[dict[str, Any]] = json.load(f)
@@ -197,6 +241,80 @@ class WaymoValidationEditDataset:
 
     def __len__(self) -> int:
         return len(self.entries)
+
+    def _metric_box_payload(
+        self,
+        *,
+        scene_dir: str,
+        scene_frame_indices: list[int],
+        ego_pose_all: np.ndarray,
+        camera_to_ego: np.ndarray,
+        camera_to_world_corrected: torch.Tensor,
+    ) -> dict[str, Any]:
+        if self.metric_box_mapping_mode == GENERIC_BOX_MAPPING_MODE:
+            return {"metric_box_mapping_mode": GENERIC_BOX_MAPPING_MODE}
+        if self._scene_gauge_table is None or self.scene_gauge_valid_channel_mean is None:
+            raise RuntimeError("Formal validation has no production scene-gauge table")
+        scene_key = str(scene_dir).zfill(3) if str(scene_dir).isdigit() else str(scene_dir)
+        selected_c2w = camera_to_world_corrected.detach().cpu().float()
+        if selected_c2w.ndim != 4 or tuple(selected_c2w.shape[1:]) != (1, 4, 4):
+            raise ValueError("Formal validation requires front-camera poses [S,1,4,4]")
+
+        gauges = []
+        gauges_raw = []
+        valids = []
+        fallback_masks = []
+        world_to_anchor = []
+        camera_to_anchor = []
+        for local_idx, scene_frame_idx in enumerate(scene_frame_indices):
+            trunk_index = int(scene_frame_idx) // CLIP_LENGTH
+            table_key = f"{scene_key}/{trunk_index}"
+            entry = self._scene_gauge_table.get(table_key)
+            if entry is None:
+                raise KeyError(
+                    "Formal validation gauge entry is missing; no Sim3 fallback is allowed: "
+                    f"key={table_key!r}, table={self.scene_gauge_path}"
+                )
+            gauge_raw, valid = entry
+            gauge, fallback_mask = effective_scene_gauge(
+                gauge_raw,
+                valid,
+                self.scene_gauge_valid_channel_mean,
+            )
+            anchor_frame = trunk_index * CLIP_LENGTH
+            if not (0 <= anchor_frame < int(ego_pose_all.shape[0])):
+                raise IndexError(
+                    f"Validation trunk anchor {anchor_frame} outside ego_pose length "
+                    f"{ego_pose_all.shape[0]}"
+                )
+            anchor_c2w = compose_waymo_camera_to_world(
+                ego_pose_all[anchor_frame], camera_to_ego
+            ).astype(np.float32)
+            w2a = np.linalg.inv(anchor_c2w).astype(np.float32)
+            c2a = (w2a @ selected_c2w[local_idx, 0].numpy()).astype(np.float32)
+            gauges.append(gauge)
+            gauges_raw.append(gauge_raw)
+            valids.append(valid)
+            fallback_masks.append(fallback_mask)
+            world_to_anchor.append(w2a)
+            camera_to_anchor.append(c2a)
+        return {
+            "metric_box_mapping_mode": METRIC_BOX_MAPPING_MODE,
+            "metric_box_scene_gauge": torch.tensor(gauges, dtype=torch.float32),
+            "metric_box_scene_gauge_raw": torch.tensor(gauges_raw, dtype=torch.float32),
+            "metric_box_scene_gauge_valid": torch.tensor(valids, dtype=torch.bool),
+            "metric_box_scene_gauge_fallback_mask": torch.tensor(
+                fallback_masks, dtype=torch.bool
+            ),
+            "metric_box_scene_gauge_valid_channel_mean": torch.tensor(
+                self.scene_gauge_valid_channel_mean, dtype=torch.float32
+            ),
+            "metric_box_scene_gauge_fallback_policy": "production_valid_channel_mean_v1",
+            "metric_box_world_to_anchor": torch.from_numpy(np.stack(world_to_anchor)),
+            "metric_box_camera_to_anchor": torch.from_numpy(np.stack(camera_to_anchor)),
+            "metric_box_gauge_table_sha256": str(self.scene_gauge_sha256),
+            "metric_box_gauge_dggt_sha256": str(self.scene_gauge_dggt_sha256),
+        }
 
     # ---- helpers -----------------------------------------------------------
 
@@ -554,4 +672,13 @@ class WaymoValidationEditDataset:
                 "trajectory": entry.get("trajectory", {}),
             },
         }
+        sample.update(
+            self._metric_box_payload(
+                scene_dir=scene_dir,
+                scene_frame_indices=scene_frame_indices,
+                ego_pose_all=ego_pose_all,
+                camera_to_ego=cam_to_ego,
+                camera_to_world_corrected=camera_to_world_corrected,
+            )
+        )
         return sample

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
+from dggt.utils.camera_generation import camera_state_from_waymo_c2w
+
 CAMERA_POSE_SUMMARY_DIM = 20
-CAMERA_CONDITION_REPRESENTATION = "waymo_rel_delta_rot6d_fov20d_direct_v2"
+CAMERA_CONDITION_REPRESENTATION = "waymo_metric_rel_delta_rot6d_fov20d_stats_v3"
 
 
 def fov_from_intrinsics(intrinsics: torch.Tensor, image_size_hw) -> torch.Tensor:
@@ -92,11 +96,36 @@ def _to_batched_sequence(x: torch.Tensor, *, last_dims: int, name: str) -> torch
     raise ValueError(f"{name} must be [S,...] or [B,S,...], got {tuple(x.shape)}")
 
 
+def _to_batched_pose(
+    value: torch.Tensor,
+    *,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    name: str,
+) -> torch.Tensor:
+    pose = torch.as_tensor(value, device=device, dtype=dtype)
+    if pose.ndim == 2:
+        pose = pose.unsqueeze(0)
+    elif pose.ndim == 4 and int(pose.shape[1]) == 1:
+        pose = pose[:, 0]
+    if pose.ndim != 3 or tuple(pose.shape[-2:]) != (4, 4):
+        raise ValueError(
+            f"{name} must be [4,4], [B,4,4], or [B,1,4,4], got {tuple(pose.shape)}"
+        )
+    if int(pose.shape[0]) == 1 and batch_size > 1:
+        pose = pose.expand(batch_size, -1, -1)
+    if int(pose.shape[0]) != batch_size:
+        raise ValueError(f"{name} batch {pose.shape[0]} != camera batch {batch_size}")
+    if not bool(torch.isfinite(pose).all()):
+        raise ValueError(f"{name} contains non-finite values")
+    return pose
+
+
 def _camera_summary_from_c2w(
     camera_to_world: torch.Tensor,
     fov: torch.Tensor,
     *,
-    translation_scale: float = 10.0,
     trajectory_anchor_to_world: torch.Tensor | None = None,
     previous_camera_to_world: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -111,17 +140,13 @@ def _camera_summary_from_c2w(
     if trajectory_anchor_to_world is None:
         anchor = c2w[:, :1]
     else:
-        anchor = _to_batched_sequence(
-            trajectory_anchor_to_world.float(), last_dims=3, name="trajectory_anchor_to_world"
-        )
-        if int(anchor.shape[1]) != 1:
-            raise ValueError(
-                f"trajectory_anchor_to_world must contain one pose, got {tuple(anchor.shape)}"
-            )
-        if int(anchor.shape[0]) == 1 and b > 1:
-            anchor = anchor.expand(b, -1, -1, -1)
-        if int(anchor.shape[0]) != b:
-            raise ValueError(f"trajectory anchor batch {anchor.shape[0]} != camera batch {b}")
+        anchor = _to_batched_pose(
+            trajectory_anchor_to_world,
+            batch_size=b,
+            device=c2w.device,
+            dtype=c2w.dtype,
+            name="trajectory_anchor_to_world",
+        ).unsqueeze(1)
     c0_inv = _invert_se3(anchor).expand(-1, s, -1, -1)
     rel = c0_inv @ c2w
 
@@ -139,9 +164,8 @@ def _camera_summary_from_c2w(
             )
     delta = _invert_se3(prev) @ c2w
 
-    scale = max(float(translation_scale), 1e-6)
-    rel_t = rel[..., :3, 3] / scale
-    delta_t = delta[..., :3, 3] / scale
+    rel_t = rel[..., :3, 3]
+    delta_t = delta[..., :3, 3]
     features = torch.cat(
         [
             rel_t,
@@ -211,7 +235,6 @@ def camera_summary_from_waymo_gt(
     intrinsics: torch.Tensor,
     *,
     image_hw: tuple[int, int] | None = None,
-    translation_scale: float = 10.0,
     trajectory_anchor_to_world: torch.Tensor | None = None,
     previous_camera_to_world: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -230,7 +253,93 @@ def camera_summary_from_waymo_gt(
     return _camera_summary_from_c2w(
         c2w,
         fov,
-        translation_scale=translation_scale,
         trajectory_anchor_to_world=trajectory_anchor_to_world,
         previous_camera_to_world=previous_camera_to_world,
     )
+
+
+def camera_condition_from_waymo_metric_target(
+    camera_to_world: torch.Tensor,
+    intrinsics: torch.Tensor,
+    *,
+    image_hw: tuple[int, int] | None,
+    trajectory_anchor_to_world: torch.Tensor,
+    previous_camera_to_world: torch.Tensor | None,
+    anchor_mask: torch.Tensor,
+    normalize_camera: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the v3 condition and its matching v4 metric generation target.
+
+    The 20-D condition keeps its raw anchor-relative pose and Waymo FOV, but
+    channels ``9:18`` are the *same* role-aware normalized 9-D state used by
+    camera generation.  Keeping this assembly in one helper prevents raw
+    pretraining, formal T1, and offline/external inference from silently using
+    different camera-condition coordinates.
+
+    ``anchor_mask`` is global: a sliced window that does not contain trunk
+    frame zero must be delta-only and must receive the preceding camera pose.
+    """
+
+    if not callable(normalize_camera):
+        raise TypeError("normalize_camera must be callable")
+    c2w = _select_front_camera_to_world(camera_to_world, intrinsics)
+    batch_size, seq_len = int(c2w.shape[0]), int(c2w.shape[1])
+    previous_front = None
+    if previous_camera_to_world is not None:
+        previous_raw = torch.as_tensor(previous_camera_to_world).float()
+        if (
+            previous_raw.ndim == 4
+            and int(previous_raw.shape[0]) == batch_size
+            and int(previous_raw.shape[1]) in (1, seq_len)
+        ):
+            previous_front = previous_raw
+        elif previous_raw.ndim == 3 and int(previous_raw.shape[0]) == batch_size:
+            previous_front = previous_raw.unsqueeze(1)
+        else:
+            previous_front = _select_front_camera_to_world(
+                previous_raw,
+                intrinsics,
+            )
+        if int(previous_front.shape[0]) != batch_size or int(previous_front.shape[1]) not in (
+            1,
+            seq_len,
+        ):
+            raise ValueError(
+                "previous_camera_to_world must provide one preceding pose or one pose per frame: "
+                f"got {tuple(previous_front.shape)} for B={batch_size}, S={seq_len}"
+            )
+    target_state, returned_anchor_mask = camera_state_from_waymo_c2w(
+        c2w,
+        trajectory_anchor_to_world,
+        previous_camera_to_world=previous_front,
+        anchor_mask=anchor_mask,
+    )
+    normalized_target = normalize_camera(target_state, returned_anchor_mask)
+    if normalized_target.shape != target_state.shape:
+        raise ValueError(
+            "normalize_camera must preserve the metric target shape: "
+            f"got {tuple(normalized_target.shape)} for {tuple(target_state.shape)}"
+        )
+    if not bool(torch.isfinite(normalized_target).all()):
+        raise ValueError("normalized camera target contains non-finite values")
+    summary_previous = previous_front
+    if summary_previous is not None and int(summary_previous.shape[1]) == 1 and seq_len > 1:
+        summary_previous = torch.cat((summary_previous, c2w[:, :-1]), dim=1)
+    condition, valid = camera_summary_from_waymo_gt(
+        c2w,
+        intrinsics,
+        image_hw=image_hw,
+        trajectory_anchor_to_world=trajectory_anchor_to_world,
+        previous_camera_to_world=summary_previous,
+    )
+    if condition.shape[:-1] != normalized_target.shape[:-1]:
+        raise ValueError(
+            "camera summary and generation target disagree on batch/time shape: "
+            f"{tuple(condition.shape)} vs {tuple(normalized_target.shape)}"
+        )
+    condition = condition.clone()
+    condition[..., 9:18] = normalized_target.to(
+        device=condition.device,
+        dtype=condition.dtype,
+    )
+    return condition, valid, target_state, returned_anchor_mask

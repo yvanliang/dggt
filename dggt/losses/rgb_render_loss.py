@@ -5,10 +5,10 @@ SceneFlow-predicted video tokens.  A cached/frozen DGGT depth map may be used
 for diagnostics or a separate preserve-region distillation loss, but it must
 never be passed into the primary RGB render path.
 
-Camera policy is owned by the caller:
-
-* pretrain passes the SceneFlow-generated DGGT camera trajectory;
-* formal editing passes the frozen DGGT camera from the input images.
+Camera policy is owned by the caller. Metric-camera pretraining deliberately
+renders with the detached frozen-teacher DGGT trajectory, because the decoded
+latents live in that teacher space. Formal editing likewise passes its frozen
+DGGT camera.
 
 Frozen DGGT/tokenizer parameters keep ``requires_grad=False`` but this module
 must not run their decode/head calls under ``torch.no_grad``: gradients are
@@ -31,6 +31,13 @@ from dggt.losses.reconstruction_feedback_loss import (
 from dggt.utils.gaussian_render import composite_gsplat_rgb, composite_original_sky
 from dggt.utils.gs import get_split_gs
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
+from dggt.utils.scene_gauge import (
+    PULLBACK_RENDER_BOUNDARY,
+    PullbackCalibration,
+    apply_pullback_calibration,
+)
+from dggt.utils.sliding_window import OFFLINE_MAX_SINGLE_WINDOW
+from dggt.utils.tokenizer_window import decode_tokenizer_windowed
 
 
 @dataclass
@@ -144,9 +151,15 @@ def _decode_sparse_image_tokens(
     z_clean_pred_n: torch.Tensor,
     patch_grid: tuple[int, int] | list[int],
     patch_start_idx: int,
+    tokenizer_window_len: int,
 ) -> list[torch.Tensor | None]:
     z = scene_flow_root.denormalize(z_clean_pred_n.float())
-    decoded = vggt_model.scene_tokenizer.decode(z, patch_grid=patch_grid)
+    decoded = decode_tokenizer_windowed(
+        vggt_model.scene_tokenizer,
+        z,
+        patch_grid=patch_grid,
+        window_len=int(tokenizer_window_len),
+    )
     if len(decoded) != len(TOKENIZER_LEVELS):
         raise RuntimeError(
             f"scene_tokenizer.decode returned {len(decoded)} levels; expected {len(TOKENIZER_LEVELS)}"
@@ -188,14 +201,22 @@ def decode_generated_dggt_geometry(
     patch_grid: tuple[int, int] | list[int],
     patch_start_idx: int,
     image_hw: tuple[int, int],
+    pullback_calibration: PullbackCalibration | None = None,
+    tokenizer_window_len: int | None = None,
 ) -> DecodedGeneratedGeometry:
     """Decode exactly the generated-token geometry used by validation/offline."""
+    resolved_window_len = (
+        int(pullback_calibration.window_len)
+        if pullback_calibration is not None
+        else int(tokenizer_window_len or OFFLINE_MAX_SINGLE_WINDOW)
+    )
     image_tokens = _decode_sparse_image_tokens(
         vggt_model=vggt_model,
         scene_flow_root=scene_flow_root,
         z_clean_pred_n=z_clean_pred_n,
         patch_grid=patch_grid,
         patch_start_idx=int(patch_start_idx),
+        tokenizer_window_len=resolved_window_len,
     )
     aggregated, dino = _split_sparse_tokens_for_heads(image_tokens)
     height, width = int(image_hw[0]), int(image_hw[1])
@@ -221,13 +242,30 @@ def decode_generated_dggt_geometry(
             int(patch_start_idx),
             image_hw=(height, width),
         )
+    depth = depth.float()
+    gs_map = gs_map.float()
+    if pullback_calibration is not None:
+        # Rendering is defined in the tokenizer's native reconstructed DGGT
+        # geometry. Calling the shared helper here makes that scope explicit
+        # and prevents the v1 metric-only correction from leaking into render.
+        pullback = apply_pullback_calibration(
+            depth,
+            gs_map,
+            log_metric_scale=0.0,
+            calibration=pullback_calibration,
+            boundary=PULLBACK_RENDER_BOUNDARY,
+        )
+        if pullback.depth_dggt is not depth or pullback.gs_map_dggt is not gs_map:
+            raise AssertionError("render pullback must be an exact identity")
+        depth = pullback.depth_dggt
+        gs_map = pullback.gs_map_dggt
     return DecodedGeneratedGeometry(
         image_tokens=image_tokens,
         aggregated_tokens=aggregated,
         dino_tokens=dino,
-        depth=depth.float(),
+        depth=depth,
         depth_conf=depth_conf.float(),
-        gs_map=gs_map.float(),
+        gs_map=gs_map,
         gs_conf=gs_conf.float(),
         dynamic_conf=dynamic_conf.float(),
     )
@@ -613,12 +651,23 @@ def compute_rgb_render_loss(
     patch_weight_mask: torch.Tensor | None = None,
     sky_weight: float = 0.0,
     camera_grad_scale: float = 0.0,
+    gauge_pose_grad_scale: float = 0.0,
     sky_mask_grad_scale: float = 0.0,
     lpips_model: torch.nn.Module | None = None,
     lpips_weight: float = 0.0,
     loss_sample_weight: torch.Tensor | None = None,
     return_debug_tensors: bool = False,
+    return_generated_depth: bool = False,
+    pullback_calibration: PullbackCalibration | None = None,
 ) -> RGBRenderLossResult:
+    if float(camera_grad_scale) != 0.0:
+        raise ValueError(
+            "camera_grad_scale must be 0: metric-gauge pretraining renders with "
+            "detached teacher-space camera poses, so a non-zero value would be a "
+            "silent no-op."
+        )
+    if float(gauge_pose_grad_scale) not in (0.0, 1.0):
+        raise ValueError("gauge_pose_grad_scale must be exactly 0 or 1")
     if images.ndim != 5 or int(images.shape[2]) != 3:
         raise ValueError(f"images must be [B,S,3,H,W], got {tuple(images.shape)}")
     if str(background_mode) == "gt_sky" and render_sky_probability is None:
@@ -662,7 +711,7 @@ def compute_rgb_render_loss(
     images = images[:batch_size].to(device=z_clean_pred_n.device, dtype=torch.float32)
     pose = scale_gradient(
         render_pose_enc_dggt[:batch_size].to(z_clean_pred_n.device, torch.float32),
-        float(camera_grad_scale),
+        float(gauge_pose_grad_scale),
     )
     render_sky = _mask_to_bshw(render_sky_probability, images)
     render_sky = scale_gradient(render_sky, float(sky_mask_grad_scale))
@@ -680,6 +729,7 @@ def compute_rgb_render_loss(
         patch_grid=patch_grid,
         patch_start_idx=int(patch_start_idx),
         image_hw=(height, width),
+        pullback_calibration=pullback_calibration,
     )
     depth = _depth_to_bshw(geometry.depth)
     if not bool(torch.isfinite(depth).all()):
@@ -701,6 +751,7 @@ def compute_rgb_render_loss(
                 patch_grid=patch_grid,
                 patch_start_idx=int(patch_start_idx),
                 image_hw=(height, width),
+                pullback_calibration=pullback_calibration,
             )
         feedback = compute_reconstruction_feedback_losses(
             student_geometry=geometry,
@@ -781,6 +832,7 @@ def compute_rgb_render_loss(
         "rgb_render_alpha_mean": float(alpha_b.detach().mean().item()),
         "rgb_render_depth_mean": float(depth.detach().mean().item()),
         "rgb_render_camera_grad_scale": float(camera_grad_scale),
+        "rgb_render_gauge_pose_grad_scale": float(gauge_pose_grad_scale),
         "rgb_render_sky_mask_grad_scale": float(sky_mask_grad_scale),
         "rgb_render_frames": float(frames),
         "rgb_render_samples": float(batch_size),
@@ -813,5 +865,9 @@ def compute_rgb_render_loss(
         head_loss=head_loss,
         logs=logs,
         rendered=rendered_b if return_debug_tensors else None,
-        generated_depth=geometry.depth if return_debug_tensors else None,
+        generated_depth=(
+            geometry.depth
+            if return_debug_tensors or return_generated_depth
+            else None
+        ),
     )

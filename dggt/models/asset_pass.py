@@ -29,6 +29,7 @@ from dggt.utils.gaussian_edit import (
     load_asset_gaussians,
 )
 from dggt.utils.tokens import select_patch_pyramid
+from dggt.utils.tokenizer_window import encode_tokenizer_windowed
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
@@ -82,7 +83,7 @@ def require_asset_patch_valid_mask(
     expected_shape: tuple[int, int, int],
     device: torch.device,
 ) -> torch.Tensor:
-    """Return a schema-v9 Mode-A patch mask, rejecting legacy frame masks."""
+    """Return a schema-v10 Mode-A patch mask, rejecting legacy frame masks."""
     mask = asset_pass_result.asset_patch_valid_mask.get(int(object_key))
     if not torch.is_tensor(mask):
         raise RuntimeError(
@@ -107,6 +108,7 @@ def build_asset_condition_slots(
     reference: torch.Tensor,
     max_assets: int = 5,
     expected_num_levels: int = 4,
+    tokenizer_window_len: int = 10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the canonical formal-training asset-condition slots.
 
@@ -214,12 +216,14 @@ def build_asset_condition_slots(
         if not bool(valid.any().item()):
             continue
 
-        encoded = scene_tokenizer.encode(
+        encoded = encode_tokenizer_windowed(
+            scene_tokenizer,
             [
                 level.to(device=reference.device, dtype=reference.dtype)
                 for level in levels
             ],
             patch_grid=patch_grid,
+            window_len=int(tokenizer_window_len),
         )
         if tuple(encoded.shape) != tuple(reference.shape):
             raise ValueError(

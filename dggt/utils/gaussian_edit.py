@@ -10,8 +10,15 @@ import torch
 import torch.nn.functional as F
 
 from dggt.utils.gaussian_ply import GAUSSIAN_SH_C0, read_gaussian_ply
+from dggt.utils.camera_condition import fov_from_intrinsics
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 from dggt.utils.rotation import mat_to_quat, quat_to_mat
+from dggt.utils.scene_gauge import (
+    GENERIC_BOX_MAPPING_MODE,
+    METRIC_BOX_MAPPING_MODE,
+    metric_box_to_dggt,
+    metric_c2w_to_dggt,
+)
 
 _GS_LWH_TO_XYZ_SCALE = (0.90, 0.90, 0.88)
 WAYMO_DYNAMIC_SPEED_THRESH_MPS = 1.0
@@ -668,18 +675,282 @@ def _points_in_box(
 
 
 def _transform_track_box(
+    obj_to_anchor_or_world: torch.Tensor,
+    box_size: torch.Tensor,
+    transform: Sim3Transform | None,
+    *,
+    mapping_mode: str,
+    camera_to_anchor: torch.Tensor | None = None,
+    waymo_intrinsics: torch.Tensor | None = None,
+    waymo_image_hw: torch.Tensor | tuple[int, int] | None = None,
+    scene_gauge: torch.Tensor | None = None,
+    dggt_anchor_to_world: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Transform a Waymo track box into the reconstructed DGGT world.
+
+    ``generic_sim3`` is retained for explicitly non-metric legacy callers.
+    ``metric_gauge_v4`` is the production Waymo path and deliberately requires
+    all camera-frame inputs.  It never falls back to ``transform.scale``:
+    corners are warped by ``diag(kx,ky,1) / metres_per_unit`` in the current
+    camera frame, then rigidly placed into the reconstructed DGGT world.
+    """
+
+    mode = str(mapping_mode)
+    if mode not in (GENERIC_BOX_MAPPING_MODE, METRIC_BOX_MAPPING_MODE):
+        raise ValueError(
+            "mapping_mode must be explicitly 'generic_sim3' or 'metric_gauge_v4', "
+            f"got {mapping_mode!r}"
+        )
+    obj_to_world = _to_cpu_float_tensor(obj_to_anchor_or_world)
+    if tuple(obj_to_world.shape) != (4, 4):
+        raise ValueError(f"object transform must be [4,4], got {tuple(obj_to_world.shape)}")
+    box_size = _to_cpu_float_tensor(box_size).view(3)
+    if not bool(torch.isfinite(box_size).all()) or bool((box_size <= 0.0).any()):
+        raise ValueError("box_size must contain three finite positive lengths")
+
+    metric_arguments = {
+        "camera_to_anchor": camera_to_anchor,
+        "waymo_intrinsics": waymo_intrinsics,
+        "waymo_image_hw": waymo_image_hw,
+        "scene_gauge": scene_gauge,
+        "dggt_anchor_to_world": dggt_anchor_to_world,
+    }
+    if mode == GENERIC_BOX_MAPPING_MODE:
+        supplied = sorted(name for name, value in metric_arguments.items() if value is not None)
+        if supplied:
+            raise ValueError(
+                "generic_sim3 must not receive metric-gauge arguments; "
+                f"got {supplied}"
+            )
+        if transform is None:
+            raise ValueError("generic_sim3 requires an explicit Sim3Transform")
+        center_waymo = obj_to_world[:3, 3].view(1, 3)
+        center_dggt = transform.apply_points(center_waymo)[0]
+        rotation_waymo = obj_to_world[:3, :3]
+        rotation_dggt = _orthonormalize_rotation(transform.rotation @ rotation_waymo)
+        size_dggt = box_size * float(transform.scale)
+        return center_dggt, size_dggt, rotation_dggt
+
+    missing = sorted(name for name, value in metric_arguments.items() if value is None)
+    if missing:
+        raise ValueError(
+            "metric_gauge_v4 box mapping is fail-closed and requires "
+            "camera_to_anchor, Waymo K/image size, scene gauge, and DGGT anchor pose; "
+            f"missing={missing}"
+        )
+    if transform is not None:
+        raise ValueError(
+            "metric_gauge_v4 forbids a Sim3Transform: its scalar scale would "
+            "silently undo the camera-frame anisotropic mapping"
+        )
+
+    c2a = _to_cpu_float_tensor(camera_to_anchor)
+    waymo_k = _to_cpu_float_tensor(waymo_intrinsics)
+    gauge = _to_cpu_float_tensor(scene_gauge).view(-1)
+    anchor_to_world = _to_cpu_float_tensor(dggt_anchor_to_world)
+    image_hw = _to_cpu_float_tensor(waymo_image_hw).view(-1)
+    if tuple(c2a.shape) != (4, 4):
+        raise ValueError(f"camera_to_anchor must be one per-frame [4,4] pose, got {tuple(c2a.shape)}")
+    if tuple(waymo_k.shape) != (3, 3):
+        raise ValueError(f"waymo_intrinsics must be one per-frame [3,3] K, got {tuple(waymo_k.shape)}")
+    if tuple(anchor_to_world.shape) != (4, 4):
+        raise ValueError(
+            f"dggt_anchor_to_world must be one per-frame [4,4] pose, got {tuple(anchor_to_world.shape)}"
+        )
+    if tuple(gauge.shape) != (3,) or not bool(torch.isfinite(gauge).all()):
+        raise ValueError("scene_gauge must be one finite [log metres/unit, log tan-half FOVx/y] vector")
+    if tuple(image_hw.shape) != (2,):
+        raise ValueError(f"waymo_image_hw must contain [height,width], got {tuple(image_hw.shape)}")
+
+    waymo_fov_xy = fov_from_intrinsics(
+        waymo_k.view(1, 3, 3), image_hw
+    ).reshape(2)
+    dggt_fov_xy = 2.0 * torch.atan(torch.exp(gauge[1:3]))
+    if not bool(torch.isfinite(dggt_fov_xy).all()):
+        raise ValueError("scene_gauge log-FOV channels produce non-finite FOV")
+
+    center_anchor = obj_to_world[:3, 3]
+    rotation_anchor = obj_to_world[:3, :3]
+    corners_anchor = build_box_corners(center_anchor, box_size, rotation_anchor)
+    half_size = 0.5 * box_size
+    axis_endpoints = (
+        center_anchor.unsqueeze(0) + rotation_anchor.T * half_size.unsqueeze(-1)
+    )
+    probe_points = torch.cat(
+        (center_anchor.view(1, 3), axis_endpoints, corners_anchor), dim=0
+    )
+    probe_dggt_anchor = metric_box_to_dggt(
+        probe_points,
+        camera_to_anchor=c2a,
+        log_metric_scale=gauge[0],
+        dggt_fov_xy=dggt_fov_xy,
+        waymo_fov_xy=waymo_fov_xy,
+    )
+    anchor_rotation = anchor_to_world[:3, :3]
+    anchor_translation = anchor_to_world[:3, 3]
+    probe_dggt_world = probe_dggt_anchor @ anchor_rotation.T + anchor_translation
+    center_dggt = probe_dggt_world[0]
+    transformed_axes = (probe_dggt_world[1:4] - center_dggt).T
+    rotation_dggt = _orthonormalize_rotation(transformed_axes)
+    corners_dggt = probe_dggt_world[4:]
+    # An anisotropic map can shear a rotated cuboid.  Downstream deletion uses
+    # an OBB, so fit the conservative closest-rotation enclosure rather than
+    # silently pretending the three transformed axes stayed orthogonal.
+    local_corners = (corners_dggt - center_dggt) @ rotation_dggt
+    size_dggt = 2.0 * local_corners.abs().amax(dim=0)
+    if not bool(torch.isfinite(size_dggt).all()) or bool((size_dggt <= 0.0).any()):
+        raise ValueError("anisotropic metric box mapping produced an invalid DGGT box")
+    return center_dggt, size_dggt, rotation_dggt
+
+
+def _box_mapping_mode(sample: dict[str, Any]) -> str:
+    mode = sample.get("metric_box_mapping_mode")
+    if mode not in (GENERIC_BOX_MAPPING_MODE, METRIC_BOX_MAPPING_MODE):
+        raise ValueError(
+            "Waymo 3D editing requires an explicit metric_box_mapping_mode. "
+            "Use 'metric_gauge_v4' with a complete 29-frame gauge table, or "
+            "explicitly opt into 'generic_sim3' only for non-metric legacy data."
+        )
+    return str(mode)
+
+
+def _metric_frame_tensor(
+    sample: dict[str, Any], key: str, frame_idx: int, expected_tail: tuple[int, ...]
+) -> torch.Tensor:
+    value = sample.get(key)
+    if not isinstance(value, torch.Tensor):
+        raise ValueError(f"metric_gauge_v4 sample is missing tensor {key!r}")
+    if value.ndim != len(expected_tail) + 1 or tuple(value.shape[1:]) != expected_tail:
+        raise ValueError(
+            f"metric_gauge_v4 sample tensor {key!r} must be [S,{','.join(map(str, expected_tail))}], "
+            f"got {tuple(value.shape)}"
+        )
+    if not (0 <= int(frame_idx) < int(value.shape[0])):
+        raise IndexError(f"frame_idx={frame_idx} is outside {key} with {value.shape[0]} frames")
+    result = value[int(frame_idx)].detach().cpu().float()
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError(f"metric_gauge_v4 sample tensor {key!r} contains non-finite values")
+    return result
+
+
+def _transform_sample_track_box(
+    sample: dict[str, Any],
+    clean_state: CleanSceneState,
+    alignment: Sim3Transform,
     obj_to_world: torch.Tensor,
     box_size: torch.Tensor,
-    transform: Sim3Transform,
+    *,
+    frame_idx: int,
+    view_offset: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    obj_to_world = _to_cpu_float_tensor(obj_to_world)
-    box_size = _to_cpu_float_tensor(box_size).view(3)
-    center_waymo = obj_to_world[:3, 3].view(1, 3)
-    center_dggt = transform.apply_points(center_waymo)[0]
-    rotation_waymo = obj_to_world[:3, :3]
-    rotation_dggt = _orthonormalize_rotation(transform.rotation @ rotation_waymo)
-    size_dggt = box_size * float(transform.scale)
-    return center_dggt, size_dggt, rotation_dggt
+    """Dispatch one formal edit-track box through an explicit mapping mode."""
+
+    mode = _box_mapping_mode(sample)
+    if mode == GENERIC_BOX_MAPPING_MODE:
+        return _transform_track_box(
+            obj_to_world,
+            box_size,
+            alignment,
+            mapping_mode=GENERIC_BOX_MAPPING_MODE,
+        )
+
+    if int(view_offset) != 0:
+        raise NotImplementedError("metric_gauge_v4 box mapping currently supports the front view only")
+    gauge = _metric_frame_tensor(sample, "metric_box_scene_gauge", frame_idx, (3,))
+    gauge_valid_value = sample.get("metric_box_scene_gauge_valid")
+    if not isinstance(gauge_valid_value, torch.Tensor) or tuple(gauge_valid_value.shape) != (
+        int(sample["metric_box_scene_gauge"].shape[0]),
+        3,
+    ):
+        raise ValueError("metric_gauge_v4 requires metric_box_scene_gauge_valid shaped [S,3]")
+    gauge_valid = gauge_valid_value[int(frame_idx)].detach().cpu().bool()
+    fallback_value = sample.get("metric_box_scene_gauge_fallback_mask")
+    raw_value = sample.get("metric_box_scene_gauge_raw")
+    mean_value = sample.get("metric_box_scene_gauge_valid_channel_mean")
+    if not isinstance(fallback_value, torch.Tensor) or tuple(fallback_value.shape) != tuple(
+        gauge_valid_value.shape
+    ):
+        raise ValueError(
+            "metric_gauge_v4 requires metric_box_scene_gauge_fallback_mask shaped [S,3]"
+        )
+    fallback_mask = fallback_value[int(frame_idx)].detach().cpu().bool()
+    if not torch.equal(fallback_mask, ~gauge_valid):
+        raise ValueError(
+            "metric_gauge_v4 fallback mask must be the complement of raw validity"
+        )
+    if not isinstance(raw_value, torch.Tensor) or tuple(raw_value.shape) != tuple(
+        gauge_valid_value.shape
+    ):
+        raise ValueError("metric_gauge_v4 requires metric_box_scene_gauge_raw shaped [S,3]")
+    if not isinstance(mean_value, torch.Tensor) or tuple(mean_value.shape) != (3,):
+        raise ValueError(
+            "metric_gauge_v4 requires metric_box_scene_gauge_valid_channel_mean shaped [3]"
+        )
+    gauge_raw = raw_value[int(frame_idx)].detach().cpu().float()
+    gauge_mean = mean_value.detach().cpu().float()
+    expected_effective = torch.where(gauge_valid, gauge_raw, gauge_mean)
+    if not torch.allclose(gauge, expected_effective, atol=1e-6, rtol=0.0):
+        raise ValueError(
+            "metric_gauge_v4 effective gauge does not match raw/valid/production-mean contract"
+        )
+    if str(sample.get("metric_box_scene_gauge_fallback_policy", "")) != (
+        "production_valid_channel_mean_v1"
+    ):
+        raise ValueError("metric_gauge_v4 has an unknown gauge fallback policy")
+    world_to_anchor = _metric_frame_tensor(
+        sample, "metric_box_world_to_anchor", frame_idx, (4, 4)
+    )
+    camera_to_anchor = _metric_frame_tensor(
+        sample, "metric_box_camera_to_anchor", frame_idx, (4, 4)
+    )
+    obj_to_anchor = world_to_anchor @ _to_cpu_float_tensor(obj_to_world)
+
+    intrinsics = sample.get("intrinsics")
+    if not isinstance(intrinsics, torch.Tensor):
+        raise ValueError("metric_gauge_v4 requires raw Waymo intrinsics")
+    intrinsics = intrinsics.detach().cpu().float()
+    if intrinsics.ndim == 4:
+        waymo_k = intrinsics[int(frame_idx), int(view_offset)]
+    elif intrinsics.ndim == 3:
+        if int(intrinsics.shape[0]) == int(sample["cam_ids"].numel()):
+            waymo_k = intrinsics[int(view_offset)]
+        else:
+            waymo_k = intrinsics[int(frame_idx)]
+    elif tuple(intrinsics.shape) == (3, 3):
+        waymo_k = intrinsics
+    else:
+        raise ValueError(f"unsupported raw Waymo intrinsics shape {tuple(intrinsics.shape)}")
+    raw_hw = sample.get("raw_image_size_hw")
+    if not isinstance(raw_hw, torch.Tensor):
+        raise ValueError("metric_gauge_v4 requires raw_image_size_hw")
+    raw_hw = raw_hw.detach().cpu()
+    if raw_hw.ndim == 3:
+        waymo_hw = raw_hw[int(frame_idx), int(view_offset)]
+    elif raw_hw.ndim == 2:
+        if int(raw_hw.shape[0]) == int(sample["cam_ids"].numel()):
+            waymo_hw = raw_hw[int(view_offset)]
+        else:
+            waymo_hw = raw_hw[int(frame_idx)]
+    elif tuple(raw_hw.shape) == (2,):
+        waymo_hw = raw_hw
+    else:
+        raise ValueError(f"unsupported raw Waymo image-size shape {tuple(raw_hw.shape)}")
+
+    source_index = int(frame_idx) * int(sample["cam_ids"].numel()) + int(view_offset)
+    clean_camera_to_world = clean_state.camera_to_world[source_index].detach().cpu().float()
+    camera_to_anchor_dggt = metric_c2w_to_dggt(camera_to_anchor, gauge[0])
+    dggt_anchor_to_world = clean_camera_to_world @ torch.linalg.inv(camera_to_anchor_dggt)
+    return _transform_track_box(
+        obj_to_anchor,
+        box_size,
+        None,
+        mapping_mode=METRIC_BOX_MAPPING_MODE,
+        camera_to_anchor=camera_to_anchor,
+        waymo_intrinsics=waymo_k,
+        waymo_image_hw=waymo_hw,
+        scene_gauge=gauge,
+        dggt_anchor_to_world=dggt_anchor_to_world,
+    )
 
 
 def _extract_foreground_seed(
@@ -827,6 +1098,7 @@ def _points_in_protected_boxes(
 
 def _collect_protected_boxes(
     sample: dict[str, Any],
+    clean_state: CleanSceneState,
     alignment: Sim3Transform,
     target_slot_idx: int,
     frame_idx: int,
@@ -848,10 +1120,14 @@ def _collect_protected_boxes(
         if isinstance(bbox_present, torch.Tensor) and isinstance(bbox_model, torch.Tensor):
             if bool(bbox_present[slot_idx, frame_idx, view_offset].item()):
                 bbox_model_view = bbox_model[slot_idx, frame_idx, view_offset].detach().cpu().float()
-        center, size, rotation = _transform_track_box(
+        center, size, rotation = _transform_sample_track_box(
+            sample,
+            clean_state,
+            alignment,
             sample["object_obj_to_world_selected"][slot_idx, frame_idx],
             sample["object_box_size_selected"][slot_idx, frame_idx],
-            alignment,
+            frame_idx=frame_idx,
+            view_offset=view_offset,
         )
         protected_boxes.append(
             {
@@ -4199,6 +4475,7 @@ def localize_objects(
     asset_cache: dict[str, dict[str, torch.Tensor]] | None = None,
     load_asset: bool = True,
 ) -> list[LocalizedFrameObject]:
+    _box_mapping_mode(sample)
     if dynamic_prob_thresh is None:
         dynamic_prob_thresh = dynamic_thresh
     num_views = int(sample["cam_ids"].numel())
@@ -4274,10 +4551,14 @@ def localize_objects(
             if view_offset is None or target_bbox_model is None:
                 continue
 
-            gt_center, gt_size, gt_rotation = _transform_track_box(
+            gt_center, gt_size, gt_rotation = _transform_sample_track_box(
+                sample,
+                clean_state,
+                alignment,
                 object_obj_to_world[slot_idx, frame_idx],
                 object_box_size[slot_idx, frame_idx],
-                alignment,
+                frame_idx=frame_idx,
+                view_offset=int(view_offset),
             )
             source_front_index = frame_idx * num_views + int(view_offset)
             label_track_rotation = _build_label_track_rotation(gt_rotation, scene_up)
@@ -4581,6 +4862,7 @@ def localize_objects(
 
             protected_boxes = _collect_protected_boxes(
                 sample,
+                clean_state,
                 alignment,
                 target_slot_idx=int(slot_idx),
                 frame_idx=int(frame_idx),

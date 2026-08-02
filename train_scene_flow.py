@@ -18,7 +18,7 @@ import time
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -58,14 +58,27 @@ from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
 from dggt.utils.feature_stats import (
     DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
+    FEATURE_STATS_SCHEMA,
+    FEATURE_STATS_SCHEMA_VERSION,
     checkpoint_sha256,
     load_all_stats_into_buffers,
+    validate_production_stats_coverage,
 )
 from dggt.utils.camera_condition import (
-    camera_summary_from_waymo_gt,
+    camera_condition_from_waymo_metric_target,
     normalize_front_image_hw,
 )
-from dggt.utils.camera_generation import CAMERA_STATS_VERSION
+from dggt.utils.camera_generation import (
+    CAMERA_GENERATION_DIM,
+    CAMERA_GENERATION_REPRESENTATION,
+    CAMERA_STATS_VERSION,
+    CAMERA_TARGET_SOURCE,
+    CAMERA_TARGET_SPACE,
+)
+from dggt.utils.factorized_asset_condition import (
+    FACTORIZED_ASSET_CONDITION_VERSION,
+    PLACEMENT_STATE_DIM,
+)
 from dggt.utils.flow_cache_io import (
     is_chunked_flow_cache,
     load_chunked_flow_cache_subset,
@@ -78,13 +91,28 @@ from dggt.utils.flow_schedule import (
     validate_checkpoint_flow_schedule,
 )
 from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
+from dggt.utils.scene_gauge import (
+    PULLBACK_RENDER_BOUNDARY,
+    PULLBACK_RUNTIME_CONTRACT_VERSION,
+    PullbackCalibration,
+    SCENE_GAUGE_DIM,
+    SCENE_GAUGE_REPRESENTATION,
+    SCENE_GAUGE_STATS_VERSION,
+    apply_pullback_calibration,
+    load_pullback_calibration,
+)
 from dggt.utils.sliding_window import cosine_window, default_window_stride, window_slices
 from dggt.utils.tokens import reattach_special_tokens, replace_selected_levels, select_patch_pyramid
 from dggt.utils.tokenizer_checkpoint import load_scene_tokenizer_checkpoint_strict
+from dggt.utils.tokenizer_window import (
+    decode_tokenizer_windowed,
+    encode_tokenizer_windowed,
+)
 from dggt.utils.validation_cache_naming import validation_asset_condition_kind
 from dggt.utils.validation_rng import make_validation_generator, preserve_validation_rng_state
 from diffusers.training_utils import EMAModel
 from train_scene_flow_pretrain import (
+    PRETRAIN_FEATURE_STATS_CONTRACT_KEY,
     TOKENIZER_LEVELS,
     DEFAULT_SKY_GRID,
     SKY_TOKEN_DIM,
@@ -99,6 +127,7 @@ from train_scene_flow_pretrain import (
     load_dggt_aggregator_and_tokenizer,
     sky_grid_shape,
     split_image_tokens_for_heads,
+    validate_pretrain_feature_stats_contract,
 )
 
 
@@ -106,6 +135,348 @@ FORMAL_FLOW_DOMAIN_VERSION = "hard_binary_edit_domain_v1"
 # All formal caches currently come from the 10 Hz Waymo camera stream. Keep
 # mRoPE time coordinates identical to the factorized pretraining stage.
 FORMAL_SCENE_FPS = 10.0
+FORMAL_DGGT_CONTEXT_LENGTH = 29
+FORMAL_TOKENIZER_WINDOW_LEN = 10
+DEFAULT_FORMAL_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_75e566ef.json"
+FORMAL_METRIC_GAUGE_CONTRACT_SCHEMA = "formal_scene_flow_metric_gauge_contract"
+FORMAL_METRIC_GAUGE_CONTRACT_VERSION = "1.0.0"
+
+METRIC_GAUGE_PROVENANCE_FIELDS = frozenset(
+    {
+        "scene_gauge_representation",
+        "scene_gauge_stats_version",
+        "gauge_table_sha256",
+        "tokenizer_sha256",
+        "dggt_checkpoint_sha256",
+        "pullback_artifact_sha256",
+        "pullback_runtime_contract_version",
+        "pullback_window_len",
+        "pullback_patch_grid_hw",
+        "camera_generation_representation",
+        "camera_target_space",
+        "camera_target_source",
+    }
+)
+
+FORMAL_METRIC_GAUGE_CONTRACT_FIELDS = frozenset(
+    {
+        "schema",
+        "version",
+        "feature_stats_sha256",
+        "dggt_context_length",
+        "camera_gen_dim",
+        "gauge_gen_dim",
+        "placement_state_dim",
+        "factorized_asset_condition_version",
+        "dggt_checkpoint_sha256",
+        "tokenizer_sha256",
+        "gauge_table_sha256",
+        "pullback_artifact_sha256",
+        "pullback_window_len",
+        "pullback_patch_grid_hw",
+    }
+)
+
+
+def _require_sha256(value: Any, *, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{name} must be a lowercase 64-character SHA-256, got {value!r}"
+        )
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError(
+            f"{name} must be a lowercase 64-character SHA-256, got {value!r}"
+        )
+    return value
+
+
+def _config_value(config: Any, field: str) -> Any:
+    if isinstance(config, Mapping):
+        return config.get(field)
+    return getattr(config, field, None)
+
+
+def _require_positive_int(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    return int(value)
+
+
+def _require_patch_grid(value: Any, *, name: str) -> tuple[int, int]:
+    if (
+        not isinstance(value, (list, tuple))
+        or len(value) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in value)
+    ):
+        raise ValueError(f"{name} must contain two positive integers, got {value!r}")
+    return int(value[0]), int(value[1])
+
+
+def validate_metric_gauge_provenance(
+    provenance: Any,
+    *,
+    config: Any,
+    expected_dggt_sha256: str | None = None,
+    expected_tokenizer_sha256: str | None = None,
+    expected_window_len: int = FORMAL_TOKENIZER_WINDOW_LEN,
+    expected_patch_grid: Sequence[int] | None = None,
+) -> dict[str, Any]:
+    """Validate the unchanged 12-field pretrain metric/gauge provenance."""
+
+    if not isinstance(provenance, Mapping):
+        raise ValueError(
+            "checkpoint is missing metric_gauge_provenance; legacy "
+            "camera_dggt_provenance checkpoints are deliberately rejected"
+        )
+    actual_fields = set(provenance)
+    if actual_fields != METRIC_GAUGE_PROVENANCE_FIELDS:
+        raise ValueError(
+            "metric_gauge_provenance does not match the strict 12-field schema: "
+            f"missing={sorted(METRIC_GAUGE_PROVENANCE_FIELDS - actual_fields)}, "
+            f"unknown={sorted(actual_fields - METRIC_GAUGE_PROVENANCE_FIELDS)}"
+        )
+    window_len = _require_positive_int(
+        provenance["pullback_window_len"],
+        name="metric_gauge_provenance.pullback_window_len",
+    )
+    expected_window = _require_positive_int(
+        int(expected_window_len), name="expected_window_len"
+    )
+    artifact_grid = _require_patch_grid(
+        provenance["pullback_patch_grid_hw"],
+        name="metric_gauge_provenance.pullback_patch_grid_hw",
+    )
+    config_grid = _require_patch_grid(
+        _config_value(config, "patch_grid"), name="SceneFlow config patch_grid"
+    )
+    runtime_grid = (
+        config_grid
+        if expected_patch_grid is None
+        else _require_patch_grid(tuple(int(item) for item in expected_patch_grid), name="expected_patch_grid")
+    )
+    if config_grid != runtime_grid:
+        raise ValueError(
+            f"SceneFlow config patch_grid={config_grid} != runtime patch_grid={runtime_grid}"
+        )
+    expected_values = {
+        "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
+        "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
+        "pullback_runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+        "pullback_window_len": expected_window,
+        "pullback_patch_grid_hw": list(runtime_grid),
+        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
+        "camera_target_space": CAMERA_TARGET_SPACE,
+        "camera_target_source": CAMERA_TARGET_SOURCE,
+    }
+    if expected_dggt_sha256 is not None:
+        expected_values["dggt_checkpoint_sha256"] = _require_sha256(
+            expected_dggt_sha256, name="runtime DGGT checkpoint SHA-256"
+        )
+    if expected_tokenizer_sha256 is not None:
+        expected_values["tokenizer_sha256"] = _require_sha256(
+            expected_tokenizer_sha256, name="runtime tokenizer checkpoint SHA-256"
+        )
+    for field, expected in expected_values.items():
+        if provenance[field] != expected:
+            raise ValueError(
+                f"metric_gauge_provenance.{field} mismatch: "
+                f"checkpoint={provenance[field]!r}, expected={expected!r}"
+            )
+    if window_len != expected_window or artifact_grid != runtime_grid:
+        raise AssertionError("unreachable pullback window/grid mismatch")
+    for field in (
+        "gauge_table_sha256",
+        "tokenizer_sha256",
+        "dggt_checkpoint_sha256",
+        "pullback_artifact_sha256",
+    ):
+        _require_sha256(
+            provenance[field], name=f"metric_gauge_provenance.{field}"
+        )
+
+    config_expectations = {
+        "camera_gen_dim": CAMERA_GENERATION_DIM,
+        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
+        "camera_stats_version": CAMERA_STATS_VERSION,
+        "gauge_gen_dim": SCENE_GAUGE_DIM,
+        "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
+        "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
+        "asset_condition_protocol": "factorized_v1",
+        "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
+    }
+    for field, expected in config_expectations.items():
+        actual = _config_value(config, field)
+        if actual != expected:
+            raise ValueError(
+                f"SceneFlow config {field}={actual!r} does not satisfy the v4 "
+                f"metric/gauge contract {expected!r}"
+            )
+    for field in ("placement_mean", "placement_std"):
+        value = _config_value(config, field)
+        if not isinstance(value, (list, tuple)) or len(value) != PLACEMENT_STATE_DIM:
+            raise ValueError(
+                f"SceneFlow config {field} must contain {PLACEMENT_STATE_DIM} values"
+            )
+    return dict(provenance)
+
+
+def build_formal_metric_gauge_contract(
+    provenance: Mapping[str, Any],
+    *,
+    feature_stats_sha256: str,
+) -> dict[str, Any]:
+    """Cross-bind formal-only metadata without changing base provenance."""
+
+    return {
+        "schema": FORMAL_METRIC_GAUGE_CONTRACT_SCHEMA,
+        "version": FORMAL_METRIC_GAUGE_CONTRACT_VERSION,
+        "feature_stats_sha256": _require_sha256(
+            feature_stats_sha256, name="feature-stats SHA-256"
+        ),
+        "dggt_context_length": FORMAL_DGGT_CONTEXT_LENGTH,
+        "camera_gen_dim": CAMERA_GENERATION_DIM,
+        "gauge_gen_dim": SCENE_GAUGE_DIM,
+        "placement_state_dim": PLACEMENT_STATE_DIM,
+        "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
+        "dggt_checkpoint_sha256": provenance["dggt_checkpoint_sha256"],
+        "tokenizer_sha256": provenance["tokenizer_sha256"],
+        "gauge_table_sha256": provenance["gauge_table_sha256"],
+        "pullback_artifact_sha256": provenance["pullback_artifact_sha256"],
+        "pullback_window_len": provenance["pullback_window_len"],
+        "pullback_patch_grid_hw": list(provenance["pullback_patch_grid_hw"]),
+    }
+
+
+def validate_formal_metric_gauge_contract(
+    contract: Any,
+    *,
+    provenance: Mapping[str, Any],
+    expected_feature_stats_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Validate the formal-only cross-binding block with an exact schema."""
+
+    if not isinstance(contract, Mapping):
+        raise ValueError(
+            "formal checkpoint is missing formal_metric_gauge_contract; old formal "
+            "checkpoints are deliberately rejected"
+        )
+    actual_fields = set(contract)
+    if actual_fields != FORMAL_METRIC_GAUGE_CONTRACT_FIELDS:
+        raise ValueError(
+            "formal_metric_gauge_contract does not match the strict schema: "
+            f"missing={sorted(FORMAL_METRIC_GAUGE_CONTRACT_FIELDS - actual_fields)}, "
+            f"unknown={sorted(actual_fields - FORMAL_METRIC_GAUGE_CONTRACT_FIELDS)}"
+        )
+    expected = build_formal_metric_gauge_contract(
+        provenance,
+        feature_stats_sha256=(
+            contract["feature_stats_sha256"]
+            if expected_feature_stats_sha256 is None
+            else expected_feature_stats_sha256
+        ),
+    )
+    for field, expected_value in expected.items():
+        if contract[field] != expected_value:
+            raise ValueError(
+                f"formal_metric_gauge_contract.{field} mismatch: "
+                f"checkpoint={contract[field]!r}, expected={expected_value!r}"
+            )
+    _require_sha256(
+        contract["feature_stats_sha256"],
+        name="formal_metric_gauge_contract.feature_stats_sha256",
+    )
+    return dict(contract)
+
+
+def validate_formal_feature_stats_artifact(
+    path: str | Path,
+    *,
+    provenance: Mapping[str, Any],
+    expected_window_len: int,
+    expected_patch_grid: Sequence[int],
+) -> str:
+    """Validate and hash the exact production feature-stats artifact."""
+
+    stats_path = Path(path)
+    payload = torch.load(stats_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Feature stats at {stats_path} must be a dict")
+    validate_production_stats_coverage(payload)
+    source = payload.get("source")
+    if not isinstance(source, Mapping):
+        raise ValueError("Feature stats are missing source provenance")
+    expected_source = {
+        "sequence_length": int(expected_window_len),
+        "dggt_context_length": FORMAL_DGGT_CONTEXT_LENGTH,
+        "patch_grid": list(_require_patch_grid(tuple(int(v) for v in expected_patch_grid), name="expected_patch_grid")),
+        "tokenizer_checkpoint_sha256": provenance["tokenizer_sha256"],
+        "scene_gauge_table_sha256": provenance["gauge_table_sha256"],
+    }
+    for field, expected in expected_source.items():
+        if source.get(field) != expected:
+            raise ValueError(
+                f"Feature stats source.{field} mismatch: "
+                f"stats={source.get(field)!r}, expected={expected!r}"
+            )
+    top_level_expected = {
+        "stats_schema": FEATURE_STATS_SCHEMA,
+        "stats_schema_version": FEATURE_STATS_SCHEMA_VERSION,
+        "dggt_checkpoint_sha256": provenance["dggt_checkpoint_sha256"],
+        "tokenizer_checkpoint_sha256": provenance["tokenizer_sha256"],
+        "gauge_table_sha256": provenance["gauge_table_sha256"],
+        "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
+        "placement_dim": PLACEMENT_STATE_DIM,
+    }
+    for field, expected in top_level_expected.items():
+        if payload.get(field) != expected:
+            raise ValueError(
+                f"Feature stats {field} mismatch: "
+                f"stats={payload.get(field)!r}, expected={expected!r}"
+            )
+    return checkpoint_sha256(stats_path)
+
+
+def validate_metric_gauge_checkpoint_payload(
+    payload: Any,
+    *,
+    path: str | Path,
+    config: Any,
+    require_formal_contract: bool,
+    expected_dggt_sha256: str | None = None,
+    expected_tokenizer_sha256: str | None = None,
+    expected_feature_stats_sha256: str | None = None,
+    expected_window_len: int = FORMAL_TOKENIZER_WINDOW_LEN,
+    expected_patch_grid: Sequence[int] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Validate base provenance and, for formal checkpoints, its cross-binding."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{path} is not a versioned metric/gauge checkpoint")
+    if "camera_dggt_provenance" in payload:
+        raise ValueError(
+            f"{path} contains legacy camera_dggt_provenance; old checkpoints are deliberately rejected"
+        )
+    provenance = validate_metric_gauge_provenance(
+        payload.get("metric_gauge_provenance"),
+        config=config,
+        expected_dggt_sha256=expected_dggt_sha256,
+        expected_tokenizer_sha256=expected_tokenizer_sha256,
+        expected_window_len=expected_window_len,
+        expected_patch_grid=expected_patch_grid,
+    )
+    raw_contract = payload.get("formal_metric_gauge_contract")
+    if raw_contract is None:
+        if require_formal_contract:
+            raise ValueError(
+                f"{path} is missing formal_metric_gauge_contract; old formal checkpoints are rejected"
+            )
+        return provenance, None
+    contract = validate_formal_metric_gauge_contract(
+        raw_contract,
+        provenance=provenance,
+        expected_feature_stats_sha256=expected_feature_stats_sha256,
+    )
+    return provenance, contract
 
 
 def _asset_condition_kind_from_item(item: dict[str, Any], mode_kind: str) -> str:
@@ -271,30 +642,60 @@ def build_camera_condition_from_waymo_gt(
     image_hw: tuple[int, int] | None = None,
     trajectory_anchor_to_world: torch.Tensor | None = None,
     previous_camera_to_world: torch.Tensor | None = None,
+    anchor_mask: torch.Tensor,
+    scene_flow: nn.Module,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if not torch.is_tensor(camera_to_world) or not torch.is_tensor(intrinsics):
         return None, None
-    return camera_summary_from_waymo_gt(
-        camera_to_world.to(device=device, dtype=torch.float32),
-        intrinsics.to(device=device, dtype=torch.float32),
-        image_hw=image_hw,
-        trajectory_anchor_to_world=(
-            None
-            if not torch.is_tensor(trajectory_anchor_to_world)
-            else trajectory_anchor_to_world.to(device=device, dtype=torch.float32)
-        ),
-        previous_camera_to_world=(
-            None
-            if not torch.is_tensor(previous_camera_to_world)
-            else previous_camera_to_world.to(device=device, dtype=torch.float32)
-        ),
+    if not torch.is_tensor(trajectory_anchor_to_world):
+        raise ValueError(
+            "Formal metric camera conditioning requires trajectory_anchor_to_world"
+        )
+    camera_metric = camera_to_world.to(device=device, dtype=torch.float32)
+    intrinsics_metric = intrinsics.to(device=device, dtype=torch.float32)
+    # A formal cache item is unbatched.  Its common multi-view layout
+    # [S,V,4,4] / [S,V,3,3] is rank-identical to a batched front-camera
+    # [B,S,...] tensor, so resolve that ambiguity at this single-item adapter
+    # before entering the shared helper.
+    if (
+        camera_metric.ndim == 4
+        and intrinsics_metric.ndim == 4
+        and tuple(camera_metric.shape[:2]) == tuple(intrinsics_metric.shape[:2])
+        and int(camera_metric.shape[0]) > 1
+    ):
+        camera_metric = camera_metric[:, 0].unsqueeze(0)
+        intrinsics_metric = intrinsics_metric[:, 0].unsqueeze(0)
+    condition, valid, _, returned_anchor_mask = (
+        camera_condition_from_waymo_metric_target(
+            camera_metric,
+            intrinsics_metric,
+            image_hw=image_hw,
+            trajectory_anchor_to_world=trajectory_anchor_to_world.to(
+                device=device, dtype=torch.float32
+            ),
+            previous_camera_to_world=(
+                None
+                if not torch.is_tensor(previous_camera_to_world)
+                else previous_camera_to_world.to(device=device, dtype=torch.float32)
+            ),
+            anchor_mask=anchor_mask.to(device=device, dtype=torch.bool),
+            normalize_camera=unwrap_ddp(scene_flow).normalize_camera,
+        )
     )
+    expected_anchor_mask = anchor_mask.to(
+        device=returned_anchor_mask.device, dtype=torch.bool
+    )
+    if not torch.equal(returned_anchor_mask, expected_anchor_mask):
+        raise RuntimeError("formal metric camera condition changed global anchor roles")
+    return condition, valid
 
 
 def build_camera_condition_from_sample(
     sample: dict[str, Any],
     *,
     device: torch.device,
+    anchor_mask: torch.Tensor,
+    scene_flow: nn.Module,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     image_hw = normalize_front_image_hw(sample.get("raw_image_size_hw"))
     return build_camera_condition_from_waymo_gt(
@@ -304,6 +705,8 @@ def build_camera_condition_from_sample(
         image_hw=image_hw,
         trajectory_anchor_to_world=sample.get("camera_trajectory_anchor_to_world_corrected"),
         previous_camera_to_world=sample.get("camera_previous_to_world_corrected"),
+        anchor_mask=anchor_mask,
+        scene_flow=scene_flow,
     )
 
 
@@ -484,11 +887,21 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "camera_gen_dim",
     "camera_generation_representation",
     "camera_stats_version",
+    "gauge_gen_dim",
+    "scene_gauge_representation",
+    "scene_gauge_stats_version",
     "camera_condition_representation",
     "mask_compositing_version",
     "asset_position_mode",
+    "asset_condition_protocol",
+    "factorized_asset_condition_version",
+    "placement_mean",
+    "placement_std",
     "sky_rope_temporal_offset",
     "camera_rope_spatial_mode",
+    "sky_mask_head_version",
+    "sky_mask_refine_scale",
+    "sky_mask_refine_channels",
 )
 
 
@@ -506,10 +919,25 @@ def build_scene_flow_from_checkpoint_config(
             "pretrained architecture from a versioned checkpoint."
         )
     config = dict(payload["scene_flow_config"])
-    camera_dim = int(config.get("camera_gen_dim", 2048))
-    config.setdefault("camera_generation_representation", "dggt_hidden_v1" if camera_dim == 2048 else "relative_se3_rot6d_logfov_v2")
-    config.setdefault("asset_position_mode", "localized")
-    config.setdefault("mask_compositing_version", "legacy_hard_mask_v1")
+    is_formal_checkpoint = bool(
+        payload.get("formal_flow_domain_version") is not None
+        or payload.get("formal_metric_gauge_contract") is not None
+    )
+    validate_metric_gauge_checkpoint_payload(
+        payload,
+        path=checkpoint_path,
+        config=config,
+        require_formal_contract=is_formal_checkpoint,
+        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        expected_patch_grid=patch_grid,
+    )
+    if not is_formal_checkpoint:
+        validate_pretrain_feature_stats_contract(
+            payload.get(PRETRAIN_FEATURE_STATS_CONTRACT_KEY),
+            path=checkpoint_path,
+            expected_sequence_length=FORMAL_TOKENIZER_WINDOW_LEN,
+            expected_patch_grid=patch_grid,
+        )
     if tuple(config.get("patch_grid", ())) != tuple(patch_grid):
         raise ValueError(f"checkpoint patch_grid={config.get('patch_grid')} != cache patch_grid={patch_grid}")
     if int(config.get("out_channels", -1)) != int(latent_dim):
@@ -541,13 +969,38 @@ def _config_values_match(current: Any, saved: Any) -> bool:
 def _validate_scene_flow_checkpoint_config(scene_flow: nn.Module, payload: Any, path: str | Path) -> None:
     _validate_scene_flow_prediction_type(scene_flow, payload, path)
     if not isinstance(payload, dict):
-        return
+        raise ValueError(f"{path} is not a versioned metric/gauge SceneFlow checkpoint")
     saved_cfg = payload.get("scene_flow_config")
     if not isinstance(saved_cfg, dict):
-        return
-    if saved_cfg.get("sky_representation_version") != "rgb_patch_v2":
+        raise ValueError(f"{path} is missing scene_flow_config; old checkpoints are rejected")
+    require_formal_contract = bool(
+        payload.get("formal_flow_domain_version") is not None
+        or payload.get("formal_metric_gauge_contract") is not None
+    )
+    provenance, formal_contract = validate_metric_gauge_checkpoint_payload(
+        payload,
+        path=path,
+        config=saved_cfg,
+        require_formal_contract=require_formal_contract,
+        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        expected_patch_grid=saved_cfg.get("patch_grid"),
+    )
+    current_provenance = getattr(unwrap_ddp(scene_flow), "_metric_gauge_provenance", None)
+    if current_provenance is not None and dict(current_provenance) != provenance:
         raise ValueError(
-            f"{path} is not an rgb_patch_v2 sky checkpoint and cannot be resumed directly."
+            f"{path} metric_gauge_provenance does not match the active formal coordinate contract"
+        )
+    current_formal_contract = getattr(
+        unwrap_ddp(scene_flow), "_formal_metric_gauge_contract", None
+    )
+    if current_formal_contract is not None and require_formal_contract:
+        if formal_contract is None or dict(current_formal_contract) != formal_contract:
+            raise ValueError(
+                f"{path} formal_metric_gauge_contract does not match the active formal coordinate contract"
+            )
+    if saved_cfg.get("sky_representation_version") != "rgb_patch_teacher_anchor_v3":
+        raise ValueError(
+            f"{path} is not an rgb_patch_teacher_anchor_v3 sky checkpoint and cannot be resumed directly."
         )
     if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
         raise ValueError(
@@ -606,6 +1059,21 @@ def load_scene_flow_warm_start(
     _validate_scene_flow_checkpoint_config(scene_flow, payload, pretrain_path)
     if args is None:
         raise ValueError("SceneFlow warm-start requires runtime args for flow-schedule validation")
+    stats_contract = validate_pretrain_feature_stats_contract(
+        payload.get(PRETRAIN_FEATURE_STATS_CONTRACT_KEY),
+        path=pretrain_path,
+        expected_feature_stats_sha256=getattr(args, "feature_stats_sha256", None),
+        expected_sequence_length=FORMAL_TOKENIZER_WINDOW_LEN,
+        expected_patch_grid=getattr(unwrap_ddp(scene_flow).config, "patch_grid", None),
+    )
+    # The pretrain checkpoint owns the frozen metric/gauge coordinate system.
+    # Keep the exact validated 12-field block on the formal model so every
+    # later save inherits it verbatim rather than reconstructing provenance
+    # from runtime arguments.
+    sf._metric_gauge_provenance = copy.deepcopy(
+        payload["metric_gauge_provenance"]
+    )
+    sf._pretrain_feature_stats_contract = copy.deepcopy(stats_contract)
     validate_checkpoint_flow_schedule(
         payload,
         args,
@@ -772,10 +1240,21 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--feature_stats_path", type=str, default=str(DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH),
                         help=(
-                            "Latent+camera stats contract; defaults to feature_stats_pretrain_v2.pt. "
+                            "Metric-gauge v4 latent/camera/gauge/placement stats contract; "
+                            "defaults to feature_stats_pretrain_v4.pt. "
                             "The file must exactly match the "
                             "buffers stored in the warm-start/resume checkpoint; mismatches fail fast."
                         ))
+    parser.add_argument(
+        "--pullback_calibration_path",
+        type=str,
+        default=DEFAULT_FORMAL_PULLBACK_CALIBRATION,
+        help=(
+            "Strict checkpoint-bound tokenizer pullback artifact. Formal render/decode "
+            "always executes its explicit identity boundary and rejects a hash, tokenizer, "
+            "DGGT, window, or patch-grid mismatch."
+        ),
+    )
     parser.add_argument(
         "--latent_dim",
         type=int,
@@ -813,6 +1292,16 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Optional independent validation cache root. Enables --val_caption_root.")
     parser.add_argument("--val_caption_root", type=str, default=None,
                         help="Caption root for an independent validation manifest/cache.")
+    parser.add_argument(
+        "--val_scene_gauge_sha256",
+        type=str,
+        default=None,
+        help=(
+            "Trusted scene-gauge table SHA-256 for an independent validation cache. "
+            "Required with --val_manifest_path/--val_cache_root; internal holdout uses "
+            "the training checkpoint provenance."
+        ),
+    )
     parser.add_argument("--val_split", type=str, default="validation")
     parser.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B")
     parser.add_argument("--text_max_length", type=int, default=256)
@@ -1243,6 +1732,7 @@ def _encode_fast_asset_conditions(
     reference: torch.Tensor,
     device: torch.device,
     mode_kind: str = "mode_a",
+    tokenizer_window_len: int = FORMAL_TOKENIZER_WINDOW_LEN,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Encode each asset's 4-level LUT through the tokenizer.
 
@@ -1265,6 +1755,7 @@ def _encode_fast_asset_conditions(
         reference=reference,
         max_assets=5,
         expected_num_levels=4,
+        tokenizer_window_len=int(tokenizer_window_len),
     )
     return out, mask
 
@@ -1494,6 +1985,7 @@ def build_cached_flow_bundle(
     device: torch.device,
     args=None,
     *,
+    scene_flow: nn.Module,
     include_rgb_render_context: bool = False,
 ) -> Any:
     flow_inputs = {
@@ -1529,8 +2021,18 @@ def build_cached_flow_bundle(
 
     if assembler.scene_tokenizer is None:
         raise RuntimeError("FlowFeatureAssembler needs scene_tokenizer for cached SceneFlow inputs.")
-    z_clean = assembler.scene_tokenizer.encode(F_g_lut_scene, patch_grid=assembler.patch_grid)
-    z_splat = assembler.scene_tokenizer.encode(splatted_tok_low, patch_grid=assembler.patch_grid)
+    z_clean = encode_tokenizer_windowed(
+        assembler.scene_tokenizer,
+        F_g_lut_scene,
+        patch_grid=assembler.patch_grid,
+        window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+    )
+    z_splat = encode_tokenizer_windowed(
+        assembler.scene_tokenizer,
+        splatted_tok_low,
+        patch_grid=assembler.patch_grid,
+        window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+    )
 
     M_preserve = flow_inputs["M_preserve"].to(device=device, dtype=torch.float32)
     M_source = flow_inputs["M_source"].to(device=device, dtype=torch.float32)
@@ -1550,6 +2052,13 @@ def build_cached_flow_bundle(
         reference=z_clean,
         device=device,
         mode_kind=mode_kind,
+        tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+    )
+    frame_ids = _frame_ids_from_item(
+        item,
+        seq_len=int(z_clean.shape[1]),
+        device=device,
+        flow_inputs=flow_inputs,
     )
     camera_gt = item.get("camera_gt") or {}
     camera_condition_tokens, camera_attention_mask = build_camera_condition_from_waymo_gt(
@@ -1559,6 +2068,8 @@ def build_cached_flow_bundle(
         image_hw=camera_gt.get("raw_image_size_hw"),
         trajectory_anchor_to_world=camera_gt.get("trajectory_anchor_to_world"),
         previous_camera_to_world=camera_gt.get("previous_camera_to_world"),
+        anchor_mask=frame_ids.eq(0),
+        scene_flow=scene_flow,
     )
     if camera_condition_tokens is None:
         raise RuntimeError(
@@ -1583,7 +2094,7 @@ def build_cached_flow_bundle(
         patch_start_idx=assembler.patch_start_idx,
         splatted_tok_low=splatted_tok_low,
         F_g_lut_scene=F_g_lut_scene,
-        frame_ids=_frame_ids_from_item(item, seq_len=int(z_clean.shape[1]), device=device, flow_inputs=flow_inputs),
+        frame_ids=frame_ids,
     )
     bundle = _attach_sky_tokens_to_bundle(bundle, item, args, device)
     if include_rgb_render_context:
@@ -1597,6 +2108,7 @@ def build_cached_flow_batch_bundle(
     device: torch.device,
     args=None,
     *,
+    scene_flow: nn.Module,
     include_rgb_render_context: bool = False,
 ) -> tuple[Any, list[int], float]:
     if len(items) == 0:
@@ -1620,8 +2132,18 @@ def build_cached_flow_batch_bundle(
 
     if assembler.scene_tokenizer is None:
         raise RuntimeError("FlowFeatureAssembler needs scene_tokenizer for cached SceneFlow inputs.")
-    z_clean = assembler.scene_tokenizer.encode(F_g_lut_scene, patch_grid=assembler.patch_grid)
-    z_splat = assembler.scene_tokenizer.encode(splatted_tok_low, patch_grid=assembler.patch_grid)
+    z_clean = encode_tokenizer_windowed(
+        assembler.scene_tokenizer,
+        F_g_lut_scene,
+        patch_grid=assembler.patch_grid,
+        window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+    )
+    z_splat = encode_tokenizer_windowed(
+        assembler.scene_tokenizer,
+        splatted_tok_low,
+        patch_grid=assembler.patch_grid,
+        window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+    )
 
     flow_inputs = {
         key: torch.cat(
@@ -1657,6 +2179,7 @@ def build_cached_flow_batch_bundle(
             reference=z_clean[len(asset_bundles) : len(asset_bundles) + 1],
             device=device,
             mode_kind=mode_kind,
+            tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
         )
         asset_bundles.append(
             SimpleNamespace(
@@ -1668,9 +2191,18 @@ def build_cached_flow_batch_bundle(
         num_objects += float(len(item_flow_inputs.get("phase4_slots", [])))
     F_asset_tokens, asset_mask = _pad_asset_tokens_for_batch(asset_bundles)
     asset_lengths = [int(bundle.F_asset_tokens.shape[1]) for bundle in asset_bundles]
+    frame_id_rows = [
+        _frame_ids_from_item(
+            item,
+            seq_len=int(z_clean.shape[1]),
+            device=device,
+            flow_inputs=item.get("flow_inputs_cached"),
+        )
+        for item in items
+    ]
     camera_token_rows: list[torch.Tensor] = []
     camera_mask_rows: list[torch.Tensor] = []
-    for item in items:
+    for item, item_frame_ids in zip(items, frame_id_rows):
         camera_gt = item.get("camera_gt") or {}
         camera_tokens_i, camera_mask_i = build_camera_condition_from_waymo_gt(
             camera_gt.get("camera_to_world_corrected"),
@@ -1679,6 +2211,8 @@ def build_cached_flow_batch_bundle(
             image_hw=camera_gt.get("raw_image_size_hw"),
             trajectory_anchor_to_world=camera_gt.get("trajectory_anchor_to_world"),
             previous_camera_to_world=camera_gt.get("previous_camera_to_world"),
+            anchor_mask=item_frame_ids.eq(0),
+            scene_flow=scene_flow,
         )
         if camera_tokens_i is None:
             raise RuntimeError(
@@ -1701,18 +2235,7 @@ def build_cached_flow_batch_bundle(
     # no generated-sky tokens are packed into the SceneFlow sequence.
     sky_gen_clean = None
     sky_gen_attention_mask = None
-    frame_ids = torch.cat(
-        [
-            _frame_ids_from_item(
-                item,
-                seq_len=int(z_clean.shape[1]),
-                device=device,
-                flow_inputs=item.get("flow_inputs_cached"),
-            )
-            for item in items
-        ],
-        dim=0,
-    )
+    frame_ids = torch.cat(frame_id_rows, dim=0)
 
     merged = SimpleNamespace(
         z_clean=z_clean,
@@ -1761,6 +2284,7 @@ def build_flow_bundle(
     device: torch.device,
     args=None,
     *,
+    scene_flow: nn.Module,
     include_rgb_render_context: bool = False,
 ) -> Any:
     if item.get("flow_inputs_cached") is not None:
@@ -1769,6 +2293,7 @@ def build_flow_bundle(
             assembler,
             device,
             args=args,
+            scene_flow=scene_flow,
             include_rgb_render_context=include_rgb_render_context,
         )
 
@@ -1798,7 +2323,18 @@ def build_flow_bundle(
         phase1_localized_lite=phase1_localized_lite,
         splatted_tok_low_cached=splatted_tok_low_cached,
     )
-    camera_condition_tokens, camera_attention_mask = build_camera_condition_from_sample(sample, device=device)
+    frame_ids = _frame_ids_from_item(
+        item,
+        seq_len=int(bundle.z_clean.shape[1]),
+        device=device,
+        sample=sample,
+    )
+    camera_condition_tokens, camera_attention_mask = build_camera_condition_from_sample(
+        sample,
+        device=device,
+        anchor_mask=frame_ids.eq(0),
+        scene_flow=scene_flow,
+    )
     if camera_condition_tokens is None:
         raise RuntimeError(
             f"Formal SceneFlow item {item.get('cache_path', '<unknown>')} "
@@ -1807,7 +2343,7 @@ def build_flow_bundle(
     bundle.camera_condition_tokens = camera_condition_tokens
     bundle.camera_attention_mask = camera_attention_mask
     bundle.captions = [str(item.get("caption", ""))]
-    bundle.frame_ids = _frame_ids_from_item(item, seq_len=int(bundle.z_clean.shape[1]), device=device, sample=sample)
+    bundle.frame_ids = frame_ids
     kind = str(getattr(bundle, "extras", {}).get("asset_condition_kind", mode_kind))
     bundle.asset_condition_kind = _asset_condition_kind_from_item(item, kind)
     bundle = _attach_sky_tokens_to_bundle(bundle, item, args, device)
@@ -1999,6 +2535,24 @@ def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor
     return merged, asset_mask, lengths
 
 
+def require_formal_pullback_calibration(scene_flow: nn.Module) -> PullbackCalibration:
+    """Return the validated formal pullback contract or fail closed.
+
+    Formal editing currently uses the render boundary, which is numerically an
+    identity for tokenizer v1.  Requiring the artifact anyway prevents a later
+    tokenizer or calibration swap from silently bypassing the checkpoint-bound
+    contract merely because today's coefficients happen to be one.
+    """
+
+    calibration = getattr(unwrap_ddp(scene_flow), "_pullback_calibration", None)
+    if not isinstance(calibration, PullbackCalibration):
+        raise RuntimeError(
+            "Formal SceneFlow decode/render requires a validated "
+            "PullbackCalibration attached at startup"
+        )
+    return calibration
+
+
 def _add_formal_rgb_render_loss(
     loss: torch.Tensor,
     metrics: dict[str, float],
@@ -2042,6 +2596,7 @@ def _add_formal_rgb_render_loss(
         sigma,
         float(getattr(args, "rgb_render_sigma_power", 2.0)),
     )
+    pullback_calibration = require_formal_pullback_calibration(scene_flow_root)
     result = compute_rgb_render_loss(
         vggt_model=unwrap_ddp(render_vggt_model),
         scene_flow_root=scene_flow_root,
@@ -2069,6 +2624,7 @@ def _add_formal_rgb_render_loss(
         lpips_model=lpips_model,
         lpips_weight=float(args.rgb_render_lpips_weight),
         loss_sample_weight=sigma_weights,
+        pullback_calibration=pullback_calibration,
     )
     ramp = rgb_render_loss_ramp(args, global_step)
     weighted = float(args.lambda_rgb_render) * float(ramp) * result.loss
@@ -2125,6 +2681,7 @@ def train_step(
                     assembler,
                     device,
                     args=args,
+                    scene_flow=scene_flow,
                     include_rgb_render_context=rgb_render_active,
                 )
                 asset_mask = getattr(bundle, "encoder_attention_mask", None)
@@ -2135,6 +2692,7 @@ def train_step(
                         assembler,
                         device,
                         args=args,
+                        scene_flow=scene_flow,
                         include_rgb_render_context=rgb_render_active,
                     )
                     for single in item
@@ -2313,6 +2871,7 @@ def train_step(
         assembler,
         device,
         args=args,
+        scene_flow=scene_flow,
         include_rgb_render_context=rgb_render_active,
     )
     sf = unwrap_ddp(scene_flow)
@@ -3039,7 +3598,7 @@ def load_validation_visualization_batch(
         subset_payload = subset
 
     if not is_chunked_flow_cache(cache_path):
-        WaymoFlowCacheDataset._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
+        dataset._validate_loaded_payload(payload, cache_path=cache_path, entry=entry)
     sample = dataset._build_sample(payload, subset_payload)
     return _prepare_visualization_batch(
         sample,
@@ -3107,6 +3666,7 @@ def render_validation_rgb_gt_sky(
     render_pose_enc_dggt = _cached_render_pose_from_batch(batch, images, device)
     frames = min(int(args.val_log_images), int(images.shape[1]))
     sf = unwrap_ddp(scene_flow)
+    pullback_calibration = require_formal_pullback_calibration(sf)
     timestamps_raw = batch["timestamps"]
     timestamps = timestamps_raw[0] if torch.is_tensor(timestamps_raw) else torch.as_tensor(timestamps_raw[0])
 
@@ -3121,9 +3681,19 @@ def render_validation_rgb_gt_sky(
         del outputs
 
         tokens_4 = select_patch_pyramid(image_tokens_list, TOKENIZER_LEVELS, patch_start_idx)
-        z_recon = vggt_model.scene_tokenizer.encode(tokens_4, patch_grid=args.patch_grid)
+        z_recon = encode_tokenizer_windowed(
+            vggt_model.scene_tokenizer,
+            tokens_4,
+            patch_grid=args.patch_grid,
+            window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        )
         del tokens_4
-        recon_patch_tokens = vggt_model.scene_tokenizer.decode(z_recon, patch_grid=args.patch_grid)
+        recon_patch_tokens = decode_tokenizer_windowed(
+            vggt_model.scene_tokenizer,
+            z_recon,
+            patch_grid=args.patch_grid,
+            window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        )
         del z_recon
         recon_full_tokens = reattach_special_tokens(
             image_tokens_list,
@@ -3173,6 +3743,8 @@ def render_validation_rgb_gt_sky(
             patch_grid=args.patch_grid,
             patch_start_idx=patch_start_idx,
             image_hw=(int(images.shape[-2]), int(images.shape[-1])),
+            tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+            pullback_calibration=pullback_calibration,
         )
         with torch.amp.autocast(device_type=device.type, enabled=False):
             generated_semantic_logits, _ = vggt_model.semantic_head(
@@ -3220,6 +3792,18 @@ def render_validation_rgb_gt_sky(
             recon_dynamic_conf, _ = vggt_model.instance_head(recon_dino, images, patch_start_idx)
             recon_gs_map, recon_gs_conf = vggt_model.gs_head(recon_image_tokens, images, patch_start_idx)
 
+    recon_pullback = apply_pullback_calibration(
+        recon_depth,
+        recon_gs_map,
+        log_metric_scale=0.0,
+        calibration=pullback_calibration,
+        boundary=PULLBACK_RENDER_BOUNDARY,
+    )
+    if recon_pullback.depth_dggt is not recon_depth or recon_pullback.gs_map_dggt is not recon_gs_map:
+        raise AssertionError("formal tokenizer-recon render pullback must be an exact identity")
+    recon_depth = recon_pullback.depth_dggt
+    recon_gs_map = recon_pullback.gs_map_dggt
+
     del recon_image_tokens, recon_agg, recon_dino
 
     result["tokenizer_recon_3dgs_rgb"] = _render_gs_map_rgb(
@@ -3259,6 +3843,7 @@ def render_validation_generated_rgb_gt_sky(
     render_pose_enc_dggt = _cached_render_pose_from_batch(batch, images, device)
     frames = min(int(args.val_log_images), int(images.shape[1]))
     sf = unwrap_ddp(scene_flow)
+    pullback_calibration = require_formal_pullback_calibration(sf)
     timestamps_raw = batch["timestamps"]
     timestamps = timestamps_raw[0] if torch.is_tensor(timestamps_raw) else torch.as_tensor(timestamps_raw[0])
 
@@ -3273,6 +3858,8 @@ def render_validation_generated_rgb_gt_sky(
             patch_grid=args.patch_grid,
             patch_start_idx=patch_start_idx,
             image_hw=(int(images.shape[-2]), int(images.shape[-1])),
+            tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+            pullback_calibration=pullback_calibration,
         )
         with torch.amp.autocast(device_type=device.type, enabled=False):
             generated_semantic_logits, _ = vggt_model.semantic_head(
@@ -3527,7 +4114,13 @@ def _run_validation_impl(
                     f"{type(exc).__name__}: {exc}",
                     flush=True,
                 )
-            first_bundle = build_flow_bundle(first_item, assembler, device, args=args)
+            first_bundle = build_flow_bundle(
+                first_item,
+                assembler,
+                device,
+                args=args,
+                scene_flow=scene_flow,
+            )
             image_paths = save_validation_images(
                 first_bundle,
                 scene_flow,
@@ -3617,6 +4210,24 @@ def load_resume_checkpoint(
 def main() -> None:
     args = build_argparser().parse_args()
     args.sky_grid = sky_grid_shape(args)
+    if not args.tokenizer_ckpt_path:
+        raise ValueError(
+            "Formal metric/gauge training requires an explicit --tokenizer_ckpt_path "
+            "for content-hash verification"
+        )
+    if not args.feature_stats_path:
+        raise ValueError(
+            "Formal metric/gauge training requires --feature_stats_path"
+        )
+    if not args.pullback_calibration_path:
+        raise ValueError(
+            "Formal metric/gauge training requires --pullback_calibration_path"
+        )
+    if int(args.sequence_length) != FORMAL_TOKENIZER_WINDOW_LEN:
+        raise ValueError(
+            "Formal metric/gauge training must use the checkpoint-bound tokenizer "
+            f"window {FORMAL_TOKENIZER_WINDOW_LEN}, got {args.sequence_length}"
+        )
     if float(args.lambda_rgb_render) < 0.0:
         raise ValueError("--lambda_rgb_render must be non-negative.")
     if float(args.lambda_level_consistency) < 0.0:
@@ -3672,6 +4283,7 @@ def main() -> None:
         include_rgb_training_data=enable_rgb_render_loss,
         require_edit_window=True,
         edit_domain_threshold=args.edit_domain_threshold,
+        require_metric_gauge_provenance=True,
     )
     independent_val = args.val_manifest_path is not None or args.val_cache_root is not None
     val_caption_root = args.val_caption_root
@@ -3693,6 +4305,7 @@ def main() -> None:
             require_edit_window=True,
             edit_domain_threshold=args.edit_domain_threshold,
             deterministic_windows=True,
+            require_metric_gauge_provenance=True,
         )
     else:
         if args.val_caption_root is not None:
@@ -3779,6 +4392,7 @@ def main() -> None:
         H_splat=h_splat,
         W_splat=w_splat,
         scaffold_out_dim=int(args.latent_dim),
+        tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
         editor_kwargs={"use_pose_refine": True},
     ).to(device)
     # Freeze inner editor / soft_mask (no params), scaffold packer trainable.
@@ -3799,23 +4413,80 @@ def main() -> None:
         device=device,
     )
     args.dggt_checkpoint_sha256 = checkpoint_sha256(args.ckpt_path)
+    args.tokenizer_checkpoint_sha256 = checkpoint_sha256(args.tokenizer_ckpt_path)
     architecture_payload = torch.load(architecture_checkpoint, map_location="cpu")
-    provenance = architecture_payload.get("camera_dggt_provenance") if isinstance(architecture_payload, dict) else None
-    recorded_hash = provenance.get("dggt_checkpoint_sha256") if isinstance(provenance, dict) else None
-    if recorded_hash != args.dggt_checkpoint_sha256:
-        raise ValueError(
-            "Formal training DGGT checkpoint does not match the pretrain camera provenance: "
-            f"pretrain={recorded_hash!r}, current={args.dggt_checkpoint_sha256!r}."
+    base_provenance = validate_metric_gauge_provenance(
+        architecture_payload.get("metric_gauge_provenance")
+        if isinstance(architecture_payload, Mapping)
+        else None,
+        config=scene_flow.config,
+        expected_dggt_sha256=args.dggt_checkpoint_sha256,
+        expected_tokenizer_sha256=args.tokenizer_checkpoint_sha256,
+        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        expected_patch_grid=patch_grid,
+    )
+    args.feature_stats_sha256 = validate_formal_feature_stats_artifact(
+        args.feature_stats_path,
+        provenance=base_provenance,
+        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        expected_patch_grid=patch_grid,
+    )
+    base_provenance, existing_formal_contract = validate_metric_gauge_checkpoint_payload(
+        architecture_payload,
+        path=architecture_checkpoint,
+        config=scene_flow.config,
+        require_formal_contract=bool(args.resume_path),
+        expected_dggt_sha256=args.dggt_checkpoint_sha256,
+        expected_tokenizer_sha256=args.tokenizer_checkpoint_sha256,
+        expected_feature_stats_sha256=args.feature_stats_sha256,
+        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        expected_patch_grid=patch_grid,
+    )
+    train_ds.bind_metric_gauge_provenance(
+        expected_scene_gauge_sha256=base_provenance["gauge_table_sha256"],
+        expected_dggt_sha256=args.dggt_checkpoint_sha256,
+    )
+    if val_ds is not None:
+        if independent_val:
+            if args.val_scene_gauge_sha256 is None:
+                raise ValueError(
+                    "Independent formal validation requires --val_scene_gauge_sha256 "
+                    "so its cache provenance is checked against a trusted table."
+                )
+            val_gauge_sha256 = args.val_scene_gauge_sha256
+        else:
+            val_gauge_sha256 = base_provenance["gauge_table_sha256"]
+        val_ds.bind_metric_gauge_provenance(
+            expected_scene_gauge_sha256=val_gauge_sha256,
+            expected_dggt_sha256=args.dggt_checkpoint_sha256,
         )
-    recorded_stats_version = provenance.get("camera_stats_version") if isinstance(provenance, dict) else None
-    if recorded_stats_version != CAMERA_STATS_VERSION:
-        raise ValueError(
-            "Formal training requires global-context camera stats provenance: "
-            f"checkpoint={recorded_stats_version!r}, required={CAMERA_STATS_VERSION!r}."
+    formal_metric_gauge_contract = (
+        existing_formal_contract
+        if existing_formal_contract is not None
+        else build_formal_metric_gauge_contract(
+            base_provenance,
+            feature_stats_sha256=args.feature_stats_sha256,
         )
-    if int(provenance.get("dggt_context_length", 0)) != 29:
-        raise ValueError(
-            "Formal training requires a pretrain checkpoint built from complete 29-frame DGGT context."
+    )
+    pullback_calibration = load_pullback_calibration(
+        args.pullback_calibration_path,
+        tokenizer_checkpoint_path=args.tokenizer_ckpt_path,
+        dggt_checkpoint_path=args.ckpt_path,
+        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        expected_patch_grid=patch_grid,
+        expected_artifact_sha256=base_provenance["pullback_artifact_sha256"],
+    )
+    scene_flow._metric_gauge_provenance = copy.deepcopy(base_provenance)
+    scene_flow._formal_metric_gauge_contract = copy.deepcopy(
+        formal_metric_gauge_contract
+    )
+    scene_flow._pullback_calibration = pullback_calibration
+    if is_main_process():
+        print(
+            "[pullback] verified formal render identity contract "
+            f"{pullback_calibration.path} "
+            f"(sha256={pullback_calibration.artifact_sha256})",
+            flush=True,
         )
     if str(scene_flow.config.asset_position_mode) != str(args.asset_position_mode):
         raise ValueError(
@@ -3897,23 +4568,24 @@ def main() -> None:
         device,
         args,
     )
-    if args.feature_stats_path:
-        load_all_stats_into_buffers(
-            unwrap_ddp(scene_flow),
-            args.feature_stats_path,
-            token_dim=int(args.latent_dim),
-            expected_dggt_sha256=args.dggt_checkpoint_sha256,
-            expected_sequence_length=int(args.sequence_length),
-            require_existing_match=True,
+    load_all_stats_into_buffers(
+        unwrap_ddp(scene_flow),
+        args.feature_stats_path,
+        token_dim=int(args.latent_dim),
+        expected_dggt_sha256=args.dggt_checkpoint_sha256,
+        expected_tokenizer_sha256=args.tokenizer_checkpoint_sha256,
+        expected_scene_gauge_sha256=base_provenance["gauge_table_sha256"],
+        expected_sequence_length=FORMAL_TOKENIZER_WINDOW_LEN,
+        require_existing_match=True,
+    )
+    if is_main_process():
+        checkpoint_kind = "resume" if args.resume_path else "warm-start"
+        print(
+            f"[stats] verified latent+camera+gauge+placement stats against the effective "
+            f"{checkpoint_kind} checkpoint and loaded {args.feature_stats_path} "
+            f"(sha256={args.feature_stats_sha256})",
+            flush=True,
         )
-        stats_sha256 = checkpoint_sha256(args.feature_stats_path)
-        if is_main_process():
-            checkpoint_kind = "resume" if args.resume_path else "warm-start"
-            print(
-                f"[stats] verified latent+camera stats against the effective {checkpoint_kind} "
-                f"checkpoint and loaded {args.feature_stats_path} (sha256={stats_sha256})",
-                flush=True,
-            )
 
     sampler = DistributedSampler(train_ds, shuffle=True) if world_size > 1 else None
     loader = DataLoader(
@@ -4153,13 +4825,27 @@ def _save_checkpoint(
         t_eps=scene_flow_t_eps(sf),
     )
     flow_domain_config = formal_flow_domain_config(args)
-    provenance = {
-        "dggt_checkpoint_sha256": str(args.dggt_checkpoint_sha256),
-        "camera_generation_representation": str(scene_flow_config.get("camera_generation_representation")),
-        "camera_target_source": "frozen_dggt_camera_head",
-        "camera_stats_version": CAMERA_STATS_VERSION,
-        "dggt_context_length": 29,
-    }
+    provenance = copy.deepcopy(getattr(sf, "_metric_gauge_provenance", None))
+    formal_metric_gauge_contract = copy.deepcopy(
+        getattr(sf, "_formal_metric_gauge_contract", None)
+    )
+    provenance = validate_metric_gauge_provenance(
+        provenance,
+        config=scene_flow_config,
+        expected_dggt_sha256=getattr(args, "dggt_checkpoint_sha256", None),
+        expected_tokenizer_sha256=getattr(
+            args, "tokenizer_checkpoint_sha256", None
+        ),
+        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
+        expected_patch_grid=scene_flow_config.get("patch_grid"),
+    )
+    formal_metric_gauge_contract = validate_formal_metric_gauge_contract(
+        formal_metric_gauge_contract,
+        provenance=provenance,
+        expected_feature_stats_sha256=getattr(
+            args, "feature_stats_sha256", None
+        ),
+    )
     state = {
         "step": int(step),
         "scene_flow": scene_flow_state,
@@ -4171,7 +4857,8 @@ def _save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
         "args": vars(args),
-        "camera_dggt_provenance": provenance,
+        "metric_gauge_provenance": provenance,
+        "formal_metric_gauge_contract": formal_metric_gauge_contract,
         "formal_flow_domain_version": FORMAL_FLOW_DOMAIN_VERSION,
         "formal_flow_domain_config": flow_domain_config,
     }
@@ -4182,7 +4869,8 @@ def _save_checkpoint(
             "scaffold_packer": scaffold_packer_state,
             "scene_flow_config": scene_flow_config,
             "flow_schedule_config": flow_schedule_config,
-            "camera_dggt_provenance": provenance,
+            "metric_gauge_provenance": provenance,
+            "formal_metric_gauge_contract": formal_metric_gauge_contract,
             "formal_flow_domain_version": FORMAL_FLOW_DOMAIN_VERSION,
             "formal_flow_domain_config": flow_domain_config,
         },
@@ -4196,7 +4884,8 @@ def _save_checkpoint(
             "flow_schedule_config": flow_schedule_config,
             "step": int(step),
             "is_ema_weights": True,
-            "camera_dggt_provenance": provenance,
+            "metric_gauge_provenance": provenance,
+            "formal_metric_gauge_contract": formal_metric_gauge_contract,
             "formal_flow_domain_version": FORMAL_FLOW_DOMAIN_VERSION,
             "formal_flow_domain_config": flow_domain_config,
         },

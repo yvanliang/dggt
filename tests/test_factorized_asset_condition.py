@@ -9,6 +9,7 @@ import torch.nn as nn
 from dggt.models.canonical_asset_encoder import CanonicalAssetEncoder
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.factorized_asset_condition import (
+    PLACEMENT_STATE_DIM,
     FactorizedAssetCondition,
     alpha_to_patch_mask,
     build_factorized_asset_condition,
@@ -531,8 +532,8 @@ def test_legacy_checkpoint_state_loads_with_new_factorized_parameters_initialize
             del state[key]
     restored = _tiny_model(asset_condition_protocol="legacy_compatible")
     restored.load_state_dict(state, strict=True)
-    assert restored.placement_mean.shape == (12,)
-    assert restored.placement_std.shape == (12,)
+    assert restored.placement_mean.shape == (PLACEMENT_STATE_DIM,)
+    assert restored.placement_std.shape == (PLACEMENT_STATE_DIM,)
 
 
 class _FakeAggregator(nn.Module):

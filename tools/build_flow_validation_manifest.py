@@ -7,7 +7,7 @@ emits a JSONL manifest consumed by
 ``WaymoFlowCacheDataset(manifest_path=...)``. Legacy numeric filenames remain
 readable; if both names exist for one pair, the canonical filename wins.
 
-Only current schema-v9 chunked-zstd SQLite caches are accepted. Legacy caches
+Only current schema-v10 chunked-zstd SQLite caches are accepted. Legacy caches
 or monolithic files are skipped so a manifest cannot silently mix cache
 semantics or physical formats.
 

@@ -12,6 +12,7 @@ import gzip
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -29,17 +30,37 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SQLITE_MAGIC = b"SQLite format 3\x00"
 CHUNKED_FLOW_CACHE_FORMAT = "flow_cache_chunked_zstd_sqlite"
 CHUNKED_FLOW_CACHE_FORMAT_VERSION = 2
-CURRENT_FLOW_CACHE_SCHEMA_VERSION = 9
+CURRENT_FLOW_CACHE_SCHEMA_VERSION = 10
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def is_current_flow_cache_summary(summary: dict[str, Any]) -> bool:
     schema_version = int(summary.get("schema_version", 0))
-    return (
+    base_current = (
         str(summary.get("format", "")) == CHUNKED_FLOW_CACHE_FORMAT
         and int(summary.get("format_version", 0)) == CHUNKED_FLOW_CACHE_FORMAT_VERSION
         and schema_version == CURRENT_FLOW_CACHE_SCHEMA_VERSION
         and str(summary.get("gaussian_time_representation", ""))
         == GAUSSIAN_TIME_REPRESENTATION
+    )
+    if not base_current:
+        return False
+    mapping_mode = summary.get("metric_box_mapping_mode")
+    dggt_sha256 = str(summary.get("dggt_checkpoint_sha256", ""))
+    if mapping_mode not in ("metric_gauge_v4", "generic_sim3"):
+        return False
+    if _SHA256_RE.fullmatch(dggt_sha256) is None:
+        return False
+    table_sha256 = summary.get("scene_gauge_table_sha256")
+    if mapping_mode == "generic_sim3":
+        return table_sha256 is None
+    if _SHA256_RE.fullmatch(str(table_sha256)) is None:
+        return False
+    return (
+        summary.get("metric_box_gauge_fallback_policy")
+        == "production_valid_channel_mean_v1"
+        and isinstance(summary.get("metric_box_gauge_fallback_channel_count"), int)
+        and isinstance(summary.get("metric_box_gauge_fallback_frame_count"), int)
     )
 
 
@@ -303,7 +324,14 @@ def _slice_object_meta_for_frames(obj: dict[str, Any], subset: torch.Tensor) -> 
 
 def _slice_meta_for_frames(meta: dict[str, Any], subset: torch.Tensor) -> dict[str, Any]:
     out = dict(meta)
-    for key in ("frame_indices_scene", "timestamps"):
+    for key in (
+        "frame_indices_scene",
+        "timestamps",
+        "metric_box_scene_gauge",
+        "metric_box_scene_gauge_raw",
+        "metric_box_scene_gauge_valid",
+        "metric_box_scene_gauge_fallback_mask",
+    ):
         value = out.get(key)
         if torch.is_tensor(value) and value.dim() >= 1:
             out[key] = value.index_select(0, subset)
@@ -427,6 +455,14 @@ def save_flow_cache_chunked(
             "num_frames": num_frames,
             "patch_grid": list(meta.get("patch_grid", [])),
             "patch_start_idx": int(meta.get("patch_start_idx", 0)),
+            # Schema v10 binds every cache to the edit-coordinate convention,
+            # scene-gauge table, and DGGT checkpoint that produced it.  Keep
+            # the same values in both the cheap SQLite summary and global/meta
+            # so skip/probe paths cannot silently accept a cache from another
+            # geometry contract.
+            "metric_box_mapping_mode": meta.get("metric_box_mapping_mode"),
+            "scene_gauge_table_sha256": meta.get("scene_gauge_table_sha256"),
+            "dggt_checkpoint_sha256": meta.get("dggt_checkpoint_sha256"),
             "asset_object_keys": asset_keys,
             "asset_num_levels": asset_num_levels,
             "consumers": ["scene_flow", "tokenizer_stage_b"],
@@ -437,6 +473,18 @@ def save_flow_cache_chunked(
                 "pass1.dino_tokens_*",
             ],
         }
+        gauge_fallback_mask = meta.get("metric_box_scene_gauge_fallback_mask")
+        if torch.is_tensor(gauge_fallback_mask):
+            gauge_fallback_mask = gauge_fallback_mask.detach().cpu().to(torch.bool)
+            summary["metric_box_gauge_fallback_channel_count"] = int(
+                gauge_fallback_mask.sum().item()
+            )
+            summary["metric_box_gauge_fallback_frame_count"] = int(
+                gauge_fallback_mask.any(dim=-1).sum().item()
+            )
+            summary["metric_box_gauge_fallback_policy"] = meta.get(
+                "metric_box_scene_gauge_fallback_policy"
+            )
         flow_inputs = pass2.get("flow_inputs") if isinstance(pass2, dict) else None
         if isinstance(flow_inputs, dict):
             summary["has_flow_inputs"] = True
@@ -1093,7 +1141,7 @@ def load_chunked_flow_cache_subset(
                 if not torch.is_tensor(patch_valid_full):
                     raise RuntimeError(
                         f"Mode-A cache asset {obj_key} is missing asset_patch_valid_mask; "
-                        "regenerate the Mode-A cache with schema v9."
+                        "regenerate the Mode-A cache with schema v10."
                     )
                 if patch_valid_full.ndim != 2 or int(patch_valid_full.shape[0]) != int(summary["num_frames"]):
                     raise ValueError(

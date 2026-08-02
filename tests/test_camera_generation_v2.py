@@ -1,27 +1,37 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from dggt.utils.camera_generation import (
-    CAMERA_GENERATION_REPRESENTATION,
     CAMERA_GENERATION_DIM,
+    CAMERA_GENERATION_REPRESENTATION,
+    CAMERA_STATS_VERSION,
+    CAMERA_TARGET_SOURCE,
+    CAMERA_TARGET_SPACE,
     camera_anchor_mask,
     camera_geometry_loss,
-    camera_state_from_dggt_pose_enc,
+    camera_state_from_waymo_c2w,
     decode_camera_trajectory,
+    denormalize_camera_state,
     invert_se3,
     normalize_camera_state,
     rotation_6d_to_matrix,
     rotation_matrix_to_6d,
 )
 from datasets.dataset import WaymoOpenDataset
-from dggt.utils.camera_condition import camera_summary_from_waymo_gt, fov_from_intrinsics
+from dggt.utils.camera_condition import (
+    CAMERA_CONDITION_REPRESENTATION,
+    camera_condition_from_waymo_metric_target,
+    camera_summary_from_waymo_gt,
+    fov_from_intrinsics,
+)
 from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
-from dggt.utils.rotation import mat_to_quat
+from dggt.utils.scene_gauge import assemble_dggt_pose_encoding
 from dggt.models.scene_flow import ChannelScale
 from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
 from dggt.utils.flow_cache_io import _slice_object_meta_for_frames
@@ -38,12 +48,11 @@ from train_scene_flow_pretrain import (
     build_camera_anchor_context_dropout,
     build_pretrain_bundle_from_batch,
     cfg_sample_pretrain_latents,
-    decode_pose_from_camera_features,
+    decode_metric_camera_from_features,
     pretrain_validation_stride,
     pretrain_validation_window_offsets,
     select_rgb_render_rows,
 )
-from tools.compute_pretrain_feature_stats import compute_dggt_stats_single_pass
 
 
 def _trajectory(batch: int = 2, frames: int = 5) -> torch.Tensor:
@@ -62,35 +71,39 @@ def _trajectory(batch: int = 2, frames: int = 5) -> torch.Tensor:
     return c2w
 
 
-def _dggt_pose(c2w: torch.Tensor, fov_xy: torch.Tensor) -> torch.Tensor:
-    w2c = invert_se3(c2w)
-    return torch.cat(
-        (w2c[..., :3, 3], mat_to_quat(w2c[..., :3, :3]), fov_xy[..., 1:2], fov_xy[..., 0:1]),
-        dim=-1,
+def _world_trajectory(batch: int = 2, frames: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    relative = _trajectory(batch=batch, frames=frames)
+    anchor = torch.eye(4).repeat(batch, 1, 1)
+    anchor[..., :3, :3] = relative[:, -1, :3, :3]
+    anchor[..., 0, 3] = torch.linspace(17.0, 23.0, batch)
+    anchor[..., 1, 3] = torch.linspace(-4.0, 2.0, batch)
+    return anchor[:, None] @ relative, anchor
+
+
+def test_camera_v4_waymo_metric_round_trip_and_so3_projection() -> None:
+    c2w, anchor = _world_trajectory()
+    state, anchors = camera_state_from_waymo_c2w(c2w, anchor)
+    decoded = decode_camera_trajectory(
+        state,
+        anchors,
+        trajectory_anchor_to_world=anchor,
     )
 
-
-def test_camera_v2_absolute_relative_round_trip_and_so3_projection() -> None:
-    c2w = _trajectory()
-    intrinsics = torch.eye(3).repeat(2, 5, 1, 1)
-    intrinsics[..., 0, 0] = 600
-    intrinsics[..., 1, 1] = 550
-    intrinsics[..., 0, 2] = 300
-    intrinsics[..., 1, 2] = 245
-    fov_xy = fov_from_intrinsics(intrinsics, (500, 640))
-    pose_enc_dggt = _dggt_pose(c2w, fov_xy)
-    state, anchors = camera_state_from_dggt_pose_enc(pose_enc_dggt)
-    decoded = decode_camera_trajectory(state, anchors)
-
     assert state.shape == (2, 5, CAMERA_GENERATION_DIM)
+    assert CAMERA_GENERATION_DIM == 9
+    assert CAMERA_GENERATION_REPRESENTATION == "waymo_metric_relative_se3_rot6d_v4"
+    assert CAMERA_STATS_VERSION == "waymo_metric_camera_anchor_delta_per_channel_v5_global_context"
+    assert CAMERA_TARGET_SPACE == "waymo_metric_camera_to_world"
+    assert CAMERA_TARGET_SOURCE == "waymo_gt_extrinsics"
     assert torch.allclose(decoded.camera_to_world, c2w, atol=2e-6)
+    assert torch.allclose(decoded.world_to_camera, invert_se3(c2w), atol=2e-6)
     rotation = decoded.camera_to_world[..., :3, :3]
     eye = torch.eye(3)
     assert torch.allclose(rotation.transpose(-1, -2) @ rotation, eye, atol=1e-6)
     assert torch.allclose(torch.det(rotation), torch.ones(2, 5), atol=1e-6)
-    assert (decoded.pose_encoding[..., 3:7].norm(dim=-1) - 1.0).abs().max() < 1e-6
-    assert (decoded.pose_encoding[..., :3] - pose_enc_dggt[..., :3]).abs().max() < 1e-5
-    assert (decoded.pose_encoding[..., 7:] - pose_enc_dggt[..., 7:]).abs().max() < 1e-5
+    expected_first = invert_se3(anchor) @ c2w[:, 0]
+    assert torch.allclose(state[:, 0, :3], expected_first[:, :3, 3], atol=2e-6)
+    assert state.shape[-1] == 9
 
 
 def test_rot6d_round_trip_preserves_rotation_column_convention() -> None:
@@ -109,6 +122,115 @@ def test_principal_point_aware_fov_and_missing_raw_size_error() -> None:
         fov_from_intrinsics(K, None)
 
 
+def test_waymo_condition_delta_half_equals_metric_generation_target() -> None:
+    assert CAMERA_CONDITION_REPRESENTATION == "waymo_metric_rel_delta_rot6d_fov20d_stats_v3"
+    frames = 8
+    c2w = _trajectory(batch=2, frames=frames)
+    anchor = c2w[:, 0]
+    intrinsics = torch.eye(3).view(1, 1, 3, 3).repeat(2, frames, 1, 1)
+    intrinsics[..., 0, 0] = 700.0
+    intrinsics[..., 1, 1] = 680.0
+    intrinsics[..., 0, 2] = 320.0
+    intrinsics[..., 1, 2] = 240.0
+    target, anchors = camera_state_from_waymo_c2w(c2w, anchor)
+    condition, valid = camera_summary_from_waymo_gt(
+        c2w,
+        intrinsics,
+        image_hw=(480, 640),
+        trajectory_anchor_to_world=anchor[:, None],
+    )
+    assert condition.shape == (2, frames, 20)
+    assert valid.all()
+    assert target.shape == (2, frames, 9)
+    assert torch.allclose(condition[..., 9:18], target, atol=2e-6)
+    assert torch.equal(anchors, camera_anchor_mask(2, frames))
+    # FOV is condition-only and remains outside the 9D generation target.
+    assert bool((condition[..., 18:20] > 0).all())
+
+    start = 3
+    window_anchors = anchors[:, start:]
+    previous = torch.cat((c2w[:, start - 1 : start], c2w[:, start:-1]), dim=1)
+    window_target, _ = camera_state_from_waymo_c2w(
+        c2w[:, start:],
+        anchor,
+        previous_camera_to_world=previous[:, 0],
+        anchor_mask=window_anchors,
+    )
+    window_condition, _ = camera_summary_from_waymo_gt(
+        c2w[:, start:],
+        intrinsics[:, start:],
+        image_hw=(480, 640),
+        trajectory_anchor_to_world=anchor[:, None],
+        previous_camera_to_world=previous,
+    )
+    assert torch.allclose(window_condition[..., 9:18], window_target, atol=2e-6)
+
+
+def test_shared_metric_camera_condition_uses_global_role_aware_stats() -> None:
+    frames = 7
+    c2w = _trajectory(batch=1, frames=frames)
+    anchor = c2w[:, 0]
+    intrinsics = torch.eye(3).view(1, 1, 3, 3).repeat(1, frames, 1, 1)
+    intrinsics[..., 0, 0] = 700.0
+    intrinsics[..., 1, 1] = 680.0
+    intrinsics[..., 0, 2] = 320.0
+    intrinsics[..., 1, 2] = 240.0
+    anchor_mean = torch.linspace(-0.4, 0.4, CAMERA_GENERATION_DIM)
+    anchor_std = torch.linspace(0.8, 1.6, CAMERA_GENERATION_DIM)
+    delta_mean = torch.linspace(0.5, -0.5, CAMERA_GENERATION_DIM)
+    delta_std = torch.linspace(1.7, 0.9, CAMERA_GENERATION_DIM)
+
+    def normalize(state: torch.Tensor, roles: torch.Tensor) -> torch.Tensor:
+        return normalize_camera_state(
+            state,
+            roles,
+            anchor_mean,
+            anchor_std,
+            delta_mean,
+            delta_std,
+        )
+
+    roles = camera_anchor_mask(1, frames)
+    condition, valid, target, returned_roles = (
+        camera_condition_from_waymo_metric_target(
+            c2w,
+            intrinsics,
+            image_hw=(480, 640),
+            trajectory_anchor_to_world=anchor,
+            previous_camera_to_world=None,
+            anchor_mask=roles,
+            normalize_camera=normalize,
+        )
+    )
+    torch.testing.assert_close(condition[..., 9:18], normalize(target, roles))
+    assert valid.all()
+    assert torch.equal(returned_roles, roles)
+
+    start = 3
+    delta_only_roles = roles[:, start:]
+    previous = c2w[:, start - 1 : start]
+    window_condition, _, window_target, returned_window_roles = (
+        camera_condition_from_waymo_metric_target(
+            c2w[:, start:],
+            intrinsics[:, start:],
+            image_hw=(480, 640),
+            trajectory_anchor_to_world=anchor,
+            previous_camera_to_world=previous,
+            anchor_mask=delta_only_roles,
+            normalize_camera=normalize,
+        )
+    )
+    torch.testing.assert_close(
+        window_condition[..., 9:18],
+        normalize(window_target, delta_only_roles),
+    )
+    assert torch.equal(returned_window_roles, delta_only_roles)
+    assert not torch.allclose(
+        window_condition[..., 9:18],
+        window_target,
+    )
+
+
 def test_sliding_windows_only_slice_the_global_anchor_mask() -> None:
     mask = camera_anchor_mask(1, 12)
     assert mask[:, :8].tolist() == [[True] + [False] * 7]
@@ -119,17 +241,24 @@ def test_sliding_windows_only_slice_the_global_anchor_mask() -> None:
 
 
 def test_delta_only_window_keeps_global_roles_and_decodes_from_previous_frame() -> None:
-    c2w = _trajectory(batch=1, frames=12)
-    fov = torch.full((1, 12, 2), 1.0)
-    full_state, full_anchors = camera_state_from_dggt_pose_enc(_dggt_pose(c2w, fov))
+    c2w, anchor = _world_trajectory(batch=1, frames=12)
+    full_state, _ = camera_state_from_waymo_c2w(c2w, anchor)
     start, end = 4, 10
-    window_state = full_state[:, start:end]
-    window_anchors = full_anchors[:, start:end]
+    window_anchors = torch.zeros(1, end - start, dtype=torch.bool)
+    window_state, returned_anchors = camera_state_from_waymo_c2w(
+        c2w[:, start:end],
+        anchor,
+        previous_camera_to_world=c2w[:, start - 1],
+        anchor_mask=window_anchors,
+    )
+    assert torch.equal(returned_anchors, window_anchors)
+    assert torch.allclose(window_state, full_state[:, start:end], atol=2e-6)
     assert not bool(window_anchors.any())
     decoded = decode_camera_trajectory(
         window_state,
         window_anchors,
         initial_camera_to_world=c2w[:, start - 1],
+        trajectory_anchor_to_world=anchor,
     )
     assert torch.allclose(decoded.camera_to_world, c2w[:, start:end], atol=2e-6)
     prediction = window_state.clone().requires_grad_(True)
@@ -138,11 +267,73 @@ def test_delta_only_window_keeps_global_roles_and_decodes_from_previous_frame() 
         window_state,
         window_anchors,
         initial_camera_to_world=c2w[:, start - 1],
+        trajectory_anchor_to_world=anchor,
     )
     loss.backward()
     assert loss.item() < 1e-8
     assert all(value.item() < 1e-8 for value in metrics.values())
     assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
+
+
+def test_unbatched_delta_only_window_accepts_per_frame_previous_context() -> None:
+    c2w, anchor = _world_trajectory(batch=1, frames=9)
+    start = 3
+    window = c2w[0, start:]
+    previous = c2w[0, start - 1 : -1]
+    anchors = torch.zeros(window.shape[0], dtype=torch.bool)
+    state, returned = camera_state_from_waymo_c2w(
+        window,
+        anchor[0],
+        previous_camera_to_world=previous,
+        anchor_mask=anchors,
+    )
+    decoded = decode_camera_trajectory(
+        state,
+        returned,
+        initial_camera_to_world=previous[0],
+        trajectory_anchor_to_world=anchor[0],
+    )
+    assert state.shape == (window.shape[0], 9)
+    assert torch.allclose(decoded.camera_to_world, window, atol=2e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_metric_camera_v4_cuda0_roundtrip_condition_and_loss_smoke() -> None:
+    device = torch.device("cuda:0")
+    c2w = _trajectory(batch=2, frames=6).to(device)
+    anchor = c2w[:, 0]
+    state, anchors = camera_state_from_waymo_c2w(c2w, anchor)
+    decoded = decode_camera_trajectory(
+        state,
+        anchors,
+        trajectory_anchor_to_world=anchor,
+    )
+    torch.testing.assert_close(decoded.camera_to_world, c2w, atol=2e-6, rtol=2e-6)
+
+    intrinsics = torch.eye(3, device=device).view(1, 1, 3, 3).repeat(2, 6, 1, 1)
+    intrinsics[..., 0, 0] = 700.0
+    intrinsics[..., 1, 1] = 680.0
+    intrinsics[..., 0, 2] = 320.0
+    intrinsics[..., 1, 2] = 240.0
+    condition, valid = camera_summary_from_waymo_gt(
+        c2w,
+        intrinsics,
+        image_hw=(480, 640),
+        trajectory_anchor_to_world=anchor[:, None],
+    )
+    torch.testing.assert_close(condition[..., 9:18], state, atol=2e-6, rtol=2e-6)
+    assert valid.all()
+
+    prediction = state.detach().clone().requires_grad_(True)
+    loss, metrics = camera_geometry_loss(
+        prediction,
+        state,
+        anchors,
+        trajectory_anchor_to_world=anchor,
+    )
+    loss.backward()
+    assert prediction.grad is not None and bool(torch.isfinite(prediction.grad).all())
+    assert len(metrics) == 6
 
 
 def test_balanced_camera_window_sampling_separates_anchor_and_delta_starts() -> None:
@@ -174,28 +365,32 @@ def test_validation_window_offsets_cover_anchor_and_delta_only_rollout() -> None
 
 
 def test_render_camera_decode_requires_global_roles_and_previous_pose() -> None:
-    c2w = _trajectory(batch=1, frames=12)
-    fov = torch.full((1, 12, 2), 1.0)
-    state, anchors = camera_state_from_dggt_pose_enc(_dggt_pose(c2w, fov))
+    c2w, anchor = _world_trajectory(batch=1, frames=12)
+    state, anchors = camera_state_from_waymo_c2w(c2w, anchor)
 
     with pytest.raises(ValueError, match="global camera_anchor_mask"):
-        decode_pose_from_camera_features(SimpleNamespace(), state[:, 7:])
+        decode_metric_camera_from_features(
+            state[:, 7:], camera_anchor_mask=None  # type: ignore[arg-type]
+        )
 
-    decoded_pose = decode_pose_from_camera_features(
-        SimpleNamespace(),
+    decoded = decode_metric_camera_from_features(
         state[:, 7:],
         camera_anchor_mask=anchors[:, 7:],
         initial_camera_to_world=c2w[:, 6],
+        trajectory_anchor_to_world=anchor,
     )
-    expected_pose = _dggt_pose(c2w[:, 7:], fov[:, 7:])
-    assert torch.allclose(decoded_pose, expected_pose, atol=2e-5)
+    assert torch.allclose(decoded.camera_to_world, c2w[:, 7:], atol=2e-6)
 
 
-def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt() -> None:
+def test_pretrain_bundle_uses_metric_waymo_target_and_matching_condition_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     batch_size, context_frames, window_frames, patches, channels = 2, 29, 10, 2, 4
     full_c2w = _trajectory(batch=batch_size, frames=context_frames)
-    full_fov = torch.full((batch_size, context_frames, 2), 1.0)
-    full_pose = _dggt_pose(full_c2w, full_fov)
+    scene_gauge = torch.tensor(
+        [[0.0, math.log(math.tan(0.5)), math.log(math.tan(0.4))]]
+    ).repeat(batch_size, 1)
+    full_pose = assemble_dggt_pose_encoding(full_c2w, scene_gauge)
 
     class _Tokenizer(torch.nn.Module):
         def __init__(self):
@@ -235,6 +430,10 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
             }
 
     class _SceneFlow(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.register_buffer("gauge_mean", torch.zeros(3))
+
         @staticmethod
         def normalize(value):
             return value
@@ -242,6 +441,10 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
         @staticmethod
         def normalize_camera(value, anchor_mask):
             del anchor_mask
+            return value
+
+        @staticmethod
+        def normalize_gauge(value):
             return value
 
     window_indices = torch.stack((torch.arange(10), torch.arange(7, 17)))
@@ -274,7 +477,12 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
         "raw_image_size_hw": torch.tensor([[2, 2], [2, 2]]),
         "camera_trajectory_anchor_to_world_corrected": full_c2w[:, :1],
         "camera_previous_to_world_corrected": previous_c2w,
-        "pretrain_asset_condition_version": ["factorized_asset_v1"] * batch_size,
+        "metric_lidar_depth_m": torch.full(
+            (batch_size, window_frames, 2, 2), 10.0, dtype=torch.float32
+        ),
+        "scene_gauge": scene_gauge,
+        "scene_gauge_valid": torch.ones(batch_size, 3, dtype=torch.bool),
+        "pretrain_asset_condition_version": ["factorized_asset_v3"] * batch_size,
         "pretrain_asset_source_kind": ["instances_projected"] * batch_size,
         "pretrain_reference_rgb": torch.ones(batch_size, 1, 3, 2, 2),
         "pretrain_reference_alpha": torch.ones(batch_size, 1, 1, 2, 2),
@@ -301,6 +509,16 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
         sky_mask_refine_scale=2,
     )
     scene_flow = _SceneFlow()
+    import train_scene_flow_pretrain as pretrain_entry
+
+    image_transfer_shapes: list[tuple[int, ...]] = []
+    original_images_to_device = pretrain_entry._images_to_device
+
+    def record_images_to_device(images, device):
+        image_transfer_shapes.append(tuple(images.shape))
+        return original_images_to_device(images, device)
+
+    monkeypatch.setattr(pretrain_entry, "_images_to_device", record_images_to_device)
     torch.manual_seed(123)
     bundle = build_pretrain_bundle_from_batch(
         batch,
@@ -315,28 +533,99 @@ def test_pretrain_bundle_slices_latents_and_camera_roles_after_full_context_dggt
         [False] * 10,
     ]
     assert torch.equal(bundle.z_clean_n[:, :, 0, 0], window_indices.float())
+    assert (batch_size, context_frames, 3, 2, 2) in image_transfer_shapes
+    assert (batch_size, window_frames, 3, 2, 2) not in image_transfer_shapes
     assert bundle.F_asset_tokens.shape == (batch_size, 0, channels)
     assert bundle.factorized_asset_condition.appearance_mask.any(dim=-1).all()
 
     scene_flow.eval()
+    batch_without_lidar = dict(batch)
+    batch_without_lidar.pop("metric_lidar_depth_m")
     eval_bundle = build_pretrain_bundle_from_batch(
-        batch,
+        batch_without_lidar,
         _Vggt(),
         scene_flow,
         torch.device("cpu"),
         args,
     )
+    assert eval_bundle.metric_lidar_depth_m is None
+    assert eval_bundle.metric_lidar_depth_valid is None
+    bundle_without_metric_transfer = build_pretrain_bundle_from_batch(
+        batch,
+        _Vggt(),
+        scene_flow,
+        torch.device("cpu"),
+        args,
+        include_metric_depth_diagnostic=False,
+    )
+    assert bundle_without_metric_transfer.metric_lidar_depth_m is None
+    assert bundle_without_metric_transfer.metric_lidar_depth_valid is None
     assert torch.equal(
         eval_bundle.factorized_asset_condition.appearance_tokens,
         bundle.factorized_asset_condition.appearance_tokens,
     )
-    assert torch.allclose(bundle.camera_previous_c2w_dggt[1], full_c2w[1, 6])
+    assert torch.allclose(bundle.camera_previous_c2w_metric[1], full_c2w[1, 6])
+    assert bundle.camera_target_state_metric.shape[-1] == 9
+    assert torch.equal(
+        bundle.camera_condition_tokens[..., 9:18], bundle.camera_target_clean_n
+    )
+    torch.testing.assert_close(
+        bundle.sky_pose_enc_gauge,
+        bundle.render_pose_enc_teacher_gauge,
+        atol=0.0,
+        rtol=0.0,
+    )
+    assert (
+        bundle.sky_pose_enc_gauge.untyped_storage().data_ptr()
+        == bundle.render_pose_enc_teacher_gauge.untyped_storage().data_ptr()
+    )
+
+    invalid_batch = dict(batch)
+    invalid_batch["scene_gauge"] = batch["scene_gauge"].clone()
+    invalid_batch["scene_gauge_valid"] = batch["scene_gauge_valid"].clone()
+    invalid_batch["scene_gauge"][0, 1] = 0.0  # finite sentinel for table JSON null
+    invalid_batch["scene_gauge_valid"][0, 1] = False
+    scene_flow.gauge_mean.copy_(torch.tensor([0.3, -0.7, -0.9]))
+    invalid_bundle = build_pretrain_bundle_from_batch(
+        invalid_batch,
+        _Vggt(),
+        scene_flow,
+        torch.device("cpu"),
+        args,
+    )
+    assert invalid_bundle.scene_gauge_clean[0, 0, 1].item() == 0.0
+    assert invalid_bundle.scene_gauge_effective[0, 0, 1].item() == pytest.approx(-0.7)
+    assert invalid_bundle.scene_gauge_clean_n[0, 0, 1].item() == pytest.approx(-0.7)
+    expected_sky_pose = assemble_dggt_pose_encoding(
+        selected_c2w,
+        invalid_bundle.scene_gauge_effective,
+    )
+    torch.testing.assert_close(invalid_bundle.sky_pose_enc_gauge, expected_sky_pose)
     decoded = decode_camera_trajectory(
-        bundle.camera_target_state_dggt[1:2],
+        bundle.camera_target_state_metric[1:2],
         bundle.camera_gen_anchor_mask[1:2],
-        initial_camera_to_world=bundle.camera_previous_c2w_dggt[1:2],
+        initial_camera_to_world=bundle.camera_previous_c2w_metric[1:2],
+        trajectory_anchor_to_world=bundle.camera_trajectory_anchor_to_world_metric[1:2],
     )
     assert torch.allclose(decoded.camera_to_world, full_c2w[1:2, 7:17], atol=2e-6)
+
+
+def test_production_pretrain_launchers_enable_pinned_memory() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    launchers = (
+        "pretrain_four_nodes.sh",
+        "pretrain_half_node_p6000.sh",
+        "pretrain_ppu.sh",
+        "pretrain_ppu_two_nodes_dlc.sh",
+        "pretrain_single_node.sh",
+        "pretrain_single_node30.sh",
+        "pretrain_three_nodes.sh",
+        "pretrain_two_nodes26.sh",
+        "pretrain_two_nodes31.sh",
+    )
+    for launcher in launchers:
+        source = (repo_root / launcher).read_text(encoding="utf-8")
+        assert "--pin_memory" in source, launcher
 
 
 def test_global_waymo_camera_context_matches_full_trajectory_slice() -> None:
@@ -354,8 +643,8 @@ def test_global_waymo_camera_context_matches_full_trajectory_slice() -> None:
         previous_camera_to_world=c2w[start - 1 : end - 1],
     )
     assert torch.allclose(window, full[:, start:end], atol=1e-6)
-    assert window[0, 0, 0].item() == pytest.approx(0.4)
-    assert window[0, 0, 9].item() == pytest.approx(0.1)
+    assert window[0, 0, 0].item() == pytest.approx(4.0)
+    assert window[0, 0, 9].item() == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -436,50 +725,58 @@ def test_gaussian_time_is_window_length_independent() -> None:
 
 
 def test_gt_camera_prediction_has_zero_geometry_loss_and_gradient() -> None:
-    c2w = _trajectory(batch=1, frames=5)
-    fov = torch.full((1, 5, 2), 1.0)
-    target, anchors = camera_state_from_dggt_pose_enc(_dggt_pose(c2w, fov))
+    c2w, anchor = _world_trajectory(batch=1, frames=5)
+    target, anchors = camera_state_from_waymo_c2w(c2w, anchor)
     prediction = target.clone().requires_grad_(True)
-    loss, metrics = camera_geometry_loss(prediction, target, anchors)
-    loss.backward()
-    assert loss.item() < 1e-8
-    assert all(value.item() < 1e-8 for value in metrics.values())
-    assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
-
-
-def test_camera_geometry_loss_applies_component_weights_to_every_objective() -> None:
-    c2w = _trajectory(batch=1, frames=5)
-    fov = torch.full((1, 5, 2), 1.0)
-    target, anchors = camera_state_from_dggt_pose_enc(_dggt_pose(c2w, fov))
-    prediction = target.clone()
-    prediction[..., :3] += torch.tensor([0.2, -0.1, 0.05])
-    prediction[..., 3:9] += 0.03 * torch.arange(6, dtype=prediction.dtype)
-    prediction[..., 9:11] += torch.tensor([0.04, -0.02])
-
-    absolute_weight, relative_weight, smoothness_weight = 1.3, 0.7, 0.2
-    translation_weight, rotation_weight, fov_weight = 2.0, 3.0, 5.0
     loss, metrics = camera_geometry_loss(
         prediction,
         target,
         anchors,
+        trajectory_anchor_to_world=anchor,
+    )
+    loss.backward()
+    assert loss.item() < 1e-8
+    assert all(value.item() < 1e-8 for value in metrics.values())
+    assert set(metrics) == {
+        "camera_absolute_translation",
+        "camera_absolute_rotation_rad",
+        "camera_relative_translation",
+        "camera_relative_rotation_rad",
+        "camera_acceleration_translation",
+        "camera_acceleration_rotation_rad",
+    }
+    assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
+
+
+def test_camera_geometry_loss_applies_component_weights_to_every_objective() -> None:
+    c2w, anchor = _world_trajectory(batch=1, frames=5)
+    target, anchors = camera_state_from_waymo_c2w(c2w, anchor)
+    prediction = target.clone()
+    prediction[..., :3] += torch.tensor([0.2, -0.1, 0.05])
+    prediction[..., 3:9] += 0.03 * torch.arange(6, dtype=prediction.dtype)
+
+    absolute_weight, relative_weight, smoothness_weight = 1.3, 0.7, 0.2
+    translation_weight, rotation_weight = 2.0, 3.0
+    loss, metrics = camera_geometry_loss(
+        prediction,
+        target,
+        anchors,
+        trajectory_anchor_to_world=anchor,
         absolute_weight=absolute_weight,
         relative_weight=relative_weight,
         smoothness_weight=smoothness_weight,
         translation_weight=translation_weight,
         rotation_weight=rotation_weight,
-        fov_weight=fov_weight,
     )
     expected = absolute_weight * (
         translation_weight * metrics["camera_absolute_translation"]
         + rotation_weight * metrics["camera_absolute_rotation_rad"]
-        + fov_weight * metrics["camera_log_fov"]
     ) + relative_weight * (
         translation_weight * metrics["camera_relative_translation"]
         + rotation_weight * metrics["camera_relative_rotation_rad"]
     ) + smoothness_weight * (
         translation_weight * metrics["camera_acceleration_translation"]
         + rotation_weight * metrics["camera_acceleration_rotation_rad"]
-        + fov_weight * metrics["camera_acceleration_fov"]
     )
     assert torch.allclose(loss, expected)
 
@@ -498,6 +795,15 @@ def test_role_normalization_matches_noise_scale() -> None:
         delta_values.mean(0),
         delta_values.std(0, unbiased=False),
     )
+    restored = denormalize_camera_state(
+        normalized,
+        anchors,
+        anchor_values.mean(0),
+        anchor_values.std(0, unbiased=False),
+        delta_values.mean(0),
+        delta_values.std(0, unbiased=False),
+    )
+    assert torch.allclose(restored, state, atol=1e-6)
     assert normalized[anchors].mean(0).abs().max() < 1e-5
     assert (normalized[anchors].std(0, unbiased=False) - 1).abs().max() < 1e-4
     assert abs(normalized.norm(dim=-1).mean().item() - math.sqrt(CAMERA_GENERATION_DIM)) < 0.3
@@ -623,59 +929,6 @@ def test_checkpoint_stats_contract_rejects_latent_or_camera_mismatch(tmp_path, f
         )
 
 
-def test_stats_single_dggt_forward_streams_latent_and_camera_without_waymo_fields() -> None:
-    class _Model:
-        def __init__(self) -> None:
-            self.calls = 0
-            self.scene_tokenizer = SimpleNamespace(
-                encode=lambda levels, patch_grid: torch.ones(
-                    int(levels[0].shape[0]), int(levels[0].shape[1]), 1, 4
-                )
-            )
-
-            def camera_head(levels):
-                frames = int(levels[0].shape[1])
-                pose = torch.zeros(1, frames, 9)
-                pose[..., 0] = torch.arange(frames, dtype=torch.float32) * 0.1
-                pose[..., 6] = 1.0
-                pose[..., 7] = 1.0
-                pose[..., 8] = 1.1
-                return [pose]
-
-            self.camera_head = camera_head
-
-        def get_aggregator_token_outputs(self, images):
-            self.calls += 1
-            levels = [torch.zeros(1, int(images.shape[1]), 1, 4) for _ in range(24)]
-            return {"aggregated_tokens_list": levels, "image_tokens_list": levels, "patch_start_idx": 0}
-
-    model = _Model()
-    args = SimpleNamespace(
-        latent_dim=4,
-        max_batches=None,
-        require_dynamic_mask=False,
-        precision="fp32",
-        log_every=100,
-    )
-    latent, camera = compute_dggt_stats_single_pass(
-        model,
-        [{
-            "images": torch.zeros(1, 2, 3, 2, 2),
-            "dggt_context_images": torch.zeros(1, 29, 3, 2, 2),
-            "dggt_window_indices": torch.tensor([[27, 28]]),
-        }],
-        args,
-        torch.device("cpu"),
-        compute_latents=True,
-        dggt_checkpoint_sha256="abc",
-    )
-    assert model.calls == 1
-    assert latent is not None and int(latent["count"]) == 2
-    assert int(camera["camera_anchor_count"]) == 1
-    assert int(camera["camera_delta_count"]) == 28
-    validate_camera_stats_provenance(camera, "abc")
-
-
 class _CfgCameraFlow(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -740,7 +993,8 @@ def test_global_text_cfg_does_not_change_camera_when_camera_text_scale_is_one() 
         camera_condition_kind=["camera_uncond"],
         camera_target_clean_n=torch.zeros(1, 3, CAMERA_GENERATION_DIM),
         camera_gen_anchor_mask=anchors,
-        camera_previous_c2w_dggt=torch.eye(4).view(1, 4, 4),
+        camera_previous_c2w_metric=torch.eye(4).view(1, 4, 4),
+        camera_trajectory_anchor_to_world_metric=torch.eye(4).view(1, 4, 4),
         frame_ids=torch.arange(3).view(1, 3),
         captions=["move forward"],
     )
@@ -763,9 +1017,13 @@ def test_global_text_cfg_does_not_change_camera_when_camera_text_scale_is_one() 
         flow, bundle, args, 0, torch.device("cpu"), guidance_scale=4.0,
         text_encoder=_CfgText(), return_camera=True,
     )
-    assert torch.equal(sample_1.camera_state_dggt, sample_4.camera_state_dggt)
+    assert torch.equal(sample_1.camera_state_metric, sample_4.camera_state_metric)
     assert torch.equal(sample_1.camera_anchor_mask, anchors)
-    assert torch.equal(sample_1.camera_initial_c2w_dggt, bundle.camera_previous_c2w_dggt)
+    assert torch.equal(sample_1.camera_initial_c2w_metric, bundle.camera_previous_c2w_metric)
+    assert torch.equal(
+        sample_1.camera_trajectory_anchor_to_world_metric,
+        bundle.camera_trajectory_anchor_to_world_metric,
+    )
     assert not torch.equal(sample_1.video, sample_4.video)
 
 
@@ -788,7 +1046,8 @@ def test_29_frame_sliding_sampler_slices_global_camera_roles() -> None:
         camera_condition_kind=["camera_uncond"],
         camera_target_clean_n=torch.zeros(1, frames, CAMERA_GENERATION_DIM),
         camera_gen_anchor_mask=anchors,
-        camera_previous_c2w_dggt=initial_c2w,
+        camera_previous_c2w_metric=initial_c2w,
+        camera_trajectory_anchor_to_world_metric=torch.eye(4).view(1, 4, 4),
         frame_ids=torch.arange(frames).view(1, frames),
         captions=[""],
     )
@@ -819,4 +1078,4 @@ def test_29_frame_sliding_sampler_slices_global_camera_roles() -> None:
         assert frame_ids.tolist() == [list(range(start, start + 10))]
         assert anchor_mask.tolist() == [([True] + [False] * 9 if start == 0 else [False] * 10)]
     assert torch.equal(sample.camera_anchor_mask, anchors)
-    assert torch.equal(sample.camera_initial_c2w_dggt, initial_c2w)
+    assert torch.equal(sample.camera_initial_c2w_metric, initial_c2w)

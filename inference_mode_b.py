@@ -18,8 +18,10 @@ from datasets.waymo_edit_dataset import (
     WaymoEditDataset,
 )
 from dggt.models.gaussian_scene_editor import GaussianSceneEditor
+from dggt.utils.gaussian_edit import _transform_sample_track_box
 from dggt.utils.gs import concat_list
 from dggt.utils.mode_b_planner import ModeBPlanner, apply_mode_b
+from dggt.utils.scene_gauge import resolve_scene_gauge_checkpoint_sha256
 from inference_scene_editor import (
     _as_homogeneous_viewmats,
     _load_model,
@@ -62,6 +64,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--asset_root", type=str, default=DEFAULT_ASSET_ROOT)
     parser.add_argument("--mode_b_manifest", type=str, default=None)
     parser.add_argument("--mode_b_candidate_path", type=str, default=None)
+    parser.add_argument(
+        "--metric_box_mapping_mode",
+        choices=["metric_gauge_v4", "generic_sim3"],
+        default="metric_gauge_v4",
+    )
+    parser.add_argument("--scene_gauge_path", type=str, default=None)
+    parser.add_argument("--expected_scene_gauge_dggt_sha256", type=str, default=None)
     parser.add_argument("--render_max_points", type=int, default=250000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -112,7 +121,9 @@ def _default_mode_b_candidates(processed_root: str, split: str) -> Path:
     return Path(processed_root) / "waymo_edit_cache" / "metadata" / split / "mode_b_candidates.jsonl"
 
 
-def _collect_existing_objects_dggt(sample: dict[str, Any], alignment) -> list[dict[str, Any]]:
+def _collect_existing_objects_dggt(
+    sample: dict[str, Any], clean_state, alignment
+) -> list[dict[str, Any]]:
     if "object_valid_mask" not in sample or "object_track_valid_mask_selected" not in sample:
         return []
     object_valid = sample["object_valid_mask"].detach().cpu().bool()
@@ -135,10 +146,18 @@ def _collect_existing_objects_dggt(sample: dict[str, Any], alignment) -> list[di
         for frame_idx in range(int(present.shape[0])):
             if bool(present[frame_idx].item()):
                 transform = obj_to_world[slot_idx, frame_idx]
-                center_waymo = transform[:3, 3].view(1, 3)
-                centers.append(alignment.apply_points(center_waymo)[0])
-                rotations.append(alignment.rotation @ transform[:3, :3])
-                sizes.append(box_size[slot_idx, frame_idx] * float(alignment.scale))
+                center, size, rotation = _transform_sample_track_box(
+                    sample,
+                    clean_state,
+                    alignment,
+                    transform,
+                    box_size[slot_idx, frame_idx],
+                    frame_idx=frame_idx,
+                    view_offset=0,
+                )
+                centers.append(center)
+                rotations.append(rotation)
+                sizes.append(size)
             else:
                 centers.append(torch.zeros(3, dtype=torch.float32))
                 rotations.append(torch.eye(3, dtype=torch.float32))
@@ -159,7 +178,12 @@ def _collect_existing_objects_dggt(sample: dict[str, Any], alignment) -> list[di
     return objects
 
 
-def _convert_waymo_existing_objects_to_dggt(raw_objects: list[dict[str, Any]], alignment) -> list[dict[str, Any]]:
+def _convert_waymo_existing_objects_to_dggt(
+    raw_objects: list[dict[str, Any]],
+    sample: dict[str, Any],
+    clean_state,
+    alignment,
+) -> list[dict[str, Any]]:
     objects = []
     for obj in raw_objects:
         obj_to_world_seq = list(obj.get("obj_to_world_waymo", []))
@@ -177,10 +201,18 @@ def _convert_waymo_existing_objects_to_dggt(raw_objects: list[dict[str, Any]], a
             present = bool(present_mask[frame_idx]) if frame_idx < len(present_mask) else False
             if present:
                 transform = torch.tensor(obj_to_world_seq[frame_idx], dtype=torch.float32)
-                center_waymo = transform[:3, 3].view(1, 3)
-                centers.append(alignment.apply_points(center_waymo)[0])
-                rotations.append(alignment.rotation @ transform[:3, :3])
-                sizes.append(torch.tensor(box_size_seq[frame_idx], dtype=torch.float32) * float(alignment.scale))
+                center, size, rotation = _transform_sample_track_box(
+                    sample,
+                    clean_state,
+                    alignment,
+                    transform,
+                    torch.tensor(box_size_seq[frame_idx], dtype=torch.float32),
+                    frame_idx=frame_idx,
+                    view_offset=0,
+                )
+                centers.append(center)
+                rotations.append(rotation)
+                sizes.append(size)
             else:
                 centers.append(torch.zeros(3, dtype=torch.float32))
                 rotations.append(torch.eye(3, dtype=torch.float32))
@@ -479,8 +511,12 @@ def _run_one_sample(
     editor = GaussianSceneEditor()
     clean_state = editor.build_clean_bundle(sample, predictions)
     alignment = editor.align(sample, clean_state)
-    existing_objects = _collect_existing_objects_dggt(sample, alignment)
-    existing_objects.extend(_convert_waymo_existing_objects_to_dggt(record.get("existing_objects", []), alignment))
+    existing_objects = _collect_existing_objects_dggt(sample, clean_state, alignment)
+    existing_objects.extend(
+        _convert_waymo_existing_objects_to_dggt(
+            record.get("existing_objects", []), sample, clean_state, alignment
+        )
+    )
     existing_objects.extend(record.get("existing_objects_dggt", []))
 
     planner_seed = _planner_seed_for_index(args.planner_seed, sample_index)
@@ -910,6 +946,11 @@ def main() -> None:
     args = build_argparser().parse_args()
     torch.manual_seed(args.seed)
 
+    scene_gauge_dggt_sha256 = resolve_scene_gauge_checkpoint_sha256(
+        args.ckpt_path,
+        args.expected_scene_gauge_dggt_sha256,
+    )
+
     root_output_dir = Path(args.output_dir)
     root_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -936,6 +977,9 @@ def main() -> None:
         mode=args.dataset_mode,
         sequence_length=args.sequence_length,
         sample_window=args.sequence_length,
+        metric_box_mapping_mode=args.metric_box_mapping_mode,
+        scene_gauge_path=args.scene_gauge_path,
+        expected_scene_gauge_dggt_sha256=scene_gauge_dggt_sha256,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

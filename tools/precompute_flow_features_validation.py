@@ -8,7 +8,7 @@ decoupled localization ONCE, then derive 5 variant caches:
 * ``deletion`` / ``insertion`` / ``replacement`` / ``repositioning`` --
   single-edit-type caches.
 
-Output (schema-identical to Mode A v9, ``mode_kind="mode_a"``) uses the same
+Output (schema-identical to Mode A v10, ``mode_kind="mode_a"``) uses the same
 six-digit padding as training plus a readable edit suffix:
 
     {out_root}/validation/{entry_index:06d}_{edit_name}.pt
@@ -65,6 +65,7 @@ from dggt.utils.flow_cache_io import (
     save_flow_cache_chunked,
 )
 from dggt.utils.gaussian_time import GAUSSIAN_TIME_REPRESENTATION
+from dggt.utils.scene_gauge import resolve_scene_gauge_checkpoint_sha256
 from dggt.utils.validation_edit_localize import (
     VALIDATION_LOCALIZATION_POLICY,
     VARIANT_SLOTS,
@@ -147,6 +148,18 @@ def _migrate_legacy_validation_cache(
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--ckpt_path", required=True)
+    p.add_argument(
+        "--metric_box_mapping_mode",
+        choices=["metric_gauge_v4"],
+        default="metric_gauge_v4",
+        help="Formal validation caches always use the 29-frame metric gauge.",
+    )
+    p.add_argument(
+        "--scene_gauge_path",
+        default=None,
+        help="Complete validation scene-gauge table (required).",
+    )
+    p.add_argument("--expected_scene_gauge_dggt_sha256", default=None)
     p.add_argument("--out_root", required=True)
     p.add_argument("--asset_root", default=DEFAULT_ASSET_ROOT)
     p.add_argument("--processed_root", default=DEFAULT_PROCESSED_ROOT)
@@ -175,7 +188,7 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Deprecated compatibility flag. Validation now always regenerates existing "
-            "legacy or non-chunked files and only skips current v9 chunked-zstd caches."
+            "legacy or non-chunked files and only skips current v10 chunked-zstd caches."
         ),
     )
     p.add_argument("--asset_batch_size", type=int, default=1)
@@ -187,7 +200,7 @@ def build_argparser() -> argparse.ArgumentParser:
         choices=["chunked_zstd", "gzip", "zstd", "none"],
         default="chunked_zstd",
         help=(
-            "Cache physical format. Default matches current training: schema-v9 "
+            "Cache physical format. Default matches current training: schema-v10 "
             "chunked-zstd SQLite. Legacy monolithic formats are retained only for debugging."
         ),
     )
@@ -203,8 +216,11 @@ def _should_skip_existing_validation_cache(
     path: Path,
     *,
     force_overwrite: bool,
+    expected_mapping_mode: str | None = None,
+    expected_scene_gauge_sha256: str | None = None,
+    expected_dggt_sha256: str | None = None,
 ) -> tuple[bool, str]:
-    """Only reuse a current v9 cache in the current chunked physical format.
+    """Only reuse a current v10 cache in the current chunked physical format.
 
     Validation must not silently retain v6/v7 payloads (which predate the
     finite-fp32 gs_conf and corrected dynamic lifecycle threshold) or an older
@@ -237,6 +253,16 @@ def _should_skip_existing_validation_cache(
         return False, "unreadable_meta"
     if policy != VALIDATION_LOCALIZATION_POLICY:
         return False, f"localization_policy_{policy or 'missing'}"
+    if expected_mapping_mode is not None:
+        expected = {
+            "metric_box_mapping_mode": str(expected_mapping_mode),
+            "scene_gauge_table_sha256": str(expected_scene_gauge_sha256),
+            "dggt_checkpoint_sha256": str(expected_dggt_sha256),
+        }
+        for field, expected_value in expected.items():
+            actual_value = summary.get(field)
+            if actual_value != expected_value:
+                return False, f"provenance_{field}_mismatch"
     return True, f"schema_v{schema_version}_chunked_zstd"
 
 
@@ -308,6 +334,25 @@ def _assemble_payload(
             "cam_ids": sample_cached["cam_ids"].cpu().to(torch.long),
             "timestamps": sample_cached["timestamps"].cpu().to(torch.float32),
             "gaussian_time_representation": GAUSSIAN_TIME_REPRESENTATION,
+            "metric_box_mapping_mode": str(args.metric_box_mapping_mode),
+            "scene_gauge_table_sha256": str(args.scene_gauge_table_sha256),
+            "dggt_checkpoint_sha256": str(args.scene_gauge_dggt_sha256),
+            "metric_box_scene_gauge": sample_cached.get("metric_box_scene_gauge"),
+            "metric_box_scene_gauge_raw": sample_cached.get(
+                "metric_box_scene_gauge_raw"
+            ),
+            "metric_box_scene_gauge_valid": sample_cached.get(
+                "metric_box_scene_gauge_valid"
+            ),
+            "metric_box_scene_gauge_fallback_mask": sample_cached.get(
+                "metric_box_scene_gauge_fallback_mask"
+            ),
+            "metric_box_scene_gauge_valid_channel_mean": sample_cached.get(
+                "metric_box_scene_gauge_valid_channel_mean"
+            ),
+            "metric_box_scene_gauge_fallback_policy": sample_cached.get(
+                "metric_box_scene_gauge_fallback_policy"
+            ),
             "image_size_model_hw": (H_img, W_img),
             "patch_grid": (H_img // 14, W_img // 14),
             "patch_start_idx": patch_start_idx,
@@ -519,6 +564,12 @@ def precompute_one_entry(
 
 def main() -> None:
     args = build_argparser().parse_args()
+    if args.scene_gauge_path is None:
+        raise ValueError("Formal validation cache generation requires --scene_gauge_path")
+    scene_gauge_dggt_sha256 = resolve_scene_gauge_checkpoint_sha256(
+        args.ckpt_path,
+        args.expected_scene_gauge_dggt_sha256,
+    )
     variants = [
         normalize_validation_variant(v.strip())
         for v in args.variants.split(",")
@@ -552,7 +603,12 @@ def main() -> None:
         all_object_info_reposition_root=args.all_object_info_reposition_root,
         asset_root=args.asset_root,
         split=args.split,
+        metric_box_mapping_mode=args.metric_box_mapping_mode,
+        scene_gauge_path=args.scene_gauge_path,
+        expected_scene_gauge_dggt_sha256=scene_gauge_dggt_sha256,
     )
+    args.scene_gauge_dggt_sha256 = scene_gauge_dggt_sha256
+    args.scene_gauge_table_sha256 = dataset.scene_gauge_sha256
     total = len(dataset)
     start = int(args.start) if args.start is not None else 0
     end = int(args.end) if args.end is not None else total
@@ -593,6 +649,9 @@ def main() -> None:
                 skip_existing, skip_reason = _should_skip_existing_validation_cache(
                     out_path,
                     force_overwrite=bool(args.force_overwrite),
+                    expected_mapping_mode=args.metric_box_mapping_mode,
+                    expected_scene_gauge_sha256=args.scene_gauge_table_sha256,
+                    expected_dggt_sha256=args.scene_gauge_dggt_sha256,
                 )
                 if skip_existing:
                     continue

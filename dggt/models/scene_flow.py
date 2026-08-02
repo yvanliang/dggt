@@ -30,8 +30,18 @@ from dggt.utils.camera_generation import (
 )
 from dggt.utils.factorized_asset_condition import (
     FACTORIZED_ASSET_CONDITION_VERSION,
+    PLACEMENT_PASSTHROUGH_CHANNELS,
     PLACEMENT_STATE_DIM,
     FactorizedAssetCondition,
+)
+from dggt.utils.scene_gauge import (
+    GAUGE_MROPE_TEMPORAL_OFFSET,
+    SCENE_GAUGE_DIM,
+    SCENE_GAUGE_REPRESENTATION,
+    SCENE_GAUGE_STATS_STD_FLOOR,
+    SCENE_GAUGE_STATS_VERSION,
+    denormalize_scene_gauge,
+    normalize_scene_gauge,
 )
 
 
@@ -778,6 +788,9 @@ class RAEVideoSceneFlow(nn.Module):
         camera_gen_dim: int = CAMERA_GENERATION_DIM,
         camera_generation_representation: str | None = None,
         camera_stats_version: str = CAMERA_STATS_VERSION,
+        gauge_gen_dim: int = SCENE_GAUGE_DIM,
+        scene_gauge_representation: str = SCENE_GAUGE_REPRESENTATION,
+        scene_gauge_stats_version: str = SCENE_GAUGE_STATS_VERSION,
         camera_condition_representation: str = CAMERA_CONDITION_REPRESENTATION,
         mask_compositing_version: str = "soft_opacity_premultiplied_v2",
         asset_position_mode: str = "localized",
@@ -849,6 +862,20 @@ class RAEVideoSceneFlow(nn.Module):
                 f"camera_condition_representation must be {CAMERA_CONDITION_REPRESENTATION!r}, "
                 f"got {camera_condition_representation!r}"
             )
+        if int(gauge_gen_dim) != SCENE_GAUGE_DIM:
+            raise ValueError(
+                f"scene gauge generation requires gauge_gen_dim={SCENE_GAUGE_DIM}, got {gauge_gen_dim}"
+            )
+        if str(scene_gauge_representation) != SCENE_GAUGE_REPRESENTATION:
+            raise ValueError(
+                "unsupported scene gauge representation "
+                f"{scene_gauge_representation!r}; expected {SCENE_GAUGE_REPRESENTATION!r}"
+            )
+        if str(scene_gauge_stats_version) != SCENE_GAUGE_STATS_VERSION:
+            raise ValueError(
+                "unsupported scene gauge stats version "
+                f"{scene_gauge_stats_version!r}; expected {SCENE_GAUGE_STATS_VERSION!r}"
+            )
         if camera_generation_representation is None:
             camera_generation_representation = (
                 CAMERA_GENERATION_REPRESENTATION
@@ -906,11 +933,12 @@ class RAEVideoSceneFlow(nn.Module):
             if sky_grid_t[0] <= 0 or sky_grid_t[1] <= 0:
                 raise ValueError(f"sky_grid entries must be positive, got {sky_grid_t}")
         if sky_representation_version is None:
-            sky_representation_version = "rgb_patch_v2" if int(sky_token_dim) == 12 else "legacy_rgb_v1"
-        if str(sky_representation_version) == "rgb_patch_v2":
+            sky_representation_version = "rgb_patch_teacher_anchor_v3" if int(sky_token_dim) == 12 else "legacy_rgb_v1"
+        if str(sky_representation_version) == "rgb_patch_teacher_anchor_v3":
             if int(sky_token_dim) != 12 or tuple(int(v) for v in sky_atlas_hw) != (32, 64) or sky_grid_t != (16, 32):
                 raise ValueError(
-                    "rgb_patch_v2 requires sky_token_dim=12, sky_atlas_hw=(32,64), and sky_grid=(16,32)"
+                    "rgb_patch_teacher_anchor_v3 requires sky_token_dim=12, "
+                    "sky_atlas_hw=(32,64), and sky_grid=(16,32)"
                 )
         video_state_dim = int(video_state_dim)
         if video_state_dim != VIDEO_STATE_DIM:
@@ -923,10 +951,14 @@ class RAEVideoSceneFlow(nn.Module):
             )
         if sky_mask_refine_channels <= 0:
             raise ValueError(f"sky_mask_refine_channels must be positive, got {sky_mask_refine_channels}")
-        if float(rope_max_position) <= SKY_MROPE_TEMPORAL_OFFSET + SKY_MROPE_SPHERE_RADIUS:
+        required_rope_position = max(
+            SKY_MROPE_TEMPORAL_OFFSET + SKY_MROPE_SPHERE_RADIUS,
+            float(GAUGE_MROPE_TEMPORAL_OFFSET),
+        )
+        if float(rope_max_position) <= required_rope_position:
             raise ValueError(
-                f"rope_max_position={rope_max_position} must exceed the spherical sky RoPE range ending at "
-                f"{SKY_MROPE_TEMPORAL_OFFSET + SKY_MROPE_SPHERE_RADIUS}"
+                f"rope_max_position={rope_max_position} must exceed all scene-global RoPE positions; "
+                f"required > {required_rope_position}"
             )
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
@@ -1003,6 +1035,9 @@ class RAEVideoSceneFlow(nn.Module):
             camera_gen_dim=int(camera_gen_dim),
             camera_generation_representation=str(camera_generation_representation),
             camera_stats_version=str(camera_stats_version),
+            gauge_gen_dim=int(gauge_gen_dim),
+            scene_gauge_representation=str(scene_gauge_representation),
+            scene_gauge_stats_version=str(scene_gauge_stats_version),
             camera_condition_representation=str(camera_condition_representation),
             mask_compositing_version=str(mask_compositing_version),
             asset_position_mode=str(asset_position_mode),
@@ -1083,6 +1118,14 @@ class RAEVideoSceneFlow(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, int(camera_gen_dim)),
         )
+        self.gauge_gen_norm = ChannelScale(int(gauge_gen_dim))
+        self.gauge_gen_proj = nn.Linear(int(gauge_gen_dim), hidden_size)
+        self.gauge_gen_decoder = nn.Sequential(
+            RMSNorm(hidden_size, eps=float(eps)),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, int(gauge_gen_dim)),
+        )
         # Sky tokens are deterministically packed RGB patch states. Their norm
         # encodes absolute brightness, so RMSNorm across the packed channels
         # would make proportional colors indistinguishable. Retain a
@@ -1114,6 +1157,7 @@ class RAEVideoSceneFlow(nn.Module):
         self.camera_gen_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
         self.camera_gen_role_embed = nn.Embedding(2, hidden_size)
         self.sky_gen_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
+        self.gauge_gen_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
         self.asset_patch_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
         self.asset_summary_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
         self.edit_control_modality_embed = nn.Parameter(torch.randn(1, 1, hidden_size) / math.sqrt(float(hidden_size)))
@@ -1159,6 +1203,9 @@ class RAEVideoSceneFlow(nn.Module):
         self.register_buffer("camera_delta_mean", torch.zeros(int(camera_gen_dim)))
         self.register_buffer("camera_delta_std", torch.ones(int(camera_gen_dim)))
         self.register_buffer("camera_stats_valid", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("gauge_mean", torch.zeros(int(gauge_gen_dim)))
+        self.register_buffer("gauge_std", torch.ones(int(gauge_gen_dim)))
+        self.register_buffer("gauge_stats_valid", torch.tensor(False, dtype=torch.bool))
         self.repa_layer_depth = repa_layer_depth_i
         self.repa_block_idx = repa_layer_depth_i - 1
         self.repa_proj = nn.Sequential(
@@ -1192,6 +1239,7 @@ class RAEVideoSceneFlow(nn.Module):
             self.camera_proj,
             self.camera_gen_proj,
             self.sky_gen_proj,
+            self.gauge_gen_proj,
         ):
             nn.init.xavier_uniform_(module.weight)
             nn.init.zeros_(module.bias)
@@ -1205,6 +1253,10 @@ class RAEVideoSceneFlow(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
         for module in self.sky_gen_decoder:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.zeros_(module.bias)
+        for module in self.gauge_gen_decoder:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
@@ -1225,6 +1277,10 @@ class RAEVideoSceneFlow(nn.Module):
         if isinstance(sky_final, nn.Linear):
             nn.init.zeros_(sky_final.weight)
             nn.init.zeros_(sky_final.bias)
+        gauge_final = self.gauge_gen_decoder[-1]
+        if isinstance(gauge_final, nn.Linear):
+            nn.init.zeros_(gauge_final.weight)
+            nn.init.zeros_(gauge_final.bias)
         sky_mask_final = self.sky_mask_decoder[-1]
         if isinstance(sky_mask_final, nn.Linear):
             nn.init.zeros_(sky_mask_final.weight)
@@ -1412,7 +1468,7 @@ class RAEVideoSceneFlow(nn.Module):
             return
         if not bool(self.camera_stats_valid.item()):
             raise RuntimeError(
-                "DGGT v3 camera generation requires anchor/delta statistics. Recompute them with "
+                "Waymo metric v4 camera generation requires anchor/delta statistics. Recompute them with "
                 "`python tools/compute_pretrain_feature_stats.py ... --output <stats.pt>` and pass "
                 "the resulting file via --feature_stats_path."
             )
@@ -1438,6 +1494,40 @@ class RAEVideoSceneFlow(nn.Module):
             self.camera_delta_mean,
             self.camera_delta_std,
         )
+
+    def set_gauge_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        expected = (SCENE_GAUGE_DIM,)
+        mean_t = torch.as_tensor(mean)
+        std_t = torch.as_tensor(std)
+        if tuple(mean_t.shape) != expected or not bool(torch.isfinite(mean_t).all()):
+            raise ValueError(f"gauge_mean must be finite with shape {expected}, got {tuple(mean_t.shape)}")
+        if tuple(std_t.shape) != expected or not bool(torch.isfinite(std_t).all()):
+            raise ValueError(f"gauge_std must be finite with shape {expected}, got {tuple(std_t.shape)}")
+        if bool((std_t <= 0).any()):
+            raise ValueError("gauge_std must be strictly positive")
+        self.gauge_mean.copy_(mean_t.to(device=self.gauge_mean.device, dtype=self.gauge_mean.dtype))
+        self.gauge_std.copy_(
+            std_t.to(device=self.gauge_std.device, dtype=self.gauge_std.dtype).clamp_min(
+                SCENE_GAUGE_STATS_STD_FLOOR
+            )
+        )
+        self.gauge_stats_valid.fill_(True)
+
+    def require_gauge_stats(self) -> None:
+        if not bool(self.gauge_stats_valid.item()):
+            raise RuntimeError(
+                "Scene gauge generation requires per-channel statistics. Recompute them with "
+                "`python tools/compute_pretrain_feature_stats.py ... --scene_gauge_path <table> "
+                "--output <stats.pt>` and pass --feature_stats_path."
+            )
+
+    def normalize_gauge(self, gauge: torch.Tensor) -> torch.Tensor:
+        self.require_gauge_stats()
+        return normalize_scene_gauge(gauge, self.gauge_mean, self.gauge_std)
+
+    def denormalize_gauge(self, normalized: torch.Tensor) -> torch.Tensor:
+        self.require_gauge_stats()
+        return denormalize_scene_gauge(normalized, self.gauge_mean, self.gauge_std)
 
     def normalize(self, z: torch.Tensor) -> torch.Tensor:
         return (z - self.mu_z.to(device=z.device, dtype=z.dtype)) / self.sigma_z.to(
@@ -1470,10 +1560,11 @@ class RAEVideoSceneFlow(nn.Module):
         mean = self.placement_mean.to(device=state.device, dtype=state.dtype)
         std = self.placement_std.to(device=state.device, dtype=state.dtype).clamp_min(1.0e-6)
         normalized = (state - mean) / std
-        # Yaw sin/cos and the binary frustum flag retain their natural scales.
+        # All dimensionless direction/ratio/angle/boolean channels retain
+        # their natural scales; only the five metric log channels use stats.
         normalized = normalized.clone()
-        normalized[..., 6:8] = state[..., 6:8]
-        normalized[..., 11] = state[..., 11]
+        passthrough = list(PLACEMENT_PASSTHROUGH_CHANNELS)
+        normalized[..., passthrough] = state[..., passthrough]
         return normalized
 
     @staticmethod
@@ -1924,7 +2015,7 @@ class RAEVideoSceneFlow(nn.Module):
         track_valid = condition.track_valid.to(device=device, dtype=torch.bool)
         source_valid = appearance_mask.any(dim=-1)
         track_valid = track_valid & source_valid.unsqueeze(-1)
-        in_frustum = condition.placement_state[..., 11].to(device=device).gt(0.5)
+        in_frustum = condition.placement_state[..., 15].to(device=device).gt(0.5)
 
         appearance = self.asset_latent_proj(
             self.asset_latent_norm(condition.appearance_tokens)
@@ -2784,6 +2875,16 @@ class RAEVideoSceneFlow(nn.Module):
         pos = center + SKY_MROPE_SPHERE_RADIUS * direction
         return pos.view(1, num_tokens, 3).expand(batch_size, -1, -1).contiguous()
 
+    def _gauge_position_ids(self, *, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Return the single scene-global gauge coordinate outside video/sky ranges."""
+
+        return torch.full(
+            (int(batch_size), 1, 3),
+            int(GAUGE_MROPE_TEMPORAL_OFFSET),
+            device=device,
+            dtype=torch.long,
+        )
+
     def _build_camera_condition(
         self,
         z_t: torch.Tensor,
@@ -2892,7 +2993,7 @@ class RAEVideoSceneFlow(nn.Module):
         tokens = tokens + self.camera_gen_modality_embed.to(device=tokens.device, dtype=tokens.dtype)
         if str(self.config.camera_generation_representation) == CAMERA_GENERATION_REPRESENTATION:
             if camera_gen_anchor_mask is None:
-                raise ValueError("camera_gen_anchor_mask is required for DGGT v3 camera generation")
+                raise ValueError("camera_gen_anchor_mask is required for Waymo metric v4 camera generation")
             roles = camera_gen_anchor_mask.to(device=z_t.device, dtype=torch.bool)
             if roles.shape != (b, s):
                 raise ValueError(f"camera_gen_anchor_mask shape {tuple(roles.shape)} != {(b, s)}")
@@ -2947,6 +3048,41 @@ class RAEVideoSceneFlow(nn.Module):
         tokens = tokens * mask.to(device=tokens.device, dtype=tokens.dtype).unsqueeze(-1)
         pos = self._sky_position_ids(batch_size=b, num_tokens=k, device=z_t.device)
         return tokens, mask, pos
+
+    def _build_gauge_generation(
+        self,
+        z_t: torch.Tensor,
+        gauge_gen_tokens: torch.Tensor | None,
+        gauge_gen_attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Embed one scene-global gauge token, independent of video length."""
+
+        b = int(z_t.shape[0])
+        hidden_size = int(self.config.hidden_size)
+        if gauge_gen_tokens is None:
+            empty_tokens = z_t.new_zeros((b, 0, hidden_size))
+            empty_pos = torch.zeros((b, 0, 3), device=z_t.device, dtype=torch.long)
+            return empty_tokens, None, empty_pos
+        if tuple(gauge_gen_tokens.shape) != (b, 1, int(self.config.gauge_gen_dim)):
+            raise ValueError(
+                "gauge_gen_tokens must be scene-global [B,1,3], got "
+                f"{tuple(gauge_gen_tokens.shape)}"
+            )
+        if not bool(torch.isfinite(gauge_gen_tokens).all()):
+            raise ValueError("scene gauge generation tokens contain non-finite values")
+        gauge_dtype = self.gauge_gen_proj.weight.dtype
+        tokens = self.gauge_gen_proj(
+            self.gauge_gen_norm(gauge_gen_tokens).to(dtype=gauge_dtype)
+        )
+        tokens = tokens + self.gauge_gen_modality_embed.to(device=tokens.device, dtype=tokens.dtype)
+        if gauge_gen_attention_mask is None:
+            mask = torch.ones((b, 1), device=z_t.device, dtype=torch.bool)
+        else:
+            mask = gauge_gen_attention_mask.to(device=z_t.device, dtype=torch.bool)
+            if tuple(mask.shape) != (b, 1):
+                raise ValueError(f"gauge_gen_attention_mask must be [B,1], got {tuple(mask.shape)}")
+        tokens = tokens * mask.to(device=tokens.device, dtype=tokens.dtype).unsqueeze(-1)
+        return tokens, mask, self._gauge_position_ids(batch_size=b, device=z_t.device)
 
     def _dilate_edit_mask(self, M_edit: torch.Tensor, patch_grid: tuple[int, int], radius: int) -> torch.Tensor:
         if radius <= 0:
@@ -3064,6 +3200,8 @@ class RAEVideoSceneFlow(nn.Module):
         camera_gen_anchor_mask: torch.Tensor | None = None,
         sky_gen_tokens: torch.Tensor | None = None,
         sky_gen_attention_mask: torch.Tensor | None = None,
+        gauge_gen_tokens: torch.Tensor | None = None,
+        gauge_gen_attention_mask: torch.Tensor | None = None,
         return_base: bool = False,
         asset_condition_kind: Any = None,
         camera_condition_kind: Any = None,
@@ -3134,6 +3272,11 @@ class RAEVideoSceneFlow(nn.Module):
             sky_gen_tokens,
             sky_gen_attention_mask,
         )
+        gauge_gen_seq, gauge_gen_mask, gauge_gen_pos = self._build_gauge_generation(
+            z_t,
+            gauge_gen_tokens,
+            gauge_gen_attention_mask,
+        )
         if factorized_asset_condition is not None:
             if encoder_attention_mask is not None and bool(
                 torch.as_tensor(encoder_attention_mask).any().item()
@@ -3192,6 +3335,8 @@ class RAEVideoSceneFlow(nn.Module):
             camera_gen_mask = torch.ones((b, camera_gen_seq.shape[1]), device=z_t.device, dtype=torch.bool)
         if sky_gen_mask is None and sky_gen_seq.shape[1] > 0:
             sky_gen_mask = torch.ones((b, sky_gen_seq.shape[1]), device=z_t.device, dtype=torch.bool)
+        if gauge_gen_mask is None and gauge_gen_seq.shape[1] > 0:
+            gauge_gen_mask = torch.ones((b, gauge_gen_seq.shape[1]), device=z_t.device, dtype=torch.bool)
         if asset_mask is None and asset_seq.shape[1] > 0:
             asset_mask = torch.ones((b, asset_seq.shape[1]), device=z_t.device, dtype=torch.bool)
         if control_mask is None and control_seq.shape[1] > 0:
@@ -3204,6 +3349,8 @@ class RAEVideoSceneFlow(nn.Module):
             camera_gen_mask = torch.ones((b, camera_gen_seq.shape[1]), device=z_t.device, dtype=torch.bool)
         if sky_gen_mask is None:
             sky_gen_mask = torch.ones((b, sky_gen_seq.shape[1]), device=z_t.device, dtype=torch.bool)
+        if gauge_gen_mask is None:
+            gauge_gen_mask = torch.ones((b, gauge_gen_seq.shape[1]), device=z_t.device, dtype=torch.bool)
         if asset_mask is None:
             asset_mask = torch.ones((b, asset_seq.shape[1]), device=z_t.device, dtype=torch.bool)
         if control_mask is None:
@@ -3239,6 +3386,7 @@ class RAEVideoSceneFlow(nn.Module):
                 video_seq,
                 camera_gen_seq.to(dtype=video_seq.dtype),
                 sky_gen_seq.to(dtype=video_seq.dtype),
+                gauge_gen_seq.to(dtype=video_seq.dtype),
             ],
             dim=1,
         )
@@ -3247,7 +3395,9 @@ class RAEVideoSceneFlow(nn.Module):
             gen_mask = torch.cat([gen_mask, camera_gen_mask], dim=1)
         if sky_gen_mask.shape[1] > 0:
             gen_mask = torch.cat([gen_mask, sky_gen_mask], dim=1)
-        gen_pos = torch.cat([target_pos, camera_gen_pos, sky_gen_pos], dim=1)
+        if gauge_gen_mask.shape[1] > 0:
+            gen_mask = torch.cat([gen_mask, gauge_gen_mask], dim=1)
+        gen_pos = torch.cat([target_pos, camera_gen_pos, sky_gen_pos, gauge_gen_pos], dim=1)
         full_seq = torch.cat([gen_seq, cond_seq], dim=1)
         full_pos = torch.cat([gen_pos, cond_pos], dim=1)
         if full_pos.numel():
@@ -3280,8 +3430,10 @@ class RAEVideoSceneFlow(nn.Module):
         video_len = s * p
         camera_gen_len = int(camera_gen_seq.shape[1])
         sky_gen_len = int(sky_gen_seq.shape[1])
+        gauge_gen_len = int(gauge_gen_seq.shape[1])
         camera_hidden = None
         sky_hidden = None
+        gauge_hidden = None
         for idx, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 full_seq = torch.utils.checkpoint.checkpoint(
@@ -3307,7 +3459,19 @@ class RAEVideoSceneFlow(nn.Module):
         if sky_gen_len > 0:
             sky_start = video_len + camera_gen_len
             sky_hidden = full_seq[:, sky_start : sky_start + sky_gen_len]
-        cond = self.s_projector(F.silu(enc_video + t_base.to(dtype=enc_video.dtype)))
+        if gauge_gen_len > 0:
+            gauge_start = video_len + camera_gen_len + sky_gen_len
+            gauge_hidden = full_seq[:, gauge_start : gauge_start + gauge_gen_len]
+        gauge_context = enc_video.new_zeros((b, 1, int(self.config.hidden_size)))
+        if gauge_hidden is not None:
+            gauge_context = gauge_hidden
+        cond = self.s_projector(
+            F.silu(
+                enc_video
+                + t_base.to(dtype=enc_video.dtype)
+                + gauge_context.to(dtype=enc_video.dtype)
+            )
+        )
         dec_rope = VideoRoPE3D(
             seq_len=s,
             patch_grid=patch_grid,
@@ -3336,6 +3500,10 @@ class RAEVideoSceneFlow(nn.Module):
         if sky_hidden is not None:
             sky_cond = F.silu(sky_hidden + t_base.to(dtype=sky_hidden.dtype))
             sky_out = self.sky_gen_decoder(sky_cond).reshape(b, sky_gen_len, int(self.config.sky_token_dim))
+        gauge_out = None
+        if gauge_hidden is not None:
+            gauge_cond = F.silu(gauge_hidden + t_base.to(dtype=gauge_hidden.dtype))
+            gauge_out = self.gauge_gen_decoder(gauge_cond).reshape(b, 1, int(self.config.gauge_gen_dim))
         sky_mask_logits = None
         sky_mask_refined_logits = None
         if return_sky_mask:
@@ -3366,6 +3534,8 @@ class RAEVideoSceneFlow(nn.Module):
                 result["camera"] = camera_out
             if sky_out is not None:
                 result["sky"] = sky_out
+            if gauge_out is not None:
+                result["gauge"] = gauge_out
             result["sky_mask_logits"] = sky_mask_logits
             result["sky_mask_refined_logits"] = sky_mask_refined_logits
             if return_mid:
@@ -3379,10 +3549,18 @@ class RAEVideoSceneFlow(nn.Module):
             return model_out, self.repa_proj(mid_feat).reshape(b, s, p, int(self.config.out_channels))
         if camera_out is not None:
             if sky_out is not None:
+                if gauge_out is not None:
+                    return model_out, camera_out, sky_out, gauge_out
                 return model_out, camera_out, sky_out
+            if gauge_out is not None:
+                return model_out, camera_out, gauge_out
             return model_out, camera_out
         if sky_out is not None:
+            if gauge_out is not None:
+                return model_out, sky_out, gauge_out
             return model_out, sky_out
+        if gauge_out is not None:
+            return model_out, gauge_out
         return model_out
 
     @torch.no_grad()

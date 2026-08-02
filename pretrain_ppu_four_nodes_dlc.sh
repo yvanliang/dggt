@@ -41,7 +41,7 @@ export EXPECTED_GLOBAL_BATCH_SIZE=64
 # 与双机任务分开保存每个 DLC 节点的 torchrun 启动日志。
 export LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_dlc_four_nodes_launch}"
 
-# 沿用 v3 的训练任务名称；公共启动器固定从 step 0 开始且 wandb 不 resume。
-export WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v3}"
+# metric-gauge v4 固定从 step 0 开始，公共启动器不会 resume 旧 run。
+export WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v4}"
 
 exec bash "${BASE_DLC_LAUNCHER}"

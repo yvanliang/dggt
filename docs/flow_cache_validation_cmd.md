@@ -3,7 +3,7 @@
 本文档介绍 FlowDGGT **validation** 离线缓存的生成。它与 `docs/flow_cache_cmd.md`
 的当前 training Mode A 共享**完全相同的逻辑与物理格式**：
 
-* 逻辑 schema：`schema_version=9`、`mode_kind="mode_a"`；
+* 逻辑 schema：`schema_version=10`、`mode_kind="mode_a"`；
 * 物理格式：chunked-zstd SQLite container，文件扩展名仍为 `.pt`；
 * chunked format：当前为 `format_version=2`，Mode-A asset LUT 保存完整 4 levels；
 * 读取入口：`dggt.utils.flow_cache_io`，不要直接假定是普通 `torch.save` 文件。
@@ -11,13 +11,30 @@
 因此下游 `WaymoFlowCacheDataset` / `FlowFeatureAssembler` / `SceneFlowMatching`
 可零改动消费。
 
-v8 同时包含旧版本问题的修复：
+当前 v10 保留了旧版本问题的修复，并新增强制 geometry provenance：
 
 * v7 修复：`pass1.gs_conf` 以 finite fp32 保存，避免 v6 的 fp16 `inf` 溢出；
 * v8 修复：pass2 splat 使用与当前 training 一致的动态 Gaussian 生命周期阈值
   `sigmoid(0.5)`，不再使用旧的 `0.5` 概率阈值；
-* validation 生成器只复用已有的当前 v9 chunked cache。已有旧 schema、旧 chunked
-  format v1 或 monolithic v8 文件会默认自动重算，避免静默混用旧数据。
+* v9 asset patch mask 契约仍保留；Mode-A 缺少 `alpha_max_t005_v1` mask 会被拒绝。
+* v10 在 payload `meta` 与 SQLite summary 中同时写入
+  `metric_box_mapping_mode=metric_gauge_v4`、validation scene-gauge 表 SHA 与实际
+  DGGT checkpoint SHA。
+* validation 生成器只复用 schema/format、localization policy 及上述三项
+  provenance 全部匹配的当前 v10 chunked cache。schema v9 及更旧、旧 chunked
+  format、monolithic 或 provenance 不匹配的文件会默认原路径重算。
+
+schema v10 还保留每帧三通道的 gauge 证据：
+
+* `metric_box_scene_gauge_raw[S,3]`：表中原始值；
+* `metric_box_scene_gauge_valid[S,3]`：原始通道是否有效；
+* `metric_box_scene_gauge_fallback_mask[S,3]`：必须严格等于 `~valid`；
+* `metric_box_scene_gauge[S,3]`：真正用于映射的 effective 值，等于
+  `where(valid, raw, metric_box_scene_gauge_valid_channel_mean)`；
+* `metric_box_scene_gauge_fallback_policy=production_valid_channel_mean_v1`。
+
+chunked summary 记录 fallback channel/frame 数和 policy；正式 loader 会同时验证
+payload 中的 effective/raw/valid/fallback 关系与 summary 计数。
 
 与训练 Mode A 的区别：
 
@@ -49,13 +66,19 @@ v8 同时包含旧版本问题的修复：
 
 > **坐标系**：已验证 `all_object_info` tar 的 `object_to_world` 与处理后数据集的
 > `instances_info`/`ego_pose` 同处一个绝对 Waymo 世界系（平移差 ~3cm），**不做任何
-> center_point 归一化**；`estimate_scene_alignment` 用 `camera_to_world_corrected`
-> （来自 `ego_pose`）与 DGGT 预测相机求 Sim3，把 tar 框搬到 DGGT 系。
+> center_point 归一化**。正式 validation 的 3D 框统一由
+> `_transform_sample_track_box(..., metric_gauge_v4)` 按完整 29 帧表给出的逐帧
+> anisotropic effective gauge 映射到 DGGT 系；不得用 generic Sim3 代替。
 
 ## 0. 前置条件
 
 ```bash
 conda activate dggt
+
+export DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
+export VALIDATION_SCENE_GAUGE=data/scene_gauge/validation.json
+export DGGT_SHA256="$(sha256sum "$DGGT_CKPT" | awk '{print $1}')"
+export VALIDATION_SCENE_GAUGE_SHA256="$(sha256sum "$VALIDATION_SCENE_GAUGE" | awk '{print $1}')"
 ```
 
 * 处理后数据集：`/data/disk2/lyy_dataset/waymo_processed_dggt/validation/{NNN}`
@@ -78,7 +101,10 @@ conda activate dggt
 ```bash
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. conda run -n dggt --no-capture-output \
     python -u tools/precompute_flow_features_validation.py \
-    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+    --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$VALIDATION_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
     --asset_root /data/disk2/lyy_dataset/test_transfer/objects_ply_transformed \
     --out_root /data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_validation \
     --save_compression chunked_zstd \
@@ -86,6 +112,17 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. conda run -n dggt --no-capture-output \
     --overwrite_v7 \
     --max_save_threads 1
 ```
+
+生成器会自己 hash `--ckpt_path` 实际文件；
+`--expected_scene_gauge_dggt_sha256` 只是对这个实测值的附加断言。它也会从
+`--scene_gauge_path` 实际文件计算 `$VALIDATION_SCENE_GAUGE_SHA256`，并检查表是
+`status=complete`、split/image root 属于 validation 且 DGGT SHA 匹配的正式 29 帧表。
+后续独立 validation 训练必须传
+`--val_scene_gauge_sha256 "$VALIDATION_SCENE_GAUGE_SHA256"`；正式 offline inference
+必须传 `--cache_scene_gauge_sha256 "$VALIDATION_SCENE_GAUGE_SHA256"`。两者都把这个
+外部可信值与每个 schema v10 cache 的 meta/summary 做精确比较，不能信任 cache 自报值。
+该参数只绑定 validation cache；SceneFlow feature stats 仍必须使用 checkpoint 记录的
+training gauge 表 SHA，不得把 validation SHA 填入 stats provenance。
 
 输出使用与 training 相同的六位数字补零，再接单下划线和完整编辑名称：
 
@@ -118,8 +155,9 @@ manifest 中仍保留逻辑数字 `index = entry_index*5 + variant_ord`，只用
 
 * `--variants combined,deletion` —— 只生成指定 variant（调试 / 省时）。
 * `--start N --end M` —— 只处理 entry 索引 `[N, M)`（0..32）。
-* `--force_overwrite` —— 无条件覆盖已存在的 `.pt`。默认只跳过合法的当前 v9
-  chunked-zstd cache；v6/v7、旧 chunked format v1 或非 chunked 文件会自动重算。
+* `--force_overwrite` —— 无条件覆盖已存在的 `.pt`。默认只跳过合法的当前 v10
+  chunked-zstd cache；schema v9 及更旧、旧 chunked format、非 chunked、localization
+  policy 或 geometry provenance 不匹配的文件会自动重算。
 * `--save_compression chunked_zstd` —— 默认值，与 training 一致。`gzip/zstd/none`
   仅保留用于调试，不应作为正式 validation cache 格式。
 * `--asset_yaw_correction_deg 180 --max_pose_refine_yaw_deg 15` —— 与 Mode A 默认一致。
@@ -156,20 +194,40 @@ python tools/build_flow_validation_manifest.py \
 ```bash
 # 3.1 Smoke：entry 0 的四种编辑在 29 帧内均有目标，生成 5 个 .pt
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u tools/precompute_flow_features_validation.py \
-    --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+    --ckpt_path "$DGGT_CKPT" \
+    --metric_box_mapping_mode metric_gauge_v4 \
+    --scene_gauge_path "$VALIDATION_SCENE_GAUGE" \
+    --expected_scene_gauge_dggt_sha256 "$DGGT_SHA256" \
     --asset_root /data/disk2/lyy_dataset/test_transfer/objects_ply_transformed \
     --out_root /tmp/valcache_smoke --start 0 --end 1 --sync_save
 ls /tmp/valcache_smoke/validation/   # 000000_combined.pt ... 000000_repositioning.pt
 
 # 3.2 Schema 与 Mode A 逐字段对齐
 PYTHONPATH=. python -c "
-from dggt.utils.flow_cache_io import is_chunked_flow_cache, load_flow_cache
+import torch
+from dggt.utils.flow_cache_io import (is_chunked_flow_cache, load_flow_cache,
+                                      load_chunked_flow_cache_summary)
 a=load_flow_cache('/data/disk2/lyy_dataset/waymo_processed_dggt/flow_cache_mode_a/training/000190.pt')
 b=load_flow_cache('/tmp/valcache_smoke/validation/000000_combined.pt')
+summary=load_chunked_flow_cache_summary('/tmp/valcache_smoke/validation/000000_combined.pt')
 assert set(a)==set(b), (set(a)^set(b))
 assert is_chunked_flow_cache('/tmp/valcache_smoke/validation/000000_combined.pt')
-assert a['schema_version']==b['schema_version']==9 and b['mode_kind']=='mode_a'
-assert b['pass1']['gs_conf'].dtype == __import__('torch').float32
+assert a['schema_version']==b['schema_version']==10 and b['mode_kind']=='mode_a'
+assert b['pass1']['gs_conf'].dtype == torch.float32
+meta=b['meta']
+assert meta['metric_box_mapping_mode']==summary['metric_box_mapping_mode']=='metric_gauge_v4'
+assert meta['scene_gauge_table_sha256']==summary['scene_gauge_table_sha256']=='$VALIDATION_SCENE_GAUGE_SHA256'
+assert meta['dggt_checkpoint_sha256']==summary['dggt_checkpoint_sha256']=='$DGGT_SHA256'
+raw=meta['metric_box_scene_gauge_raw'].float()
+valid=meta['metric_box_scene_gauge_valid'].bool()
+fallback=meta['metric_box_scene_gauge_fallback_mask'].bool()
+effective=meta['metric_box_scene_gauge'].float()
+mean=meta['metric_box_scene_gauge_valid_channel_mean'].float()
+assert torch.equal(fallback, ~valid)
+assert torch.allclose(effective, torch.where(valid, raw, mean.view(1,3)), atol=1e-6, rtol=0)
+assert meta['metric_box_scene_gauge_fallback_policy']=='production_valid_channel_mean_v1'
+assert summary['metric_box_gauge_fallback_channel_count']==int(fallback.sum())
+assert summary['metric_box_gauge_fallback_frame_count']==int(fallback.any(dim=-1).sum())
 for k in ('pass1','phase1_localized','pass2_splatted_tok_low'):
     assert set(a[k])==set(b[k]), (k, set(a[k])^set(b[k]))   # binding blocks identical
 print('schema OK')"
@@ -181,6 +239,9 @@ PYTHONPATH=. python tools/build_flow_validation_manifest.py --cache_root /tmp/va
 PYTHONPATH=. python -c "
 from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
 ds=WaymoFlowCacheDataset(manifest_path='/tmp/valcache_smoke/validation_manifest.jsonl')
+ds.bind_metric_gauge_provenance(
+    expected_scene_gauge_sha256='$VALIDATION_SCENE_GAUGE_SHA256',
+    expected_dggt_sha256='$DGGT_SHA256')
 for i in range(len(ds)): ds[i]
 print('downstream OK', len(ds), 'rows')"
 
@@ -199,8 +260,8 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. conda run -n dggt --no-capture-output \
 * entry 0 的 `000000_{combined,deletion,insertion,replacement,repositioning}.pt` 5 个齐全。
 * 3.2 打印 `schema OK`（顶层 key 全等；`pass1`/`phase1_localized`/`pass2_splatted_tok_low`
   绑定块与 Mode A 子 key 全等；`meta` 仅多出 `variant`/`validation_edit` 等附加键）。
-* 3.3 `WaymoFlowCacheDataset` 5 行全部取样不抛错（过 `_validate_v6_payload` + `_subset_phase1_localized`
-  + `_build_asset_pass` + `_subset_pass2_splatted_tok_low`）。
+* 3.3 `WaymoFlowCacheDataset` 先用 validation gauge SHA 和实际 DGGT SHA 做全量
+  provenance preflight，然后 5 行全部取样不抛错。
 * 3.4 WYSIWYG 在 `runs/val_wysiwyg_combined/` 下生成 mask/coverage/scaffold/depth 可视化网格。
 
 > 历史 smoke 使用 entry 12，其中 move 是无目标的合法 no-op。现在建议使用 entry 0，
@@ -255,7 +316,8 @@ RGB 用缓存权威的 `cameras_dggt` + 缓存高斯（保留=clean 去掉
 `phase1_localized.delete_mask`；资产=`asset_pass.G_asset_dggt`/`I_asset`）直接 gsplat 渲染，
 不需要模型；`flow_features/` 由训练同款 `FlowFeatureAssembler` + `dump_flow_features` 产出，
 与 `verify_flow_cache_wysiwyg` / 训练消费的 bundle 逐值对齐。正式 validation
-产物统一为 v9 chunked cache，并携带 `alpha_max_t005_v1` asset patch mask。
+产物统一为 v10 chunked cache，并携带 `alpha_max_t005_v1` asset patch mask、
+effective/raw/valid/fallback gauge 证据及 geometry provenance。
 
 ## 4. 实现要点（与 Mode A 的复用关系）
 

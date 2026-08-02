@@ -52,6 +52,7 @@ from dggt.utils.gaussian_edit import (
     apply_sim3_to_gaussian_dict,
     parse_object_slots,
 )
+from dggt.utils.tokenizer_window import encode_tokenizer_windowed
 
 
 DEFAULT_LEVELS = (4, 11, 17, 23)
@@ -237,6 +238,7 @@ class FlowFeatureAssembler(nn.Module):
         asset_token_direct_blend: bool = True,
         asset_token_full_alpha: float = 0.5,
         unedited_preserve_threshold: float = 1e-4,
+        tokenizer_window_len: int = 10,
         editor_kwargs: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
@@ -251,6 +253,11 @@ class FlowFeatureAssembler(nn.Module):
         self.asset_token_direct_blend = bool(asset_token_direct_blend)
         self.asset_token_full_alpha = float(asset_token_full_alpha)
         self.unedited_preserve_threshold = float(unedited_preserve_threshold)
+        self.tokenizer_window_len = int(tokenizer_window_len)
+        if self.tokenizer_window_len <= 0:
+            raise ValueError(
+                f"tokenizer_window_len must be positive, got {tokenizer_window_len}"
+            )
         # Kept only so older configs that still pass these fields keep loading.
         del gamma_dest, eps_floor, sigma_partial
 
@@ -600,8 +607,18 @@ class FlowFeatureAssembler(nn.Module):
         # are produced with the same (current) tokenizer weights.  The cache
         # only stores the *input* to tokenizer.encode (splatted_tok_low); the
         # encode itself (~38ms) is cheap and must reflect live weights.
-        z_clean = self.scene_tokenizer.encode(F_g_lut_scene, patch_grid=self.patch_grid)
-        z_splat = self.scene_tokenizer.encode(splatted_tok_low, patch_grid=self.patch_grid)
+        z_clean = encode_tokenizer_windowed(
+            self.scene_tokenizer,
+            F_g_lut_scene,
+            patch_grid=self.patch_grid,
+            window_len=self.tokenizer_window_len,
+        )
+        z_splat = encode_tokenizer_windowed(
+            self.scene_tokenizer,
+            splatted_tok_low,
+            patch_grid=self.patch_grid,
+            window_len=self.tokenizer_window_len,
+        )
         if z_splat.shape != z_clean.shape:
             raise ValueError(
                 f"z_splat shape {tuple(z_splat.shape)} does not match "
@@ -619,6 +636,7 @@ class FlowFeatureAssembler(nn.Module):
             reference=z_clean,
             max_assets=5,
             expected_num_levels=len(F_g_lut_scene),
+            tokenizer_window_len=self.tokenizer_window_len,
         )
 
         return FlowFeatureBundle(
@@ -863,9 +881,17 @@ class FlowFeatureAssembler(nn.Module):
         # tokenizer.encode runs online for both branches so z_clean and z_splat
         # share the latest tokenizer weights.  The cache only stores the input
         # to tokenizer.encode (post-blend splatted_tok_low).
-        z_clean = self.scene_tokenizer.encode(F_g_lut_scene, patch_grid=self.patch_grid)
-        z_splat = z_clean if mode_b_noop else self.scene_tokenizer.encode(
-            splatted_tok_low, patch_grid=self.patch_grid
+        z_clean = encode_tokenizer_windowed(
+            self.scene_tokenizer,
+            F_g_lut_scene,
+            patch_grid=self.patch_grid,
+            window_len=self.tokenizer_window_len,
+        )
+        z_splat = z_clean if mode_b_noop else encode_tokenizer_windowed(
+            self.scene_tokenizer,
+            splatted_tok_low,
+            patch_grid=self.patch_grid,
+            window_len=self.tokenizer_window_len,
         )
         if z_splat.shape != z_clean.shape:
             raise ValueError(

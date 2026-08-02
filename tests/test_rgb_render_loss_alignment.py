@@ -30,6 +30,7 @@ from dggt.losses.rgb_render_loss import (
     torch_unproject_depth,
 )
 from dggt.utils.gaussian_render import composite_gsplat_rgb
+from dggt.utils.scene_gauge import PullbackCalibration
 from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
 import train_scene_flow as formal_train
 from train_scene_flow import (
@@ -133,6 +134,23 @@ class _VGGT(nn.Module):
 
 
 class _SceneFlow(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._pullback_calibration = PullbackCalibration(
+            path=Path("/tmp/pullback.json"),
+            artifact_sha256="a" * 64,
+            tokenizer_sha256="b" * 64,
+            dggt_sha256="c" * 64,
+            tokenizer_generation="test",
+            window_len=10,
+            patch_grid_hw=(25, 37),
+            depth_a=0.0,
+            depth_b=0.0,
+            reference_depth_m=20.0,
+            runtime_depth_clamp_m=(0.5, 80.0),
+            c_gs=1.0,
+        )
+
     def denormalize(self, z):
         return z
 
@@ -170,6 +188,27 @@ def test_primary_rgb_api_has_no_teacher_depth_argument():
     parameters = inspect.signature(compute_rgb_render_loss).parameters
     assert "depth" not in parameters
     assert "render_pose_enc_dggt" in parameters
+
+
+def test_teacher_render_camera_gradient_scale_rejects_nonzero_value():
+    with pytest.raises(ValueError, match="camera_grad_scale must be 0"):
+        compute_rgb_render_loss(
+            vggt_model=None,
+            scene_flow_root=None,
+            z_clean_pred_n=torch.empty(0),
+            images=torch.empty(0),
+            timestamps=torch.empty(0),
+            render_pose_enc_dggt=torch.empty(0),
+            render_sky_probability=None,
+            loss_sky_mask_gt=None,
+            patch_grid=(1, 1),
+            patch_start_idx=0,
+            max_samples=0,
+            max_frames=0,
+            render_stride=1,
+            background_mode="black",
+            camera_grad_scale=0.5,
+        )
 
 
 def test_gradient_scaling_preserves_value_and_scales_gradient():
@@ -419,6 +458,10 @@ def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
             "/tmp/dggt.pt",
             "--feature_stats_path",
             "/tmp/stats.pt",
+            "--scene_gauge_path",
+            "/tmp/scene_gauge.json",
+            "--pullback_calibration_path",
+            "/tmp/pullback.json",
             "--log_dir",
             "/tmp/logs",
         ]
@@ -542,6 +585,35 @@ def test_generated_depth_head_is_differentiable_on_cpu():
     geometry.depth.mean().backward()
     assert z.grad is not None
     assert float(z.grad.abs().sum()) > 0.0
+
+
+def test_long_generated_geometry_decode_never_calls_tokenizer_above_calibrated_window():
+    class _WindowSpyTokenizer(_Tokenizer):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lengths: list[int] = []
+
+        def decode(self, z: torch.Tensor, patch_grid):
+            self.lengths.append(int(z.shape[1]))
+            return super().decode(z, patch_grid)
+
+    vggt = _VGGT()
+    vggt.scene_tokenizer = _WindowSpyTokenizer()
+    z = torch.randn((1, 29, 1, 4), requires_grad=True)
+    geometry = decode_generated_dggt_geometry(
+        vggt_model=vggt,
+        scene_flow_root=_SceneFlow(),
+        z_clean_pred_n=z,
+        patch_grid=(1, 1),
+        patch_start_idx=1,
+        image_hw=(4, 4),
+        tokenizer_window_len=10,
+    )
+    assert len(vggt.scene_tokenizer.lengths) > 1
+    assert max(vggt.scene_tokenizer.lengths) <= 10
+    assert geometry.depth.shape[:2] == (1, 29)
+    geometry.depth.mean().backward()
+    assert z.grad is not None and bool(torch.isfinite(z.grad).all())
 
 
 def _feedback_geometry(z: torch.Tensor, *, image_hw: tuple[int, int] = (8, 8)):

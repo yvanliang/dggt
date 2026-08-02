@@ -26,6 +26,7 @@ from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
 from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_split_gs
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
+from dggt.utils.scene_gauge import resolve_scene_gauge_checkpoint_sha256
 
 PRED_VEHICLE_SEMANTIC_CLASS_ID = 4
 CUSTOM_MASK_VEHICLE_VALUE = 40
@@ -74,6 +75,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--asset_root", type=str, default=DEFAULT_ASSET_ROOT)
     parser.add_argument("--manifest_path", type=str, default=None)
     parser.add_argument("--candidate_path", type=str, default=None)
+    parser.add_argument(
+        "--metric_box_mapping_mode",
+        choices=["metric_gauge_v4", "generic_sim3"],
+        default="metric_gauge_v4",
+        help="Formal Waymo edit defaults to the 29-frame anisotropic gauge path.",
+    )
+    parser.add_argument(
+        "--scene_gauge_path",
+        type=str,
+        default=None,
+        help="Complete split-specific 29-frame gauge table; required by metric_gauge_v4.",
+    )
+    parser.add_argument("--expected_scene_gauge_dggt_sha256", type=str, default=None)
     parser.add_argument("--object_slots", type=str, default="all", help="Comma-separated slot ids or 'all'.")
     parser.add_argument("--min_match_score", type=float, default=0.1, help="Skip low-confidence slot-to-scene matches.")
     parser.add_argument("--dynamic_thresh", type=float, default=0.5)
@@ -1240,6 +1254,11 @@ def main() -> None:
         )
     torch.manual_seed(args.seed)
 
+    scene_gauge_dggt_sha256 = resolve_scene_gauge_checkpoint_sha256(
+        args.ckpt_path,
+        args.expected_scene_gauge_dggt_sha256,
+    )
+
     root_output_dir = Path(args.output_dir)
     root_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1254,6 +1273,9 @@ def main() -> None:
         views=args.views,
         mode=args.dataset_mode,
         sequence_length=args.sequence_length,
+        metric_box_mapping_mode=args.metric_box_mapping_mode,
+        scene_gauge_path=args.scene_gauge_path,
+        expected_scene_gauge_dggt_sha256=scene_gauge_dggt_sha256,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -52,14 +52,23 @@ ALEXNET_CKPT="${TORCH_HOME}/hub/checkpoints/alexnet-owt-7be5be79.pth"
 # ============================================================
 WAYMO_DGGT_ROOT="${WAYMO_DGGT_ROOT:-${DATASET_ROOT}/training}"
 WAYMO_DGGT_VAL_ROOT="${WAYMO_DGGT_VAL_ROOT:-${DATASET_ROOT}/validation}"
-DGGT_CKPT="${DGGT_CKPT:-${PROJECT_ROOT}/pretrained/model_latest_waymo.pt}"
+DEFAULT_DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
+if [[ ! -f "${DEFAULT_DGGT_CKPT}" && -f /data/lyy_dataset/model/dggt/model_latest_waymo.pt ]]; then
+  DEFAULT_DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
+elif [[ ! -f "${DEFAULT_DGGT_CKPT}" && -f /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt ]]; then
+  DEFAULT_DGGT_CKPT=/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt
+fi
+DGGT_CKPT="${DGGT_CKPT:-${DEFAULT_DGGT_CKPT}}"
 TOKENIZER_CKPT="${TOKENIZER_CKPT:-${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt}"
-FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v3.pt}"
+FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v4.pt}"
+SCENE_GAUGE_PATH="${SCENE_GAUGE_PATH:-${PROJECT_ROOT}/data/scene_gauge/training.json}"
+VAL_SCENE_GAUGE_PATH="${VAL_SCENE_GAUGE_PATH:-${PROJECT_ROOT}/data/scene_gauge/validation.json}"
+PULLBACK_CALIBRATION_PATH="${PULLBACK_CALIBRATION_PATH:-${PROJECT_ROOT}/data/scene_gauge/pullback_75e566ef.json}"
 SCENE_CAPTION_ROOT="${SCENE_CAPTION_ROOT:-${DATASET_ROOT}/training_captions}"
 SCENE_CAPTION_VAL_ROOT="${SCENE_CAPTION_VAL_ROOT:-${DATASET_ROOT}/validation_captions}"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${MODEL_ROOT}/Qwen/Qwen3-0.6B}"
 
-LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_v3}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_v4}"
 LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_launch}"
 
 # ============================================================
@@ -82,6 +91,19 @@ GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
 ASSET_CONTROL_GUIDANCE_SCALE="${ASSET_CONTROL_GUIDANCE_SCALE:-1.0}"
 CAMERA_GUIDANCE_SCALE="${CAMERA_GUIDANCE_SCALE:-1.0}"
 VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
+
+# Keep production defaults unchanged while allowing the real-training PPU
+# smoke launcher to shorten the run without maintaining a second copy of the
+# training argument list.
+MAX_STEPS="${MAX_STEPS:-200000}"
+WARMUP_STEPS="${WARMUP_STEPS:-4000}"
+SAVE_EVERY="${SAVE_EVERY:-2000}"
+VAL_EVERY="${VAL_EVERY:-1000}"
+VAL_BATCHES="${VAL_BATCHES:-1}"
+VAL_LOG_IMAGES="${VAL_LOG_IMAGES:-10}"
+VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-35}"
+RESUME_PATH="${RESUME_PATH:-}"
+WARM_START_PATH="${WARM_START_PATH:-}"
 
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_PPU * GRAD_ACCUM_STEPS))
 
@@ -175,6 +197,19 @@ check_required_paths() {
     check_file "DGGT_CKPT" "${DGGT_CKPT}"
     check_file "TOKENIZER_CKPT" "${TOKENIZER_CKPT}"
     check_file "FEATURE_STATS" "${FEATURE_STATS}"
+    check_file "SCENE_GAUGE_PATH" "${SCENE_GAUGE_PATH}"
+    check_file "VAL_SCENE_GAUGE_PATH" "${VAL_SCENE_GAUGE_PATH}"
+    check_file "PULLBACK_CALIBRATION_PATH" "${PULLBACK_CALIBRATION_PATH}"
+    if [[ -n "${RESUME_PATH}" ]]; then
+        check_file "RESUME_PATH" "${RESUME_PATH}"
+    fi
+    if [[ -n "${WARM_START_PATH}" ]]; then
+        check_file "WARM_START_PATH" "${WARM_START_PATH}"
+    fi
+    if [[ -n "${RESUME_PATH}" && -n "${WARM_START_PATH}" ]]; then
+        echo "[错误] RESUME_PATH 和 WARM_START_PATH 不能同时设置。" >&2
+        exit 1
+    fi
     check_dir "SCENE_CAPTION_ROOT" "${SCENE_CAPTION_ROOT}"
     check_dir "SCENE_CAPTION_VAL_ROOT" "${SCENE_CAPTION_VAL_ROOT}"
     check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
@@ -199,6 +234,9 @@ build_train_args() {
         --dggt_ckpt_path "${DGGT_CKPT}"
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
+        --scene_gauge_path "${SCENE_GAUGE_PATH}"
+        --val_scene_gauge_path "${VAL_SCENE_GAUGE_PATH}"
+        --pullback_calibration_path "${PULLBACK_CALIBRATION_PATH}"
         --log_dir "${LOG_DIR}"
         --caption_root "${SCENE_CAPTION_ROOT}"
         --val_caption_root "${SCENE_CAPTION_VAL_ROOT}"
@@ -216,14 +254,15 @@ build_train_args() {
         --grad_accum_steps "${GRAD_ACCUM_STEPS}"
         --num_workers "${NUM_WORKERS}"
         --prefetch_factor "${PREFETCH_FACTOR}"
+        --pin_memory
         --lr 1e-4
         --final_lr 1e-5
         --weight_decay 0.0
         --optimizer_type gmuon
         --ema_decay 0.9995
-        --warmup_steps 4000
-        --max_steps 200000
-        --save_every 2000
+        --warmup_steps "${WARMUP_STEPS}"
+        --max_steps "${MAX_STEPS}"
+        --save_every "${SAVE_EVERY}"
         --shift 10.0
         --weighting_scheme waver
         --mode_scale 1.29
@@ -233,7 +272,7 @@ build_train_args() {
         --base_model_coeff 0.25
         --lambda_boundary 0.25
         --lambda_camera_flow 0.1
-        --lambda_camera_pose 0.5
+        --lambda_camera_pose 1.0
         --lambda_sky_flow 0.1
         --uncond_drop_prob "${UNCOND_DROP_PROB}"
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
@@ -246,16 +285,20 @@ build_train_args() {
         --val_guidance_scales "${VAL_GUIDANCE_SCALES}"
         --val_scene_start 0
         --val_scene_end 100
-        --val_every 1000
-        --val_batches 1
-        --val_log_images 10
-        --val_sample_steps 35
-        --rgb_render_every 2
+        --val_every "${VAL_EVERY}"
+        --val_batches "${VAL_BATCHES}"
+        --val_log_images "${VAL_LOG_IMAGES}"
+        --val_sample_steps "${VAL_SAMPLE_STEPS}"
         --grad_clip_norm 1.0
         --seed 0
         --precision bf16
         --ddp_timeout_minutes 60
     )
+    if [[ -n "${RESUME_PATH}" ]]; then
+        TRAIN_ARGS+=(--resume_path "${RESUME_PATH}")
+    elif [[ -n "${WARM_START_PATH}" ]]; then
+        TRAIN_ARGS+=(--warm_start_path "${WARM_START_PATH}")
+    fi
 }
 
 setup_common_env

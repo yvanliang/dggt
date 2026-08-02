@@ -31,7 +31,7 @@ addition to training-validation image grids (except ``abs_error``), each CFG
 result contains:
 
 * ``generated_raw_gaussians__cfg*_frame*.ply``: per-frame DGGT/3DGS Gaussian
-  PLY schema;
+  PLY schema in the selected export units (metric by default);
 * ``generated_raw_points__cfg*_frame*.ply``: per-frame xyz + uchar RGB,
   directly viewable in MeshLab.
 
@@ -49,6 +49,7 @@ import json
 import math
 import sys
 import types
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -90,16 +91,42 @@ from datasets.dataset import WaymoOpenDataset
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.models.canonical_asset_encoder import CanonicalAssetEncoder
 from dggt.losses.rgb_render_loss import decode_generated_dggt_geometry
-from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers, load_into_buffers
-from dggt.utils.camera_generation import CAMERA_GENERATION_DIM, CAMERA_GENERATION_REPRESENTATION
-from dggt.utils.camera_condition import camera_summary_from_waymo_gt
+from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers
+from dggt.utils.camera_generation import (
+    CAMERA_GENERATION_DIM,
+    CAMERA_GENERATION_REPRESENTATION,
+    CAMERA_STATS_VERSION,
+    CAMERA_TARGET_SOURCE,
+    CAMERA_TARGET_SPACE,
+)
+from dggt.utils.camera_condition import camera_condition_from_waymo_metric_target
+from dggt.utils.camera_geometry_flow_consistency import (
+    CAMERA_GEOMETRY_FLOW_DIAGNOSTIC_SCHEMA,
+    camera_geometry_flow_consistency,
+)
 from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.flow_schedule import resolve_inference_flow_schedule
 from dggt.utils.gaussian_edit import CleanSceneState, build_clean_scene_state
 from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
 from dggt.utils.sliding_window import resolve_offline_window
+from dggt.utils.scene_gauge import (
+    PULLBACK_METRIC_BOUNDARY,
+    PULLBACK_RENDER_BOUNDARY,
+    PULLBACK_RUNTIME_CONTRACT_VERSION,
+    SCENE_GAUGE_DIM,
+    SCENE_GAUGE_REPRESENTATION,
+    SCENE_GAUGE_STATS_VERSION,
+    PullbackCalibration,
+    PullbackResult,
+    apply_pullback_calibration,
+    assemble_dggt_pose_encoding,
+    gauge_to_pose_enc_fov,
+    load_pullback_calibration,
+    metric_c2w_to_teacher_anchor_dggt,
+)
 from dggt.utils.factorized_asset_condition import (
     FACTORIZED_ASSET_CONDITION_VERSION,
+    PLACEMENT_STATE_DIM,
     FactorizedAssetCondition,
     build_factorized_asset_condition,
     canonicalize_asset_reference,
@@ -109,6 +136,7 @@ from dggt.utils.factorized_asset_condition import (
 )
 from train_scene_flow_pretrain import (
     DEFAULT_SKY_GRID,
+    PRETRAIN_FEATURE_STATS_CONTRACT_KEY,
     SKY_TOKEN_DIM,
     CyclicSequentialSampler,
     _align_sliding_asset_payload_slots,
@@ -128,7 +156,7 @@ from train_scene_flow_pretrain import (
     build_pretrain_bundle_from_batch,
     build_full_scene_bundle,
     cfg_sample_pretrain_latents,
-    decode_pose_from_camera_features,
+    decode_metric_camera_from_features,
     decode_sky_patch_tokens,
     discover_scene_names,
     load_dggt_aggregator_and_tokenizer,
@@ -137,6 +165,7 @@ from train_scene_flow_pretrain import (
     sky_generation_enabled,
     sky_grid_shape,
     sky_tokens_to_background,
+    validate_pretrain_feature_stats_contract,
     validate_scene_flow_checkpoint_config,
     unwrap_ddp,
 )
@@ -147,8 +176,136 @@ DEFAULT_VAL_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt/validation"
 DEFAULT_CAPTION_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions"
 DEFAULT_DGGT_CKPT = "/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt"
 DEFAULT_TOKENIZER_CKPT = "logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
+DEFAULT_VAL_SCENE_GAUGE = "data/scene_gauge/validation.json"
+DEFAULT_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_75e566ef.json"
 DEFAULT_TEXT_ENCODER = "/home/dancer/model/Qwen/Qwen3-0.6B"
 CONDITION_MODES = ("none", "asset", "cam", "asset_cam")
+GENERATED_METRIC_CAMERA_SCHEMA = "generated_metric_camera_trajectory_v1"
+
+METRIC_GAUGE_PROVENANCE_FIELDS = frozenset(
+    {
+        "scene_gauge_representation",
+        "scene_gauge_stats_version",
+        "gauge_table_sha256",
+        "tokenizer_sha256",
+        "dggt_checkpoint_sha256",
+        "pullback_artifact_sha256",
+        "pullback_runtime_contract_version",
+        "pullback_window_len",
+        "pullback_patch_grid_hw",
+        "camera_generation_representation",
+        "camera_target_space",
+        "camera_target_source",
+    }
+)
+
+
+def _require_sha256(value: Any, *, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a lowercase 64-character SHA-256, got {value!r}.")
+    result = value
+    if len(result) != 64 or any(character not in "0123456789abcdef" for character in result):
+        raise ValueError(f"{name} must be a lowercase 64-character SHA-256, got {value!r}.")
+    return result
+
+
+def validate_metric_gauge_provenance(
+    provenance: Any,
+    *,
+    scene_flow: nn.Module,
+    dggt_sha256: str,
+    tokenizer_sha256: str,
+    expected_window_len: int,
+    expected_patch_grid: Sequence[int],
+) -> dict[str, Any]:
+    """Reject anything except the clean-cut metric/gauge checkpoint contract."""
+    if not isinstance(provenance, Mapping):
+        raise ValueError(
+            "SceneFlow checkpoint is missing the required `metric_gauge_provenance` block; "
+            "legacy camera/checkpoint formats are intentionally unsupported."
+        )
+    actual_fields = set(provenance)
+    if actual_fields != METRIC_GAUGE_PROVENANCE_FIELDS:
+        raise ValueError(
+            "metric_gauge_provenance does not match the strict schema: "
+            f"missing={sorted(METRIC_GAUGE_PROVENANCE_FIELDS - actual_fields)}, "
+            f"unknown={sorted(actual_fields - METRIC_GAUGE_PROVENANCE_FIELDS)}."
+        )
+    if isinstance(expected_window_len, bool) or int(expected_window_len) <= 0:
+        raise ValueError("expected_window_len must be a positive integer")
+    expected_grid = tuple(int(value) for value in expected_patch_grid)
+    if len(expected_grid) != 2 or any(value <= 0 for value in expected_grid):
+        raise ValueError("expected_patch_grid must contain two positive integers")
+    if isinstance(provenance["pullback_window_len"], bool) or not isinstance(
+        provenance["pullback_window_len"], int
+    ):
+        raise ValueError("metric_gauge_provenance.pullback_window_len must be an integer")
+    artifact_grid = provenance["pullback_patch_grid_hw"]
+    if not isinstance(artifact_grid, list) or len(artifact_grid) != 2 or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in artifact_grid
+    ):
+        raise ValueError(
+            "metric_gauge_provenance.pullback_patch_grid_hw must be a two-item positive integer list"
+        )
+    config = getattr(unwrap_ddp(scene_flow), "config", None)
+    expected_values = {
+        "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
+        "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
+        "tokenizer_sha256": _require_sha256(tokenizer_sha256, name="tokenizer checkpoint SHA-256"),
+        "dggt_checkpoint_sha256": _require_sha256(dggt_sha256, name="DGGT checkpoint SHA-256"),
+        "pullback_runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+        "pullback_window_len": int(expected_window_len),
+        "pullback_patch_grid_hw": list(expected_grid),
+        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
+        "camera_target_space": CAMERA_TARGET_SPACE,
+        "camera_target_source": CAMERA_TARGET_SOURCE,
+    }
+    for field, expected in expected_values.items():
+        if provenance[field] != expected:
+            raise ValueError(
+                f"metric_gauge_provenance.{field} mismatch: "
+                f"checkpoint={provenance[field]!r}, current={expected!r}."
+            )
+    for field in (
+        "gauge_table_sha256",
+        "pullback_artifact_sha256",
+        "tokenizer_sha256",
+        "dggt_checkpoint_sha256",
+    ):
+        _require_sha256(provenance[field], name=f"metric_gauge_provenance.{field}")
+    config_expectations = {
+        "gauge_gen_dim": SCENE_GAUGE_DIM,
+        "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
+        "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
+        "camera_gen_dim": CAMERA_GENERATION_DIM,
+        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
+        "asset_condition_protocol": "factorized_v1",
+        "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
+    }
+    for field, expected in config_expectations.items():
+        actual = getattr(config, field, None)
+        if actual != expected:
+            raise ValueError(
+                f"SceneFlow config {field}={actual!r} does not satisfy the metric/gauge "
+                f"inference contract {expected!r}."
+            )
+    for field in ("placement_mean", "placement_std"):
+        values = getattr(config, field, None)
+        if not isinstance(values, (list, tuple)) or len(values) != PLACEMENT_STATE_DIM:
+            raise ValueError(
+                f"SceneFlow config {field} must contain exactly {PLACEMENT_STATE_DIM} "
+                "factorized-v3 values."
+            )
+        try:
+            numeric_values = tuple(float(value) for value in values)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"SceneFlow config {field} must contain numeric values.") from exc
+        if not all(math.isfinite(value) for value in numeric_values):
+            raise ValueError(f"SceneFlow config {field} must contain finite values.")
+        if field == "placement_std" and not all(value > 0.0 for value in numeric_values):
+            raise ValueError("SceneFlow config placement_std must contain positive values.")
+    return dict(provenance)
 
 
 def parse_cfg_scales(value: str | Sequence[str]) -> list[float]:
@@ -437,19 +594,27 @@ def build_external_factorized_pretrain_bundle(
         patch_grid=patch_grid,
         reference_frame_id=reference_frame_id,
     )
-    # Anchor coordinates are a valid "world" for the shared camera summary.
-    camera_tokens, camera_mask = camera_summary_from_waymo_gt(
-        camera_to_anchor.unsqueeze(0).to(device),
-        intrinsics.unsqueeze(0).to(device),
-        image_hw=tuple(int(value) for value in image_size_hw.tolist()),
-        trajectory_anchor_to_world=torch.eye(4, device=device).view(1, 1, 4, 4),
+    # Anchor coordinates are a valid metric world.  Use the same role-aware
+    # normalized 9-D condition channels as raw pretraining and formal T1.
+    frame_ids = torch.arange(seq_len, device=device, dtype=torch.long).view(1, -1)
+    camera_tokens, camera_mask, _, returned_anchor_mask = (
+        camera_condition_from_waymo_metric_target(
+            camera_to_anchor.unsqueeze(0).to(device),
+            intrinsics.unsqueeze(0).to(device),
+            image_hw=tuple(int(value) for value in image_size_hw.tolist()),
+            trajectory_anchor_to_world=torch.eye(4, device=device).view(1, 1, 4, 4),
+            previous_camera_to_world=None,
+            anchor_mask=frame_ids.eq(0),
+            normalize_camera=sf.normalize_camera,
+        )
     )
+    if not torch.equal(returned_anchor_mask, frame_ids.eq(0)):
+        raise RuntimeError("external metric camera condition returned inconsistent anchor roles")
     latent_dim = int(sf.config.out_channels)
     dummy_endpoint = torch.zeros(
         (1, seq_len, int(patch_grid[0]) * int(patch_grid[1]), latent_dim),
         device=device,
     )
-    frame_ids = torch.arange(seq_len, device=device, dtype=torch.long).view(1, -1)
     bundle = build_full_scene_bundle(
         dummy_endpoint,
         kv_dim=latent_dim,
@@ -505,32 +670,86 @@ def build_scene_flow_from_checkpoint(
             "to be absent until training writes it; pass --weights when it becomes available."
         )
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    flow_schedule = resolve_inference_flow_schedule(payload, fallback_args, path)
+    if isinstance(payload, dict) and "camera_dggt_provenance" in payload:
+        raise ValueError(
+            f"{path} contains legacy camera_dggt_provenance; mixed old/new provenance is rejected."
+        )
+    checkpoint_provenance = (
+        payload.get("metric_gauge_provenance") if isinstance(payload, dict) else None
+    )
+    if not isinstance(payload, dict) or not isinstance(checkpoint_provenance, Mapping):
+        raise ValueError(
+            f"{path} is not a metric/gauge SceneFlow checkpoint: the strict "
+            "`metric_gauge_provenance` block is missing. Legacy checkpoints are rejected."
+        )
+    provenance_fields = set(checkpoint_provenance)
+    if provenance_fields != METRIC_GAUGE_PROVENANCE_FIELDS:
+        raise ValueError(
+            f"{path} metric_gauge_provenance violates the strict schema before model "
+            f"construction: missing={sorted(METRIC_GAUGE_PROVENANCE_FIELDS - provenance_fields)}, "
+            f"unknown={sorted(provenance_fields - METRIC_GAUGE_PROVENANCE_FIELDS)}."
+        )
+    checkpoint_stats_contract = validate_pretrain_feature_stats_contract(
+        payload.get(PRETRAIN_FEATURE_STATS_CONTRACT_KEY),
+        path=path,
+    )
     config = _checkpoint_config(payload)
-    if config is not None:
-        camera_dim = int(config.get("camera_gen_dim", 2048))
-        config.setdefault(
-            "camera_generation_representation",
-            "dggt_hidden_v1" if camera_dim == 2048 else CAMERA_GENERATION_REPRESENTATION,
+    if config is None:
+        raise ValueError(
+            f"{path} has no versioned scene_flow_config; metric/gauge v4 inference "
+            "does not construct a fallback architecture."
         )
-        config.setdefault("asset_position_mode", "localized")
-        config.setdefault("mask_compositing_version", "legacy_hard_mask_v1")
-        scene_flow = WanSceneFlow(**config)
-    else:
-        scene_flow = WanSceneFlow.from_scene_config(
-            bring_up=False,
-            patch_grid=fallback_args.patch_grid,
-            in_channels=3 * int(fallback_args.latent_dim) + 3,
-            out_channels=int(fallback_args.latent_dim),
-            camera_gen_dim=int(fallback_args.camera_gen_dim),
-            camera_generation_representation="dggt_hidden_v1",
-            sky_token_dim=SKY_TOKEN_DIM,
-            sky_grid=fallback_args.sky_grid,
-            max_sky_tokens=int(fallback_args.sky_grid[0] * fallback_args.sky_grid[1]),
-            sky_mask_refine_scale=int(fallback_args.sky_mask_refine_scale),
-            sky_mask_refine_channels=int(fallback_args.sky_mask_refine_channels),
-            prediction_type=str(fallback_args.prediction_type),
+    required_config = {
+        "camera_gen_dim": CAMERA_GENERATION_DIM,
+        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
+        "camera_stats_version": CAMERA_STATS_VERSION,
+        "gauge_gen_dim": SCENE_GAUGE_DIM,
+        "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
+        "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
+        "asset_condition_protocol": "factorized_v1",
+        "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
+    }
+    required_shape_config = {"patch_grid", "placement_mean", "placement_std"}
+    missing_config = sorted((set(required_config) | required_shape_config) - set(config))
+    mismatched_config = {
+        field: {"checkpoint": config.get(field), "required": expected}
+        for field, expected in required_config.items()
+        if field in config and config[field] != expected
+    }
+    if missing_config or mismatched_config:
+        raise ValueError(
+            f"{path} does not satisfy the clean-cut Waymo metric camera/gauge v4 config: "
+            f"missing={missing_config}, mismatched={mismatched_config}."
         )
+    patch_grid = config["patch_grid"]
+    if (
+        not isinstance(patch_grid, (list, tuple))
+        or len(patch_grid) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in patch_grid)
+    ):
+        raise ValueError(f"{path} scene_flow_config.patch_grid must contain two positive integers.")
+    for field in ("placement_mean", "placement_std"):
+        values = config[field]
+        if not isinstance(values, (list, tuple)) or len(values) != PLACEMENT_STATE_DIM:
+            raise ValueError(
+                f"{path} scene_flow_config.{field} must contain exactly "
+                f"{PLACEMENT_STATE_DIM} factorized-v3 values."
+            )
+        try:
+            numeric_values = tuple(float(value) for value in values)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path} scene_flow_config.{field} must be numeric.") from exc
+        if not all(math.isfinite(value) for value in numeric_values):
+            raise ValueError(f"{path} scene_flow_config.{field} must be finite.")
+        if field == "placement_std" and not all(value > 0.0 for value in numeric_values):
+            raise ValueError(f"{path} scene_flow_config.placement_std must be positive.")
+    validate_pretrain_feature_stats_contract(
+        checkpoint_stats_contract,
+        path=path,
+        expected_patch_grid=patch_grid,
+    )
+    flow_schedule = resolve_inference_flow_schedule(payload, fallback_args, path)
+    scene_flow = WanSceneFlow(**config)
     validate_scene_flow_checkpoint_config(scene_flow, payload, path)
 
     source = ""
@@ -547,26 +766,14 @@ def build_scene_flow_from_checkpoint(
     elif isinstance(payload, dict) and bool(payload.get("is_ema_weights")) and "scene_flow" in payload:
         state = payload["scene_flow"]
         source = "EMA-only scene_flow"
-    elif isinstance(payload, dict) and "ema_scene_flow" in payload and "scene_flow" in payload:
-        # Legacy full checkpoint: materialize EMA shadow tensors on the model.
-        from diffusers.training_utils import EMAModel
-
-        scene_flow.load_state_dict(_strip_module_prefix(payload["scene_flow"]), strict=True)
-        ema = EMAModel(scene_flow.parameters())
-        ema.load_state_dict(payload["ema_scene_flow"])
-        ema.copy_to(scene_flow.parameters())
-        state = None
-        source = "legacy ema_scene_flow"
     elif isinstance(payload, dict) and "scene_flow" in payload:
         state = payload["scene_flow"]
         source = "raw scene_flow (EMA unavailable)"
         print(f"[warn] {path} does not contain EMA weights; falling back to raw weights.", flush=True)
-    elif isinstance(payload, dict):
-        state = payload
-        source = "bare state_dict"
-        print(f"[warn] {path} is a bare state_dict; EMA provenance cannot be verified.", flush=True)
     else:
-        raise ValueError(f"Unsupported SceneFlow checkpoint format: {path}")
+        raise ValueError(
+            f"Unsupported metric/gauge SceneFlow checkpoint weight container: {path}"
+        )
 
     if state is not None:
         if not isinstance(state, dict):
@@ -580,7 +787,10 @@ def build_scene_flow_from_checkpoint(
         "weight_source": source,
         "step": int(payload.get("step", 0)) if isinstance(payload, dict) else 0,
         "scene_flow_config": config,
-        "camera_dggt_provenance": payload.get("camera_dggt_provenance") if isinstance(payload, dict) else None,
+        "metric_gauge_provenance": payload.get("metric_gauge_provenance")
+        if isinstance(payload, dict)
+        else None,
+        PRETRAIN_FEATURE_STATS_CONTRACT_KEY: checkpoint_stats_contract,
         "flow_schedule_config": flow_schedule,
     }
     del payload
@@ -598,6 +808,11 @@ def sync_args_from_model(args: argparse.Namespace, scene_flow: nn.Module) -> Non
     args.sky_mask_refine_scale = int(config.sky_mask_refine_scale)
     args.sky_mask_refine_channels = int(config.sky_mask_refine_channels)
     args.asset_position_mode = str(getattr(config, "asset_position_mode", "localized"))
+    args.camera_gen_dim = int(config.camera_gen_dim)
+    args.camera_generation_representation = str(config.camera_generation_representation)
+    args.gauge_gen_dim = int(config.gauge_gen_dim)
+    args.scene_gauge_representation = str(config.scene_gauge_representation)
+    args.scene_gauge_stats_version = str(config.scene_gauge_stats_version)
 
 
 def build_generated_dggt_scene_state(
@@ -657,6 +872,267 @@ def build_generated_dggt_scene_state(
     return state
 
 
+def prepare_generated_geometry_boundaries(
+    *,
+    depth: torch.Tensor,
+    gs_map: torch.Tensor,
+    gauge: torch.Tensor,
+    calibration: PullbackCalibration,
+    export_units: str,
+) -> tuple[PullbackResult, PullbackResult]:
+    """Keep native rendering exact and calibrate only a requested metric export."""
+    if export_units not in {"dggt", "metric"}:
+        raise ValueError(f"export_units must be 'dggt' or 'metric', got {export_units!r}")
+    if (
+        not torch.is_tensor(gauge)
+        or gauge.ndim != 3
+        or tuple(gauge.shape[-2:]) != (1, SCENE_GAUGE_DIM)
+    ):
+        raise ValueError(f"generated gauge must be [B,1,{SCENE_GAUGE_DIM}], got {getattr(gauge, 'shape', None)}")
+    if float(calibration.c_gs) != 1.0:
+        raise ValueError(f"v1 metric inference requires c_gs=1.0, got {calibration.c_gs!r}")
+    log_metric_scale = gauge[..., 0]
+    render_geometry = apply_pullback_calibration(
+        depth,
+        gs_map,
+        log_metric_scale=log_metric_scale,
+        calibration=calibration,
+        boundary=PULLBACK_RENDER_BOUNDARY,
+    )
+    # Rendering must remain bitwise in the frozen tokenizer's native geometry.
+    if render_geometry.depth_dggt is not depth or render_geometry.gs_map_dggt is not gs_map:
+        raise AssertionError("render pullback boundary must return the original depth and GS tensors")
+    if not bool(torch.equal(render_geometry.c_depth_factor, torch.ones_like(render_geometry.c_depth_factor))):
+        raise AssertionError("render pullback boundary must have unit depth factors")
+    if export_units == "dggt":
+        return render_geometry, render_geometry
+    metric_geometry = apply_pullback_calibration(
+        depth,
+        gs_map,
+        log_metric_scale=log_metric_scale,
+        calibration=calibration,
+        boundary=PULLBACK_METRIC_BOUNDARY,
+    )
+    return render_geometry, metric_geometry
+
+
+def _single_sample_gauge_summary(gauge: torch.Tensor) -> dict[str, Any]:
+    value = torch.as_tensor(gauge).detach().float()
+    if value.ndim == 1:
+        value = value.view(1, 1, -1)
+    elif value.ndim == 2:
+        value = value.unsqueeze(1)
+    if tuple(value.shape) != (1, 1, SCENE_GAUGE_DIM) or not bool(torch.isfinite(value).all()):
+        raise ValueError(
+            f"PLY export requires one finite scene gauge [1,1,{SCENE_GAUGE_DIM}], got {tuple(value.shape)}"
+        )
+    fov_yx = gauge_to_pose_enc_fov(value, 1)[0, 0]
+    log_metric_scale = float(value[0, 0, 0].item())
+    metres_per_unit = math.exp(log_metric_scale)
+    if not math.isfinite(metres_per_unit) or metres_per_unit <= 0.0:
+        raise ValueError(f"generated metres_per_unit is invalid: {metres_per_unit!r}")
+    return {
+        "representation": SCENE_GAUGE_REPRESENTATION,
+        "values": [float(channel) for channel in value[0, 0].cpu().tolist()],
+        "log_metric_scale": log_metric_scale,
+        "metres_per_unit": metres_per_unit,
+        "fov_deg": {
+            "x": math.degrees(float(fov_yx[1].item())),
+            "y": math.degrees(float(fov_yx[0].item())),
+        },
+    }
+
+
+def _single_camera_trajectory(
+    value: torch.Tensor | Any,
+    *,
+    name: str,
+    allow_front_view_axis: bool = False,
+) -> torch.Tensor:
+    """Canonicalize one metric camera trajectory to CPU ``[S,4,4]``.
+
+    Raw Waymo batches may carry an explicit view axis, whereas decoded
+    generated trajectories do not.  Offline inference is deliberately
+    batch-size one, so accepting a larger batch here would make the JSON
+    artifact ambiguous and is rejected.
+    """
+
+    tensor = torch.as_tensor(value).detach().float()
+    if allow_front_view_axis and tensor.ndim == 5:
+        if int(tensor.shape[2]) < 1:
+            raise ValueError(f"{name} has an empty view axis")
+        tensor = tensor[:, :, 0]
+    if tensor.ndim == 3 and tuple(tensor.shape[-2:]) == (4, 4):
+        tensor = tensor.unsqueeze(0)
+    if tensor.ndim != 4 or tuple(tensor.shape[-2:]) != (4, 4):
+        raise ValueError(
+            f"{name} must be [1,S,4,4]"
+            + (" or [1,S,V,4,4]" if allow_front_view_axis else "")
+            + f", got {tuple(tensor.shape)}"
+        )
+    if int(tensor.shape[0]) != 1 or int(tensor.shape[1]) < 1:
+        raise ValueError(f"{name} must contain exactly one non-empty trajectory, got {tuple(tensor.shape)}")
+    if not bool(torch.isfinite(tensor).all()):
+        raise ValueError(f"{name} contains non-finite values")
+    return tensor[0].cpu()
+
+
+def condition_vs_generated_camera_translation_metrics(
+    generated_camera_to_world_metric: torch.Tensor,
+    waymo_camera_to_world_metric: torch.Tensor,
+) -> dict[str, float | int]:
+    """Compare generated and requested Waymo camera centers in metres.
+
+    ``translation_l2_m_rmse`` is the plan's direct controllability measure:
+    the root mean squared Euclidean camera-center error over frames.  The
+    relative-to-first variant removes a common global translation and exposes
+    trajectory-shape drift separately.
+    """
+
+    generated = _single_camera_trajectory(
+        generated_camera_to_world_metric,
+        name="generated_camera_to_world_metric",
+    )
+    waymo = _single_camera_trajectory(
+        waymo_camera_to_world_metric,
+        name="waymo_camera_to_world_metric",
+        allow_front_view_axis=True,
+    )
+    if generated.shape != waymo.shape:
+        raise ValueError(
+            "generated and Waymo camera trajectories must have identical shape, "
+            f"got {tuple(generated.shape)} and {tuple(waymo.shape)}"
+        )
+    generated_t = generated[:, :3, 3]
+    waymo_t = waymo[:, :3, 3]
+    absolute_error = torch.linalg.vector_norm(generated_t - waymo_t, dim=-1)
+    generated_relative = generated_t - generated_t[:1]
+    waymo_relative = waymo_t - waymo_t[:1]
+    relative_error = torch.linalg.vector_norm(
+        generated_relative - waymo_relative, dim=-1
+    )
+
+    def summarize(error: torch.Tensor, prefix: str) -> dict[str, float]:
+        return {
+            f"{prefix}_mean": float(error.mean().item()),
+            f"{prefix}_rmse": float(error.square().mean().sqrt().item()),
+            f"{prefix}_max": float(error.max().item()),
+        }
+
+    return {
+        "frame_count": int(generated.shape[0]),
+        **summarize(absolute_error, "translation_l2_m"),
+        **summarize(relative_error, "relative_to_first_translation_l2_m"),
+    }
+
+
+def build_generated_metric_camera_summary(
+    *,
+    camera_state_metric_9d: torch.Tensor,
+    camera_to_world_metric: torch.Tensor,
+    camera_anchor_mask: torch.Tensor,
+    gauge: torch.Tensor,
+    waymo_camera_to_world_metric: torch.Tensor | None,
+    camera_condition_active: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build JSON and tensor artifacts for 10/29-frame camera comparison."""
+
+    state = torch.as_tensor(camera_state_metric_9d).detach().float()
+    if state.ndim == 2:
+        state = state.unsqueeze(0)
+    if state.ndim != 3 or int(state.shape[0]) != 1 or int(state.shape[-1]) != CAMERA_GENERATION_DIM:
+        raise ValueError(
+            "camera_state_metric_9d must be [1,S,9], "
+            f"got {tuple(state.shape)}"
+        )
+    if int(state.shape[1]) < 1 or not bool(torch.isfinite(state).all()):
+        raise ValueError("camera_state_metric_9d must be non-empty and finite")
+    generated_c2w = _single_camera_trajectory(
+        camera_to_world_metric,
+        name="camera_to_world_metric",
+    )
+    if int(generated_c2w.shape[0]) != int(state.shape[1]):
+        raise ValueError(
+            "camera state and decoded trajectory lengths differ: "
+            f"{int(state.shape[1])} vs {int(generated_c2w.shape[0])}"
+        )
+    anchors = torch.as_tensor(camera_anchor_mask).detach().to(dtype=torch.bool)
+    if anchors.ndim == 1:
+        anchors = anchors.unsqueeze(0)
+    if tuple(anchors.shape) != tuple(state.shape[:2]):
+        raise ValueError(
+            f"camera_anchor_mask must be {tuple(state.shape[:2])}, got {tuple(anchors.shape)}"
+        )
+    gauge_summary = _single_sample_gauge_summary(gauge)
+    gauge_tensor = torch.as_tensor(gauge).detach().float().reshape(1, 1, SCENE_GAUGE_DIM)
+    generated_translations = generated_c2w[:, :3, 3]
+    first_ten = min(10, int(state.shape[1]))
+
+    comparison: dict[str, Any]
+    waymo_c2w: torch.Tensor | None = None
+    if waymo_camera_to_world_metric is None:
+        comparison = {
+            "status": "unavailable",
+            "reason": "waymo_camera_to_world_metric_missing",
+            "camera_condition_active": bool(camera_condition_active),
+            "eligible_for_camera_controllability_gate": False,
+        }
+    else:
+        waymo_c2w = _single_camera_trajectory(
+            waymo_camera_to_world_metric,
+            name="waymo_camera_to_world_metric",
+            allow_front_view_axis=True,
+        )
+        metrics = condition_vs_generated_camera_translation_metrics(
+            generated_c2w,
+            waymo_c2w,
+        )
+        comparison = {
+            "status": (
+                "computed_camera_condition_active"
+                if camera_condition_active
+                else "reference_only_camera_condition_inactive"
+            ),
+            "camera_condition_active": bool(camera_condition_active),
+            "eligible_for_camera_controllability_gate": bool(camera_condition_active),
+            "target": "Waymo front-camera camera_to_world_corrected",
+            **metrics,
+            "waymo_translations_m": waymo_c2w[:, :3, 3].tolist(),
+            "first_10_waymo_translations_m": waymo_c2w[:first_ten, :3, 3].tolist(),
+        }
+
+    summary = {
+        "schema": GENERATED_METRIC_CAMERA_SCHEMA,
+        "units": "metres",
+        "camera_state_representation": CAMERA_GENERATION_REPRESENTATION,
+        "frame_count": int(state.shape[1]),
+        "camera_state_metric_9d": state[0].cpu().tolist(),
+        "camera_to_world_metric": generated_c2w.tolist(),
+        "translations_m": generated_translations.tolist(),
+        "first_10_camera_state_metric_9d": state[0, :first_ten].cpu().tolist(),
+        "first_10_translations_m": generated_translations[:first_ten].tolist(),
+        "camera_anchor_mask": anchors[0].cpu().tolist(),
+        "scene_global_gauge": gauge_summary,
+        "scene_global_gauge_shape": [1, 1, SCENE_GAUGE_DIM],
+        "condition_vs_generated": comparison,
+    }
+    tensor_artifact = {
+        "schema": GENERATED_METRIC_CAMERA_SCHEMA,
+        "units": "metres",
+        "camera_state_representation": CAMERA_GENERATION_REPRESENTATION,
+        "camera_state_metric_9d": state.cpu(),
+        "camera_to_world_metric": generated_c2w.unsqueeze(0),
+        "translations_m": generated_translations.unsqueeze(0),
+        "camera_anchor_mask": anchors.cpu(),
+        "scene_global_gauge": gauge_tensor.cpu(),
+        "waymo_camera_to_world_metric": (
+            None if waymo_c2w is None else waymo_c2w.unsqueeze(0)
+        ),
+        "condition_vs_generated": comparison,
+    }
+    return summary, tensor_artifact
+
+
 def export_generated_pointclouds(
     *,
     scene_state: CleanSceneState,
@@ -665,8 +1141,12 @@ def export_generated_pointclouds(
     stride: int,
     sky_probability_threshold: float = 0.5,
     min_effective_opacity: float = 0.01,
+    export_units: str = "dggt",
+    gauge: torch.Tensor | None = None,
+    c_depth_factor: torch.Tensor | None = None,
+    calibration: PullbackCalibration | None = None,
 ) -> dict[str, Any]:
-    """Write one DGGT canonical Gaussian/point PLY pair per generated frame.
+    """Write one canonical Gaussian/point PLY pair per generated frame.
 
     DGGT's inspection/export utilities write frame-local point clouds such as
     ``sample00_frame00.ply``.  Keeping that convention matters for MeshLab:
@@ -674,6 +1154,14 @@ def export_generated_pointclouds(
     camera poses overlap densely, which visually reads as oversized points even
     though the PLY schema has no point-size field.
     """
+    if export_units not in {"dggt", "metric"}:
+        raise ValueError(f"export_units must be 'dggt' or 'metric', got {export_units!r}")
+    gauge_summary = None if gauge is None else _single_sample_gauge_summary(gauge)
+    if export_units == "metric" and gauge_summary is None:
+        raise ValueError("metric PLY export requires the generated scene gauge")
+    if export_units == "metric" and calibration is None:
+        raise ValueError("metric PLY export requires a validated pullback calibration")
+    metres_per_unit = 1.0 if export_units == "dggt" else float(gauge_summary["metres_per_unit"])
     stride = max(1, int(stride))
     seq_len = int(scene_state.images.shape[0])
     frame_summaries: list[dict[str, Any]] = []
@@ -700,10 +1188,10 @@ def export_generated_pointclouds(
         total_sky_removed += sky_removed
         total_opacity_removed += opacity_removed
 
-        points = scene_state.means[keep]
+        points = scene_state.means[keep] * metres_per_unit
         colors = scene_state.colors[keep]
         opacities = scene_state.opacities[keep]
-        scales = scene_state.scales[keep]
+        scales = scene_state.scales[keep] * metres_per_unit
         quats = scene_state.quats[keep]
         count = int(points.shape[0])
         frame_counts.append(count)
@@ -735,7 +1223,27 @@ def export_generated_pointclouds(
             }
         )
 
-    return {
+    c_depth_summary: dict[str, Any] | None = None
+    if torch.is_tensor(c_depth_factor):
+        factors = c_depth_factor.detach().float().reshape(-1)
+        if factors.numel() == 0 or not bool(torch.isfinite(factors).all()):
+            raise ValueError("c_depth_factor must be finite and non-empty")
+        c_depth_summary = {
+            "form": "loglinear" if export_units == "metric" else "identity",
+            "factor_min": float(factors.min().item()),
+            "factor_median": float(factors.median().item()),
+            "factor_max": float(factors.max().item()),
+        }
+        if export_units == "metric" and calibration is not None:
+            c_depth_summary.update(
+                {
+                    "a": float(calibration.depth_a),
+                    "b": float(calibration.depth_b),
+                    "reference_depth_m": float(calibration.reference_depth_m),
+                    "runtime_depth_clamp_m": list(calibration.runtime_depth_clamp_m),
+                }
+            )
+    summary = {
         "frames": frame_summaries,
         "num_points": int(total_points),
         "num_points_before_filter": int(total_before),
@@ -748,10 +1256,33 @@ def export_generated_pointclouds(
         "schema": "Per-frame DGGT Gaussian PLY + MeshLab xyz/uchar-RGB PLY",
         "scene_builder": "dggt.utils.gaussian_edit.build_clean_scene_state",
         "validity_rule": "generated depth > 1e-4 AND p_sky < threshold AND effective opacity >= threshold",
-        "coordinates": "DGGT generated-camera world coordinates",
+        "export_units": export_units,
+        "coordinates": (
+            "metres in generated-camera world coordinates"
+            if export_units == "metric"
+            else "DGGT generated-camera world coordinates"
+        ),
+        "metres_per_unit_applied": float(metres_per_unit),
+        "gauge": gauge_summary,
+        "c_depth": c_depth_summary,
+        "c_gs": 1.0 if calibration is None else float(calibration.c_gs),
+        "pullback_boundary": (
+            PULLBACK_METRIC_BOUNDARY if export_units == "metric" else PULLBACK_RENDER_BOUNDARY
+        ),
+        "pullback_artifact_sha256": None if calibration is None else calibration.artifact_sha256,
+        "tokenizer_sha256": None if calibration is None else calibration.tokenizer_sha256,
         "merged_ply_saved": False,
         "meshlab_note": "Open one frame PLY at a time; merged multi-frame clouds visually over-densify points.",
     }
+    if gauge_summary is not None:
+        summary.update(
+            {
+                "log_metric_scale": gauge_summary["log_metric_scale"],
+                "metres_per_unit": gauge_summary["metres_per_unit"],
+                "fov_deg": gauge_summary["fov_deg"],
+            }
+        )
+    return summary
 
 
 @torch.no_grad()
@@ -765,18 +1296,28 @@ def render_and_export_generated(
     device: torch.device,
     output_dir: Path,
     suffix: str,
-) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    camera_condition_active: bool,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any], dict[str, Any]]:
     z_generated = generated_sample.video
-    camera_generated = generated_sample.camera_state_dggt
+    camera_generated = generated_sample.camera_state_metric
     camera_anchor_mask = generated_sample.camera_anchor_mask
-    camera_initial_c2w = generated_sample.camera_initial_c2w_dggt
+    camera_initial_c2w = generated_sample.camera_initial_c2w_metric
+    camera_trajectory_anchor_to_world = (
+        generated_sample.camera_trajectory_anchor_to_world_metric
+    )
+    gauge_generated = generated_sample.gauge
     sky_generated = generated_sample.sky
     sky_mask_patch = generated_sample.sky_mask_patch
     sky_mask_refined = generated_sample.sky_mask_refined
     if camera_generated is None:
         raise RuntimeError("Pretrain sampling did not generate camera tokens.")
+    if gauge_generated is None:
+        raise RuntimeError("Pretrain sampling did not generate the required scene gauge.")
     if sky_mask_patch is None:
         raise RuntimeError("Pretrain sampling did not generate a sky mask.")
+    pullback_calibration = getattr(args, "pullback_calibration", None)
+    if not isinstance(pullback_calibration, PullbackCalibration):
+        raise RuntimeError("Inference is missing a validated checkpoint-bound pullback calibration.")
 
     seq_len = int(z_generated.shape[1])
     height, width = _fixed_render_hw(args)
@@ -792,12 +1333,7 @@ def render_and_export_generated(
             patch_grid=args.patch_grid,
             patch_start_idx=patch_start_idx,
             image_hw=(height, width),
-        )
-        generated_pose = decode_pose_from_camera_features(
-            vggt_model,
-            camera_generated.to(device),
-            camera_anchor_mask=camera_anchor_mask,
-            initial_camera_to_world=camera_initial_c2w,
+            pullback_calibration=pullback_calibration,
         )
         generated_sky_mask = _sky_mask_patch_to_image(
             sky_mask_refined if sky_mask_refined is not None else sky_mask_patch,
@@ -806,8 +1342,49 @@ def render_and_export_generated(
             width=width,
             device=device,
         )
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        generated_camera_trajectory = decode_metric_camera_from_features(
+            camera_generated.to(device=device, dtype=torch.float32),
+            camera_anchor_mask=camera_anchor_mask,
+            initial_camera_to_world=camera_initial_c2w,
+            trajectory_anchor_to_world=camera_trajectory_anchor_to_world,
+        )
+        camera_to_world_dggt = metric_c2w_to_teacher_anchor_dggt(
+            generated_camera_trajectory.camera_to_world,
+            camera_trajectory_anchor_to_world,
+            gauge_generated[..., 0].to(device=device, dtype=torch.float32),
+        )
+        generated_pose = assemble_dggt_pose_encoding(
+            camera_to_world_dggt,
+            gauge_generated.to(device=device, dtype=torch.float32),
+        )
+    camera_summary, camera_tensor_artifact = build_generated_metric_camera_summary(
+        camera_state_metric_9d=camera_generated,
+        camera_to_world_metric=generated_camera_trajectory.camera_to_world,
+        camera_anchor_mask=camera_anchor_mask,
+        gauge=gauge_generated,
+        waymo_camera_to_world_metric=batch.get("camera_to_world_corrected"),
+        camera_condition_active=bool(camera_condition_active),
+    )
+    camera_artifact_path = output_dir / f"generated_metric_camera__{suffix}.pt"
+    torch.save(camera_tensor_artifact, camera_artifact_path)
+    camera_summary["tensor_artifact"] = str(camera_artifact_path)
     gs_map, gs_conf = geometry.gs_map, geometry.gs_conf
     generated_depth, generated_dynamic = geometry.depth, geometry.dynamic_conf
+    render_geometry, export_geometry = prepare_generated_geometry_boundaries(
+        depth=generated_depth,
+        gs_map=gs_map,
+        gauge=gauge_generated.to(device),
+        calibration=pullback_calibration,
+        export_units=str(args.export_units),
+    )
+    flow_consistency = camera_geometry_flow_consistency(
+        render_geometry.depth_dggt,
+        generated_pose,
+        sky_probability=generated_sky_mask,
+        dynamic_logits=generated_dynamic,
+        sample_stride=int(args.flow_consistency_stride),
+    )
 
     sky_background = None
     sky_grid_image = None
@@ -834,8 +1411,8 @@ def render_and_export_generated(
             generated_sky_mask,
             timestamps,
             generated_pose,
-            generated_depth,
-            gs_map,
+            render_geometry.depth_dggt,
+            render_geometry.gs_map_dggt,
             gs_conf,
             generated_dynamic,
             device,
@@ -852,8 +1429,8 @@ def render_and_export_generated(
 
     scene_state = build_generated_dggt_scene_state(
         pose_enc=generated_pose,
-        depth=generated_depth,
-        gs_map=gs_map,
+        depth=export_geometry.depth_dggt,
+        gs_map=export_geometry.gs_map_dggt,
         gs_conf=gs_conf,
         dynamic_conf=generated_dynamic,
         sky_mask=generated_sky_mask,
@@ -865,11 +1442,27 @@ def render_and_export_generated(
         stride=args.ply_stride,
         sky_probability_threshold=float(args.ply_sky_probability_threshold),
         min_effective_opacity=float(args.ply_min_effective_opacity),
+        export_units=str(args.export_units),
+        gauge=gauge_generated,
+        c_depth_factor=export_geometry.c_depth_factor,
+        calibration=pullback_calibration,
     )
-    del generated_pose, generated_depth, generated_dynamic, generated_sky_mask, gs_map, gs_conf, scene_state
+    del (
+        generated_camera_trajectory,
+        camera_to_world_dggt,
+        generated_pose,
+        generated_depth,
+        generated_dynamic,
+        generated_sky_mask,
+        gs_map,
+        gs_conf,
+        render_geometry,
+        export_geometry,
+        scene_state,
+    )
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    return images, ply_summary
+    return images, ply_summary, flow_consistency, camera_summary
 
 
 def _first(value: Any, default: Any = None) -> Any:
@@ -947,11 +1540,21 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dggt_ckpt_path", default=DEFAULT_DGGT_CKPT)
     parser.add_argument("--tokenizer_ckpt_path", default=DEFAULT_TOKENIZER_CKPT)
     parser.add_argument(
+        "--pullback_calibration_path",
+        default=DEFAULT_PULLBACK_CALIBRATION,
+        help="Strict checkpoint-bound tokenizer pullback artifact.",
+    )
+    parser.add_argument(
         "--feature_stats_path",
         default=None,
         help="Optional override; by default mu_z/sigma_z are loaded from the SceneFlow checkpoint.",
     )
     parser.add_argument("--val_image_dir", "--image_dir", dest="val_image_dir", default=DEFAULT_VAL_ROOT)
+    parser.add_argument(
+        "--val_scene_gauge_path",
+        default=DEFAULT_VAL_SCENE_GAUGE,
+        help="Offline full-29-frame validation gauge table (raw Waymo mode only).",
+    )
     parser.add_argument("--val_caption_root", "--caption_root", dest="val_caption_root", default=DEFAULT_CAPTION_ROOT)
     parser.add_argument("--text_encoder_path", default=DEFAULT_TEXT_ENCODER)
     parser.add_argument("--text_max_length", type=int, default=256)
@@ -1028,6 +1631,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--no_ema", action="store_true", help="Use raw weights from a full checkpoint.")
     parser.add_argument("--no_sky_generation", action="store_true")
     parser.add_argument(
+        "--export_units",
+        choices=("dggt", "metric"),
+        default="metric",
+        help="Point/Gaussian PLY coordinate units; metric applies the validated pullback and gauge.",
+    )
+    parser.add_argument(
         "--ply_stride",
         type=int,
         default=1,
@@ -1038,6 +1647,15 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ply_sky_probability_threshold", type=float, default=0.5)
     parser.add_argument("--ply_min_effective_opacity", type=float, default=0.01)
+    parser.add_argument(
+        "--flow_consistency_stride",
+        type=int,
+        default=4,
+        help=(
+            "Pixel sampling stride for the generated static-geometry reprojection/cycle "
+            "diagnostic. Coordinates and errors remain in full-resolution pixels."
+        ),
+    )
     parser.add_argument(
         "--val_sliding_window",
         type=int,
@@ -1077,6 +1695,8 @@ def validate_args(args: argparse.Namespace) -> list[float]:
         raise ValueError("--sample_steps must be positive.")
     if int(args.ply_stride) <= 0:
         raise ValueError("--ply_stride must be positive.")
+    if int(args.flow_consistency_stride) <= 0:
+        raise ValueError("--flow_consistency_stride must be positive.")
     if not 0.0 <= float(args.ply_sky_probability_threshold) <= 1.0:
         raise ValueError("--ply_sky_probability_threshold must be in [0,1].")
     if not 0.0 <= float(args.ply_min_effective_opacity) <= 1.0:
@@ -1098,8 +1718,9 @@ def main() -> None:
     )
     args.patch_grid = (int(args.patch_grid_h), int(args.patch_grid_w))
     args.sky_grid = (int(args.sky_grid_h), int(args.sky_grid_w))
-    # Bare legacy checkpoints have no config and are interpreted as CameraHead hidden v1.
-    args.camera_gen_dim = 2048
+    # Architecture construction is checkpoint-only; this value exists for
+    # argument/config reporting before the strict checkpoint sync.
+    args.camera_gen_dim = CAMERA_GENERATION_DIM
     args.caption_root = args.val_caption_root
     args.val_log_images = int(args.num_frames)
     # `--cfg` is text guidance.  As in Cosmos conditional video generation,
@@ -1120,27 +1741,73 @@ def main() -> None:
         fallback_args=args,
     )
     sync_args_from_model(args, scene_flow)
-    dggt_sha256 = checkpoint_sha256(args.dggt_ckpt_path)
-    provenance = checkpoint_info.get("camera_dggt_provenance")
-    recorded_hash = provenance.get("dggt_checkpoint_sha256") if isinstance(provenance, dict) else None
-    if recorded_hash != dggt_sha256:
-        raise ValueError(
-            "Pretrain inference DGGT checkpoint does not match camera provenance: "
-            f"checkpoint={recorded_hash!r}, current={dggt_sha256!r}."
-        )
+    raw_provenance = checkpoint_info.get("metric_gauge_provenance")
+    recorded_tokenizer_sha256 = (
+        raw_provenance.get("tokenizer_sha256")
+        if isinstance(raw_provenance, Mapping)
+        else ""
+    )
+    recorded_dggt_sha256 = (
+        raw_provenance.get("dggt_checkpoint_sha256")
+        if isinstance(raw_provenance, Mapping)
+        else ""
+    )
+    provenance = validate_metric_gauge_provenance(
+        raw_provenance,
+        scene_flow=scene_flow,
+        dggt_sha256=recorded_dggt_sha256,
+        tokenizer_sha256=recorded_tokenizer_sha256,
+        expected_window_len=int(args.val_sliding_window),
+        expected_patch_grid=args.patch_grid,
+    )
+    pullback_calibration = load_pullback_calibration(
+        args.pullback_calibration_path,
+        tokenizer_checkpoint_path=args.tokenizer_ckpt_path,
+        dggt_checkpoint_path=args.dggt_ckpt_path,
+        expected_window_len=int(args.val_sliding_window),
+        expected_patch_grid=args.patch_grid,
+        expected_artifact_sha256=provenance["pullback_artifact_sha256"],
+    )
+    provenance = validate_metric_gauge_provenance(
+        provenance,
+        scene_flow=scene_flow,
+        dggt_sha256=pullback_calibration.dggt_sha256,
+        tokenizer_sha256=pullback_calibration.tokenizer_sha256,
+        expected_window_len=int(args.val_sliding_window),
+        expected_patch_grid=args.patch_grid,
+    )
+    checkpoint_info["metric_gauge_provenance"] = provenance
+    stats_contract = validate_pretrain_feature_stats_contract(
+        checkpoint_info.get(PRETRAIN_FEATURE_STATS_CONTRACT_KEY),
+        path=args.weights,
+        expected_sequence_length=int(args.val_sliding_window),
+        expected_patch_grid=args.patch_grid,
+    )
+    checkpoint_info[PRETRAIN_FEATURE_STATS_CONTRACT_KEY] = stats_contract
+    args.pullback_calibration = pullback_calibration
+    scene_flow._pullback_calibration = pullback_calibration
     if args.feature_stats_path:
-        if str(scene_flow.config.camera_generation_representation) == CAMERA_GENERATION_REPRESENTATION:
-            load_all_stats_into_buffers(
-                scene_flow,
-                args.feature_stats_path,
-                token_dim=int(args.latent_dim),
-                dggt_ckpt_path=args.dggt_ckpt_path,
-                require_existing_match=True,
-            )
-        else:
-            load_into_buffers(scene_flow, args.feature_stats_path, token_dim=int(args.latent_dim))
-    if str(scene_flow.config.camera_generation_representation) == CAMERA_GENERATION_REPRESENTATION:
-        scene_flow.require_camera_stats()
+        runtime_stats_sha256 = checkpoint_sha256(args.feature_stats_path)
+        validate_pretrain_feature_stats_contract(
+            stats_contract,
+            path=args.weights,
+            expected_feature_stats_sha256=runtime_stats_sha256,
+            expected_sequence_length=int(args.val_sliding_window),
+            expected_patch_grid=args.patch_grid,
+        )
+        load_all_stats_into_buffers(
+            scene_flow,
+            args.feature_stats_path,
+            token_dim=int(args.latent_dim),
+            dggt_ckpt_path=args.dggt_ckpt_path,
+            expected_tokenizer_sha256=pullback_calibration.tokenizer_sha256,
+            expected_sequence_length=int(args.val_sliding_window),
+            expected_patch_grid=args.patch_grid,
+            expected_scene_gauge_sha256=provenance["gauge_table_sha256"],
+            require_existing_match=True,
+        )
+    scene_flow.require_camera_stats()
+    scene_flow.require_gauge_stats()
 
     print(
         f"[checkpoint] {checkpoint_info['weight_source']} step={checkpoint_info['step']} "
@@ -1155,7 +1822,8 @@ def main() -> None:
         and int(scene_flow.config.camera_gen_dim) != CAMERA_GENERATION_DIM
     ):
         raise ValueError(
-            f"DGGT v3 SceneFlow camera_gen_dim={scene_flow.config.camera_gen_dim} must be {CAMERA_GENERATION_DIM}."
+            "Waymo metric camera v4 SceneFlow "
+            f"camera_gen_dim={scene_flow.config.camera_gen_dim} must be {CAMERA_GENERATION_DIM}."
         )
     text_encoder = setup_text_encoder(args, device)
 
@@ -1174,6 +1842,11 @@ def main() -> None:
             int(args.val_sliding_window),
             int(args.val_sliding_stride),
         )
+        if int(args.val_sliding_window) != int(pullback_calibration.window_len):
+            raise ValueError(
+                "External manifest changed the effective inference window after pullback validation: "
+                f"window={args.val_sliding_window}, artifact={pullback_calibration.window_len}."
+            )
         apply_condition_mode(bundle, "asset_cam")
         output_root = Path(args.output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
@@ -1190,8 +1863,12 @@ def main() -> None:
                 text_encoder=text_encoder,
                 return_camera=False,
                 return_sky=sky_generation_enabled(args),
+                return_gauge=True,
                 return_sky_mask=True,
             )
+            if generated.gauge is None:
+                raise RuntimeError("External factorized sampling did not return the required scene gauge.")
+            gauge_summary = _single_sample_gauge_summary(generated.gauge)
             output_path = output_root / f"external_factorized__cfg{cfg_tag(scale)}.pt"
             torch.save(
                 {
@@ -1200,19 +1877,43 @@ def main() -> None:
                     "sky_mask_patch": None
                     if generated.sky_mask_patch is None
                     else generated.sky_mask_patch.detach().cpu(),
+                    "gauge": generated.gauge.detach().cpu(),
                     "frame_ids": bundle.frame_ids.detach().cpu(),
                     "fps": bundle.fps.detach().cpu(),
                     "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
                 },
                 output_path,
             )
-            results.append({"cfg": float(scale), "output": str(output_path)})
+            results.append(
+                {"cfg": float(scale), "output": str(output_path), "gauge": gauge_summary}
+            )
         summary = {
             "mode": "external_factorized_asset",
             "target_video_read": False,
             "target_dynamic_mask_read": False,
             "manifest": manifest_info,
             "checkpoint": checkpoint_info,
+            "pullback": {
+                "artifact_sha256": pullback_calibration.artifact_sha256,
+                "tokenizer_sha256": pullback_calibration.tokenizer_sha256,
+                "dggt_checkpoint_sha256": pullback_calibration.dggt_sha256,
+                "runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+                "c_depth": {
+                    "form": "loglinear",
+                    "a": pullback_calibration.depth_a,
+                    "b": pullback_calibration.depth_b,
+                },
+                "c_gs": pullback_calibration.c_gs,
+            },
+            "camera_geometry_flow_consistency": {
+                "schema": CAMERA_GEOMETRY_FLOW_DIAGNOSTIC_SCHEMA,
+                "status": "not_computed",
+                "reason": (
+                    "external factorized mode saves generated latents/gauge without decoding "
+                    "camera and geometry"
+                ),
+                "requires_gt_images": False,
+            },
             "window": int(args.val_sliding_window),
             "window_stride": int(args.val_sliding_stride),
             "sliding_window_active": bool(offline_sliding),
@@ -1240,6 +1941,9 @@ def main() -> None:
         load_dynamic_masks=False,
         binary_mask_channels=1,
         image_output_dtype="uint8",
+        scene_gauge_path=args.val_scene_gauge_path,
+        expected_scene_gauge_dggt_sha256=pullback_calibration.dggt_sha256,
+        expected_scene_gauge_split=Path(args.val_image_dir).name,
     )
     if len(dataset) == 0:
         raise RuntimeError("The selected validation dataset has no full caption-trunk samples.")
@@ -1281,6 +1985,7 @@ def main() -> None:
     )
 
     all_summaries: list[dict[str, Any]] = []
+    run_flow_diagnostics: list[dict[str, Any]] = []
     iterator = tqdm(loader, total=selected_count, desc="pretrain inference", dynamic_ncols=True)
     for position, batch in enumerate(iterator):
         if position >= selected_count:
@@ -1332,10 +2037,16 @@ def main() -> None:
                 text_encoder=text_encoder,
                 return_camera=True,
                 return_sky=sky_generation_enabled(args),
+                return_gauge=True,
                 return_sky_mask=True,
             )
             suffix = f"cfg{cfg_tag(scale)}"
-            rgb_images, ply_summary = render_and_export_generated(
+            (
+                rgb_images,
+                ply_summary,
+                flow_consistency,
+                generated_metric_camera,
+            ) = render_and_export_generated(
                 batch=batch,
                 vggt_model=vggt_model,
                 scene_flow=scene_flow,
@@ -1344,6 +2055,7 @@ def main() -> None:
                 device=device,
                 output_dir=sample_dir,
                 suffix=suffix,
+                camera_condition_active=bool(condition_rows["camera"][0]),
             )
             image_paths = save_cfg_images(
                 generated.video, rgb_images, sample_dir, args, suffix
@@ -1360,9 +2072,33 @@ def main() -> None:
                     },
                     "images": image_paths,
                     "pointcloud": ply_summary,
+                    "generated_metric_camera": generated_metric_camera,
+                    "camera_geometry_flow_consistency": flow_consistency,
                 }
             )
-            del generated, rgb_images
+            run_flow_diagnostics.append(
+                {
+                    "dataset_index": dataset_index,
+                    "scene_name": scene_name,
+                    "clip_index": clip_index,
+                    "start_idx": start_idx,
+                    "cfg": float(scale),
+                    "status": flow_consistency["status"],
+                    "pair_count": flow_consistency["pair_count"],
+                    "informative_pair_count": flow_consistency[
+                        "informative_pair_count"
+                    ],
+                    "pair_status_counts": flow_consistency["pair_status_counts"],
+                    "support": flow_consistency["support"],
+                    "all_supported_metrics": flow_consistency[
+                        "all_supported_metrics"
+                    ],
+                    "informative_metrics": flow_consistency[
+                        "informative_metrics"
+                    ],
+                }
+            )
+            del generated, rgb_images, flow_consistency
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -1389,6 +2125,24 @@ def main() -> None:
             "sample_steps": int(args.val_sample_steps),
             "shift": float(args.shift),
             "checkpoint": checkpoint_info,
+            "export_units": str(args.export_units),
+            "validation_gauge_table_sha256": dataset.scene_gauge_sha256,
+            "generated_gauges": [item["pointcloud"]["gauge"] for item in per_cfg],
+            "generated_metric_cameras": [
+                item["generated_metric_camera"] for item in per_cfg
+            ],
+            "pullback": {
+                "artifact_sha256": pullback_calibration.artifact_sha256,
+                "tokenizer_sha256": pullback_calibration.tokenizer_sha256,
+                "dggt_checkpoint_sha256": pullback_calibration.dggt_sha256,
+                "runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+                "c_depth": {
+                    "form": "loglinear" if args.export_units == "metric" else "identity",
+                    "a": pullback_calibration.depth_a,
+                    "b": pullback_calibration.depth_b,
+                },
+                "c_gs": pullback_calibration.c_gs,
+            },
             "common_images": common_paths,
             "cfg_results": per_cfg,
             "abs_error_saved": False,
@@ -1406,12 +2160,27 @@ def main() -> None:
         "checkpoint": checkpoint_info,
         "validation_root": str(args.val_image_dir),
         "caption_root": None if args.no_text_condition else str(args.val_caption_root),
+        "validation_gauge_table": str(args.val_scene_gauge_path),
+        "validation_gauge_table_sha256": dataset.scene_gauge_sha256,
+        "gauge_table_sha256": provenance["gauge_table_sha256"],
+        "tokenizer_sha256": pullback_calibration.tokenizer_sha256,
+        "dggt_checkpoint_sha256": pullback_calibration.dggt_sha256,
+        "pullback_artifact_sha256": pullback_calibration.artifact_sha256,
+        "pullback_runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+        "c_depth": {
+            "form": "loglinear" if args.export_units == "metric" else "identity",
+            "a": pullback_calibration.depth_a,
+            "b": pullback_calibration.depth_b,
+        },
+        "c_gs": pullback_calibration.c_gs,
+        "export_units": str(args.export_units),
         "rgb_compositing": "gsplat_premultiplied_over_background",
         "selected_range": [start, end],
         "cfg_scales": cfg_scales,
         "asset_control_guidance_scale": float(args.asset_control_guidance_scale),
         "camera_guidance_scale": float(args.camera_guidance_scale),
         "camera_text_guidance_scale": float(args.camera_text_guidance_scale),
+        "generated_metric_camera_schema": GENERATED_METRIC_CAMERA_SCHEMA,
         "condition_cycle": list(CONDITION_MODES),
         "num_frames": int(args.num_frames),
         "window": int(args.val_sliding_window),
@@ -1420,6 +2189,14 @@ def main() -> None:
         "sample_steps": int(args.val_sample_steps),
         "shift": float(args.shift),
         "ply_stride": int(args.ply_stride),
+        "camera_geometry_flow_consistency": {
+            "schema": CAMERA_GEOMETRY_FLOW_DIAGNOSTIC_SCHEMA,
+            "name": "generated static-geometry reprojection/cycle diagnostic",
+            "is_independently_predicted_optical_flow": False,
+            "requires_gt_images": False,
+            "sample_stride": int(args.flow_consistency_stride),
+            "results": run_flow_diagnostics,
+        },
         "samples": all_summaries,
     }
     (output_root / "all_summary.json").write_text(json.dumps(run_summary, indent=2, default=str))

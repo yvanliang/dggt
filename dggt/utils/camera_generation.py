@@ -1,10 +1,11 @@
-"""DGGT-space geometry for Cosmos-style SceneFlow camera generation.
+"""Metric Waymo geometry for Cosmos-style SceneFlow camera generation.
 
 The generated token is deliberately small and interpretable.  Frame zero is an
-absolute camera-to-world pose; every later frame is the adjacent camera motion
-``inv(c2w[t-1]) @ c2w[t]``.  FOV remains absolute for every frame.  Rotations
-use the continuous six-dimensional representation from Zhou et al. and are
-projected onto SO(3) during decoding.
+absolute camera-to-trajectory-anchor pose; every later frame is the adjacent
+camera motion ``inv(c2w[t-1]) @ c2w[t]``.  Translations are metres.  FOV belongs
+to the separate scene-global gauge token.  Rotations use the continuous
+six-dimensional representation from Zhou et al. and are projected onto SO(3)
+during decoding.
 """
 from __future__ import annotations
 
@@ -12,14 +13,14 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from dggt.utils.rotation import mat_to_quat, quat_to_mat
+from dggt.utils.rotation import quat_to_mat
 
 
-CAMERA_GENERATION_REPRESENTATION = "dggt_relative_se3_rot6d_logfov_v3"
-CAMERA_GENERATION_DIM = 11
-CAMERA_STATS_VERSION = "dggt_camera_anchor_delta_per_channel_v4_global_context"
-CAMERA_TARGET_SPACE = "dggt_camera_head_pose_enc"
-CAMERA_TARGET_SOURCE = "frozen_dggt_camera_head"
+CAMERA_GENERATION_REPRESENTATION = "waymo_metric_relative_se3_rot6d_v4"
+CAMERA_GENERATION_DIM = 9
+CAMERA_STATS_VERSION = "waymo_metric_camera_anchor_delta_per_channel_v5_global_context"
+CAMERA_TARGET_SPACE = "waymo_metric_camera_to_world"
+CAMERA_TARGET_SOURCE = "waymo_gt_extrinsics"
 CAMERA_STATS_STD_FLOOR = 1.0e-4
 
 
@@ -78,18 +79,6 @@ def _as_batched_sequence(x: torch.Tensor, trailing_ndim: int, name: str) -> tupl
     raise ValueError(f"{name} has unsupported shape {tuple(x.shape)}")
 
 
-def log_tan_half_fov(fov_xy: torch.Tensor) -> torch.Tensor:
-    if fov_xy.shape[-1] != 2:
-        raise ValueError(f"FOV must end in two channels, got {tuple(fov_xy.shape)}")
-    if not bool(torch.isfinite(fov_xy).all()) or bool(((fov_xy <= 0) | (fov_xy >= torch.pi)).any()):
-        raise ValueError("horizontal/vertical FOV must be finite and in (0, pi)")
-    return torch.log(torch.tan(0.5 * fov_xy))
-
-
-def fov_from_log_tan(log_fov_xy: torch.Tensor) -> torch.Tensor:
-    return 2.0 * torch.atan(torch.exp(log_fov_xy))
-
-
 def camera_anchor_mask(batch_size: int, seq_len: int, *, device: torch.device | None = None) -> torch.Tensor:
     if batch_size <= 0 or seq_len <= 0:
         raise ValueError("batch_size and seq_len must be positive")
@@ -117,36 +106,80 @@ def camera_to_world_from_dggt_pose_enc(pose_enc_dggt: torch.Tensor) -> torch.Ten
     return c2w.squeeze(0) if squeezed else c2w
 
 
-def camera_state_from_dggt_pose_enc(pose_enc_dggt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Encode frozen DGGT CameraHead ``[t_w2c,q_xyzw,FOVy,FOVx]`` to 11D.
-
-    This is intentionally the sole public target-construction entry point.
-    Waymo extrinsics/intrinsics belong to the independent 20D conditioning
-    path and must never be converted into this target space.
-    """
-    pose, squeezed = _as_batched_sequence(pose_enc_dggt.float(), 2, "pose_enc_dggt")
-    if pose.shape[-1] != 9:
-        raise ValueError(f"DGGT pose_enc must be [B,S,9], got {tuple(pose.shape)}")
+def _as_batched_pose(value: torch.Tensor, *, batch_size: int, name: str) -> torch.Tensor:
+    pose = torch.as_tensor(value).float()
+    if pose.ndim == 2:
+        pose = pose.unsqueeze(0)
+    elif pose.ndim == 4 and int(pose.shape[1]) == 1:
+        pose = pose[:, 0]
+    if pose.ndim != 3 or tuple(pose.shape[-2:]) != (4, 4):
+        raise ValueError(f"{name} must be [4,4], [B,4,4], or [B,1,4,4], got {tuple(pose.shape)}")
+    if int(pose.shape[0]) == 1 and batch_size > 1:
+        pose = pose.expand(batch_size, -1, -1)
+    if int(pose.shape[0]) != batch_size:
+        raise ValueError(f"{name} batch {pose.shape[0]} != camera batch {batch_size}")
     if not bool(torch.isfinite(pose).all()):
-        raise ValueError("DGGT pose_enc contains non-finite values")
-    if bool(((pose[..., 7:9] <= 0) | (pose[..., 7:9] >= torch.pi)).any()):
-        raise ValueError("DGGT FOVy/FOVx must be in (0, pi)")
-    c2w = camera_to_world_from_dggt_pose_enc(pose)
-    b, s = int(pose.shape[0]), int(pose.shape[1])
-    relative = c2w.clone()
+        raise ValueError(f"{name} contains non-finite values")
+    return pose
+
+
+def camera_state_from_waymo_c2w(
+    camera_to_world: torch.Tensor,
+    anchor_to_world: torch.Tensor,
+    *,
+    previous_camera_to_world: torch.Tensor | None = None,
+    anchor_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode deterministic Waymo camera GT as a 9D metric trajectory.
+
+    The first token is ``inv(anchor_to_world) @ camera_to_world[0]`` and every
+    later token is the adjacent transform.  This makes the target exactly the
+    metric delta half of the Waymo camera condition; no frozen DGGT gauge enters
+    the target construction.
+    """
+
+    c2w, squeezed = _as_batched_sequence(camera_to_world.float(), 3, "camera_to_world")
+    if tuple(c2w.shape[-2:]) != (4, 4):
+        raise ValueError(f"camera_to_world must end in [4,4], got {tuple(c2w.shape)}")
+    if not bool(torch.isfinite(c2w).all()):
+        raise ValueError("camera_to_world contains non-finite values")
+    b, s = int(c2w.shape[0]), int(c2w.shape[1])
+    anchor = _as_batched_pose(anchor_to_world, batch_size=b, name="anchor_to_world").to(
+        device=c2w.device, dtype=c2w.dtype
+    )
+    anchor_relative = invert_se3(anchor).unsqueeze(1) @ c2w
+    relative = anchor_relative.clone()
     if s > 1:
         relative[:, 1:] = invert_se3(c2w[:, :-1]) @ c2w[:, 1:]
-    # DGGT stores [FOVy,FOVx], while the state stores [log FOVx, log FOVy].
-    fov_xy = torch.stack((pose[..., 8], pose[..., 7]), dim=-1)
+    anchors = camera_anchor_mask(b, s, device=c2w.device) if anchor_mask is None else torch.as_tensor(
+        anchor_mask, device=c2w.device, dtype=torch.bool
+    )
+    if anchors.ndim == 1:
+        anchors = anchors.unsqueeze(0)
+    if tuple(anchors.shape) != (b, s):
+        raise ValueError(f"anchor_mask shape {tuple(anchors.shape)} != {(b, s)}")
+    if not bool(((anchors.sum(dim=1) == 0) | ((anchors.sum(dim=1) == 1) & anchors[:, 0])).all()):
+        raise ValueError("each camera window must be complete (anchor at local 0) or delta-only")
+    delta_only = anchors.sum(dim=1) == 0
+    if bool(delta_only.any()):
+        if previous_camera_to_world is None:
+            raise ValueError("delta-only camera targets require previous_camera_to_world")
+        previous = torch.as_tensor(
+            previous_camera_to_world, device=c2w.device, dtype=c2w.dtype
+        )
+        if previous.ndim == 4 and tuple(previous.shape[:2]) == (b, s):
+            previous = previous[:, 0]
+        elif squeezed and previous.ndim == 3 and tuple(previous.shape) == (s, 4, 4):
+            previous = previous[0]
+        previous = _as_batched_pose(
+            previous, batch_size=b, name="previous_camera_to_world"
+        ).to(device=c2w.device, dtype=c2w.dtype)
+        first_delta = invert_se3(previous) @ c2w[:, 0]
+        relative[:, 0] = torch.where(delta_only.view(b, 1, 1), first_delta, relative[:, 0])
     state = torch.cat(
-        (
-            relative[..., :3, 3],
-            rotation_matrix_to_6d(relative[..., :3, :3]),
-            log_tan_half_fov(fov_xy),
-        ),
+        (relative[..., :3, 3], rotation_matrix_to_6d(relative[..., :3, :3])),
         dim=-1,
     )
-    anchors = camera_anchor_mask(b, s, device=c2w.device)
     if squeezed:
         return state.squeeze(0), anchors.squeeze(0)
     return state, anchors
@@ -156,8 +189,6 @@ def camera_state_from_dggt_pose_enc(pose_enc_dggt: torch.Tensor) -> tuple[torch.
 class DecodedCameraTrajectory:
     camera_to_world: torch.Tensor
     world_to_camera: torch.Tensor
-    pose_encoding: torch.Tensor
-    fov_xy: torch.Tensor
 
 
 def decode_camera_trajectory(
@@ -165,8 +196,9 @@ def decode_camera_trajectory(
     anchor_mask: torch.Tensor,
     *,
     initial_camera_to_world: torch.Tensor | None = None,
+    trajectory_anchor_to_world: torch.Tensor | None = None,
 ) -> DecodedCameraTrajectory:
-    """Integrate a complete or globally sliced v3 camera trajectory.
+    """Integrate a complete or globally sliced v4 metric camera trajectory.
 
     A complete clip has its unique anchor at local token zero.  A window that
     starts later contains deltas only and must provide the global previous
@@ -177,6 +209,8 @@ def decode_camera_trajectory(
     if tokens.shape[-1] != CAMERA_GENERATION_DIM:
         raise ValueError(f"camera state dim must be {CAMERA_GENERATION_DIM}, got {tokens.shape[-1]}")
     b, s = int(tokens.shape[0]), int(tokens.shape[1])
+    if anchor_mask is None:
+        raise ValueError("global camera_anchor_mask is required to decode a metric camera trajectory")
     anchors = torch.as_tensor(anchor_mask, device=tokens.device, dtype=torch.bool)
     if anchors.ndim == 1:
         anchors = anchors.unsqueeze(0)
@@ -190,19 +224,26 @@ def decode_camera_trajectory(
             "camera windows must either contain the one global anchor at local frame 0 "
             "or contain deltas only"
         )
+    anchor = None
+    if trajectory_anchor_to_world is not None:
+        anchor = _as_batched_pose(
+            trajectory_anchor_to_world,
+            batch_size=b,
+            name="trajectory_anchor_to_world",
+        ).to(device=tokens.device, dtype=tokens.dtype)
     initial = None
     if bool(delta_only_rows.any()):
         if initial_camera_to_world is None:
             raise ValueError(
                 "delta-only camera windows require initial_camera_to_world from the global previous frame"
             )
-        initial = torch.as_tensor(initial_camera_to_world, device=tokens.device, dtype=tokens.dtype)
-        if initial.ndim == 2:
-            initial = initial.unsqueeze(0)
-        if initial.shape != (b, 4, 4):
-            raise ValueError(f"initial_camera_to_world shape {tuple(initial.shape)} != {(b, 4, 4)}")
-        if not bool(torch.isfinite(initial).all()):
-            raise ValueError("initial_camera_to_world contains non-finite values")
+        initial = _as_batched_pose(
+            initial_camera_to_world,
+            batch_size=b,
+            name="initial_camera_to_world",
+        ).to(device=tokens.device, dtype=tokens.dtype)
+        if anchor is not None:
+            initial = invert_se3(anchor) @ initial
     relative = torch.zeros((b, s, 4, 4), device=tokens.device, dtype=tokens.dtype)
     relative[..., :3, :3] = rotation_6d_to_matrix(tokens[..., 3:9])
     relative[..., :3, 3] = tokens[..., :3]
@@ -217,15 +258,12 @@ def decode_camera_trajectory(
     c2w_frames = [first]
     for index in range(1, s):
         c2w_frames.append(c2w_frames[-1] @ relative[:, index])
-    c2w = torch.stack(c2w_frames, dim=1)
+    camera_to_reference = torch.stack(c2w_frames, dim=1)
+    c2w = camera_to_reference if anchor is None else anchor.unsqueeze(1) @ camera_to_reference
     w2c = invert_se3(c2w)
-    fov_xy = fov_from_log_tan(tokens[..., 9:11])
-    # DGGT pose encoding is [w2c translation, xyzw quaternion, vertical FOV, horizontal FOV].
-    quaternion = mat_to_quat(w2c[..., :3, :3])
-    pose = torch.cat((w2c[..., :3, 3], quaternion, fov_xy[..., 1:2], fov_xy[..., 0:1]), dim=-1)
     if squeezed:
-        return DecodedCameraTrajectory(c2w.squeeze(0), w2c.squeeze(0), pose.squeeze(0), fov_xy.squeeze(0))
-    return DecodedCameraTrajectory(c2w, w2c, pose, fov_xy)
+        return DecodedCameraTrajectory(c2w.squeeze(0), w2c.squeeze(0))
+    return DecodedCameraTrajectory(c2w, w2c)
 
 
 def so3_geodesic_angle(rotation_a: torch.Tensor, rotation_b: torch.Tensor) -> torch.Tensor:
@@ -254,17 +292,17 @@ def camera_geometry_loss(
     anchor_mask: torch.Tensor,
     *,
     initial_camera_to_world: torch.Tensor | None = None,
+    trajectory_anchor_to_world: torch.Tensor | None = None,
     absolute_weight: float = 1.0,
     relative_weight: float = 1.0,
     smoothness_weight: float = 0.25,
     translation_weight: float = 1.0,
     rotation_weight: float = 1.0,
-    fov_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Pose/trajectory loss on the fully reconstructed camera clip.
 
     The absolute/relative/smoothness weights select the trajectory objective,
-    while the translation/rotation/FOV weights select physical components
+    while the translation/rotation weights select physical components
     consistently across those objectives.
     """
     if predicted_state.shape != target_state.shape or predicted_state.shape[-1] != CAMERA_GENERATION_DIM:
@@ -273,11 +311,13 @@ def camera_geometry_loss(
         predicted_state,
         anchor_mask,
         initial_camera_to_world=initial_camera_to_world,
+        trajectory_anchor_to_world=trajectory_anchor_to_world,
     )
     target = decode_camera_trajectory(
         target_state,
         anchor_mask,
         initial_camera_to_world=initial_camera_to_world,
+        trajectory_anchor_to_world=trajectory_anchor_to_world,
     )
     p_c2w, t_c2w = pred.camera_to_world, target.camera_to_world
     if p_c2w.ndim == 3:
@@ -285,7 +325,6 @@ def camera_geometry_loss(
     zero = _differentiable_zero(predicted_state)
     abs_t = F.smooth_l1_loss(p_c2w[..., :3, 3], t_c2w[..., :3, 3])
     abs_r = so3_geodesic_angle(p_c2w[..., :3, :3], t_c2w[..., :3, :3]).mean()
-    abs_fov = F.smooth_l1_loss(predicted_state[..., 9:11], target_state[..., 9:11])
     anchors = torch.as_tensor(anchor_mask, device=predicted_state.device, dtype=torch.bool)
     if anchors.ndim == 1:
         anchors = anchors.unsqueeze(0)
@@ -309,32 +348,25 @@ def camera_geometry_loss(
         pred_dr2 = pred_dr[..., :-1, :, :].transpose(-1, -2) @ pred_dr[..., 1:, :, :]
         target_dr2 = target_dr[..., :-1, :, :].transpose(-1, -2) @ target_dr[..., 1:, :, :]
         accel_r = so3_geodesic_angle(pred_dr2, target_dr2).mean()
-        pred_fov_d = predicted_state[..., 1:, 9:11] - predicted_state[..., :-1, 9:11]
-        target_fov_d = target_state[..., 1:, 9:11] - target_state[..., :-1, 9:11]
-        accel_fov = F.smooth_l1_loss(pred_fov_d[..., 1:, :] - pred_fov_d[..., :-1, :], target_fov_d[..., 1:, :] - target_fov_d[..., :-1, :])
     else:
-        accel_t = accel_r = accel_fov = zero
+        accel_t = accel_r = zero
     absolute = (
         float(translation_weight) * abs_t
         + float(rotation_weight) * abs_r
-        + float(fov_weight) * abs_fov
     )
     relative = float(translation_weight) * rel_t + float(rotation_weight) * rel_r
     smoothness = (
         float(translation_weight) * accel_t
         + float(rotation_weight) * accel_r
-        + float(fov_weight) * accel_fov
     )
     total = float(absolute_weight) * absolute + float(relative_weight) * relative + float(smoothness_weight) * smoothness
     metrics = {
         "camera_absolute_translation": abs_t,
         "camera_absolute_rotation_rad": abs_r,
-        "camera_log_fov": abs_fov,
         "camera_relative_translation": rel_t,
         "camera_relative_rotation_rad": rel_r,
         "camera_acceleration_translation": accel_t,
         "camera_acceleration_rotation_rad": accel_r,
-        "camera_acceleration_fov": accel_fov,
     }
     return total, metrics
 

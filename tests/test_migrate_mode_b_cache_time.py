@@ -67,6 +67,9 @@ def _mode_b_payload() -> dict:
         "mode_kind": "mode_b",
         "meta": {
             "gaussian_time_representation": GAUSSIAN_TIME_REPRESENTATION,
+            "metric_box_mapping_mode": "generic_sim3",
+            "scene_gauge_table_sha256": None,
+            "dggt_checkpoint_sha256": "a" * 64,
             "scene_name": "synthetic",
             "clip_name": "clip_3",
             "frame_indices_scene": torch.tensor([87, 88, 89]),

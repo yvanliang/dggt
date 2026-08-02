@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import warnings
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,7 @@ from dggt.utils.flow_cache_io import (
     load_flow_cache,
 )
 from dggt.utils.gaussian_edit import Sim3Transform
+from dggt.utils.scene_gauge import METRIC_BOX_MAPPING_MODE
 from dggt.utils.validation_cache_naming import (
     is_canonical_validation_cache_filename,
     normalize_validation_variant,
@@ -60,9 +62,10 @@ from dggt.utils.validation_cache_naming import (
 )
 
 
-SUPPORTED_CACHE_SCHEMA_VERSIONS = (9,)
+SUPPORTED_CACHE_SCHEMA_VERSIONS = (10,)
 GS_CONF_REPAIR_VALUE = 1_000_000.0
 EXPECTED_ASSET_LUT_LEVELS = 4
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class CaptionLookupError(RuntimeError):
@@ -75,6 +78,10 @@ class AssetLutIncompleteError(RuntimeError):
 
 class EmptyEditWindowError(RuntimeError):
     """Raised when formal training cannot find a window with edit supervision."""
+
+
+class MetricGaugeCacheProvenanceError(RuntimeError):
+    """A formal cache was made with a different metric/gauge contract."""
 
 
 def repair_cached_gs_conf(gs_conf: torch.Tensor) -> torch.Tensor:
@@ -383,6 +390,7 @@ class WaymoFlowCacheDataset(Dataset):
         require_edit_window: bool = False,
         edit_domain_threshold: float = 1e-4,
         deterministic_windows: bool = False,
+        require_metric_gauge_provenance: bool = False,
     ) -> None:
         super().__init__()
         if min_frames <= 0 or max_frames < min_frames:
@@ -411,6 +419,10 @@ class WaymoFlowCacheDataset(Dataset):
         self.include_sky_training_data = bool(include_sky_training_data)
         self.include_rgb_training_data = bool(include_rgb_training_data)
         self.require_edit_window = bool(require_edit_window)
+        self.require_metric_gauge_provenance = bool(require_metric_gauge_provenance)
+        self._expected_metric_box_mapping_mode: str | None = None
+        self._expected_scene_gauge_table_sha256: str | None = None
+        self._expected_dggt_checkpoint_sha256: str | None = None
         self.edit_domain_threshold = float(edit_domain_threshold)
         if not 0.0 <= self.edit_domain_threshold < 1.0:
             raise ValueError(
@@ -457,6 +469,66 @@ class WaymoFlowCacheDataset(Dataset):
     def __len__(self) -> int:
         return len(self.entries)
 
+    def bind_metric_gauge_provenance(
+        self,
+        *,
+        expected_scene_gauge_sha256: str,
+        expected_dggt_sha256: str,
+        expected_mapping_mode: str = METRIC_BOX_MAPPING_MODE,
+    ) -> None:
+        """Bind and preflight every formal cache against trusted provenance.
+
+        The expected hashes come from the already validated SceneFlow
+        checkpoint and the DGGT checkpoint file loaded by the current process;
+        cache metadata is evidence to compare, never the source of truth.
+        """
+
+        mapping_mode = str(expected_mapping_mode)
+        if mapping_mode != METRIC_BOX_MAPPING_MODE:
+            raise ValueError(
+                "Formal cache provenance requires metric_box_mapping_mode="
+                f"{METRIC_BOX_MAPPING_MODE!r}, got {mapping_mode!r}."
+            )
+        gauge_sha = self._normalize_expected_sha256(
+            expected_scene_gauge_sha256,
+            field="expected_scene_gauge_sha256",
+        )
+        dggt_sha = self._normalize_expected_sha256(
+            expected_dggt_sha256,
+            field="expected_dggt_sha256",
+        )
+        self.require_metric_gauge_provenance = True
+        self._expected_metric_box_mapping_mode = mapping_mode
+        self._expected_scene_gauge_table_sha256 = gauge_sha
+        self._expected_dggt_checkpoint_sha256 = dggt_sha
+
+        # Fail before a training/inference run starts rather than discovering a
+        # stale pre-v10 or cross-checkpoint cache after many optimizer steps.
+        seen: set[Path] = set()
+        for entry in self.entries:
+            cache_path = Path(entry["cache_path"])
+            resolved = cache_path.expanduser().resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if is_chunked_flow_cache(cache_path):
+                payload = load_chunked_flow_cache_probe(cache_path)
+            else:
+                payload = load_flow_cache(
+                    cache_path,
+                    map_location="cpu",
+                    weights_only=False,
+                    mmap=self.mmap_plain_cache,
+                )
+            self._validate_loaded_payload(payload, cache_path=cache_path, entry=entry)
+
+    @staticmethod
+    def _normalize_expected_sha256(value: str, *, field: str) -> str:
+        normalized = str(value).lower()
+        if _SHA256_RE.fullmatch(normalized) is None:
+            raise ValueError(f"{field} must be 64 lowercase hexadecimal characters")
+        return normalized
+
     # ------------------------------------------------------------------ #
     def __getitem__(self, idx: int) -> dict[str, Any]:
         self._reseed_rng_for_worker_if_needed()
@@ -486,7 +558,11 @@ class WaymoFlowCacheDataset(Dataset):
             tried.add(current_idx)
             try:
                 return load_fn(current_idx)
-            except (CaptionLookupError, AssetLutIncompleteError):
+            except (
+                CaptionLookupError,
+                AssetLutIncompleteError,
+                MetricGaugeCacheProvenanceError,
+            ):
                 raise
             except Exception as exc:
                 last_exc = exc
@@ -642,7 +718,7 @@ class WaymoFlowCacheDataset(Dataset):
         window_rng = self._window_rng(sample_index)
         if is_chunked_flow_cache(cache_path):
             probe = load_chunked_flow_cache_probe(cache_path)
-            self._validate_v6_payload(probe, cache_path=cache_path, entry=entry)
+            self._validate_loaded_payload(probe, cache_path=cache_path, entry=entry)
             num_frames_all = int(probe["meta"]["num_frames"])
             subset_t = self._sample_contiguous_subset(probe, num_frames_all, rng=window_rng)
             try:
@@ -662,7 +738,7 @@ class WaymoFlowCacheDataset(Dataset):
                     asset_lut_level_indices=self.asset_lut_level_indices,
                 )
             if consumer != "tokenizer_stage_b":
-                self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
+                self._validate_loaded_payload(payload, cache_path=cache_path, entry=entry)
             subset_payload = torch.arange(int(subset_t.numel()), dtype=torch.long)
             return payload, subset_t, subset_payload
 
@@ -672,7 +748,7 @@ class WaymoFlowCacheDataset(Dataset):
             weights_only=False,
             mmap=self.mmap_plain_cache,
         )
-        self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
+        self._validate_loaded_payload(payload, cache_path=cache_path, entry=entry)
         num_frames_all = int(payload["meta"]["num_frames"])
         subset_t = self._sample_contiguous_subset(payload, num_frames_all, rng=window_rng)
         return payload, subset_t, subset_t
@@ -999,6 +1075,111 @@ class WaymoFlowCacheDataset(Dataset):
                     if bool(mask.index_select(1, cols).any().item()):
                         return True
         return False
+
+    # ------------------------------------------------------------------ #
+    def _validate_loaded_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        cache_path: Path,
+        entry: dict[str, Any],
+    ) -> None:
+        self._validate_v6_payload(payload, cache_path=cache_path, entry=entry)
+        if not bool(getattr(self, "require_metric_gauge_provenance", False)):
+            return
+        expected_mode = getattr(self, "_expected_metric_box_mapping_mode", None)
+        expected_gauge = getattr(self, "_expected_scene_gauge_table_sha256", None)
+        expected_dggt = getattr(self, "_expected_dggt_checkpoint_sha256", None)
+        if None in (expected_mode, expected_gauge, expected_dggt):
+            raise MetricGaugeCacheProvenanceError(
+                "Formal cache dataset has not been bound to trusted metric/gauge "
+                "provenance. Call bind_metric_gauge_provenance() before reading it."
+            )
+        sources = [("meta", payload.get("meta", {}))]
+        summary = payload.get("_chunked_summary")
+        if isinstance(summary, dict):
+            sources.append(("chunked summary", summary))
+        expected = {
+            "metric_box_mapping_mode": expected_mode,
+            "scene_gauge_table_sha256": expected_gauge,
+            "dggt_checkpoint_sha256": expected_dggt,
+        }
+        for source_name, source in sources:
+            if not isinstance(source, dict):
+                raise MetricGaugeCacheProvenanceError(
+                    f"Cache {cache_path} has no mapping-like {source_name} provenance."
+                )
+            for field, expected_value in expected.items():
+                actual_value = source.get(field)
+                if actual_value != expected_value:
+                    raise MetricGaugeCacheProvenanceError(
+                        f"Cache {cache_path} {source_name}.{field}={actual_value!r}; "
+                        f"expected {expected_value!r}. Regenerate this cache with "
+                        "tools/precompute_flow_features.py and the current formal artifacts."
+                    )
+        meta = payload["meta"]
+        effective = meta.get("metric_box_scene_gauge")
+        raw = meta.get("metric_box_scene_gauge_raw")
+        valid = meta.get("metric_box_scene_gauge_valid")
+        fallback = meta.get("metric_box_scene_gauge_fallback_mask")
+        mean = meta.get("metric_box_scene_gauge_valid_channel_mean")
+        frame_tensors = {
+            "metric_box_scene_gauge": effective,
+            "metric_box_scene_gauge_raw": raw,
+            "metric_box_scene_gauge_valid": valid,
+            "metric_box_scene_gauge_fallback_mask": fallback,
+        }
+        shapes = {
+            key: tuple(value.shape) if torch.is_tensor(value) else None
+            for key, value in frame_tensors.items()
+        }
+        if any(shape is None or len(shape) != 2 or shape[1] != 3 for shape in shapes.values()):
+            raise MetricGaugeCacheProvenanceError(
+                f"Cache {cache_path} must preserve effective/raw/valid/fallback gauge "
+                f"tensors shaped [S,3], got {shapes}."
+            )
+        if len(set(shapes.values())) != 1:
+            raise MetricGaugeCacheProvenanceError(
+                f"Cache {cache_path} gauge provenance tensors disagree in shape: {shapes}."
+            )
+        if not torch.is_tensor(mean) or tuple(mean.shape) != (3,):
+            raise MetricGaugeCacheProvenanceError(
+                f"Cache {cache_path} must preserve the production valid-channel mean [3]."
+            )
+        valid_bool = valid.detach().cpu().to(torch.bool)
+        fallback_bool = fallback.detach().cpu().to(torch.bool)
+        if not torch.equal(fallback_bool, ~valid_bool):
+            raise MetricGaugeCacheProvenanceError(
+                f"Cache {cache_path} fallback mask is not the complement of raw validity."
+            )
+        effective_f = effective.detach().cpu().float()
+        raw_f = raw.detach().cpu().float()
+        mean_f = mean.detach().cpu().float()
+        expected_effective = torch.where(valid_bool, raw_f, mean_f.view(1, 3))
+        if not bool(torch.isfinite(expected_effective).all()) or not torch.allclose(
+            effective_f, expected_effective, atol=1.0e-6, rtol=0.0
+        ):
+            raise MetricGaugeCacheProvenanceError(
+                f"Cache {cache_path} effective gauge violates the raw/valid/table-mean contract."
+            )
+        policy = meta.get("metric_box_scene_gauge_fallback_policy")
+        if policy != "production_valid_channel_mean_v1":
+            raise MetricGaugeCacheProvenanceError(
+                f"Cache {cache_path} has unknown metric gauge fallback policy {policy!r}."
+            )
+        if isinstance(summary, dict):
+            expected_channel_count = int(fallback_bool.sum().item())
+            expected_frame_count = int(fallback_bool.any(dim=-1).sum().item())
+            if (
+                summary.get("metric_box_gauge_fallback_channel_count")
+                != expected_channel_count
+                or summary.get("metric_box_gauge_fallback_frame_count")
+                != expected_frame_count
+                or summary.get("metric_box_gauge_fallback_policy") != policy
+            ):
+                raise MetricGaugeCacheProvenanceError(
+                    f"Cache {cache_path} chunked summary disagrees with gauge fallback metadata."
+                )
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -1328,7 +1509,7 @@ class WaymoFlowCacheDataset(Dataset):
             if not torch.is_tensor(patch_mask):
                 raise RuntimeError(
                     f"Mode-A cache {cache_path} asset {k} is missing asset_patch_valid_mask; "
-                    "regenerate the Mode-A cache with schema v9."
+                    "regenerate the Mode-A cache with schema v10."
                 )
             if patch_mask.ndim != 2:
                 raise ValueError(
@@ -1422,7 +1603,7 @@ class WaymoFlowCacheDataset(Dataset):
             if not torch.is_tensor(patch_mask):
                 raise RuntimeError(
                     f"Mode-A cache {cache_path} asset {k} is missing asset_patch_valid_mask; "
-                    "regenerate the Mode-A cache with schema v9."
+                    "regenerate the Mode-A cache with schema v10."
                 )
             patch_mask = patch_mask.index_select(0, subset).to(torch.bool).contiguous()
             if self.asset_lut_level_indices is None:

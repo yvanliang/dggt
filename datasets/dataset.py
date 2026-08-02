@@ -11,6 +11,7 @@ from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
 import json
+import hashlib
 
 from dggt.utils.gaussian_time import gaussian_timestamps_from_frame_ids
 from dggt.utils.factorized_asset_condition import (
@@ -20,6 +21,11 @@ from dggt.utils.factorized_asset_condition import (
     canonicalize_asset_reference,
     project_anchor_boxes_to_patch_bboxes,
     resize_crop_intrinsics_to_model_canvas,
+)
+from dggt.utils.scene_gauge import (
+    SCENE_GAUGE_TABLE_SCHEMA,
+    SCENE_GAUGE_TABLE_SCHEMA_VERSION,
+    scene_gauge_production_protocol,
 )
 
 
@@ -715,6 +721,11 @@ class WaymoOpenDataset(Dataset):
         load_dynamic_masks=True,
         binary_mask_channels=3,
         image_output_dtype="float32",
+        scene_gauge_path=None,
+        scene_gauge_missing_policy="error",
+        expected_scene_gauge_dggt_sha256=None,
+        expected_scene_gauge_split=None,
+        load_metric_depth_diagnostic=False,
     ):
         #mode 1 : train
         #mode 2 : pure reconstruction
@@ -781,6 +792,64 @@ class WaymoOpenDataset(Dataset):
             )
         if self.return_full_dggt_context and self.views != 1:
             raise ValueError("Full DGGT context is currently supported only for views=1.")
+        self.scene_gauge_missing_policy = str(scene_gauge_missing_policy).strip().lower()
+        if self.scene_gauge_missing_policy not in ("error", "mask"):
+            raise ValueError(
+                "scene_gauge_missing_policy must be 'error' or 'mask', got "
+                f"{scene_gauge_missing_policy!r}"
+            )
+        self.load_metric_depth_diagnostic = bool(load_metric_depth_diagnostic)
+        if self.load_metric_depth_diagnostic and (self.mode != 1 or self.views != 1):
+            raise ValueError(
+                "load_metric_depth_diagnostic is supported only for mode=1 front-camera pretraining"
+            )
+        self.scene_gauge_path = None
+        self.scene_gauge_sha256 = None
+        self.scene_gauge_dggt_sha256 = None
+        self.scene_gauge_split = None
+        self.scene_gauge_image_dir = None
+        self.scene_gauge_requested_keys = None
+        self.scene_gauge_required_keys = None
+        self._scene_gauge_table = None
+        if scene_gauge_path is not None:
+            if self.mode != 1:
+                raise ValueError("scene_gauge_path is supported only for mode=1 raw pretraining.")
+            if self.views != 1:
+                raise ValueError("scene_gauge_path is supported only for the front camera (views=1).")
+            if self.trunk_frames != 29:
+                raise ValueError(
+                    "scene_gauge_path uses the fixed 29-frame offline trunk definition; "
+                    f"got trunk_frames={self.trunk_frames}."
+                )
+            (
+                self.scene_gauge_path,
+                self.scene_gauge_sha256,
+                self.scene_gauge_dggt_sha256,
+                self.scene_gauge_split,
+                self.scene_gauge_image_dir,
+                self.scene_gauge_requested_keys,
+                self._scene_gauge_table,
+            ) = self._load_scene_gauge_table(scene_gauge_path)
+            if expected_scene_gauge_dggt_sha256 is not None:
+                expected_teacher_sha = str(expected_scene_gauge_dggt_sha256).lower()
+                if self.scene_gauge_dggt_sha256 != expected_teacher_sha:
+                    raise ValueError(
+                        "Scene gauge table DGGT checkpoint mismatch: "
+                        f"table={self.scene_gauge_dggt_sha256!r}, "
+                        f"expected={expected_teacher_sha!r}, path={self.scene_gauge_path}"
+                    )
+            if expected_scene_gauge_split is not None and self.scene_gauge_split != str(
+                expected_scene_gauge_split
+            ):
+                raise ValueError(
+                    "Scene gauge table split mismatch: "
+                    f"table={self.scene_gauge_split!r}, "
+                    f"expected={str(expected_scene_gauge_split)!r}"
+                )
+            # ``image_dir`` is provenance, not dataset identity.  Absolute roots
+            # legitimately change when an artifact is copied to another machine;
+            # split, protocol/checkpoint hashes, and requested trunk keys provide
+            # the portable compatibility checks.
         if trunk_major_window_offsets is None:
             self.trunk_major_window_offsets = None
         else:
@@ -959,6 +1028,13 @@ class WaymoOpenDataset(Dataset):
         # trunk 1, etc. Only trunks that can provide a full sequence are used.
         self.trunk_major_index = []
         if self.trunk_major_samples:
+            # Latent extraction and offline gauge supervision are both defined
+            # on complete 29-frame trunks.  Keep the historical partial-trunk
+            # behavior for ordinary sequence-only datasets, but never index a
+            # tail that cannot supply the complete context/provenance contract.
+            require_complete_trunk = (
+                self.return_full_dggt_context or self._scene_gauge_table is not None
+            )
             max_trunks = max(
                 (
                     len(paths[0] if self.views == 3 else paths) // self.trunk_frames
@@ -971,7 +1047,9 @@ class WaymoOpenDataset(Dataset):
                 for scene_idx, paths in enumerate(self.image_paths):
                     total_frames = len(paths[0] if self.views == 3 else paths)
                     available = min(trunk_base + self.trunk_frames, total_frames) - trunk_base
-                    if available >= int(self.sequence_length):
+                    if available >= int(self.sequence_length) and (
+                        not require_complete_trunk or available == self.trunk_frames
+                    ):
                         if self.trunk_major_window_offsets is None:
                             self.trunk_major_index.append((scene_idx, trunk_idx))
                         else:
@@ -979,6 +1057,26 @@ class WaymoOpenDataset(Dataset):
                             for offset in self.trunk_major_window_offsets:
                                 if offset <= max_offset:
                                     self.trunk_major_index.append((scene_idx, trunk_idx, offset))
+
+        if self._scene_gauge_table is not None and self.scene_gauge_missing_policy == "error":
+            required_gauge_keys = set()
+            for scene_idx, paths in enumerate(self.image_paths):
+                total_frames = len(paths[0] if self.views == 3 else paths)
+                scene_name = str(self.scenes[scene_idx])
+                scene_key = scene_name.zfill(3) if scene_name.isdigit() else scene_name
+                for trunk_idx in range(total_frames // self.trunk_frames):
+                    required_gauge_keys.add(f"{scene_key}/{trunk_idx}")
+            missing_gauge_keys = sorted(
+                required_gauge_keys.difference(self._scene_gauge_table),
+                key=lambda key: (key.split("/")[0], int(key.split("/")[1])),
+            )
+            if missing_gauge_keys:
+                raise ValueError(
+                    "Scene gauge table does not cover every complete 29-frame trunk "
+                    "selected by this dataset; missing examples="
+                    f"{missing_gauge_keys[:10]}, total_missing={len(missing_gauge_keys)}"
+                )
+            self.scene_gauge_required_keys = tuple(sorted(required_gauge_keys))
 
 
     def _build_scene_name_to_base(self, scene_name_to_index_path, image_dir):
@@ -1063,6 +1161,282 @@ class WaymoOpenDataset(Dataset):
         scene_base = _normalize_waymo_caption_base(scene_base)
         clip_index = int(start_idx) // 29
         return os.path.join(str(self.caption_root), "pinhole_front", f"{scene_base}_{clip_index}.json")
+
+    @staticmethod
+    def _load_scene_gauge_table(path):
+        """Load and validate the immutable 29-frame scene-gauge lookup table."""
+        resolved_path = os.path.realpath(os.path.abspath(os.path.expanduser(os.fspath(path))))
+        if not os.path.isfile(resolved_path):
+            raise FileNotFoundError(f"Scene gauge table not found: {resolved_path}")
+        try:
+            with open(resolved_path, "rb") as handle:
+                payload = handle.read()
+        except OSError as exc:
+            raise OSError(f"Failed to read scene gauge table: {resolved_path}") from exc
+
+        def reject_duplicate_keys(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError(f"duplicate JSON key {key!r}")
+                obj[key] = value
+            return obj
+
+        try:
+            raw_table = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"Invalid scene gauge JSON at {resolved_path}: {exc}") from exc
+        if not isinstance(raw_table, dict):
+            raise ValueError(
+                f"Scene gauge table must be a JSON object keyed by '<scene>/<trunk>': {resolved_path}"
+            )
+        if "entries" not in raw_table:
+            raise ValueError(
+                "Scene gauge training requires the complete production wrapper; "
+                f"bare early Phase-1a tables are rejected: {resolved_path}"
+            )
+        if "entries" in raw_table:
+            required_wrapper_fields = {
+                "schema",
+                "status",
+                "metadata",
+                "summary",
+                "entries",
+                "errors",
+            }
+            missing_wrapper_fields = required_wrapper_fields.difference(raw_table)
+            unexpected_wrapper_fields = set(raw_table).difference(required_wrapper_fields)
+            if missing_wrapper_fields or unexpected_wrapper_fields:
+                raise ValueError(
+                    "Scene gauge wrapper must contain exactly "
+                    "schema/status/metadata/summary/entries/errors; "
+                    f"missing={sorted(missing_wrapper_fields)}, "
+                    f"unexpected={sorted(unexpected_wrapper_fields)}: {resolved_path}"
+                )
+            if raw_table["schema"] != SCENE_GAUGE_TABLE_SCHEMA:
+                raise ValueError(
+                    "Scene gauge wrapper field 'schema' must be "
+                    f"{SCENE_GAUGE_TABLE_SCHEMA!r}: {resolved_path}"
+                )
+            if raw_table["status"] != "complete":
+                raise ValueError(
+                    "Scene gauge production table must have status='complete'; "
+                    f"got {raw_table['status']!r}: {resolved_path}"
+                )
+            if not isinstance(raw_table["metadata"], dict):
+                raise ValueError(f"Scene gauge wrapper field 'metadata' must be an object: {resolved_path}")
+            if not isinstance(raw_table["summary"], dict):
+                raise ValueError(f"Scene gauge wrapper field 'summary' must be an object: {resolved_path}")
+            if not isinstance(raw_table["entries"], dict):
+                raise ValueError(f"Scene gauge wrapper field 'entries' must be an object: {resolved_path}")
+            if not isinstance(raw_table["errors"], list):
+                raise ValueError(f"Scene gauge wrapper field 'errors' must be a list: {resolved_path}")
+            if raw_table["errors"]:
+                raise ValueError(
+                    f"Scene gauge production table contains extraction errors: {resolved_path}"
+                )
+            metadata = raw_table["metadata"]
+            expected_metadata = {
+                "schema_version": SCENE_GAUGE_TABLE_SCHEMA_VERSION,
+                "representation": "dggt_teacher_log_metric_scale_logfov_v1",
+                "trunk_frames": 29,
+            }
+            for field_name, expected_value in expected_metadata.items():
+                if metadata.get(field_name) != expected_value:
+                    raise ValueError(
+                        f"Scene gauge metadata field {field_name!r} must be {expected_value!r}: "
+                        f"{resolved_path}"
+                    )
+            if not isinstance(metadata.get("split"), str) or not metadata["split"].strip():
+                raise ValueError(f"Scene gauge metadata field 'split' must be a non-empty string: {resolved_path}")
+            if not isinstance(metadata.get("image_dir"), str) or not metadata["image_dir"].strip():
+                raise ValueError(
+                    f"Scene gauge metadata field 'image_dir' must be a non-empty string: {resolved_path}"
+                )
+            checkpoint_sha256 = metadata.get("checkpoint_sha256")
+            if (
+                not isinstance(checkpoint_sha256, str)
+                or len(checkpoint_sha256) != 64
+                or any(character not in "0123456789abcdefABCDEF" for character in checkpoint_sha256)
+            ):
+                raise ValueError(
+                    f"Scene gauge metadata field 'checkpoint_sha256' must be 64 hex characters: {resolved_path}"
+                )
+            checkpoint_sha256 = checkpoint_sha256.lower()
+            protocol = metadata.get("protocol")
+            if not isinstance(protocol, dict):
+                raise ValueError(
+                    f"Scene gauge metadata field 'protocol' must be an object: {resolved_path}"
+                )
+            expected_protocol = scene_gauge_production_protocol(checkpoint_sha256)
+            if protocol != expected_protocol:
+                raise ValueError(
+                    "Scene gauge table does not use the frozen production extraction protocol: "
+                    f"{resolved_path}"
+                )
+            protocol_sha256 = hashlib.sha256(
+                json.dumps(
+                    protocol,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            if metadata.get("protocol_sha256") != protocol_sha256:
+                raise ValueError(
+                    f"Scene gauge metadata protocol_sha256 mismatch: {resolved_path}"
+                )
+            requested_keys = metadata.get("requested_keys")
+            if (
+                not isinstance(requested_keys, list)
+                or any(not isinstance(key, str) for key in requested_keys)
+                or len(requested_keys) != len(set(requested_keys))
+            ):
+                raise ValueError(
+                    f"Scene gauge metadata requested_keys must be a unique string list: {resolved_path}"
+                )
+            expected_entry_count = metadata.get("expected_entry_count")
+            if (
+                isinstance(expected_entry_count, bool)
+                or not isinstance(expected_entry_count, int)
+                or expected_entry_count != len(requested_keys)
+            ):
+                raise ValueError(
+                    f"Scene gauge metadata expected_entry_count mismatch: {resolved_path}"
+                )
+            raw_entries = raw_table["entries"]
+            if set(raw_entries) != set(requested_keys):
+                raise ValueError(
+                    "Scene gauge complete table entries do not exactly match requested_keys: "
+                    f"{resolved_path}"
+                )
+            summary = raw_table["summary"]
+            if (
+                int(summary.get("entry_count", -1)) != expected_entry_count
+                or int(summary.get("expected_entry_count", -1)) != expected_entry_count
+                or float(summary.get("coverage_fraction", -1.0)) != 1.0
+            ):
+                raise ValueError(
+                    f"Scene gauge summary does not prove complete coverage: {resolved_path}"
+                )
+            table_checkpoint_sha256 = checkpoint_sha256
+            table_split = str(metadata["split"])
+            table_image_dir = str(metadata["image_dir"])
+            table_requested_keys = tuple(requested_keys)
+        def finite_float(value, field_name, table_key):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(
+                    f"Scene gauge entry {table_key!r} field {field_name!r} must be a finite number."
+                )
+            result = float(value)
+            if not np.isfinite(result):
+                raise ValueError(
+                    f"Scene gauge entry {table_key!r} field {field_name!r} must be finite."
+                )
+            return result
+
+        table = {}
+        for raw_key, entry in raw_entries.items():
+            if not isinstance(raw_key, str) or raw_key.count("/") != 1:
+                raise ValueError(
+                    f"Invalid scene gauge key {raw_key!r}; expected '<scene>/<trunk>'."
+                )
+            scene_name, trunk_text = raw_key.split("/", 1)
+            if not scene_name or not trunk_text.isdigit():
+                raise ValueError(
+                    f"Invalid scene gauge key {raw_key!r}; expected '<scene>/<nonnegative trunk>'."
+                )
+            canonical_scene = scene_name.zfill(3) if scene_name.isdigit() else scene_name
+            canonical_key = f"{canonical_scene}/{int(trunk_text)}"
+            if canonical_key in table:
+                raise ValueError(
+                    f"Duplicate canonical scene gauge key {canonical_key!r} in {resolved_path}."
+                )
+            if not isinstance(entry, dict):
+                raise ValueError(f"Scene gauge entry {raw_key!r} must be a JSON object.")
+            if "log_metric_scale" not in entry:
+                raise ValueError(f"Scene gauge entry {raw_key!r} lacks 'log_metric_scale'.")
+            if "log_tan_half_fov" not in entry:
+                raise ValueError(f"Scene gauge entry {raw_key!r} lacks 'log_tan_half_fov'.")
+            if "valid" not in entry:
+                raise ValueError(f"Scene gauge entry {raw_key!r} lacks 'valid'.")
+
+            fov = entry["log_tan_half_fov"]
+            if not isinstance(fov, list) or len(fov) != 2:
+                raise ValueError(
+                    f"Scene gauge entry {raw_key!r} field 'log_tan_half_fov' must have length 2."
+                )
+            valid = entry["valid"]
+            if (
+                not isinstance(valid, list)
+                or len(valid) != 3
+                or any(type(channel_valid) is not bool for channel_valid in valid)
+            ):
+                raise ValueError(
+                    f"Scene gauge entry {raw_key!r} field 'valid' must be a length-3 bool list."
+                )
+            raw_values = (entry["log_metric_scale"], fov[0], fov[1])
+            field_names = (
+                "log_metric_scale",
+                "log_tan_half_fov[0]",
+                "log_tan_half_fov[1]",
+            )
+            values = []
+            for raw_value, field_name, channel_valid in zip(
+                raw_values, field_names, valid
+            ):
+                if raw_value is None:
+                    if channel_valid:
+                        raise ValueError(
+                            f"Scene gauge entry {raw_key!r} field {field_name!r} "
+                            "cannot be null when its validity flag is true."
+                        )
+                    values.append(0.0)
+                else:
+                    values.append(finite_float(raw_value, field_name, raw_key))
+            table[canonical_key] = (values, tuple(valid))
+
+        return (
+            resolved_path,
+            hashlib.sha256(payload).hexdigest(),
+            table_checkpoint_sha256,
+            table_split,
+            table_image_dir,
+            table_requested_keys,
+            table,
+        )
+
+    def _scene_gauge_for_context(self, scene_name, context_base):
+        if self._scene_gauge_table is None:
+            return None
+        context_base = int(context_base)
+        if context_base < 0 or context_base % self.trunk_frames != 0:
+            raise ValueError(
+                f"Invalid scene gauge context_base={context_base}; expected a {self.trunk_frames}-frame boundary."
+            )
+        scene_key = str(scene_name).zfill(3) if str(scene_name).isdigit() else str(scene_name)
+        table_key = f"{scene_key}/{context_base // self.trunk_frames}"
+        entry = self._scene_gauge_table.get(table_key)
+        if entry is None:
+            if self.scene_gauge_missing_policy == "mask":
+                return (
+                    torch.zeros(3, dtype=torch.float32),
+                    torch.zeros(3, dtype=torch.bool),
+                )
+            raise KeyError(
+                "Scene gauge entry is missing: "
+                f"key={table_key!r}, scene={scene_name!r}, context_base={context_base}, "
+                f"path={self.scene_gauge_path}"
+            )
+        values, valid = entry
+        return (
+            torch.tensor(values, dtype=torch.float32),
+            torch.tensor(valid, dtype=torch.bool),
+        )
 
     def _load_caption(self, scene_name, start_idx):
         path = self._caption_path(scene_name, start_idx)
@@ -2172,12 +2546,12 @@ class WaymoOpenDataset(Dataset):
 
         if self.mode == 1:
             indices = list(range(start_idx, start_idx + self.sequence_length))
+            context_base = (int(start_idx) // self.trunk_frames) * self.trunk_frames
 
             #images
             if self.views == 1:
                 seq = [image_paths[i] for i in indices]
                 if self.return_full_dggt_context:
-                    context_base = (int(start_idx) // self.trunk_frames) * self.trunk_frames
                     context_end = context_base + self.trunk_frames
                     if context_end > total_frames:
                         raise RuntimeError(
@@ -2246,6 +2620,9 @@ class WaymoOpenDataset(Dataset):
                 "start_idx": start_idx,
                 "clip_index": start_idx // 29,
             }
+            scene_gauge = self._scene_gauge_for_context(self.scenes[idx], context_base)
+            if scene_gauge is not None:
+                input_dict["scene_gauge"], input_dict["scene_gauge_valid"] = scene_gauge
             if self.return_full_dggt_context:
                 input_dict["dggt_context_images"] = dggt_context_images
                 input_dict["dggt_window_indices"] = window_context_indices
@@ -2294,6 +2671,55 @@ class WaymoOpenDataset(Dataset):
 
             if self.views == 1:
                 input_dict.update(self._project_pretrain_object_slots(idx, indices, seq))
+
+            if self.load_metric_depth_diagnostic:
+                # Depth files are optional diagnostics, not a training input.  Resolve
+                # them by the actual global frame id: indexing a sorted list of only
+                # the files that exist shifts every frame after the first gap.
+                height, width = int(images.shape[-2]), int(images.shape[-1])
+                metric_depth = torch.zeros(
+                    (len(indices), height, width), dtype=torch.float32
+                )
+                metric_depth_valid = torch.zeros_like(metric_depth, dtype=torch.bool)
+                depth_root = os.path.join(self.scene_roots[idx], "depth_flows_4")
+                available = [
+                    (local_idx, os.path.join(depth_root, f"{int(frame_idx):03d}_0.npy"))
+                    for local_idx, frame_idx in enumerate(indices)
+                ]
+                available = [item for item in available if os.path.isfile(item[1])]
+                if available:
+                    depth_and_flow = load_and_preprocess_flow(
+                        [path for _, path in available],
+                        None,
+                        None,
+                        height,
+                        width,
+                    )
+                    if depth_and_flow.ndim == 4:
+                        loaded_depth = depth_and_flow[..., 0]
+                    elif depth_and_flow.ndim == 3:
+                        loaded_depth = depth_and_flow
+                    else:
+                        raise ValueError(
+                            "preprocessed LiDAR depth-flow must be [S,H,W,C] or [S,H,W], got "
+                            f"{tuple(depth_and_flow.shape)}"
+                        )
+                    expected_shape = (len(available), height, width)
+                    if tuple(loaded_depth.shape) != expected_shape:
+                        raise ValueError(
+                            "preprocessed LiDAR depth shape must match available frames and image canvas: "
+                            f"expected {expected_shape}, got {tuple(loaded_depth.shape)}"
+                        )
+                    loaded_depth = loaded_depth.to(dtype=torch.float32)
+                    loaded_valid = torch.isfinite(loaded_depth) & (loaded_depth > 0.0)
+                    loaded_depth = torch.where(
+                        loaded_valid, loaded_depth, torch.zeros_like(loaded_depth)
+                    )
+                    for loaded_idx, (local_idx, _) in enumerate(available):
+                        metric_depth[local_idx] = loaded_depth[loaded_idx]
+                        metric_depth_valid[local_idx] = loaded_valid[loaded_idx]
+                input_dict["metric_lidar_depth_m"] = metric_depth.contiguous()
+                input_dict["metric_lidar_depth_valid"] = metric_depth_valid.contiguous()
 
             
             # if len(semantic_mask_paths) > 0:

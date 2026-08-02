@@ -72,8 +72,9 @@ from dggt.utils.flow_cache_io import (
     save_flow_cache,
     save_flow_cache_chunked,
 )
-from dggt.utils.gaussian_edit import parse_object_slots
+from dggt.utils.gaussian_edit import _transform_sample_track_box, parse_object_slots
 from dggt.utils.gaussian_time import GAUSSIAN_TIME_REPRESENTATION
+from dggt.utils.scene_gauge import resolve_scene_gauge_checkpoint_sha256
 from dggt.utils.tokens import select_patch_pyramid
 
 
@@ -94,6 +95,15 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Override; default resolves from edit_mode + processed_root.")
     p.add_argument("--candidate_path", default=None,
                    help="Override; default resolves from edit_mode + processed_root.")
+    p.add_argument(
+        "--metric_box_mapping_mode",
+        choices=["metric_gauge_v4", "generic_sim3"],
+        default="metric_gauge_v4",
+        help="Formal Waymo caches use anisotropic 29-frame gauge box mapping.",
+    )
+    p.add_argument("--scene_gauge_path", default=None,
+                   help="Complete split-specific gauge table; required by metric_gauge_v4.")
+    p.add_argument("--expected_scene_gauge_dggt_sha256", default=None)
     p.add_argument("--asset_root", default=None)
     p.add_argument("--split", default="training")
     p.add_argument("--out_root", required=True)
@@ -231,22 +241,49 @@ def _should_skip_existing_cache(path: Path, args: argparse.Namespace) -> tuple[b
         return False, "missing"
     if bool(args.force_overwrite):
         return False, "force_overwrite"
-    if bool(getattr(args, "overwrite_v7", False)):
-        version = _read_cache_schema_version(path)
-        if version == CACHE_SCHEMA_VERSION:
-            if str(getattr(args, "save_compression", "")) == "chunked_zstd":
-                try:
-                    if not is_chunked_flow_cache(path):
-                        return False, f"schema_v{version}_non_chunked"
-                    summary = load_chunked_flow_cache_summary(path)
-                except Exception:
-                    return False, f"schema_v{version}_unreadable_chunked"
-                if not is_current_flow_cache_summary(summary):
-                    fmt = summary.get("format_version", "unknown")
-                    return False, f"schema_v{version}_chunked_format_v{fmt}"
-            return True, f"schema_v{version}"
+    version = _read_cache_schema_version(path)
+    if version != CACHE_SCHEMA_VERSION:
         return False, f"schema_v{version if version is not None else 'unreadable'}"
-    return True, "exists"
+
+    try:
+        if is_chunked_flow_cache(path):
+            summary = load_chunked_flow_cache_summary(path)
+            if not is_current_flow_cache_summary(summary):
+                fmt = summary.get("format_version", "unknown")
+                return False, f"schema_v{version}_chunked_format_v{fmt}"
+            provenance = summary
+        else:
+            if str(getattr(args, "save_compression", "")) == "chunked_zstd":
+                return False, f"schema_v{version}_non_chunked"
+            payload = load_flow_cache(path, map_location="cpu", weights_only=False, mmap=False)
+            provenance = payload.get("meta", {})
+    except Exception:
+        return False, f"schema_v{version}_unreadable"
+
+    expected = {
+        "metric_box_mapping_mode": str(args.metric_box_mapping_mode),
+        "scene_gauge_table_sha256": getattr(args, "scene_gauge_table_sha256", None),
+        "dggt_checkpoint_sha256": str(args.scene_gauge_dggt_sha256),
+    }
+    for field, expected_value in expected.items():
+        actual_value = provenance.get(field)
+        if actual_value != expected_value:
+            return False, f"provenance_{field}_mismatch"
+    if str(args.metric_box_mapping_mode) == "metric_gauge_v4":
+        if provenance.get("metric_box_gauge_fallback_policy") not in (
+            None,
+            "production_valid_channel_mean_v1",
+        ):
+            return False, "provenance_metric_box_gauge_fallback_policy_mismatch"
+        if is_chunked_flow_cache(path) and provenance.get(
+            "metric_box_gauge_fallback_policy"
+        ) != "production_valid_channel_mean_v1":
+            return False, "provenance_metric_box_gauge_fallback_policy_missing"
+        if not is_chunked_flow_cache(path) and provenance.get(
+            "metric_box_scene_gauge_fallback_policy"
+        ) != "production_valid_channel_mean_v1":
+            return False, "provenance_metric_box_gauge_fallback_policy_missing"
+    return True, f"schema_v{version}_provenance_match"
 
 
 def _assert_valid_mode_b_payload(payload: dict[str, Any]) -> None:
@@ -563,11 +600,13 @@ def _run_mode_b_planner(
 
     # Convert existing-object metadata into DGGT-coord centers/rotations the
     # planner uses for collision tests. Mirror inference_mode_b.py helpers.
-    existing_objects = _collect_existing_objects_dggt(sample, alignment)
+    existing_objects = _collect_existing_objects_dggt(sample, clean_state, alignment)
     if record is not None:
         from inference_mode_b import _convert_waymo_existing_objects_to_dggt
         existing_objects.extend(
-            _convert_waymo_existing_objects_to_dggt(record.get("existing_objects", []), alignment)
+            _convert_waymo_existing_objects_to_dggt(
+                record.get("existing_objects", []), sample, clean_state, alignment
+            )
         )
         existing_objects.extend(record.get("existing_objects_dggt", []))
 
@@ -622,7 +661,9 @@ def _run_mode_b_planner(
     }
 
 
-def _collect_existing_objects_dggt(sample: dict[str, Any], alignment) -> list[dict[str, Any]]:
+def _collect_existing_objects_dggt(
+    sample: dict[str, Any], clean_state, alignment
+) -> list[dict[str, Any]]:
     """Slot-level existing-object DGGT centers/rotations (subset of inference_mode_b.py)."""
     if "object_valid_mask" not in sample or "object_track_valid_mask_selected" not in sample:
         return []
@@ -643,9 +684,18 @@ def _collect_existing_objects_dggt(sample: dict[str, Any], alignment) -> list[di
         for frame_idx in range(int(present.shape[0])):
             if bool(present[frame_idx].item()):
                 T = obj_to_world[slot_idx, frame_idx]
-                centers.append(alignment.apply_points(T[:3, 3].view(1, 3))[0])
-                rotations.append(alignment.rotation @ T[:3, :3])
-                sizes.append(box_size[slot_idx, frame_idx] * float(alignment.scale))
+                center, size, rotation = _transform_sample_track_box(
+                    sample,
+                    clean_state,
+                    alignment,
+                    T,
+                    box_size[slot_idx, frame_idx],
+                    frame_idx=frame_idx,
+                    view_offset=0,
+                )
+                centers.append(center)
+                rotations.append(rotation)
+                sizes.append(size)
             else:
                 centers.append(torch.zeros(3, dtype=torch.float32))
                 rotations.append(torch.eye(3, dtype=torch.float32))
@@ -1505,6 +1555,23 @@ def precompute_one_clip(
             "cam_ids": sample["cam_ids"].cpu().to(torch.long),
             "timestamps": sample["timestamps"].cpu().to(torch.float32),
             "gaussian_time_representation": GAUSSIAN_TIME_REPRESENTATION,
+            "metric_box_mapping_mode": str(args.metric_box_mapping_mode),
+            "scene_gauge_table_sha256": getattr(
+                args, "scene_gauge_table_sha256", None
+            ),
+            "dggt_checkpoint_sha256": str(args.scene_gauge_dggt_sha256),
+            "metric_box_scene_gauge": sample.get("metric_box_scene_gauge"),
+            "metric_box_scene_gauge_raw": sample.get("metric_box_scene_gauge_raw"),
+            "metric_box_scene_gauge_valid": sample.get("metric_box_scene_gauge_valid"),
+            "metric_box_scene_gauge_fallback_mask": sample.get(
+                "metric_box_scene_gauge_fallback_mask"
+            ),
+            "metric_box_scene_gauge_valid_channel_mean": sample.get(
+                "metric_box_scene_gauge_valid_channel_mean"
+            ),
+            "metric_box_scene_gauge_fallback_policy": sample.get(
+                "metric_box_scene_gauge_fallback_policy"
+            ),
             "image_size_model_hw": (H_img, W_img),
             "patch_grid": (H_img // 14, W_img // 14),
             "patch_start_idx": patch_start_idx,
@@ -1559,6 +1626,10 @@ def precompute_one_clip(
 
 def main() -> None:
     args = build_argparser().parse_args()
+    scene_gauge_dggt_sha256 = resolve_scene_gauge_checkpoint_sha256(
+        args.ckpt_path,
+        args.expected_scene_gauge_dggt_sha256,
+    )
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -1592,10 +1663,23 @@ def main() -> None:
         mode=args.dataset_mode,
         sequence_length=CLIP_LENGTH,
         sample_window=CLIP_LENGTH,
+        metric_box_mapping_mode=args.metric_box_mapping_mode,
+        scene_gauge_path=args.scene_gauge_path,
+        expected_scene_gauge_dggt_sha256=scene_gauge_dggt_sha256,
     )
     if args.asset_root is not None:
         dataset_kwargs["asset_root"] = args.asset_root
     dataset = WaymoEditDataset(**dataset_kwargs)
+    args.scene_gauge_dggt_sha256 = scene_gauge_dggt_sha256
+    args.scene_gauge_table_sha256 = dataset.scene_gauge_sha256
+    if (
+        str(args.metric_box_mapping_mode) == "metric_gauge_v4"
+        and args.scene_gauge_table_sha256 is None
+    ):
+        raise RuntimeError(
+            "Formal metric_gauge_v4 cache generation requires a measured "
+            "scene-gauge table SHA-256."
+        )
     total = len(dataset)
     start_idx = int(args.start) if args.start is not None else int(args.start_clip_idx)
     end_idx = int(args.end) if args.end is not None else (total if args.end_clip_idx < 0 else int(args.end_clip_idx))

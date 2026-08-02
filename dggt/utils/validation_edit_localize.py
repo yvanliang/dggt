@@ -44,13 +44,15 @@ from dggt.utils.gaussian_edit import (
     _project_asset_bbox_simple,
     _solve_proposal_center_with_fixed_rotation,
     _transform_asset_gaussians_simple,
-    _transform_track_box,
+    _transform_sample_track_box,
     build_box_corners,
     compute_bbox_from_projected_points,
     project_world_points,
 )
 
-VALIDATION_LOCALIZATION_POLICY = "target_tar_member_index_sim3_bbox_depth_shared_delta_v3"
+VALIDATION_LOCALIZATION_POLICY = (
+    "target_tar_member_index_metric_gauge_bbox_depth_shared_delta_v4"
+)
 
 
 def _empty_long() -> torch.Tensor:
@@ -259,8 +261,14 @@ def localize_validation_objects(
         for f in range(int(track_valid.shape[1])):
             if not bool(track_valid[slot, f].item()):
                 continue
-            c_gt, s, R = _transform_track_box(
-                obj_to_world[slot, f], box_size[slot, f], alignment
+            c_gt, s, R = _transform_sample_track_box(
+                sample,
+                clean_state,
+                alignment,
+                obj_to_world[slot, f],
+                box_size[slot, f],
+                frame_idx=f,
+                view_offset=0,
             )
             R = _orthonormalize_rotation(R)
             c = c_gt.clone()

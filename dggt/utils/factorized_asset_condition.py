@@ -14,12 +14,14 @@ import torch
 import torch.nn.functional as F
 
 
-PLACEMENT_STATE_DIM = 12
+PLACEMENT_STATE_DIM = 16
+PLACEMENT_STANDARDIZED_CHANNELS = (3, 4, 5, 6, 13)
+PLACEMENT_PASSTHROUGH_CHANNELS = (0, 1, 2, 7, 8, 9, 10, 11, 12, 14, 15)
 CANONICAL_CROP_MARGIN = 0.15
 CANONICAL_LONG_SIDE_FRACTION = 0.80
 CANONICAL_ALPHA_PATCH_THRESHOLD = 0.05
 MAX_CANONICAL_APPEARANCE_TOKENS = 32
-FACTORIZED_ASSET_CONDITION_VERSION = "factorized_asset_v1"
+FACTORIZED_ASSET_CONDITION_VERSION = "factorized_asset_v3"
 BOX_PROJECTION_NEAR_PLANE = 1.0e-3
 
 
@@ -117,7 +119,7 @@ class FactorizedAssetCondition:
             )
         if self.placement_state.ndim != 4 or tuple(self.placement_state.shape[:2]) != (b, k):
             raise ValueError(
-                "placement_state must be [B,K,S,12], got "
+                f"placement_state must be [B,K,S,{PLACEMENT_STATE_DIM}], got "
                 f"{tuple(self.placement_state.shape)}"
             )
         if int(self.placement_state.shape[-1]) != PLACEMENT_STATE_DIM:
@@ -674,25 +676,102 @@ def build_placement_state(
     yaw: torch.Tensor,
     velocity_anchor: torch.Tensor,
     in_frustum: torch.Tensor,
+    camera_to_anchor: torch.Tensor,
 ) -> torch.Tensor:
+    """Build the scale-aware v2 placement representation.
+
+    ``center_anchor`` remains metric.  Its direction is scale-free, while the
+    distance magnitude is represented by z-depth in each frame's optical
+    coordinate system.  Using z-depth (rather than Euclidean range) is crucial:
+    it is the only distance component changed by a pure scalar when metric
+    geometry crosses the anisotropic DGGT camera convention.
+    """
+    if center_anchor.ndim != 4 or int(center_anchor.shape[-1]) != 3:
+        raise ValueError(
+            f"center_anchor must be [B,K,S,3], got {tuple(center_anchor.shape)}"
+        )
+    if not center_anchor.is_floating_point():
+        raise TypeError("center_anchor must have floating-point dtype")
+    b, _k, s = (int(value) for value in center_anchor.shape[:3])
     expected = center_anchor.shape[:-1]
-    if int(center_anchor.shape[-1]) != 3 or tuple(box_size_lwh.shape) != expected + (3,):
-        raise ValueError("center_anchor and box_size_lwh must be [...,3]")
+    if tuple(box_size_lwh.shape) != expected + (3,):
+        raise ValueError("box_size_lwh must match center_anchor as [B,K,S,3]")
     if tuple(yaw.shape) != expected or tuple(velocity_anchor.shape) != expected + (3,):
         raise ValueError("yaw must be [...] and velocity_anchor [...,3]")
     if tuple(in_frustum.shape) != expected:
         raise ValueError("in_frustum must match placement leading dimensions")
-    return torch.cat(
+
+    c2a = torch.as_tensor(
+        camera_to_anchor,
+        device=center_anchor.device,
+        dtype=center_anchor.dtype,
+    )
+    if c2a.ndim == 3:
+        c2a = c2a.unsqueeze(0)
+    if tuple(c2a.shape) != (b, s, 4, 4):
+        raise ValueError(
+            f"camera_to_anchor shape {tuple(c2a.shape)} != {(b, s, 4, 4)}"
+        )
+    anchor_to_camera = torch.linalg.inv(c2a)
+    center_h = torch.cat(
+        (center_anchor, torch.ones_like(center_anchor[..., :1])),
+        dim=-1,
+    )
+    center_camera = torch.matmul(
+        anchor_to_camera[:, None],
+        center_h.unsqueeze(-1),
+    ).squeeze(-1)[..., :3]
+    z_depth = center_camera[..., 2]
+    safe_z_depth = z_depth.clamp_min(float(BOX_PROJECTION_NEAR_PLANE))
+
+    center_norm = torch.linalg.vector_norm(center_anchor, dim=-1, keepdim=True)
+    safe_center_norm = torch.where(
+        center_norm > 0.0,
+        center_norm,
+        torch.ones_like(center_norm),
+    )
+    unit_direction_anchor = center_anchor / safe_center_norm
+
+    safe_box_size = box_size_lwh.clamp_min(1.0e-6)
+    box_diag = torch.linalg.vector_norm(safe_box_size, dim=-1)
+    log_angular_size = (box_diag / safe_z_depth).clamp_min(1.0e-12).log()
+
+    speed = torch.linalg.vector_norm(velocity_anchor, dim=-1, keepdim=True)
+    safe_speed = torch.where(speed > 0.0, speed, torch.ones_like(speed))
+    unit_velocity = torch.where(
+        speed > 0.0,
+        velocity_anchor / safe_speed,
+        torch.zeros_like(velocity_anchor),
+    )
+    state = torch.cat(
         (
-            center_anchor,
-            box_size_lwh.clamp_min(1.0e-6).log(),
+            unit_direction_anchor,
+            safe_z_depth.log().unsqueeze(-1),
+            safe_box_size.log(),
+            log_angular_size.unsqueeze(-1),
             torch.sin(yaw).unsqueeze(-1),
             torch.cos(yaw).unsqueeze(-1),
-            velocity_anchor,
+            unit_velocity,
+            speed.clamp_min(1.0e-3).log(),
+            # Bounded image-plane motion magnitude.  ``speed / z`` is useful
+            # and scale invariant, but objects behind/at the camera are
+            # clamped to the projection near plane and could otherwise inject
+            # values above 1e4 into a passthrough MLP channel.  tanh is
+            # monotonic, approximately identity for ordinary ratios, and
+            # strictly bounds every active summary token to [0, 1).
+            torch.tanh(speed.squeeze(-1) / safe_z_depth).unsqueeze(-1),
             in_frustum.to(dtype=center_anchor.dtype).unsqueeze(-1),
         ),
         dim=-1,
     )
+    if tuple(state.shape) != expected + (PLACEMENT_STATE_DIM,):
+        raise RuntimeError(
+            f"internal placement-state shape {tuple(state.shape)} != "
+            f"{expected + (PLACEMENT_STATE_DIM,)}"
+        )
+    if not bool(torch.isfinite(state).all()):
+        raise ValueError("placement state contains NaN or Inf")
+    return state
 
 
 def build_factorized_asset_condition(
@@ -750,6 +829,9 @@ def build_factorized_asset_condition(
             "object_to_anchor local-z height axis must be unit length and point "
             "approximately along anchor -y on a valid track"
         )
+    # METRIC CAMERA CONTRACT: object/camera transforms and ``intrinsics`` are
+    # all Waymo-metric quantities.  This 2D footprint and in-frustum result must
+    # never be recomputed with the generated DGGT/gauge intrinsics.
     bbox, in_frustum = project_anchor_boxes_to_patch_bboxes(
         object_to_anchor,
         box_size_lwh,
@@ -765,6 +847,7 @@ def build_factorized_asset_condition(
         yaw,
         velocity_anchor,
         in_frustum,
+        camera_to_anchor,
     )
     # A slot without a source reference is closed even when a target track is
     # present; there is intentionally no target-window fallback.
