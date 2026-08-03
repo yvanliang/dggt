@@ -46,11 +46,14 @@ from dggt.utils.factorized_asset_condition import (
 )
 from train_scene_flow_pretrain import (
     build_camera_anchor_context_dropout,
+    build_argparser,
     build_pretrain_bundle_from_batch,
+    camera_pose_loss_ramp,
     cfg_sample_pretrain_latents,
     decode_metric_camera_from_features,
     pretrain_validation_stride,
     pretrain_validation_window_offsets,
+    sample_camera_anchor_context_drop_rows,
     select_rgb_render_rows,
 )
 
@@ -697,6 +700,51 @@ def test_anchor_context_dropout_exposes_delta_only_training_context() -> None:
     assert torch.equal(supervision.squeeze(-1), attention)
 
 
+def test_anchor_context_dropout_is_disabled_in_eval_without_consuming_rng() -> None:
+    anchors = camera_anchor_mask(3, 5)
+    generator = torch.Generator().manual_seed(19)
+    state_before = generator.get_state().clone()
+    rows = sample_camera_anchor_context_drop_rows(
+        anchors,
+        1.0,
+        training=False,
+        generator=generator,
+    )
+    assert not bool(rows.any())
+    assert torch.equal(generator.get_state(), state_before)
+    assert sample_camera_anchor_context_drop_rows(
+        anchors,
+        1.0,
+        training=True,
+        generator=generator,
+    ).tolist() == [True, True, True]
+
+
+def test_camera_pose_loss_ramp_is_explicit_and_bounded() -> None:
+    args = SimpleNamespace(camera_pose_start_step=100, camera_pose_warmup_steps=400)
+    assert camera_pose_loss_ramp(args, None) == 1.0
+    assert camera_pose_loss_ramp(args, 99) == 0.0
+    assert camera_pose_loss_ramp(args, 100) == 0.0
+    assert camera_pose_loss_ramp(args, 300) == pytest.approx(0.5)
+    assert camera_pose_loss_ramp(args, 500) == 1.0
+    assert camera_pose_loss_ramp(args, 900) == 1.0
+
+
+def test_formal_camera_pose_defaults_protect_early_video_training() -> None:
+    args = build_argparser().parse_args([
+        "--image_dir", "/tmp/images",
+        "--dggt_ckpt_path", "/tmp/dggt.pt",
+        "--scene_gauge_path", "/tmp/gauge.json",
+        "--pullback_calibration_path", "/tmp/pullback.pt",
+        "--log_dir", "/tmp/logs",
+    ])
+    assert args.lambda_camera_flow == pytest.approx(0.1)
+    assert args.lambda_camera_pose == pytest.approx(0.25)
+    assert args.camera_pose_start_step == 0
+    assert args.camera_pose_warmup_steps == 10000
+    assert args.lambda_camera_pose * camera_pose_loss_ramp(args, 4000) == pytest.approx(0.1)
+
+
 def test_rgb_render_rows_exclude_anchor_dropout_before_sample_cap() -> None:
     selected = select_rgb_render_rows(
         torch.tensor([True, False, False, True]),
@@ -779,6 +827,40 @@ def test_camera_geometry_loss_applies_component_weights_to_every_objective() -> 
         + rotation_weight * metrics["camera_acceleration_rotation_rad"]
     )
     assert torch.allclose(loss, expected)
+
+
+def test_camera_geometry_translation_scales_make_metric_loss_dimensionless() -> None:
+    c2w = torch.eye(4).view(1, 1, 4, 4).repeat(1, 3, 1, 1)
+    target, anchors = camera_state_from_waymo_c2w(c2w, torch.eye(4).unsqueeze(0))
+    prediction = target.clone()
+    prediction[..., 0] += 0.5
+    _, unscaled = camera_geometry_loss(
+        prediction,
+        target,
+        anchors,
+        absolute_translation_scale_m=1.0,
+        relative_translation_scale_m=1.0,
+        acceleration_translation_scale_m=1.0,
+        rotation_weight=0.0,
+    )
+    _, scaled = camera_geometry_loss(
+        prediction,
+        target,
+        anchors,
+        absolute_translation_scale_m=10.0,
+        relative_translation_scale_m=2.0,
+        acceleration_translation_scale_m=1.0,
+        rotation_weight=0.0,
+    )
+    assert scaled["camera_absolute_translation"] < unscaled["camera_absolute_translation"]
+    assert scaled["camera_relative_translation"] < unscaled["camera_relative_translation"]
+    with pytest.raises(ValueError, match="finite positive"):
+        camera_geometry_loss(
+            prediction,
+            target,
+            anchors,
+            absolute_translation_scale_m=0.0,
+        )
 
 
 def test_role_normalization_matches_noise_scale() -> None:

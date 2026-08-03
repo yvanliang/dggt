@@ -298,15 +298,34 @@ def camera_geometry_loss(
     smoothness_weight: float = 0.25,
     translation_weight: float = 1.0,
     rotation_weight: float = 1.0,
+    absolute_translation_scale_m: float = 10.0,
+    relative_translation_scale_m: float = 1.0,
+    acceleration_translation_scale_m: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Pose/trajectory loss on the fully reconstructed camera clip.
 
     The absolute/relative/smoothness weights select the trajectory objective,
     while the translation/rotation weights select physical components
-    consistently across those objectives.
+    consistently across those objectives. Metric translations are divided by
+    explicit physical scales before Smooth-L1. This prevents the clean cut
+    from DGGT units to metres from silently amplifying the shared-backbone
+    gradient by the scene's metres-per-DGGT-unit gauge.
     """
     if predicted_state.shape != target_state.shape or predicted_state.shape[-1] != CAMERA_GENERATION_DIM:
         raise ValueError(f"camera states must match [B,S,{CAMERA_GENERATION_DIM}]")
+    translation_scales = {
+        "absolute_translation_scale_m": absolute_translation_scale_m,
+        "relative_translation_scale_m": relative_translation_scale_m,
+        "acceleration_translation_scale_m": acceleration_translation_scale_m,
+    }
+    for name, value in translation_scales.items():
+        value_tensor = torch.as_tensor(value)
+        if (
+            value_tensor.numel() != 1
+            or not bool(torch.isfinite(value_tensor).item())
+            or float(value) <= 0.0
+        ):
+            raise ValueError(f"{name} must be one finite positive scalar, got {value!r}")
     pred = decode_camera_trajectory(
         predicted_state,
         anchor_mask,
@@ -323,7 +342,10 @@ def camera_geometry_loss(
     if p_c2w.ndim == 3:
         p_c2w, t_c2w = p_c2w.unsqueeze(0), t_c2w.unsqueeze(0)
     zero = _differentiable_zero(predicted_state)
-    abs_t = F.smooth_l1_loss(p_c2w[..., :3, 3], t_c2w[..., :3, 3])
+    abs_t = F.smooth_l1_loss(
+        p_c2w[..., :3, 3] / float(absolute_translation_scale_m),
+        t_c2w[..., :3, 3] / float(absolute_translation_scale_m),
+    )
     abs_r = so3_geodesic_angle(p_c2w[..., :3, :3], t_c2w[..., :3, :3]).mean()
     anchors = torch.as_tensor(anchor_mask, device=predicted_state.device, dtype=torch.bool)
     if anchors.ndim == 1:
@@ -331,7 +353,9 @@ def camera_geometry_loss(
     delta_mask = ~anchors
     if bool(delta_mask.any()):
         rel_t_error = F.smooth_l1_loss(
-            predicted_state[..., :3], target_state[..., :3], reduction="none"
+            predicted_state[..., :3] / float(relative_translation_scale_m),
+            target_state[..., :3] / float(relative_translation_scale_m),
+            reduction="none",
         ).mean(dim=-1)
         rel_t = rel_t_error[delta_mask].mean()
         pred_rel_r = rotation_6d_to_matrix(predicted_state[..., 3:9])
@@ -342,7 +366,12 @@ def camera_geometry_loss(
     if predicted_state.shape[-2] >= 3:
         pred_dt = p_c2w[..., 1:, :3, 3] - p_c2w[..., :-1, :3, 3]
         target_dt = t_c2w[..., 1:, :3, 3] - t_c2w[..., :-1, :3, 3]
-        accel_t = F.smooth_l1_loss(pred_dt[..., 1:, :] - pred_dt[..., :-1, :], target_dt[..., 1:, :] - target_dt[..., :-1, :])
+        accel_t = F.smooth_l1_loss(
+            (pred_dt[..., 1:, :] - pred_dt[..., :-1, :])
+            / float(acceleration_translation_scale_m),
+            (target_dt[..., 1:, :] - target_dt[..., :-1, :])
+            / float(acceleration_translation_scale_m),
+        )
         pred_dr = p_c2w[..., :-1, :3, :3].transpose(-1, -2) @ p_c2w[..., 1:, :3, :3]
         target_dr = t_c2w[..., :-1, :3, :3].transpose(-1, -2) @ t_c2w[..., 1:, :3, :3]
         pred_dr2 = pred_dr[..., :-1, :, :].transpose(-1, -2) @ pred_dr[..., 1:, :, :]

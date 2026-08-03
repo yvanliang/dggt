@@ -161,6 +161,7 @@ from train_scene_flow_pretrain import (
     decode_sky_patch_tokens,
     discover_scene_names,
     load_dggt_aggregator_and_tokenizer,
+    render_validation_generated_rgb,
     seed_everything,
     setup_text_encoder,
     sky_generation_enabled,
@@ -182,6 +183,12 @@ DEFAULT_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_75e566ef.json"
 DEFAULT_TEXT_ENCODER = "/home/dancer/model/Qwen/Qwen3-0.6B"
 CONDITION_MODES = ("none", "cam", "asset_cam")
 GENERATED_METRIC_CAMERA_SCHEMA = "generated_metric_camera_trajectory_v1"
+CAMERA_GAUGE_ATTRIBUTION_ARMS = (
+    "teacher_camera__teacher_gauge",
+    "generated_camera__teacher_gauge",
+    "teacher_camera__generated_gauge",
+    "generated_camera__generated_gauge",
+)
 
 METRIC_GAUGE_PROVENANCE_FIELDS = frozenset(
     {
@@ -1496,6 +1503,133 @@ def save_cfg_images(
     return paths
 
 
+def camera_gauge_attribution_arm_inputs(
+    *,
+    teacher_camera: torch.Tensor,
+    generated_camera: torch.Tensor,
+    teacher_gauge: torch.Tensor,
+    generated_gauge: torch.Tensor,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Return the fixed 2x2 camera/gauge intervention design."""
+
+    if teacher_camera.shape != generated_camera.shape:
+        raise ValueError("teacher/generated camera tensors must have identical shapes")
+    if teacher_gauge.shape != generated_gauge.shape:
+        raise ValueError("teacher/generated gauge tensors must have identical shapes")
+    return {
+        "teacher_camera__teacher_gauge": (teacher_camera, teacher_gauge),
+        "generated_camera__teacher_gauge": (generated_camera, teacher_gauge),
+        "teacher_camera__generated_gauge": (teacher_camera, generated_gauge),
+        "generated_camera__generated_gauge": (generated_camera, generated_gauge),
+    }
+
+
+@torch.no_grad()
+def run_camera_gauge_attribution(
+    *,
+    batch: dict[str, Any],
+    bundle: Any,
+    generated_sample: Any,
+    vggt_model: nn.Module,
+    scene_flow: nn.Module,
+    args: argparse.Namespace,
+    device: torch.device,
+    output_dir: Path,
+    suffix: str,
+) -> dict[str, Any]:
+    """Render the four camera/gauge arms with one fixed generated geometry.
+
+    All four calls receive the same generated latent, sky, sky mask and camera
+    integration anchors. Only the camera trajectory and the scene-global gauge
+    change. This makes the 2x2 differences an actual intervention rather than
+    a comparison across unrelated diffusion samples.
+    """
+
+    teacher_camera = getattr(bundle, "camera_target_state_metric", None)
+    teacher_gauge = getattr(bundle, "scene_gauge_clean", None)
+    generated_camera = generated_sample.camera_state_metric
+    generated_gauge = generated_sample.gauge
+    if not all(
+        torch.is_tensor(value)
+        for value in (teacher_camera, teacher_gauge, generated_camera, generated_gauge)
+    ):
+        raise RuntimeError("four-arm attribution requires teacher/generated camera and gauge tensors")
+    arms = camera_gauge_attribution_arm_inputs(
+        teacher_camera=teacher_camera,
+        generated_camera=generated_camera,
+        teacher_gauge=teacher_gauge,
+        generated_gauge=generated_gauge,
+    )
+    frames = min(int(args.val_log_images), int(generated_sample.video.shape[1]))
+    gt = _image_grid(batch["images"], frames).float()
+    results: dict[str, dict[str, Any]] = {}
+    l1_values: dict[str, float] = {}
+    for arm_name, (camera_features, gauge) in arms.items():
+        rendered = render_validation_generated_rgb(
+            batch,
+            vggt_model,
+            scene_flow,
+            generated_sample.video,
+            args,
+            device,
+            generated_camera_features=camera_features,
+            generated_camera_anchor_mask=generated_sample.camera_anchor_mask,
+            generated_camera_initial_c2w=generated_sample.camera_initial_c2w_metric,
+            generated_camera_anchor_c2w=(
+                generated_sample.camera_trajectory_anchor_to_world_metric
+            ),
+            generated_gauge=gauge,
+            generated_sky_tokens=generated_sample.sky,
+            generated_sky_mask_patch=generated_sample.sky_mask_patch,
+            generated_sky_mask_refined=generated_sample.sky_mask_refined,
+        )
+        rgb = rendered["generated_raw_3dgs_rgb"].detach().float().cpu()
+        if rgb.shape != gt.shape:
+            raise RuntimeError(
+                f"attribution render shape {tuple(rgb.shape)} != GT {tuple(gt.shape)}"
+            )
+        error = rgb - gt
+        l1 = float(error.abs().mean().item())
+        mse = float(error.square().mean().item())
+        psnr = float(-10.0 * math.log10(max(mse, 1.0e-12)))
+        path = output_dir / f"camera_gauge_arm__{arm_name}__{suffix}.jpg"
+        save_image_grid(rgb, path, nrow=frames)
+        results[arm_name] = {
+            "l1": l1,
+            "mse": mse,
+            "psnr_db": psnr,
+            "image": str(path),
+        }
+        l1_values[arm_name] = l1
+        del rendered, rgb, error
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    tt, gt_arm, tg, gg = (
+        l1_values[name] for name in CAMERA_GAUGE_ATTRIBUTION_ARMS
+    )
+    effects = {
+        "camera_l1_effect_at_teacher_gauge": gt_arm - tt,
+        "gauge_l1_effect_at_teacher_camera": tg - tt,
+        "camera_gauge_l1_interaction": gg - gt_arm - tg + tt,
+        "end_to_end_l1_gap_from_teacher_teacher": gg - tt,
+    }
+    payload = {
+        "schema": "scene_flow_camera_gauge_four_arm_v1",
+        "fixed": ["generated_video_latent", "generated_sky", "generated_sky_mask", "noise_seed"],
+        "arms": results,
+        "effects": effects,
+        "interpretation": (
+            "positive L1 effects are degradations; interaction is the residual beyond "
+            "the additive camera-only and gauge-only effects"
+        ),
+    }
+    json_path = output_dir / f"camera_gauge_attribution__{suffix}.json"
+    json_path.write_text(json.dumps(payload, indent=2))
+    payload["json"] = str(json_path)
+    return payload
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run full-scene SceneFlow pretrain inference on raw Waymo validation clips."
@@ -1530,6 +1664,14 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--text_max_length", type=int, default=256)
     parser.add_argument("--no_text_condition", action="store_true")
     parser.add_argument("--output_dir", default="runs/scene_flow_pretrain_inference")
+    parser.add_argument(
+        "--camera_gauge_attribution",
+        action="store_true",
+        help=(
+            "Run the fixed-geometry four-arm render audit: teacher/generated camera "
+            "crossed with teacher/generated gauge. Intended for early-checkpoint diagnosis."
+        ),
+    )
     parser.add_argument(
         "--asset_manifest",
         default=None,
@@ -1657,6 +1799,11 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def validate_args(args: argparse.Namespace) -> list[float]:
+    if bool(args.camera_gauge_attribution) and args.asset_manifest:
+        raise ValueError(
+            "--camera_gauge_attribution requires raw Waymo teacher camera/gauge targets; "
+            "it is unavailable with --asset_manifest."
+        )
     if int(args.num_frames) < 2:
         raise ValueError("--num_frames must be >= 2 (the raw dataset timestamp path and pretrain require it).")
     if int(args.num_frames) > 29:
@@ -2030,6 +2177,19 @@ def main() -> None:
             image_paths = save_cfg_images(
                 generated.video, rgb_images, sample_dir, args, suffix
             )
+            attribution = None
+            if bool(args.camera_gauge_attribution):
+                attribution = run_camera_gauge_attribution(
+                    batch=batch,
+                    bundle=bundle,
+                    generated_sample=generated,
+                    vggt_model=vggt_model,
+                    scene_flow=scene_flow,
+                    args=args,
+                    device=device,
+                    output_dir=sample_dir,
+                    suffix=suffix,
+                )
             per_cfg.append(
                 {
                     "cfg": float(scale),
@@ -2044,6 +2204,7 @@ def main() -> None:
                     "pointcloud": ply_summary,
                     "generated_metric_camera": generated_metric_camera,
                     "camera_geometry_flow_consistency": flow_consistency,
+                    "camera_gauge_attribution": attribution,
                 }
             )
             run_flow_diagnostics.append(

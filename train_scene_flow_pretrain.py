@@ -1164,6 +1164,36 @@ def gauge_diagnostic_metrics(
     }
 
 
+@torch.no_grad()
+def sampled_gauge_validation_metrics(
+    predicted_gauge: torch.Tensor,
+    target_gauge: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    prior_log_scale: torch.Tensor | float,
+    prefix: str = "sample_gauge",
+) -> dict[str, float]:
+    """Prefix the physical diagnostics for the final ODE-sampled gauge.
+
+    The training-time x-prediction diagnostics are not a substitute for this:
+    validation renders with the final sampled gauge, so the same sample must be
+    measured directly against the offline 29-frame target and marginal prior.
+    """
+
+    if not prefix:
+        raise ValueError("sampled gauge metric prefix must be non-empty")
+    base = gauge_diagnostic_metrics(
+        predicted_gauge,
+        target_gauge,
+        valid,
+        prior_log_scale=prior_log_scale,
+    )
+    return {
+        f"{prefix}_{name.removeprefix('gauge_')}": value
+        for name, value in base.items()
+    }
+
+
 def metric_depth_diagnostic_log_values(
     relative_error: torch.Tensor | float | None = None,
 ) -> dict[str, float]:
@@ -1274,6 +1304,55 @@ def build_camera_anchor_context_dropout(
     attention_mask = ~hidden_anchor
     supervision_mask = (~hidden_anchor).unsqueeze(-1)
     return attention_mask, supervision_mask
+
+
+def sample_camera_anchor_context_drop_rows(
+    anchor_mask: torch.Tensor,
+    probability: float,
+    *,
+    training: bool,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Sample anchor dropout without consuming RNG during validation."""
+
+    anchors = torch.as_tensor(anchor_mask, dtype=torch.bool)
+    if anchors.ndim != 2:
+        raise ValueError(f"anchor_mask must be [B,S], got {tuple(anchors.shape)}")
+    probability = float(probability)
+    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+        raise ValueError(f"probability must be finite and in [0,1], got {probability!r}")
+    if not training or probability == 0.0:
+        return torch.zeros(int(anchors.shape[0]), device=anchors.device, dtype=torch.bool)
+    sampled = torch.rand(
+        int(anchors.shape[0]),
+        device=anchors.device,
+        generator=generator,
+    ) < probability
+    # Delta-only crops already expose the later-window context. Anchor dropout
+    # applies only to rows that actually contain the global anchor.
+    return sampled & anchors.any(dim=1)
+
+
+def camera_pose_loss_ramp(
+    args: argparse.Namespace,
+    global_step: int | None,
+) -> float:
+    """Linear startup ramp for the denormalized metric pose auxiliary loss."""
+
+    start = int(getattr(args, "camera_pose_start_step", 0))
+    warmup = int(getattr(args, "camera_pose_warmup_steps", 0))
+    if start < 0 or warmup < 0:
+        raise ValueError("camera pose start/warmup steps must be non-negative")
+    # Helper/unit callers without a training step retain the historical fully
+    # enabled objective. Formal train/validation paths always pass the step.
+    if global_step is None:
+        return 1.0
+    step = int(global_step)
+    if step < start:
+        return 0.0
+    if warmup == 0:
+        return 1.0
+    return min(1.0, max(0.0, float(step - start) / float(warmup)))
 
 
 def select_rgb_render_rows(
@@ -3754,6 +3833,10 @@ def render_validation_rgb(
         raise RuntimeError("Pretrain generated RGB validation requires generated_camera_features from SceneFlow.")
     if generated_gauge is None:
         raise RuntimeError("Pretrain generated RGB validation requires generated scene gauge tokens.")
+    if generated_camera_anchor_c2w is None:
+        raise RuntimeError(
+            "Pretrain generated RGB validation requires the metric trajectory anchor."
+        )
     if generated_sky_mask_patch is None:
         raise RuntimeError("Pretrain generated RGB validation requires generated_sky_mask_patch from SceneFlow.")
     images = _images_to_device(batch["images"], device)
@@ -3853,18 +3936,24 @@ def render_validation_rgb(
         with torch.amp.autocast(device_type=device.type, enabled=False):
             raw_gs_map, raw_gs_conf = vggt_model.gs_head(generated_image_tokens, images, patch_start_idx)
             generated_metric = decode_metric_camera_from_features(
-                generated_camera_features.to(device),
+                generated_camera_features.to(device=device, dtype=torch.float32),
                 camera_anchor_mask=generated_camera_anchor_mask,
-                initial_camera_to_world=generated_camera_initial_c2w,
-                trajectory_anchor_to_world=generated_camera_anchor_c2w,
+                initial_camera_to_world=(
+                    None
+                    if generated_camera_initial_c2w is None
+                    else generated_camera_initial_c2w.to(device=device, dtype=torch.float32)
+                ),
+                trajectory_anchor_to_world=generated_camera_anchor_c2w.to(
+                    device=device, dtype=torch.float32
+                ),
             )
             generated_pose_enc = assemble_dggt_pose_encoding(
                 metric_c2w_to_teacher_anchor_dggt(
                     generated_metric.camera_to_world,
-                    generated_camera_anchor_c2w,
-                    generated_gauge[..., 0],
+                    generated_camera_anchor_c2w.to(device=device, dtype=torch.float32),
+                    generated_gauge[..., 0].to(device=device, dtype=torch.float32),
                 ),
-                generated_gauge,
+                generated_gauge.to(device=device, dtype=torch.float32),
             )
             generated_depth, _ = vggt_model.depth_head(gen_agg, images, patch_start_idx)
             generated_dynamic_conf, _ = vggt_model.instance_head(gen_dino, images, patch_start_idx)
@@ -3973,6 +4062,10 @@ def render_validation_generated_rgb(
         raise RuntimeError("Pretrain generated RGB validation requires generated_camera_features from SceneFlow.")
     if generated_gauge is None:
         raise RuntimeError("Pretrain generated RGB validation requires generated scene gauge tokens.")
+    if generated_camera_anchor_c2w is None:
+        raise RuntimeError(
+            "Pretrain generated RGB validation requires the metric trajectory anchor."
+        )
     if generated_sky_mask_patch is None:
         raise RuntimeError("Pretrain generated RGB validation requires generated_sky_mask_patch from SceneFlow.")
     batch_size, seq_len = int(z_generated_raw_n.shape[0]), int(z_generated_raw_n.shape[1])
@@ -3993,26 +4086,37 @@ def render_validation_generated_rgb(
                 unwrap_ddp(scene_flow), "_pullback_calibration", None
             ),
         )
-        generated_metric = decode_metric_camera_from_features(
-            generated_camera_features.to(device),
-            camera_anchor_mask=generated_camera_anchor_mask,
-            initial_camera_to_world=generated_camera_initial_c2w,
-            trajectory_anchor_to_world=generated_camera_anchor_c2w,
-        )
-        generated_pose_enc = assemble_dggt_pose_encoding(
-            metric_c2w_to_teacher_anchor_dggt(
-                generated_metric.camera_to_world,
-                generated_camera_anchor_c2w,
-                generated_gauge[..., 0],
-            ),
-            generated_gauge,
-        )
         generated_sky_mask = _sky_mask_patch_to_image(
             generated_sky_mask_refined if generated_sky_mask_refined is not None else generated_sky_mask_patch,
             patch_grid=args.patch_grid,
             height=height,
             width=width,
             device=device,
+        )
+    # SE(3) inversion is unsupported in BF16 and is numerically inappropriate
+    # for camera integration even where a backend happens to accept it.
+    with torch.amp.autocast(device_type=device.type, enabled=False):
+        generated_metric = decode_metric_camera_from_features(
+            generated_camera_features.to(device=device, dtype=torch.float32),
+            camera_anchor_mask=generated_camera_anchor_mask,
+            initial_camera_to_world=(
+                None
+                if generated_camera_initial_c2w is None
+                else generated_camera_initial_c2w.to(device=device, dtype=torch.float32)
+            ),
+            trajectory_anchor_to_world=(
+                None
+                if generated_camera_anchor_c2w is None
+                else generated_camera_anchor_c2w.to(device=device, dtype=torch.float32)
+            ),
+        )
+        generated_pose_enc = assemble_dggt_pose_encoding(
+            metric_c2w_to_teacher_anchor_dggt(
+                generated_metric.camera_to_world,
+                generated_camera_anchor_c2w.to(device=device, dtype=torch.float32),
+                generated_gauge[..., 0].to(device=device, dtype=torch.float32),
+            ),
+            generated_gauge.to(device=device, dtype=torch.float32),
         )
     raw_gs_map, raw_gs_conf = geometry.gs_map, geometry.gs_conf
     generated_depth = geometry.depth
@@ -5201,6 +5305,7 @@ def train_step(
     global_step: int | None = None,
     lpips_model: nn.Module | None = None,
     generator: torch.Generator | None = None,
+    loss_terms_out: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     is_training = unwrap_ddp(scene_flow).training
     rgb_render_active = should_apply_rgb_render_loss(
@@ -5283,14 +5388,12 @@ def train_step(
         if not torch.is_tensor(anchor_mask):
             raise RuntimeError("camera target requires bundle.camera_gen_anchor_mask")
         drop_prob = float(getattr(args, "camera_anchor_context_dropout", 0.0))
-        sampled_anchor_drop_rows = torch.rand(
-            int(camera_target.z_t.shape[0]),
-            device=camera_target.z_t.device,
+        camera_anchor_context_drop_rows = sample_camera_anchor_context_drop_rows(
+            anchor_mask,
+            drop_prob,
+            training=is_training,
             generator=generator,
-        ) < drop_prob
-        # Delta-only crops already expose the later-window context.  Anchor
-        # dropout applies only to rows that actually contain the global anchor.
-        camera_anchor_context_drop_rows = sampled_anchor_drop_rows & anchor_mask.any(dim=1)
+        )
         camera_gen_attention_mask, camera_flow_supervision_mask = build_camera_anchor_context_dropout(
             anchor_mask,
             camera_anchor_context_drop_rows,
@@ -5386,6 +5489,8 @@ def train_step(
             identity_batch=False,
             preserve_floor=args.preserve_floor,
         )
+        if loss_terms_out is not None:
+            loss_terms_out["video_core"] = loss
         z_camera_pred = None
         pred_camera_state = None
         if camera_target is not None and pred_camera is not None:
@@ -5402,6 +5507,10 @@ def train_step(
                 camera_loss_mask.sum() * int(camera_sq_error.shape[-1])
             ).clamp_min(1.0)
             loss = loss + float(args.lambda_camera_flow) * loss_camera_flow
+            if loss_terms_out is not None:
+                loss_terms_out["camera_flow"] = (
+                    float(args.lambda_camera_flow) * loss_camera_flow
+                )
             logs["loss_camera_flow"] = float(loss_camera_flow.detach().item())
             logs["camera_anchor_context_dropout_frac"] = float(
                 camera_anchor_context_drop_rows.float().mean().detach().item()
@@ -5431,9 +5540,28 @@ def train_step(
                     smoothness_weight=float(getattr(args, "camera_smoothness_weight", 0.25)),
                     translation_weight=float(getattr(args, "camera_translation_weight", 1.0)),
                     rotation_weight=float(getattr(args, "camera_rotation_weight", 1.0)),
+                    absolute_translation_scale_m=float(
+                        getattr(args, "camera_absolute_translation_scale_m", 10.0)
+                    ),
+                    relative_translation_scale_m=float(
+                        getattr(args, "camera_relative_translation_scale_m", 1.0)
+                    ),
+                    acceleration_translation_scale_m=float(
+                        getattr(args, "camera_acceleration_translation_scale_m", 1.0)
+                    ),
                 )
-                loss = loss + float(args.lambda_camera_pose) * loss_cam_pose
+                pose_ramp = camera_pose_loss_ramp(args, global_step)
+                pose_weight = float(args.lambda_camera_pose) * pose_ramp
+                weighted_camera_pose = pose_weight * loss_cam_pose
+                loss = loss + weighted_camera_pose
+                if loss_terms_out is not None:
+                    loss_terms_out["camera_pose"] = weighted_camera_pose
                 logs["loss_camera_pose"] = float(loss_cam_pose.detach().item())
+                logs["camera_pose_ramp"] = float(pose_ramp)
+                logs["camera_pose_effective_weight"] = float(pose_weight)
+                logs["loss_camera_pose_weighted"] = float(
+                    weighted_camera_pose.detach().item()
+                )
                 for name, value in geometry_logs.items():
                     logs[name] = float(value.detach().item())
                 decoded_pred = decode_camera_trajectory(
@@ -5483,6 +5611,9 @@ def train_step(
             else:
                 loss = loss + 0.0 * pred_camera.sum()
                 logs["loss_camera_pose"] = 0.0
+                logs["camera_pose_ramp"] = camera_pose_loss_ramp(args, global_step)
+                logs["camera_pose_effective_weight"] = 0.0
+                logs["loss_camera_pose_weighted"] = 0.0
         elif pred_camera is not None:
             loss = loss + 0.0 * pred_camera.sum()
             logs["loss_camera_flow"] = 0.0
@@ -5532,6 +5663,13 @@ def train_step(
                 + float(args.lambda_gauge_flow) * loss_gauge_flow
                 + float(args.lambda_gauge_direct) * loss_gauge_direct
             )
+            if loss_terms_out is not None:
+                loss_terms_out["gauge_flow"] = (
+                    float(args.lambda_gauge_flow) * loss_gauge_flow
+                )
+                loss_terms_out["gauge_direct"] = (
+                    float(args.lambda_gauge_direct) * loss_gauge_direct
+                )
             logs["loss_gauge_flow"] = float(loss_gauge_flow.detach().item())
             logs["loss_gauge_direct"] = float(loss_gauge_direct.detach().item())
             logs.update(
@@ -7003,6 +7141,7 @@ def _run_validation_impl(
             device,
             args,
             text_encoder,
+            global_step=step,
             generator=validation_generator,
         )
         logs = dict(logs)
@@ -7215,6 +7354,19 @@ def _run_validation_impl(
                     ),
                 )
             )
+            metrics.update(
+                sampled_gauge_validation_metrics(
+                    gauge_generated,
+                    first_bundle.scene_gauge_clean,
+                    first_bundle.scene_gauge_valid,
+                    prior_log_scale=unwrap_ddp(scene_flow).gauge_mean[0],
+                    prefix=(
+                        "sample_gauge"
+                        if is_global_primary
+                        else _cfg_metric_prefix("sample_gauge", primary_scale)
+                    ),
+                )
+            )
             sky_feature_gt = getattr(first_bundle, "sky_gen_clean", None)
             if sky_generated_raw is not None and sky_feature_gt is not None:
                 metrics.update(
@@ -7332,6 +7484,19 @@ def _run_validation_impl(
                         camera_extra,
                         camera_target_state_metric,
                         prefix=_cfg_metric_prefix("sample_camera_feature", s_val),
+                    )
+                )
+                if gauge_extra is None:
+                    raise RuntimeError(
+                        "Pretrain validation sampling did not return generated gauge."
+                    )
+                metrics.update(
+                    sampled_gauge_validation_metrics(
+                        gauge_extra,
+                        first_bundle.scene_gauge_clean,
+                        first_bundle.scene_gauge_valid,
+                        prior_log_scale=unwrap_ddp(scene_flow).gauge_mean[0],
+                        prefix=_cfg_metric_prefix("sample_gauge", s_val),
                     )
                 )
                 if sky_extra is not None and sky_feature_gt is not None:
@@ -7656,8 +7821,20 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda_camera_pose",
         type=float,
-        default=1.0,
+        default=0.25,
         help="Geometry loss weight after denormalizing and integrating the generated 9D metric camera trajectory.",
+    )
+    parser.add_argument(
+        "--camera_pose_start_step",
+        type=int,
+        default=0,
+        help="First optimizer step for the denormalized metric camera pose auxiliary loss.",
+    )
+    parser.add_argument(
+        "--camera_pose_warmup_steps",
+        type=int,
+        default=10000,
+        help="Linear warmup length for --lambda_camera_pose; camera flow remains active throughout.",
     )
     parser.add_argument(
         "--camera_translation_weight",
@@ -7676,6 +7853,24 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--camera_absolute_weight", type=float, default=1.0)
     parser.add_argument("--camera_relative_weight", type=float, default=1.0)
     parser.add_argument("--camera_smoothness_weight", type=float, default=0.25)
+    parser.add_argument(
+        "--camera_absolute_translation_scale_m",
+        type=float,
+        default=10.0,
+        help="Physical scale used to make integrated absolute translation residuals dimensionless.",
+    )
+    parser.add_argument(
+        "--camera_relative_translation_scale_m",
+        type=float,
+        default=1.0,
+        help="Physical scale used to make frame-relative translation residuals dimensionless.",
+    )
+    parser.add_argument(
+        "--camera_acceleration_translation_scale_m",
+        type=float,
+        default=1.0,
+        help="Physical scale used to make translation-acceleration residuals dimensionless.",
+    )
     parser.add_argument(
         "--no_sky_generation",
         action="store_true",
@@ -8014,6 +8209,16 @@ def main() -> None:
         raise ValueError("--camera_anchor_window_probability must be in [0, 1].")
     if not 0.0 <= float(args.camera_anchor_context_dropout) <= 1.0:
         raise ValueError("--camera_anchor_context_dropout must be in [0, 1].")
+    if int(args.camera_pose_start_step) < 0 or int(args.camera_pose_warmup_steps) < 0:
+        raise ValueError("--camera_pose_start_step/--camera_pose_warmup_steps must be non-negative.")
+    camera_translation_scales = {
+        "--camera_absolute_translation_scale_m": args.camera_absolute_translation_scale_m,
+        "--camera_relative_translation_scale_m": args.camera_relative_translation_scale_m,
+        "--camera_acceleration_translation_scale_m": args.camera_acceleration_translation_scale_m,
+    }
+    for name, value in camera_translation_scales.items():
+        if not math.isfinite(float(value)) or float(value) <= 0.0:
+            raise ValueError(f"{name} must be finite and positive.")
     camera_loss_weights = {
         "--lambda_camera_flow": args.lambda_camera_flow,
         "--lambda_camera_pose": args.lambda_camera_pose,

@@ -538,7 +538,12 @@ build_train_args() {
         --base_model_coeff 0.25
         --lambda_boundary 0.25
         --lambda_camera_flow 0.1
-        --lambda_camera_pose 1.0
+        --lambda_camera_pose 0.25
+        --camera_pose_start_step 0
+        --camera_pose_warmup_steps 10000
+        --camera_absolute_translation_scale_m 10.0
+        --camera_relative_translation_scale_m 1.0
+        --camera_acceleration_translation_scale_m 1.0
         --lambda_sky_flow 0.1
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
         --joint_generation_prob "${JOINT_GENERATION_PROB}"
