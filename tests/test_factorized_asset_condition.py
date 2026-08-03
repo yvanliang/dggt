@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -20,7 +21,13 @@ from dggt.utils.factorized_asset_condition import (
     resize_crop_intrinsics_to_model_canvas,
     sample_canonical_tokens,
 )
-from train_scene_flow_pretrain import combine_pretrain_cfg_prediction
+from train_scene_flow_pretrain import (
+    apply_pretrain_condition_task,
+    combine_pretrain_cfg_prediction,
+    pretrain_visualization_task,
+    resolve_pretrain_optional_cfg_conditions,
+    sample_pretrain_condition_tasks,
+)
 from train_scene_flow import FORMAL_SCENE_FPS
 
 
@@ -338,20 +345,174 @@ def test_condition_rejects_non_waymo_height_axis() -> None:
         )
 
 
-def test_independent_cfg_algebra_matches_closed_form():
+def test_hierarchical_cfg_algebra_matches_closed_form():
     branch = lambda value: {"video": torch.tensor(float(value))}
     combined = combine_pretrain_cfg_prediction(
         "video",
         full=branch(10),
         no_text_full=branch(7),
-        text_only=branch(2),
-        text_asset=branch(5),
+        text_base=branch(2),
+        text_camera=branch(5),
         text_scale=2.0,
         asset_scale=3.0,
         camera_scale=4.0,
     )
     assert combined is not None
-    assert combined.item() == 34.0
+    assert combined.item() == 32.0
+
+
+def test_structured_condition_tasks_never_keep_asset_without_camera():
+    torch.manual_seed(7)
+    tasks = sample_pretrain_condition_tasks(
+        4096,
+        joint_generation_prob=0.2,
+        camera_controlled_prob=0.2,
+        asset_camera_controlled_prob=0.6,
+        device=torch.device("cpu"),
+        training=True,
+    )
+    assert not bool((~tasks.asset_drop_mask & tasks.camera_drop_mask).any())
+    assert bool(tasks.joint_generation_rows.any())
+    assert bool(tasks.camera_controlled_rows.any())
+    assert bool(tasks.asset_camera_controlled_rows.any())
+
+
+def test_structured_condition_tasks_keep_all_conditions_during_eval():
+    tasks = sample_pretrain_condition_tasks(
+        4,
+        joint_generation_prob=0.2,
+        camera_controlled_prob=0.2,
+        asset_camera_controlled_prob=0.6,
+        device=torch.device("cpu"),
+        training=False,
+    )
+    assert not bool(tasks.asset_drop_mask.any())
+    assert not bool(tasks.camera_drop_mask.any())
+    assert bool(tasks.asset_camera_controlled_rows.all())
+
+
+def test_structured_condition_tasks_force_joint_generation_without_camera():
+    tasks = sample_pretrain_condition_tasks(
+        3,
+        joint_generation_prob=0.0,
+        camera_controlled_prob=0.0,
+        asset_camera_controlled_prob=1.0,
+        device=torch.device("cpu"),
+        training=True,
+        camera_available_rows=[True, False, True],
+    )
+    assert tasks.task_ids.tolist() == [2, 0, 2]
+    assert tasks.asset_drop_mask.tolist() == [False, True, False]
+    assert tasks.camera_drop_mask.tolist() == [False, True, False]
+
+
+@pytest.mark.parametrize(
+    ("kind", "has_real_tokens", "requires_camera"),
+    [
+        ("factorized_asset", True, True),
+        ("mode_a", True, True),
+        ("mode_a_with_empty", True, True),
+        ("mode_a_plus_empty", True, True),
+        ("with_empty", True, True),
+        ("plus_empty", True, True),
+        ("none", False, False),
+        ("mode_b", False, False),
+        ("mode_b_empty", False, False),
+        ("empty", False, False),
+        ("asset_uncond", False, False),
+        ("asset_null", False, False),
+        ("asset_missing", False, False),
+        ("missing_asset", False, False),
+    ],
+)
+def test_asset_semantics_require_camera_only_for_real_placement(
+    kind: str,
+    has_real_tokens: bool,
+    requires_camera: bool,
+):
+    mask = torch.zeros(1, 1, 1, 1, dtype=torch.bool)
+    if has_real_tokens:
+        mask[0, 0, 0, 0] = True
+    bundle = SimpleNamespace(
+        F_asset_tokens=torch.zeros(1, 1, 1, 1, 4),
+        encoder_attention_mask=mask,
+        asset_condition_kind=[kind],
+        camera_condition_tokens=None,
+        camera_attention_mask=None,
+        camera_condition_kind=["camera_uncond"],
+    )
+    if requires_camera:
+        with pytest.raises(ValueError, match="asset-without-camera"):
+            resolve_pretrain_optional_cfg_conditions(
+                bundle,
+                1,
+                asset_control_scale=2.0,
+                camera_scale=3.0,
+            )
+    else:
+        resolved = resolve_pretrain_optional_cfg_conditions(
+            bundle,
+            1,
+            asset_control_scale=2.0,
+            camera_scale=3.0,
+        )
+        assert resolved.camera_scale == 1.0
+        if kind in {"none", "mode_b", "mode_b_empty", "empty"}:
+            assert resolved.has_asset_condition
+            assert resolved.asset_control_scale == 2.0
+        else:
+            assert not resolved.has_asset_condition
+            assert resolved.asset_control_scale == 1.0
+
+
+@pytest.mark.parametrize(
+    ("task", "expected_asset", "expected_camera", "factorized_visible"),
+    [
+        ("joint_generation", "asset_uncond", "camera_uncond", False),
+        ("camera_controlled", "asset_uncond", "camera", False),
+        ("asset_camera_controlled", "factorized_asset", "camera", True),
+    ],
+)
+def test_pretrain_condition_task_applies_identical_runtime_semantics(
+    task: str,
+    expected_asset: str,
+    expected_camera: str,
+    factorized_visible: bool,
+):
+    condition = _condition(10)
+    camera_tokens = torch.ones(1, condition.seq_len, 7)
+    bundle = SimpleNamespace(
+        z_clean_n=torch.zeros(1, condition.seq_len, 1, 4),
+        F_asset_tokens=torch.zeros(1, 0, 4),
+        encoder_attention_mask=None,
+        F_asset_lengths=torch.tensor([condition.num_assets]),
+        factorized_asset_condition=condition,
+        asset_condition_kind=["factorized_asset"],
+        camera_condition_tokens=camera_tokens,
+        camera_attention_mask=torch.ones(
+            1, condition.seq_len, dtype=torch.bool
+        ),
+        camera_condition_kind=["camera"],
+    )
+    result = apply_pretrain_condition_task(bundle, task)
+    assert result.asset_condition_kind == [expected_asset]
+    assert result.camera_condition_kind == [expected_camera]
+    assert bool(result.factorized_asset_condition.appearance_mask.any()) is factorized_visible
+    assert bool(result.factorized_asset_condition.track_valid.any()) is factorized_visible
+    if expected_camera == "camera":
+        assert result.camera_condition_tokens is camera_tokens
+    else:
+        assert result.camera_condition_tokens is None
+        assert result.camera_attention_mask is None
+
+
+def test_training_visualization_cycles_the_three_structured_tasks():
+    assert [pretrain_visualization_task(step, 1000) for step in (0, 1000, 2000, 3000)] == [
+        "joint_generation",
+        "camera_controlled",
+        "asset_camera_controlled",
+        "joint_generation",
+    ]
 
 
 def test_appearance_and_placement_are_independently_invariant():

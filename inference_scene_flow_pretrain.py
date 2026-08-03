@@ -10,13 +10,13 @@ The data path intentionally matches ``train_scene_flow_pretrain.py`` validation:
 
 Condition modes rotate by global trunk-major validation row:
 
-    none -> asset -> cam -> asset_cam -> ...
+    none -> cam -> asset_cam -> ...
 
 ``none`` means text-only; text remains the required base condition.  Missing
 asset/camera modalities use the learned null-condition tokens used by pretrain
-condition dropout.  Every CFG value is applied to all modalities actually
-present in the selected mode, so equal factored scales telescope to ordinary
-CFG between the full condition and the all-null condition.
+condition-task sampling. ``--cfg`` controls text only; camera and asset use
+their explicit hierarchical scales. Factorized asset placement is exposed only
+together with its matching camera condition.
 
 Example:
 
@@ -152,6 +152,7 @@ from train_scene_flow_pretrain import (
     _sky_mask_patch_to_image,
     _timestamps_for_generated_render,
     attach_training_equivalent_sliding_asset_conditions,
+    apply_pretrain_condition_task,
     autocast_context,
     build_pretrain_bundle_from_batch,
     build_full_scene_bundle,
@@ -179,7 +180,7 @@ DEFAULT_TOKENIZER_CKPT = "logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040
 DEFAULT_VAL_SCENE_GAUGE = "data/scene_gauge/validation.json"
 DEFAULT_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_75e566ef.json"
 DEFAULT_TEXT_ENCODER = "/home/dancer/model/Qwen/Qwen3-0.6B"
-CONDITION_MODES = ("none", "asset", "cam", "asset_cam")
+CONDITION_MODES = ("none", "cam", "asset_cam")
 GENERATED_METRIC_CAMERA_SCHEMA = "generated_metric_camera_trajectory_v1"
 
 METRIC_GAUGE_PROVENANCE_FIELDS = frozenset(
@@ -343,43 +344,12 @@ def apply_condition_mode(bundle: Any, mode: str) -> Any:
     """Hide optional conditions with the same learned-null semantics as training."""
     if mode not in CONDITION_MODES:
         raise ValueError(f"Unknown condition mode {mode!r}; expected one of {CONDITION_MODES}.")
-    batch_size = _batch_size_from_bundle(bundle)
-    use_asset = mode in {"asset", "asset_cam"}
-    use_camera = mode in {"cam", "asset_cam"}
-
-    if not use_asset:
-        if torch.is_tensor(getattr(bundle, "encoder_attention_mask", None)):
-            bundle.encoder_attention_mask = torch.zeros_like(bundle.encoder_attention_mask, dtype=torch.bool)
-        if torch.is_tensor(getattr(bundle, "F_asset_lengths", None)):
-            bundle.F_asset_lengths = torch.zeros_like(bundle.F_asset_lengths)
-        bundle.asset_condition_kind = ["asset_uncond"] * batch_size
-        factorized = getattr(bundle, "factorized_asset_condition", None)
-        if isinstance(factorized, FactorizedAssetCondition):
-            bundle.factorized_asset_condition = factorized.drop_rows(
-                torch.ones((batch_size,), device=factorized.appearance_mask.device, dtype=torch.bool)
-            )
-        by_window = getattr(bundle, "factorized_asset_conditions_by_window", None)
-        if by_window is not None:
-            bundle.factorized_asset_conditions_by_window = {
-                key: condition.drop_rows(
-                    torch.ones(
-                        (batch_size,),
-                        device=condition.appearance_mask.device,
-                        dtype=torch.bool,
-                    )
-                )
-                for key, condition in by_window.items()
-            }
-
-    if not use_camera:
-        # Do not pass GT-derived pose summaries at all.  The sampler inserts one
-        # learned camera-null token per generated frame via camera_condition_kind.
-        bundle.camera_condition_tokens = None
-        bundle.camera_attention_mask = None
-        bundle.camera_condition_kind = ["camera_uncond"] * batch_size
-    elif getattr(bundle, "camera_condition_kind", None) is None:
-        bundle.camera_condition_kind = ["camera"] * batch_size
-    return bundle
+    task = {
+        "none": "joint_generation",
+        "cam": "camera_controlled",
+        "asset_cam": "asset_camera_controlled",
+    }[mode]
+    return apply_pretrain_condition_task(bundle, task)
 
 
 def _row_has_any(mask: torch.Tensor | None, batch_size: int) -> list[bool]:

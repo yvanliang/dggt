@@ -402,7 +402,7 @@ def test_29_frame_all_modality_sampler_matches_non_sliding_path(
         (1.0, ("mode_a",), ("camera",)),
         (0.0, ("mode_a",), ("camera",)),
         (1.0, ("asset_uncond",), ("camera_uncond",)),
-        (1.0, ("mode_a",), ("camera_uncond",)),
+        (1.0, ("asset_uncond",), ("camera",)),
     }
     assert expected_branches.issubset(direct_flow.branch_signatures)
     assert expected_branches.issubset(sliding_flow.branch_signatures)

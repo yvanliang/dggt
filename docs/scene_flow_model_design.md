@@ -532,13 +532,13 @@ sky mask 也不走 DDT head。patch mask 使用 lightweight MLP decoder；refine
 
 ## 14. CFG 与 Optional Condition
 
-Pretrain 支持 text、asset、camera 三类可选条件。训练时按样本独立 dropout：
+Pretrain 支持 text、asset、camera 三类条件。文本独立 dropout；结构条件按样本采样三个合法任务：
 
 ```text
 text_uncond_drop_prob
-asset_uncond_drop_prob
-camera_uncond_drop_prob
-all_cond_drop_prob
+joint_generation_prob            # asset=NULL, camera=NULL
+camera_controlled_prob            # asset=NULL, camera=REAL
+asset_camera_controlled_prob      # asset=REAL, camera=REAL
 ```
 
 dropout 只隐藏输入条件，不改变 video/camera/sky/gauge 的 clean target 和 loss。
@@ -555,11 +555,11 @@ v = v_full + (text_scale - 1) * (v_full - v_no_text_full)
 因此 text conditional/unconditional 两个分支拥有完全相同的 asset 与 camera，仅文本不同。显式设置独立 control scale 时，再加入分解残差：
 
 ```text
-v_text       = text + asset_null + camera_null
-v_text_asset = text + asset      + camera_null
+v_text_base   = text + asset_null + camera_null
+v_text_camera = text + asset_null + camera
 
-v += (asset_scale  - 1) * (v_text_asset - v_text)
-v += (camera_scale - 1) * (v_full       - v_text_asset)
+v += (camera_scale - 1) * (v_text_camera - v_text_base)
+v += (asset_scale  - 1) * (v_full        - v_text_camera)
 ```
 
 对应 CLI：
@@ -570,7 +570,7 @@ v += (camera_scale - 1) * (v_full       - v_text_asset)
 --camera_guidance_scale
 ```
 
-三个 scale 默认都是 `1.0`，表示 no-op。pretrain 推理允许用户不输入 asset 或 camera 条件；采样端必须依据显式 condition kind，而不是只依据 valid mask 判断 optional condition：用户省略 asset 时使用 `asset_uncond`/`NULL`，自然零资产样本的 `none` 必须保持为零 visible token 的条件态。只有 `asset_uncond` 才表示 asset 模态缺席并使对应 scale 退回 `1.0`；`none` 与 `mode_b_empty` 都是已提供的有效条件语义。camera 整批缺失时对应 scale 强制退回 `1.0`。`asset_control_guidance_scale` 在正式训练中仍控制 asset + edit-control guidance；pretrain full-scene 没有局部 edit-control token，但保留同名参数以对齐两阶段采样接口。
+三个 scale 默认都是 `1.0`，表示 no-op。factorized asset placement 含 camera 投影得到的 bbox/RoPE，因此 asset 条件存在时必须同时提供匹配的 camera；推理会拒绝 asset-without-camera。用户省略 asset 时使用 `asset_uncond`/`NULL`；asset 与 camera 都省略时对应 `joint_generation`。自然零资产样本的 `none` 仍必须保持为零 visible token 的条件态。`asset_control_guidance_scale` 在正式训练中仍控制 asset + edit-control guidance；pretrain full-scene 没有局部 edit-control token，但保留同名参数以对齐两阶段采样接口。
 
 默认的 CFG sweep 只改变 `text_scale`，asset/camera scale 保持 `1.0`。这与 Cosmos conditional generation 的两分支设计一致：clean visual/structural condition 在 conditional 与 text-unconditional 分支中都保留，CFG 只放大上下文相关的文本残差。同时放大三个 scale 会额外外推目标外观与相机轨迹，不应作为普通 `cfg2/cfg4` 的默认含义；需要研究控制强度时可显式单独设置 asset/camera scale。
 

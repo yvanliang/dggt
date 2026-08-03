@@ -29,7 +29,7 @@ from contextlib import nullcontext
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -1457,6 +1457,99 @@ def sample_uncond_drop_mask(
     return torch.rand(int(batch_size), device=device) < float(prob)
 
 
+PRETRAIN_CONDITION_TASKS = (
+    "joint_generation",
+    "camera_controlled",
+    "asset_camera_controlled",
+)
+
+
+def sample_pretrain_condition_tasks(
+    batch_size: int,
+    *,
+    joint_generation_prob: float,
+    camera_controlled_prob: float,
+    asset_camera_controlled_prob: float,
+    device: torch.device,
+    training: bool = True,
+    camera_available_rows: Sequence[bool] | torch.Tensor | None = None,
+) -> SimpleNamespace:
+    """Sample only semantically valid structural-condition combinations.
+
+    A factorized asset condition contains camera-projected placement tokens, so
+    it may only be visible when the matching camera condition is also visible.
+    Task ids therefore encode the legal chain
+
+        joint_generation -> camera_controlled -> asset_camera_controlled.
+
+    Evaluation keeps all structural conditions and performs no stochastic
+    condition dropout.
+    """
+    probabilities = (
+        float(joint_generation_prob),
+        float(camera_controlled_prob),
+        float(asset_camera_controlled_prob),
+    )
+    if any(probability < 0.0 for probability in probabilities):
+        raise ValueError("Structured pretrain task probabilities must be non-negative.")
+    total = sum(probabilities)
+    if not math.isfinite(total) or abs(total - 1.0) > 1.0e-6:
+        raise ValueError(
+            "Structured pretrain task probabilities must sum to 1, "
+            f"got {total:.8f}."
+        )
+    if not bool(training):
+        task_ids = torch.full(
+            (int(batch_size),),
+            PRETRAIN_CONDITION_TASKS.index("asset_camera_controlled"),
+            device=device,
+            dtype=torch.long,
+        )
+    else:
+        draws = torch.rand(int(batch_size), device=device)
+        task_ids = torch.where(
+            draws < probabilities[0],
+            torch.zeros_like(draws, dtype=torch.long),
+            torch.where(
+                draws < probabilities[0] + probabilities[1],
+                torch.ones_like(draws, dtype=torch.long),
+                torch.full_like(draws, 2, dtype=torch.long),
+            ),
+        )
+    if camera_available_rows is not None:
+        camera_available = torch.as_tensor(
+            camera_available_rows,
+            device=device,
+            dtype=torch.bool,
+        ).reshape(-1)
+        if tuple(camera_available.shape) != (int(batch_size),):
+            raise ValueError(
+                "camera_available_rows must be [B], "
+                f"got {tuple(camera_available.shape)} for B={int(batch_size)}."
+            )
+        # The only legal task without a source camera condition is joint
+        # generation. This also prevents an optional-camera training sample
+        # from retaining camera-projected asset placement by accident.
+        task_ids = torch.where(
+            camera_available,
+            task_ids,
+            torch.zeros_like(task_ids),
+        )
+    joint_rows = task_ids.eq(0)
+    camera_rows = task_ids.eq(1)
+    asset_camera_rows = task_ids.eq(2)
+    camera_drop_mask = joint_rows
+    asset_drop_mask = joint_rows | camera_rows
+    return SimpleNamespace(
+        task_ids=task_ids,
+        joint_generation_rows=joint_rows,
+        camera_controlled_rows=camera_rows,
+        asset_camera_controlled_rows=asset_camera_rows,
+        asset_drop_mask=asset_drop_mask,
+        camera_drop_mask=camera_drop_mask,
+    )
+
+
 def _kind_list(
     kinds: Any,
     batch_size: int,
@@ -1646,6 +1739,34 @@ def resolve_pretrain_optional_cfg_conditions(
     )
     has_asset = any(asset_rows)
     has_camera = any(camera_rows)
+    placement_rows = list(asset_rows)
+    asset_kinds = _condition_kind_values(
+        getattr(bundle, "asset_condition_kind", None),
+        int(batch_size),
+    )
+    if asset_kinds is not None:
+        non_placement_kinds = (
+            _ASSET_NULL_OR_MISSING_KINDS
+            | _ASSET_NATURAL_EMPTY_KINDS
+            | {"mode_b", "mode_b_empty", "empty"}
+        )
+        placement_rows = [
+            bool(row) and asset_kinds[idx] not in non_placement_kinds
+            for idx, row in enumerate(placement_rows)
+        ]
+    invalid_asset_rows = [
+        idx
+        for idx, (placement_present, camera_present) in enumerate(
+            zip(placement_rows, camera_rows)
+        )
+        if bool(placement_present) and not bool(camera_present)
+    ]
+    if invalid_asset_rows:
+        raise ValueError(
+            "Factorized asset placement requires a matching camera condition; "
+            "asset-without-camera inference is not a supported condition task "
+            f"(invalid batch rows: {invalid_asset_rows})."
+        )
     asset_null_kind = ["asset_uncond"] * int(batch_size)
     camera_null_kind = ["camera_uncond"] * int(batch_size)
     full_asset_kind = _condition_kind_with_null_rows(
@@ -1688,18 +1809,18 @@ def combine_pretrain_cfg_prediction(
     *,
     full: dict[str, torch.Tensor],
     no_text_full: dict[str, torch.Tensor] | None = None,
-    text_only: dict[str, torch.Tensor] | None = None,
-    text_asset: dict[str, torch.Tensor] | None = None,
+    text_base: dict[str, torch.Tensor] | None = None,
+    text_camera: dict[str, torch.Tensor] | None = None,
     text_scale: float = 1.0,
     asset_scale: float = 1.0,
     camera_scale: float = 1.0,
 ) -> torch.Tensor | None:
-    """Compose independent text, asset and camera CFG deltas.
+    """Compose hierarchical text, camera and asset CFG deltas.
 
     ``full`` is text+asset+camera. ``no_text_full`` removes text only,
-    ``text_only`` removes asset+camera, and ``text_asset`` removes camera only.
-    Keeping this algebra in one function prevents regular, sliding and endpoint
-    sampling from silently drifting apart.
+    ``text_base`` removes asset+camera, and ``text_camera`` keeps camera but
+    removes asset. This hierarchy never evaluates the invalid combination of
+    camera-projected asset placement with a NULL camera condition.
     """
     value = full.get(key)
     if value is None:
@@ -1713,20 +1834,23 @@ def combine_pretrain_cfg_prediction(
         )
     if abs(float(asset_scale) - 1.0) > 1.0e-6:
         if (
-            text_only is None
-            or text_asset is None
-            or text_only.get(key) is None
-            or text_asset.get(key) is None
+            text_camera is None
+            or text_camera.get(key) is None
         ):
             raise RuntimeError(f"Asset-CFG branch is missing `{key}` predictions.")
         guided = guided + (float(asset_scale) - 1.0) * (
-            text_asset[key] - text_only[key]
+            value - text_camera[key]
         )
     if abs(float(camera_scale) - 1.0) > 1.0e-6:
-        if text_asset is None or text_asset.get(key) is None:
+        if (
+            text_base is None
+            or text_camera is None
+            or text_base.get(key) is None
+            or text_camera.get(key) is None
+        ):
             raise RuntimeError(f"Camera-CFG branch is missing `{key}` predictions.")
         guided = guided + (float(camera_scale) - 1.0) * (
-            value - text_asset[key]
+            text_camera[key] - text_base[key]
         )
     return guided
 
@@ -1793,6 +1917,78 @@ def apply_camera_uncond_drop(
             kinds[idx] = "camera_uncond"
     bundle.camera_condition_kind = kinds
     return bundle
+
+
+def apply_pretrain_condition_task(
+    bundle: SimpleNamespace,
+    task: str,
+) -> SimpleNamespace:
+    """Apply one of the three legal pretrain condition tasks to a bundle."""
+    if task not in PRETRAIN_CONDITION_TASKS:
+        raise ValueError(
+            f"Unknown pretrain condition task {task!r}; "
+            f"expected one of {PRETRAIN_CONDITION_TASKS}."
+        )
+    ref = getattr(bundle, "z_clean_n", None)
+    if not torch.is_tensor(ref):
+        raise ValueError("Pretrain condition task requires bundle.z_clean_n.")
+    batch_size = int(ref.shape[0])
+    drop_all_rows = torch.ones(
+        (batch_size,),
+        device=ref.device,
+        dtype=torch.bool,
+    )
+    keep_asset = task == "asset_camera_controlled"
+    keep_camera = task in {"camera_controlled", "asset_camera_controlled"}
+
+    if keep_camera:
+        if getattr(bundle, "camera_condition_kind", None) is None:
+            bundle.camera_condition_kind = ["camera"] * batch_size
+        camera_rows = _camera_condition_rows(
+            getattr(bundle, "camera_condition_tokens", None),
+            getattr(bundle, "camera_attention_mask", None),
+            getattr(bundle, "camera_condition_kind", None),
+            batch_size,
+        )
+        missing_camera_rows = [
+            idx for idx, present in enumerate(camera_rows) if not bool(present)
+        ]
+        if missing_camera_rows:
+            raise ValueError(
+                f"Pretrain condition task {task!r} requires camera condition "
+                f"on every row; missing rows: {missing_camera_rows}."
+            )
+
+    if not keep_asset:
+        bundle = apply_asset_uncond_drop(bundle, drop_all_rows)
+        factorized = getattr(bundle, "factorized_asset_condition", None)
+        if isinstance(factorized, FactorizedAssetCondition):
+            bundle.factorized_asset_condition = factorized.drop_rows(drop_all_rows)
+        by_window = getattr(bundle, "factorized_asset_conditions_by_window", None)
+        if by_window is not None:
+            bundle.factorized_asset_conditions_by_window = {
+                key: condition.drop_rows(drop_all_rows)
+                for key, condition in by_window.items()
+            }
+
+    if not keep_camera:
+        bundle = apply_camera_uncond_drop(bundle, drop_all_rows)
+        # Do not retain GT-derived camera summaries in an offline/visualization
+        # joint-generation bundle, even though camera_uncond kind already makes
+        # the model replace them with learned null tokens.
+        bundle.camera_condition_tokens = None
+        bundle.camera_attention_mask = None
+
+    return bundle
+
+
+def pretrain_visualization_task(step: int, val_every: int) -> str:
+    """Deterministically cycle training visualizations through all tasks."""
+    cadence = max(1, int(val_every))
+    validation_index = max(0, int(step)) // cadence
+    return PRETRAIN_CONDITION_TASKS[
+        validation_index % len(PRETRAIN_CONDITION_TASKS)
+    ]
 
 
 def estimate_sparse_asset_token_count(
@@ -4235,8 +4431,8 @@ def _cfg_sample_pretrain_latents_sliding(
             v_gauge_full = out_full.get("gauge")
             if do_cfg:
                 out_no_text_full = None
-                out_text = None
-                out_text_asset = None
+                out_text_base = None
+                out_text_camera = None
                 if abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6:
                     # Cosmos-style text CFG: keep all clean structural
                     # conditions identical and remove text only.
@@ -4248,8 +4444,8 @@ def _cfg_sample_pretrain_latents_sliding(
                         branch_text_mask=text_null_mask,
                         camera_kind=full_camera_kind,
                     )
-                if abs(asset_control_scale - 1.0) > 1e-6:
-                    out_text = _run_branch(
+                if abs(camera_scale - 1.0) > 1e-6:
+                    out_text_base = _run_branch(
                         F_asset_tokens=F_uncond,
                         asset_mask=uncond_asset_mask,
                         asset_kind=asset_null_kind,
@@ -4257,22 +4453,17 @@ def _cfg_sample_pretrain_latents_sliding(
                         branch_text_mask=text_mask,
                         camera_kind=camera_null_kind,
                     )
-                    out_text_asset = _run_branch(
-                        F_asset_tokens=bundle.F_asset_tokens,
-                        asset_mask=bundle.encoder_attention_mask,
-                        asset_kind=full_asset_kind_w,
+                if (
+                    abs(asset_control_scale - 1.0) > 1e-6
+                    or abs(camera_scale - 1.0) > 1e-6
+                ):
+                    out_text_camera = _run_branch(
+                        F_asset_tokens=F_uncond,
+                        asset_mask=uncond_asset_mask,
+                        asset_kind=asset_null_kind,
                         branch_text_tokens=text_tokens,
                         branch_text_mask=text_mask,
-                        camera_kind=camera_null_kind,
-                    )
-                elif abs(camera_scale - 1.0) > 1e-6:
-                    out_text_asset = _run_branch(
-                        F_asset_tokens=bundle.F_asset_tokens,
-                        asset_mask=bundle.encoder_attention_mask,
-                        asset_kind=full_asset_kind_w,
-                        branch_text_tokens=text_tokens,
-                        branch_text_mask=text_mask,
-                        camera_kind=camera_null_kind,
+                        camera_kind=full_camera_kind,
                     )
 
                 def _combine_cfg(key: str) -> torch.Tensor | None:
@@ -4281,8 +4472,8 @@ def _cfg_sample_pretrain_latents_sliding(
                         key,
                         full=out_full,
                         no_text_full=out_no_text_full,
-                        text_only=out_text,
-                        text_asset=out_text_asset,
+                        text_base=out_text_base,
+                        text_camera=out_text_camera,
                         text_scale=text_guidance,
                         asset_scale=asset_control_scale,
                         camera_scale=camera_scale,
@@ -4385,12 +4576,12 @@ def _cfg_sample_pretrain_latents_sliding(
 
             full = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask, full_asset_kind_w,
                                    text_tokens, text_mask, full_camera_kind)
-            no_text = text_only = text_asset = None
+            no_text = text_base = text_camera = None
             if do_cfg and (abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6):
                 no_text = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
                                           full_asset_kind_w, text_null, text_null_mask, full_camera_kind)
-            if do_cfg and abs(asset_control_scale - 1.0) > 1e-6:
-                text_only = endpoint_branch(
+            if do_cfg and abs(camera_scale - 1.0) > 1e-6:
+                text_base = endpoint_branch(
                     F_uncond,
                     uncond_asset_mask,
                     asset_null_kind,
@@ -4398,19 +4589,26 @@ def _cfg_sample_pretrain_latents_sliding(
                     text_mask,
                     camera_null_kind,
                 )
-                text_asset = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
-                                             full_asset_kind_w, text_tokens, text_mask, camera_null_kind)
-            elif do_cfg and abs(camera_scale - 1.0) > 1e-6:
-                text_asset = endpoint_branch(bundle.F_asset_tokens, bundle.encoder_attention_mask,
-                                             full_asset_kind_w, text_tokens, text_mask, camera_null_kind)
+            if do_cfg and (
+                abs(asset_control_scale - 1.0) > 1e-6
+                or abs(camera_scale - 1.0) > 1e-6
+            ):
+                text_camera = endpoint_branch(
+                    F_uncond,
+                    uncond_asset_mask,
+                    asset_null_kind,
+                    text_tokens,
+                    text_mask,
+                    full_camera_kind,
+                )
 
             def combine(key: str) -> torch.Tensor:
                 value = combine_pretrain_cfg_prediction(
                     key,
                     full=full,
                     no_text_full=no_text,
-                    text_only=text_only,
-                    text_asset=text_asset,
+                    text_base=text_base,
+                    text_camera=text_camera,
                     text_scale=scale,
                     asset_scale=asset_control_scale,
                     camera_scale=camera_scale,
@@ -4650,8 +4848,8 @@ def cfg_sample_pretrain_latents(
         v_gauge_full = out_full.get("gauge")
         if do_cfg:
             out_no_text_full = None
-            out_text = None
-            out_text_asset = None
+            out_text_base = None
+            out_text_camera = None
             if abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6:
                 out_no_text_full = _run_branch(
                     F_asset_tokens=bundle.F_asset_tokens,
@@ -4661,8 +4859,8 @@ def cfg_sample_pretrain_latents(
                     branch_text_mask=text_null_mask,
                     camera_kind=full_camera_kind,
                 )
-            if abs(asset_control_scale - 1.0) > 1e-6:
-                out_text = _run_branch(
+            if abs(camera_scale - 1.0) > 1e-6:
+                out_text_base = _run_branch(
                     F_asset_tokens=F_uncond,
                     asset_mask=uncond_asset_mask,
                     asset_kind=asset_null_kind,
@@ -4670,22 +4868,17 @@ def cfg_sample_pretrain_latents(
                     branch_text_mask=text_mask,
                     camera_kind=camera_null_kind,
                 )
-                out_text_asset = _run_branch(
-                    F_asset_tokens=bundle.F_asset_tokens,
-                    asset_mask=bundle.encoder_attention_mask,
-                    asset_kind=full_asset_kind,
+            if (
+                abs(asset_control_scale - 1.0) > 1e-6
+                or abs(camera_scale - 1.0) > 1e-6
+            ):
+                out_text_camera = _run_branch(
+                    F_asset_tokens=F_uncond,
+                    asset_mask=uncond_asset_mask,
+                    asset_kind=asset_null_kind,
                     branch_text_tokens=text_tokens,
                     branch_text_mask=text_mask,
-                    camera_kind=camera_null_kind,
-                )
-            elif abs(camera_scale - 1.0) > 1e-6:
-                out_text_asset = _run_branch(
-                    F_asset_tokens=bundle.F_asset_tokens,
-                    asset_mask=bundle.encoder_attention_mask,
-                    asset_kind=full_asset_kind,
-                    branch_text_tokens=text_tokens,
-                    branch_text_mask=text_mask,
-                    camera_kind=camera_null_kind,
+                    camera_kind=full_camera_kind,
                 )
 
             def _combine_cfg(key: str) -> torch.Tensor | None:
@@ -4694,8 +4887,8 @@ def cfg_sample_pretrain_latents(
                     key,
                     full=out_full,
                     no_text_full=out_no_text_full,
-                    text_only=out_text,
-                    text_asset=out_text_asset,
+                    text_base=out_text_base,
+                    text_camera=out_text_camera,
                     text_scale=text_guidance,
                     asset_scale=asset_control_scale,
                     camera_scale=camera_scale,
@@ -4739,7 +4932,7 @@ def cfg_sample_pretrain_latents(
             camera_kind=full_camera_kind,
             request_sky_mask=True,
         )
-        endpoint_no_text = endpoint_text = endpoint_text_asset = None
+        endpoint_no_text = endpoint_text_base = endpoint_text_camera = None
         if do_cfg and (abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6):
             endpoint_no_text = _run_branch(
                 F_asset_tokens=bundle.F_asset_tokens,
@@ -4750,8 +4943,8 @@ def cfg_sample_pretrain_latents(
                 camera_kind=full_camera_kind,
                 request_sky_mask=True,
             )
-        if do_cfg and abs(asset_control_scale - 1.0) > 1e-6:
-            endpoint_text = _run_branch(
+        if do_cfg and abs(camera_scale - 1.0) > 1e-6:
+            endpoint_text_base = _run_branch(
                 F_asset_tokens=F_uncond,
                 asset_mask=uncond_asset_mask,
                 asset_kind=asset_null_kind,
@@ -4760,23 +4953,17 @@ def cfg_sample_pretrain_latents(
                 camera_kind=camera_null_kind,
                 request_sky_mask=True,
             )
-            endpoint_text_asset = _run_branch(
-                F_asset_tokens=bundle.F_asset_tokens,
-                asset_mask=bundle.encoder_attention_mask,
-                asset_kind=full_asset_kind,
+        if do_cfg and (
+            abs(asset_control_scale - 1.0) > 1e-6
+            or abs(camera_scale - 1.0) > 1e-6
+        ):
+            endpoint_text_camera = _run_branch(
+                F_asset_tokens=F_uncond,
+                asset_mask=uncond_asset_mask,
+                asset_kind=asset_null_kind,
                 branch_text_tokens=text_tokens,
                 branch_text_mask=text_mask,
-                camera_kind=camera_null_kind,
-                request_sky_mask=True,
-            )
-        elif do_cfg and abs(camera_scale - 1.0) > 1e-6:
-            endpoint_text_asset = _run_branch(
-                F_asset_tokens=bundle.F_asset_tokens,
-                asset_mask=bundle.encoder_attention_mask,
-                asset_kind=full_asset_kind,
-                branch_text_tokens=text_tokens,
-                branch_text_mask=text_mask,
-                camera_kind=camera_null_kind,
+                camera_kind=full_camera_kind,
                 request_sky_mask=True,
             )
 
@@ -4785,8 +4972,8 @@ def cfg_sample_pretrain_latents(
                 key,
                 full=endpoint_full,
                 no_text_full=endpoint_no_text,
-                text_only=endpoint_text,
-                text_asset=endpoint_text_asset,
+                text_base=endpoint_text_base,
+                text_camera=endpoint_text_camera,
                 text_scale=scale,
                 asset_scale=asset_control_scale,
                 camera_scale=camera_scale,
@@ -5034,56 +5221,35 @@ def train_step(
         ),
     )
 
-    legacy_drop_prob = float(getattr(args, "uncond_drop_prob", 0.0))
-    text_drop_prob = float(
-        legacy_drop_prob if getattr(args, "text_uncond_drop_prob", None) is None else args.text_uncond_drop_prob
-    )
-    asset_drop_prob = float(
-        legacy_drop_prob if getattr(args, "asset_uncond_drop_prob", None) is None else args.asset_uncond_drop_prob
-    )
-    camera_drop_prob = float(
-        legacy_drop_prob if getattr(args, "camera_uncond_drop_prob", None) is None else args.camera_uncond_drop_prob
-    )
-    all_drop_prob = float(getattr(args, "all_cond_drop_prob", 0.0))
-    # CFG training prerequisite: independently hide text, asset, and
-    # camera condition tokens per sample. Camera generation targets/losses stay
-    # present; only the selected input modality is replaced by its learned
-    # null. Asset dropout must not also remove edit-control tokens, otherwise
-    # the asset-CFG delta changes two modalities at once.
+    text_drop_prob = float(getattr(args, "text_uncond_drop_prob", 0.1))
+    # Structural conditions are sampled as tasks rather than independent
+    # Bernoulli masks. Factorized placement contains camera-projected bbox/RoPE,
+    # so an asset-conditioned row must always retain its matching camera.
     text_drop_mask = sample_uncond_drop_mask(
         int(bundle.z_clean_n.shape[0]),
         text_drop_prob,
         device=bundle.z_clean_n.device,
         training=is_training,
     )
-    asset_drop_mask = sample_uncond_drop_mask(
+    source_camera_rows = _camera_condition_rows(
+        getattr(bundle, "camera_condition_tokens", None),
+        getattr(bundle, "camera_attention_mask", None),
+        getattr(bundle, "camera_condition_kind", None),
         int(bundle.z_clean_n.shape[0]),
-        asset_drop_prob,
+    )
+    condition_tasks = sample_pretrain_condition_tasks(
+        int(bundle.z_clean_n.shape[0]),
+        joint_generation_prob=float(args.joint_generation_prob),
+        camera_controlled_prob=float(args.camera_controlled_prob),
+        asset_camera_controlled_prob=float(args.asset_camera_controlled_prob),
         device=bundle.z_clean_n.device,
         training=is_training,
+        camera_available_rows=source_camera_rows,
     )
-    camera_drop_mask = sample_uncond_drop_mask(
-        int(bundle.z_clean_n.shape[0]),
-        camera_drop_prob,
-        device=bundle.z_clean_n.device,
-        training=is_training,
-    )
-    all_drop_mask = sample_uncond_drop_mask(
-        int(bundle.z_clean_n.shape[0]),
-        all_drop_prob,
-        device=bundle.z_clean_n.device,
-        training=is_training,
-    )
-    if all_drop_mask is not None:
-        text_drop_mask = all_drop_mask if text_drop_mask is None else (text_drop_mask | all_drop_mask)
-        asset_drop_mask = (
-            all_drop_mask if asset_drop_mask is None else (asset_drop_mask | all_drop_mask)
-        )
-        camera_drop_mask = all_drop_mask if camera_drop_mask is None else (camera_drop_mask | all_drop_mask)
-    if asset_drop_mask is not None:
-        bundle = apply_asset_uncond_drop(bundle, asset_drop_mask)
-    if camera_drop_mask is not None:
-        bundle = apply_camera_uncond_drop(bundle, camera_drop_mask)
+    asset_drop_mask = condition_tasks.asset_drop_mask
+    camera_drop_mask = condition_tasks.camera_drop_mask
+    bundle = apply_asset_uncond_drop(bundle, asset_drop_mask)
+    bundle = apply_camera_uncond_drop(bundle, camera_drop_mask)
 
     M_edit = (bundle.M_source.float() + bundle.M_dest.float()).clamp(0.0, 1.0)
     bundle.M_edit = M_edit
@@ -5843,7 +6009,15 @@ def train_step(
     logs["text_uncond_drop_frac"] = _mask_frac(text_drop_mask)
     logs["asset_uncond_drop_frac"] = _mask_frac(asset_drop_mask)
     logs["camera_uncond_drop_frac"] = _mask_frac(camera_drop_mask)
-    logs["all_cond_drop_frac"] = _mask_frac(all_drop_mask)
+    logs["task_joint_generation_frac"] = _mask_frac(
+        condition_tasks.joint_generation_rows
+    )
+    logs["task_camera_controlled_frac"] = _mask_frac(
+        condition_tasks.camera_controlled_rows
+    )
+    logs["task_asset_camera_controlled_frac"] = _mask_frac(
+        condition_tasks.asset_camera_controlled_rows
+    )
     logs["loss"] = float(loss.detach().item())
     camera_clean = getattr(bundle, "camera_target_clean_n", None)
     if torch.is_tensor(camera_clean):
@@ -6942,6 +7116,30 @@ def _run_validation_impl(
                     any(bool(item["has_asset"]) for item in window_diagnostics)
                 )
 
+            visualization_task = pretrain_visualization_task(
+                step,
+                int(getattr(args, "val_every", 1)),
+            )
+            first_bundle = apply_pretrain_condition_task(
+                first_bundle,
+                visualization_task,
+            )
+            metrics["visualization_task_joint_generation"] = float(
+                visualization_task == "joint_generation"
+            )
+            metrics["visualization_task_camera_controlled"] = float(
+                visualization_task == "camera_controlled"
+            )
+            metrics["visualization_task_asset_camera_controlled"] = float(
+                visualization_task == "asset_camera_controlled"
+            )
+            if is_main_process():
+                print(
+                    f"[validation {step:06d}] visualization condition task: "
+                    f"{visualization_task}",
+                    flush=True,
+                )
+
             # Each active rank handles its round-robin shard.  With the normal
             # three-scale/eight-GPU setup, ranks 0, 1, and 2 each execute one
             # scale concurrently while ranks 3+ proceed directly to gathering.
@@ -7702,31 +7900,31 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
-    parser.add_argument("--uncond_drop_prob", type=float, default=0.1,
-                        help="Legacy fallback per-sample condition dropout probability for text/asset/camera.")
     parser.add_argument(
         "--text_uncond_drop_prob",
+        "--uncond_drop_prob",
+        dest="text_uncond_drop_prob",
         type=float,
-        default=None,
-        help="Per-sample probability of replacing text with the null/empty prompt. Defaults to --uncond_drop_prob.",
+        default=0.1,
+        help="Per-sample probability of replacing text with the null/empty prompt.",
     )
     parser.add_argument(
-        "--asset_uncond_drop_prob",
+        "--joint_generation_prob",
         type=float,
-        default=None,
-        help="Per-sample probability of replacing asset condition with learned asset_null_condition_embed.",
+        default=0.2,
+        help="Probability of the text-only task: asset and camera conditions are both NULL.",
     )
     parser.add_argument(
-        "--camera_uncond_drop_prob",
+        "--camera_controlled_prob",
         type=float,
-        default=None,
-        help="Per-sample probability of replacing camera condition with per-frame learned camera_null_condition_embed.",
+        default=0.2,
+        help="Probability of keeping camera while replacing asset with asset NULL.",
     )
     parser.add_argument(
-        "--all_cond_drop_prob",
+        "--asset_camera_controlled_prob",
         type=float,
-        default=0.0,
-        help="Extra per-sample probability of dropping text, asset, and camera conditions together.",
+        default=0.6,
+        help="Probability of keeping the matched factorized asset and camera conditions.",
     )
     parser.add_argument("--val_guidance_scales", type=str, default="",
                         help="Comma-separated extra CFG scales to dump in validation RGB (in addition to --guidance_scale).")
@@ -7890,23 +8088,27 @@ def main() -> None:
                 raise ValueError(
                     "--val_scene_gauge_path is required when validation uses a different image root"
                 )
-    legacy_drop_prob = float(args.uncond_drop_prob)
-    if args.text_uncond_drop_prob is None:
-        args.text_uncond_drop_prob = legacy_drop_prob
-    if args.asset_uncond_drop_prob is None:
-        args.asset_uncond_drop_prob = legacy_drop_prob
-    if args.camera_uncond_drop_prob is None:
-        args.camera_uncond_drop_prob = legacy_drop_prob
-    for name in (
-        "uncond_drop_prob",
-        "text_uncond_drop_prob",
-        "asset_uncond_drop_prob",
-        "camera_uncond_drop_prob",
-        "all_cond_drop_prob",
-    ):
+    for name in ("text_uncond_drop_prob",):
         value = float(getattr(args, name))
         if value < 0.0 or value > 1.0:
             raise ValueError(f"--{name} must be in [0, 1], got {value}.")
+    task_probability_names = (
+        "joint_generation_prob",
+        "camera_controlled_prob",
+        "asset_camera_controlled_prob",
+    )
+    task_probability_sum = 0.0
+    for name in task_probability_names:
+        value = float(getattr(args, name))
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"--{name} must be in [0, 1], got {value}.")
+        task_probability_sum += value
+    if abs(task_probability_sum - 1.0) > 1.0e-6:
+        raise ValueError(
+            "--joint_generation_prob, --camera_controlled_prob and "
+            "--asset_camera_controlled_prob must sum to 1, "
+            f"got {task_probability_sum:.8f}."
+        )
     if args.resume_path and args.warm_start_path:
         raise ValueError(
             "--resume_path and --warm_start_path are mutually exclusive. "

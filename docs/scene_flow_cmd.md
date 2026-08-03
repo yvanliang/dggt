@@ -191,11 +191,10 @@ torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
     --lambda_camera_flow 0.1 \
     --lambda_camera_pose 1.0 \
     --lambda_sky_flow 0.1 \
-    --uncond_drop_prob 0.1 \
     --text_uncond_drop_prob 0.1 \
-    --asset_uncond_drop_prob 0.2 \
-    --camera_uncond_drop_prob 0.2 \
-    --all_cond_drop_prob 0.05 \
+    --joint_generation_prob 0.2 \
+    --camera_controlled_prob 0.2 \
+    --asset_camera_controlled_prob 0.6 \
     --guidance_scale 1.0 \
     --asset_control_guidance_scale 1.0 \
     --camera_guidance_scale 1.0 \
@@ -327,12 +326,14 @@ Pinned-memory 预算约为每 rank `8 workers × 2 prefetch × 50 MiB ≈ 0.8 Gi
 * `--val_batches` 表示每次 validation 只遍历几个 validation batch 估计 loss，用来控制验证耗时；它不会限制训练数据量。启动器当前用 `1`，loss 曲线噪声较大，只能看趋势；想读数值建议至少 `4`。
 * pretrain validation 的局部 loss 会按与长窗相同的 clip-global 起点轮转；10 帧、stride 7 时为 `0/7/14/19`，因此同时覆盖含唯一 anchor 的首窗和三个 delta-only 后窗。采样可视化固定使用完整 29 帧 clip，并以训练 `sequence_length` 作为窗口做滑窗 rollout；若配置 stride 不适用于更短的训练窗口（例如 `sequence_length=6, stride=7`），会自动改用该窗口的三帧重叠默认值。
 * pretrain 现在固定为 full_scene；旧的 `pseudo_edit/random_inpaint/mixed` CLI 参数已经删除。
-* `--uncond_drop_prob` 保留为旧参数 fallback；正式控制建议显式传 `--text_uncond_drop_prob --asset_uncond_drop_prob --camera_uncond_drop_prob --all_cond_drop_prob`。
+* `--uncond_drop_prob` 仅作为 `--text_uncond_drop_prob` 的兼容别名。asset/camera 不再独立 dropout，而由 `--joint_generation_prob --camera_controlled_prob --asset_camera_controlled_prob` 三项结构化任务概率控制；三者必须和为 1，且不会产生 asset-without-camera。
 * 默认训练 sky generation；如需关闭，加 `--no_sky_generation`。
 * sky target 是 `32×64` 上半球 RGB atlas，每个方向选置信度最高的可见帧；未观测区域 observation weight 为零，不再填全局均色。通过固定 `2×2` pixel-unshuffle 打包为 `16×32×12`，SceneFlow 仍只处理 512 个 sky token，不需要独立 sky tokenizer 或额外 checkpoint。
 * validation 图像会保存到 `${LOG_DIR}/validation/step_xxxxxx/`（默认启动器目录为
   `logs/scene_flow_pretrain_1024_v4`）；默认包含生成渲染、sky、mask、latent PCA
-  和误差图。额外 CFG scale 会追加 `*_cfg{scale}` 后缀。
+  和误差图。额外 CFG scale 会追加 `*_cfg{scale}` 后缀。相邻 validation event 按
+  `joint_generation -> camera_controlled -> asset_camera_controlled` 循环结构条件任务；
+  同一次 event 的全部 CFG scale 保持相同任务和初始噪声，便于直接比较。
 * pretrain offline inference 在 checkpoint 加载后只接受与 checkpoint 内 `mu_z/sigma_z` 和四组 camera anchor/delta buffers **逐元素完全一致**的 stats 文件；不一致会报错，不会再用外部文件覆盖 checkpoint 坐标系。
 * `--val_sample_steps` 只控制 validation 图像采样步数，不影响训练本身。启动器用 `35`。`15` 偏少，只适合 smoke test；需要更稳定的样本可用 `50`。FlowMatch/RAE 的生成采样也不是训练时的 1000 timestep 全跑，而是在 scheduler timestep 上做几十步推理。RAE 的 target 使用 `max(sigma,t_eps)`，因此最后一个非零采样点不能低于 `t_eps`；代码会拒绝越界配置。默认 `shift=10,t_eps=0.05` 时最多 191 步。
 * 训练内 validation 默认 `--val_sliding_window 10 --val_sliding_stride 7`，即相邻窗口重叠 3 帧。长序列必须满足 `1 <= stride < window`；`stride>=window` 直接报错。采样维护 full video/camera/sky 状态，对 video/camera/mask logits 用 cosine coverage 逐帧归一化；scene-global sky 使用 `sum(w/C)` 窗口权重，使每个全局帧贡献相等。

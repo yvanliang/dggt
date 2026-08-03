@@ -96,11 +96,10 @@ GRAD_ACCUM_STEPS=4
 NUM_WORKERS=8
 PREFETCH_FACTOR=2
 
-UNCOND_DROP_PROB=0.1
 TEXT_UNCOND_DROP_PROB=0.1
-ASSET_UNCOND_DROP_PROB=0.2
-CAMERA_UNCOND_DROP_PROB=0.2
-ALL_COND_DROP_PROB=0.05
+JOINT_GENERATION_PROB=0.2
+CAMERA_CONTROLLED_PROB=0.2
+ASSET_CAMERA_CONTROLLED_PROB=0.6
 
 GUIDANCE_SCALE=1.0
 ASSET_CONTROL_GUIDANCE_SCALE=1.0
@@ -400,11 +399,10 @@ build_train_args() {
         --lambda_camera_flow 0.1
         --lambda_camera_pose 1.0
         --lambda_sky_flow 0.1
-        --uncond_drop_prob "${UNCOND_DROP_PROB}"
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
-        --asset_uncond_drop_prob "${ASSET_UNCOND_DROP_PROB}"
-        --camera_uncond_drop_prob "${CAMERA_UNCOND_DROP_PROB}"
-        --all_cond_drop_prob "${ALL_COND_DROP_PROB}"
+        --joint_generation_prob "${JOINT_GENERATION_PROB}"
+        --camera_controlled_prob "${CAMERA_CONTROLLED_PROB}"
+        --asset_camera_controlled_prob "${ASSET_CAMERA_CONTROLLED_PROB}"
         --guidance_scale "${GUIDANCE_SCALE}"
         --asset_control_guidance_scale "${ASSET_CONTROL_GUIDANCE_SCALE}"
         --camera_guidance_scale "${CAMERA_GUIDANCE_SCALE}"
