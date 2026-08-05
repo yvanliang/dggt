@@ -123,6 +123,22 @@ class _DepthHead(nn.Module):
         return depth, torch.ones_like(depth[..., 0])
 
 
+class _SpatialConfidenceDepthHead(_DepthHead):
+    """Depth-head stub whose frozen-teacher confidence varies spatially."""
+
+    def forward(self, tokens, images, patch_start_idx, image_hw=None):
+        depth, confidence = super().forward(
+            tokens,
+            images,
+            patch_start_idx,
+            image_hw=image_hw,
+        )
+        height, _ = image_hw
+        confidence = confidence.clone()
+        confidence[..., height // 2 :, :] = 0.05
+        return depth, confidence
+
+
 class _GaussianHead(nn.Module):
     intermediate_layer_idx = (4, 11, 17, 23)
 
@@ -231,8 +247,15 @@ class _AuxiliaryDDPModel(nn.Module):
 
 def test_primary_rgb_api_has_no_teacher_depth_argument():
     parameters = inspect.signature(compute_rgb_render_loss).parameters
+    feedback_parameters = inspect.signature(
+        compute_reconstruction_feedback_losses
+    ).parameters
     assert "depth" not in parameters
     assert "render_pose_enc_dggt" in parameters
+    assert parameters["conf_weight_power"].default == pytest.approx(1.0)
+    assert parameters["conf_weight_floor"].default == pytest.approx(0.05)
+    assert feedback_parameters["conf_weight_power"].default == pytest.approx(1.0)
+    assert feedback_parameters["conf_weight_floor"].default == pytest.approx(0.05)
 
 
 def test_teacher_render_camera_gradient_scale_rejects_nonzero_value():
@@ -519,6 +542,8 @@ def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
     assert args.lambda_rgb_render == pytest.approx(0.1)
     assert args.lambda_level_consistency == pytest.approx(0.1)
     assert args.lambda_head_consistency == pytest.approx(0.1)
+    assert args.feedback_conf_weight_power == pytest.approx(1.0)
+    assert args.feedback_conf_weight_floor == pytest.approx(0.05)
 
 
 def test_formal_rgb_defaults_match_pretrain_feedback_schedule():
@@ -541,6 +566,8 @@ def test_formal_rgb_defaults_match_pretrain_feedback_schedule():
     assert args.lambda_rgb_render == pytest.approx(0.1)
     assert args.lambda_level_consistency == pytest.approx(0.1)
     assert args.lambda_head_consistency == pytest.approx(0.1)
+    assert args.feedback_conf_weight_power == pytest.approx(1.0)
+    assert args.feedback_conf_weight_floor == pytest.approx(0.05)
 
 
 def test_pretrain_launch_scripts_do_not_override_rgb_coverage_defaults():
@@ -672,6 +699,44 @@ def _feedback_geometry(z: torch.Tensor, *, image_hw: tuple[int, int] = (8, 8)):
     )
 
 
+def _spatial_conf_feedback_geometry(
+    z: torch.Tensor,
+    *,
+    image_hw: tuple[int, int] = (8, 8),
+):
+    vggt = _VGGT()
+    vggt.depth_head = _SpatialConfidenceDepthHead()
+    return decode_generated_dggt_geometry(
+        vggt_model=vggt,
+        scene_flow_root=_SceneFlow(),
+        z_clean_pred_n=z,
+        patch_grid=(1, 1),
+        patch_start_idx=1,
+        image_hw=image_hw,
+    )
+
+
+def _compute_feedback_with_conf_power(
+    student,
+    teacher,
+    power: float | None,
+):
+    kwargs = {
+        "student_geometry": student,
+        "teacher_geometry": teacher,
+        "patch_grid": (1, 1),
+        "patch_weight_mask": torch.ones((1, 1, 1, 1)),
+        "loss_sky_mask_gt": torch.zeros((1, 1, 1, 8, 8)),
+        "sky_weight": 0.0,
+        "max_frames": 0,
+        "render_stride": 1,
+        "sample_weight": torch.ones(1),
+    }
+    if power is not None:
+        kwargs["conf_weight_power"] = power
+    return compute_reconstruction_feedback_losses(**kwargs)
+
+
 def test_reconstruction_feedback_is_zero_at_clean_target():
     z = torch.tensor([[[[0.2, -0.4, 0.6, 0.1]], [[-0.1, 0.3, 0.7, -0.5]]]])
     student = _feedback_geometry(z)
@@ -720,6 +785,150 @@ def test_reconstruction_feedback_sigma_weight_attenuates_whole_sample():
     )
     assert result.logs["loss_head_consistency"] == pytest.approx(
         0.5 * result.logs["loss_head_consistency_unweighted"], rel=1.0e-5
+    )
+
+
+def test_feedback_power_zero_is_bit_identical_to_no_confidence_path(monkeypatch):
+    z = torch.zeros((1, 1, 1, 4))
+    student = _spatial_conf_feedback_geometry(z)
+    with torch.no_grad():
+        teacher = _spatial_conf_feedback_geometry(z)
+    student.depth = teacher.depth.detach().clone()
+    student.depth[..., 4:, :, 0] = student.depth[..., 4:, :, 0] + 1.0
+
+    original_conf_weight = feedback_loss_module._teacher_conf_weight
+    disabled = _compute_feedback_with_conf_power(student, teacher, 0.0)
+    monkeypatch.setattr(
+        feedback_loss_module,
+        "_teacher_conf_weight",
+        lambda *args, **kwargs: None,
+    )
+    legacy = _compute_feedback_with_conf_power(student, teacher, None)
+
+    assert torch.equal(disabled.level_loss, legacy.level_loss)
+    assert torch.equal(disabled.head_loss, legacy.head_loss)
+    assert disabled.logs == legacy.logs
+
+    monkeypatch.setattr(
+        feedback_loss_module,
+        "_slice_dense",
+        lambda *args, **kwargs: pytest.fail("power=0 must short-circuit before slicing"),
+    )
+    assert original_conf_weight(
+        teacher.depth_conf,
+        stride=1,
+        power=0.0,
+        floor=float("nan"),
+    ) is None
+
+
+def test_teacher_depth_conf_downweights_head_error_in_low_confidence_region():
+    z = torch.zeros((1, 1, 1, 4))
+    student = _spatial_conf_feedback_geometry(z)
+    with torch.no_grad():
+        teacher = _spatial_conf_feedback_geometry(z)
+    student.depth = teacher.depth.detach().clone()
+    student.depth[..., 4:, :, 0] = student.depth[..., 4:, :, 0] + 1.0
+
+    disabled = _compute_feedback_with_conf_power(student, teacher, 0.0)
+    weighted = _compute_feedback_with_conf_power(student, teacher, 1.0)
+
+    assert disabled.logs["loss_head_consistency"] > 0.0
+    assert weighted.logs["loss_head_consistency"] < 0.2 * disabled.logs[
+        "loss_head_consistency"
+    ]
+    assert weighted.logs["loss_head_consistency_no_conf"] == pytest.approx(
+        disabled.logs["loss_head_consistency"], rel=0.0, abs=0.0
+    )
+
+
+def test_teacher_depth_conf_weight_is_detached():
+    z = torch.zeros((1, 1, 1, 4))
+    student = _spatial_conf_feedback_geometry(z)
+    with torch.no_grad():
+        teacher = _spatial_conf_feedback_geometry(z)
+    depth_delta = torch.zeros_like(student.depth)
+    depth_delta[..., 4:, :, 0] = 1.0
+    student.depth = (teacher.depth.detach() + depth_delta).requires_grad_()
+    teacher_conf = teacher.depth_conf.detach().clone().requires_grad_()
+    teacher.depth_conf = teacher_conf
+
+    weighted = _compute_feedback_with_conf_power(student, teacher, 1.0)
+    weighted.head_loss.backward()
+
+    assert student.depth.grad is not None
+    assert float(student.depth.grad.abs().sum()) > 0.0
+    assert teacher_conf.grad is None
+
+
+def test_confidence_head_errors_are_not_reweighted_by_teacher_confidence():
+    z = torch.zeros((1, 1, 1, 4))
+    student = _spatial_conf_feedback_geometry(z)
+    with torch.no_grad():
+        teacher = _spatial_conf_feedback_geometry(z)
+    student.depth_conf = teacher.depth_conf.detach().clone()
+    student.depth_conf[..., 4:, :] = 0.5
+    student.gs_conf = teacher.gs_conf.detach().clone()
+    student.gs_conf[..., 4:, :] = 0.0
+
+    disabled = _compute_feedback_with_conf_power(student, teacher, 0.0)
+    weighted = _compute_feedback_with_conf_power(student, teacher, 1.0)
+
+    assert weighted.logs["loss_head_depth_conf"] == disabled.logs[
+        "loss_head_depth_conf"
+    ]
+    assert weighted.logs["loss_head_gs_conf"] == disabled.logs["loss_head_gs_conf"]
+    assert weighted.logs["loss_head_consistency"] == disabled.logs[
+        "loss_head_consistency"
+    ]
+
+
+def test_teacher_depth_conf_only_changes_rgb_photometric_weight(monkeypatch):
+    def fake_render_one_sample(**kwargs):
+        images = kwargs["images"]
+        frames = int(images.shape[0])
+        height, width = int(images.shape[-2]), int(images.shape[-1])
+        rendered = images.new_zeros((frames, 3, height, width))
+        alpha = images.new_zeros((frames, 1, height, width))
+        return rendered, alpha
+
+    monkeypatch.setattr(rgb_render_module, "_render_one_sample", fake_render_one_sample)
+    vggt = _VGGT()
+    vggt.depth_head = _SpatialConfidenceDepthHead()
+    z = torch.zeros((1, 1, 1, 4))
+    images = torch.zeros((1, 1, 3, 8, 8))
+    images[..., 4:, :] = 1.0
+    pose = torch.tensor(
+        [[[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]]
+    )
+    common = {
+        "vggt_model": vggt,
+        "scene_flow_root": _SceneFlow(),
+        "z_clean_pred_n": z,
+        "z_clean_target_n": z,
+        "images": images,
+        "timestamps": torch.zeros((1, 1)),
+        "render_pose_enc_dggt": pose,
+        "render_sky_probability": torch.zeros((1, 1, 1, 8, 8)),
+        "loss_sky_mask_gt": torch.zeros((1, 1, 1, 8, 8)),
+        "patch_grid": (1, 1),
+        "patch_start_idx": 1,
+        "max_samples": 1,
+        "max_frames": 0,
+        "render_stride": 1,
+        "background_mode": "black",
+        "patch_weight_mask": torch.ones((1, 1, 1, 1)),
+    }
+
+    disabled = compute_rgb_render_loss(**common, conf_weight_power=0.0)
+    weighted = compute_rgb_render_loss(**common, conf_weight_power=1.0)
+
+    assert weighted.logs["loss_rgb_render"] < 0.2 * disabled.logs["loss_rgb_render"]
+    assert weighted.logs["rgb_render_weight_mean"] == disabled.logs[
+        "rgb_render_weight_mean"
+    ]
+    assert weighted.logs["loss_rgb_render_no_conf"] == pytest.approx(
+        disabled.logs["loss_rgb_render"], rel=0.0, abs=0.0
     )
 
 

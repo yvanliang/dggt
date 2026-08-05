@@ -1470,6 +1470,21 @@ def build_argparser() -> argparse.ArgumentParser:
             "w(sigma)=(1-sigma)^power; 0 disables sigma weighting."
         ),
     )
+    parser.add_argument(
+        "--feedback_conf_weight_power",
+        type=float,
+        default=1.0,
+        help=(
+            "Teacher depth-confidence exponent for reconstruction feedback; "
+            "0 disables confidence weighting."
+        ),
+    )
+    parser.add_argument(
+        "--feedback_conf_weight_floor",
+        type=float,
+        default=0.05,
+        help="Lower clamp for teacher depth confidence before weighting.",
+    )
     parser.add_argument("--rgb_render_max_samples", type=int, default=1)
     parser.add_argument("--rgb_render_max_frames", type=int, default=0)
     parser.add_argument("--rgb_render_stride", type=int, default=1)
@@ -2664,6 +2679,12 @@ def _add_formal_rgb_render_loss(
         lpips_model=lpips_model,
         lpips_weight=float(args.rgb_render_lpips_weight),
         loss_sample_weight=sigma_weights,
+        conf_weight_power=float(
+            getattr(args, "feedback_conf_weight_power", 1.0)
+        ),
+        conf_weight_floor=float(
+            getattr(args, "feedback_conf_weight_floor", 0.05)
+        ),
         pullback_calibration=pullback_calibration,
     )
     ramp = rgb_render_loss_ramp(args, global_step)
@@ -4289,6 +4310,16 @@ def main() -> None:
         raise ValueError("RGB render start/warmup steps must be non-negative.")
     if not math.isfinite(float(args.rgb_render_sigma_power)) or float(args.rgb_render_sigma_power) < 0.0:
         raise ValueError("--rgb_render_sigma_power must be finite and non-negative.")
+    if (
+        not math.isfinite(float(args.feedback_conf_weight_power))
+        or float(args.feedback_conf_weight_power) < 0.0
+    ):
+        raise ValueError("--feedback_conf_weight_power must be finite and non-negative.")
+    if (
+        not math.isfinite(float(args.feedback_conf_weight_floor))
+        or not 0.0 < float(args.feedback_conf_weight_floor) <= 1.0
+    ):
+        raise ValueError("--feedback_conf_weight_floor must be finite and in (0, 1].")
     if int(args.rgb_render_max_samples) < 0 or int(args.rgb_render_max_frames) < 0:
         raise ValueError("RGB render sample/frame limits must be non-negative.")
     if int(args.rgb_render_stride) <= 0:

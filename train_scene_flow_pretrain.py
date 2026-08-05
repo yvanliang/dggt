@@ -5991,6 +5991,12 @@ def train_step(
                     lpips_model=lpips_model,
                     lpips_weight=float(args.rgb_render_lpips_weight),
                     loss_sample_weight=sigma_weights,
+                    conf_weight_power=float(
+                        getattr(args, "feedback_conf_weight_power", 1.0)
+                    ),
+                    conf_weight_floor=float(
+                        getattr(args, "feedback_conf_weight_floor", 0.05)
+                    ),
                     return_generated_depth=True,
                     pullback_calibration=getattr(
                         unwrap_ddp(scene_flow), "_pullback_calibration", None
@@ -8053,6 +8059,21 @@ def build_argparser() -> argparse.ArgumentParser:
             "with w(sigma)=(1-sigma)^power; 0 disables sigma weighting."
         ),
     )
+    parser.add_argument(
+        "--feedback_conf_weight_power",
+        type=float,
+        default=1.0,
+        help=(
+            "Teacher depth-confidence exponent for reconstruction feedback; "
+            "0 disables confidence weighting."
+        ),
+    )
+    parser.add_argument(
+        "--feedback_conf_weight_floor",
+        type=float,
+        default=0.05,
+        help="Lower clamp for teacher depth confidence before weighting.",
+    )
     parser.add_argument("--rgb_render_max_samples", type=int, default=1)
     parser.add_argument(
         "--rgb_render_max_frames",
@@ -8288,6 +8309,16 @@ def main() -> None:
         raise ValueError("RGB render start/warmup steps must be non-negative.")
     if not math.isfinite(float(args.rgb_render_sigma_power)) or float(args.rgb_render_sigma_power) < 0.0:
         raise ValueError("--rgb_render_sigma_power must be finite and non-negative.")
+    if (
+        not math.isfinite(float(args.feedback_conf_weight_power))
+        or float(args.feedback_conf_weight_power) < 0.0
+    ):
+        raise ValueError("--feedback_conf_weight_power must be finite and non-negative.")
+    if (
+        not math.isfinite(float(args.feedback_conf_weight_floor))
+        or not 0.0 < float(args.feedback_conf_weight_floor) <= 1.0
+    ):
+        raise ValueError("--feedback_conf_weight_floor must be finite and in (0, 1].")
     if not 0.0 <= float(args.rgb_render_sky_weight) <= 1.0:
         raise ValueError("--rgb_render_sky_weight must be in [0,1].")
     if float(args.rgb_render_sky_mask_grad_scale) < 0.0:

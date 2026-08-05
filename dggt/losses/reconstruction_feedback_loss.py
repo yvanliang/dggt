@@ -6,6 +6,7 @@ detached/no-grad decode of the clean target latent.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -142,6 +143,37 @@ def _dense_weight(
     weight = weight * patch_dense.clamp(0.0, 1.0)
     stride = max(1, int(stride))
     return weight[:, :, ::stride, ::stride].contiguous()
+
+
+def _teacher_conf_weight(
+    conf: torch.Tensor,
+    *,
+    stride: int,
+    power: float,
+    floor: float,
+) -> torch.Tensor | None:
+    """Return detached, per-sample-normalised teacher depth confidence.
+
+    ``power == 0`` is deliberately a true short circuit so the disabled path
+    remains bit-identical to the pre-confidence-weighting implementation.
+    """
+    power = float(power)
+    if power == 0.0:
+        return None
+    floor = float(floor)
+    if not math.isfinite(power) or power < 0.0:
+        raise ValueError("conf_weight_power must be finite and non-negative")
+    if not math.isfinite(floor) or not 0.0 < floor <= 1.0:
+        raise ValueError("conf_weight_floor must be finite and in (0, 1]")
+    conf = _slice_dense(
+        conf,
+        batch_size=int(conf.shape[0]),
+        frames=int(conf.shape[1]),
+        stride=stride,
+    )
+    conf = _scalar_dense_error_map(conf, name="teacher depth confidence")
+    weight = conf.detach().float().clamp(floor, 1.0).pow(power)
+    return weight / weight.mean(dim=(1, 2, 3), keepdim=True).clamp_min(1.0e-6)
 
 
 def _selected_patch_tokens(
@@ -357,6 +389,8 @@ def compute_reconstruction_feedback_losses(
     max_frames: int,
     render_stride: int,
     sample_weight: torch.Tensor,
+    conf_weight_power: float = 1.0,
+    conf_weight_floor: float = 0.05,
 ) -> ReconstructionFeedbackLossResult:
     """Compute four-level and rendering-head consistency losses.
 
@@ -422,12 +456,25 @@ def compute_reconstruction_feedback_losses(
         frames=frames,
         stride=render_stride,
     )
+    teacher_depth_conf = teacher_geometry.depth_conf[:batch_size, :frames]
+    conf_weight = _teacher_conf_weight(
+        teacher_depth_conf,
+        stride=render_stride,
+        power=conf_weight_power,
+        floor=conf_weight_floor,
+    )
+    geom_weight = dense_weight if conf_weight is None else dense_weight * conf_weight
     head_losses: dict[str, torch.Tensor] = {}
     head_unweighted: dict[str, torch.Tensor] = {}
     for name, value in head_maps.items():
+        map_weight = (
+            geom_weight
+            if name in ("depth", "gaussian", "dynamic")
+            else dense_weight
+        )
         weighted, unweighted = _masked_sample_mean(
             value,
-            dense_weight,
+            map_weight,
             sample_weight[:batch_size],
         )
         head_losses[name] = weighted
@@ -446,6 +493,23 @@ def compute_reconstruction_feedback_losses(
         + 0.1 * head_unweighted["gs_conf"]
         + head_unweighted["dynamic"]
     )
+    head_loss_no_conf = None
+    if conf_weight is not None:
+        no_conf_losses = {
+            name: _masked_sample_mean(
+                value,
+                dense_weight,
+                sample_weight[:batch_size],
+            )[0]
+            for name, value in head_maps.items()
+        }
+        head_loss_no_conf = (
+            no_conf_losses["depth"]
+            + 0.1 * no_conf_losses["depth_conf"]
+            + no_conf_losses["gaussian"]
+            + 0.1 * no_conf_losses["gs_conf"]
+            + no_conf_losses["dynamic"]
+        )
     for name, value in (
         ("level consistency", level_loss),
         ("head consistency", head_loss),
@@ -470,6 +534,30 @@ def compute_reconstruction_feedback_losses(
             sample_weight[:batch_size].detach().float().mean().item()
         ),
     }
+    if conf_weight is not None:
+        if head_loss_no_conf is None or not bool(torch.isfinite(head_loss_no_conf)):
+            raise FloatingPointError("head consistency without confidence loss is non-finite")
+        raw_teacher_conf = _slice_dense(
+            teacher_depth_conf,
+            batch_size=batch_size,
+            frames=frames,
+            stride=render_stride,
+        )
+        raw_teacher_conf = _scalar_dense_error_map(
+            raw_teacher_conf,
+            name="teacher depth confidence",
+        )
+        logs.update(
+            {
+                "loss_head_consistency_no_conf": float(
+                    head_loss_no_conf.detach().item()
+                ),
+                "feedback_conf_weight_mean": float(
+                    raw_teacher_conf.detach().float().mean().item()
+                ),
+                "feedback_conf_weight_power": float(conf_weight_power),
+            }
+        )
     return ReconstructionFeedbackLossResult(
         level_loss=level_loss,
         head_loss=head_loss,

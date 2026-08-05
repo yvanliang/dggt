@@ -2099,7 +2099,7 @@ $$c'[\dots,\{3,4,5,6,13\}] \;=\; c[\dots,\{3,4,5,6,13\}] - \hat g_{\text{scale}}
 | 合法任务层级 | **已落地**（`train_scene_flow_pretrain.py:1539-1629`，工作树） | 模块二；D.2 的第二条腿；层级 CFG |
 | 离线尺度 GT 表 | **已完成**：training 4787/4787 片段 / 798 场景；validation 1212/1212 / 202 场景 | 尺度的直接监督 |
 | HDS 三层 | **已落地** | 模块三 |
-| HDS 的置信度加权 | **未实现** | 回答"teacher 自己有误差" |
+| HDS 的置信度加权 | **已实现，未训练/未消融** | 回答"teacher 自己有误差" |
 | 尺度对齐的条件读取（减 $\hat g$） | **未实现** | 模块二的梯度回路 |
 | 满足度评测脚本（2D IoU / 米制 z-depth / identity + shuffled 对照） | **未实现** | E.4.4 的四行 |
 
@@ -2556,7 +2556,7 @@ render error。附全集 Spearman + 按 $\sigma$ 分层 + 局部近邻内的方�
 | **用什么单位（D.1.5）** | **三臂**：① 固定成训练集均值尺度 ② 只预测尺度但**不注入 scene decoder** ③ 完整。相机平移误差分解为"尺度误差"与"轨迹误差"；米制换算精度；尺度误差 vs 基线 | **代码已就绪，可跑** |
 | **条件怎么进来（D.2）** | ① 合法层级 vs 独立随机 dropout（**本轮新增，验证层级本身**）；② 单条件 vs 四条件联合下各控制指标退化幅度（见 G.4）；③ placement v3 vs v1 米制原值 | 可跑 |
 | 误差在哪里测（D.3/D.4） | 无 HDS / 只特征层 / 特征+高斯 / 三层全开；并报告 latent 与解码后误差的相关性变化 | 可跑 |
-| HDS 的置信度加权 | 不加权 vs 加权 + 权重图可视化 | 待实现 |
+| HDS 的置信度加权 | 不加权 vs 加权 + 权重图可视化 | **已实现，未训练/未消融** |
 | **模块一各设计决策** | 三流独立投影 vs 拍平；层注意力+learned query pooling vs 平均/拼接；有无 detail 分支；每层独立 head vs 共享；有无相似性约束 | **等 v2 训完** |
 | **尺度对齐的条件读取** | 减 / 不减 $\hat g$ → 目标 **2D IoU + 米制 z-depth 误差**、**跨实例泄漏**、**尺度误差的变化** | 待实现 |
 | **满足度评测**（非消融） | identity similarity **必须配 shuffled-reference 对照**；cycle EPE 报退化监控（静止片段占比、support 比例） | 待接脚本 |
@@ -2743,7 +2743,7 @@ CVD-STORM 比较时须注明其主结果用 3 帧 reference，若要公平比 so
 | factorized actor v3 + 窗外 reference | 已实现 | *we condition on appearance and metric placement without target-window visual leakage* |
 | 合法任务层级 `text ⊂ text+cam ⊂ text+cam+actor` | **工作树已实现，尚未进入所引 commit** | 固定代码快照 / 重训之后才可写 *we formulate* |
 | HDS 特征 / 高斯 / 图像三层 | 已实现 | *we backpropagate through frozen decoders* |
-| HDS 的置信度加权 | **未实现** | 只能写 proposal |
+| HDS 的置信度加权 | **已实现，未训练/未消融** | 可写实现事实：*we weight the Gaussian- and image-level losses by the frozen decoder's own depth confidence*；不能写任何数值或效果结论 |
 | 冻结解码器往返标定（v1，按作用域） | 已冻结 | *we calibrate and report* |
 | **RGB loss 更新生成相机** | **未实现，且被硬断言显式禁止** | **不能声称，任何形式都不行** |
 | 静态相机–几何 cycle | 已实现，但是 **no-grad 诊断** | 只能写 evaluation / diagnostic |

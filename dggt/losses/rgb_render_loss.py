@@ -656,10 +656,19 @@ def compute_rgb_render_loss(
     lpips_model: torch.nn.Module | None = None,
     lpips_weight: float = 0.0,
     loss_sample_weight: torch.Tensor | None = None,
+    conf_weight_power: float = 1.0,
+    conf_weight_floor: float = 0.05,
     return_debug_tensors: bool = False,
     return_generated_depth: bool = False,
     pullback_calibration: PullbackCalibration | None = None,
 ) -> RGBRenderLossResult:
+    conf_weight_power = float(conf_weight_power)
+    if conf_weight_power != 0.0:
+        conf_weight_floor = float(conf_weight_floor)
+        if not math.isfinite(conf_weight_power) or conf_weight_power < 0.0:
+            raise ValueError("conf_weight_power must be finite and non-negative")
+        if not math.isfinite(conf_weight_floor) or not 0.0 < conf_weight_floor <= 1.0:
+            raise ValueError("conf_weight_floor must be finite and in (0, 1]")
     if float(camera_grad_scale) != 0.0:
         raise ValueError(
             "camera_grad_scale must be 0: metric-gauge pretraining renders with "
@@ -735,6 +744,7 @@ def compute_rgb_render_loss(
     if not bool(torch.isfinite(depth).all()):
         raise FloatingPointError("generated DGGT depth contains non-finite values")
     feedback = None
+    teacher_depth_conf = None
     if z_clean_target_n is not None:
         if int(z_clean_target_n.shape[0]) < batch_size:
             raise ValueError(
@@ -753,6 +763,7 @@ def compute_rgb_render_loss(
                 image_hw=(height, width),
                 pullback_calibration=pullback_calibration,
             )
+        teacher_depth_conf = _depth_to_bshw(teacher_geometry.depth_conf).detach().float()
         feedback = compute_reconstruction_feedback_losses(
             student_geometry=geometry,
             teacher_geometry=teacher_geometry,
@@ -763,6 +774,8 @@ def compute_rgb_render_loss(
             max_frames=int(max_frames),
             render_stride=int(render_stride),
             sample_weight=sample_weight,
+            conf_weight_power=conf_weight_power,
+            conf_weight_floor=conf_weight_floor,
         )
         del teacher_geometry
 
@@ -813,14 +826,43 @@ def compute_rgb_render_loss(
             align_corners=False,
         ).reshape(batch_size, frames, 1, *rendered_b.shape[-2:]).clamp(0.0, 1.0)
         weight = weight * patch_image
+    photometric_weight = weight
+    conf_factor_mean = None
+    if conf_weight_power != 0.0 and teacher_depth_conf is not None:
+        conf_low = F.interpolate(
+            teacher_depth_conf[:, :frames].reshape(
+                batch_size * frames,
+                1,
+                *teacher_depth_conf.shape[-2:],
+            ),
+            size=rendered_b.shape[-2:],
+            mode="area",
+        ).reshape(batch_size, frames, 1, *rendered_b.shape[-2:])
+        conf_factor = (
+            conf_low.detach()
+            .float()
+            .clamp(conf_weight_floor, 1.0)
+            .pow(conf_weight_power)
+        )
+        conf_factor_mean = conf_factor.mean()
+        conf_factor = conf_factor / conf_factor.mean(
+            dim=(1, 2, 3, 4), keepdim=True
+        ).clamp_min(1.0e-6)
+        photometric_weight = weight * conf_factor.detach()
     difference = rendered_b.float() - target.float()
-    denominator = weight.sum().clamp_min(1.0e-6) * 3.0
+    denominator = photometric_weight.sum().clamp_min(1.0e-6) * 3.0
     sample_scale = sample_weight.view(batch_size, 1, 1, 1, 1)
     charbonnier_map = torch.sqrt(difference.square() + 1.0e-6)
-    charbonnier_unweighted = (charbonnier_map * weight).sum() / denominator
-    charbonnier = (charbonnier_map * weight * sample_scale).sum() / denominator
-    l1_unweighted = (difference.abs() * weight).sum() / denominator
-    l1 = (difference.abs() * weight * sample_scale).sum() / denominator
+    charbonnier_unweighted = (
+        charbonnier_map * photometric_weight
+    ).sum() / denominator
+    charbonnier = (
+        charbonnier_map * photometric_weight * sample_scale
+    ).sum() / denominator
+    l1_unweighted = (difference.abs() * photometric_weight).sum() / denominator
+    l1 = (
+        difference.abs() * photometric_weight * sample_scale
+    ).sum() / denominator
     loss = charbonnier
     logs = {
         "loss_rgb_render": float(charbonnier.detach().item()),
@@ -837,6 +879,23 @@ def compute_rgb_render_loss(
         "rgb_render_frames": float(frames),
         "rgb_render_samples": float(batch_size),
     }
+    if conf_factor_mean is not None:
+        no_conf_denominator = weight.sum().clamp_min(1.0e-6) * 3.0
+        charbonnier_no_conf = (
+            charbonnier_map * weight * sample_scale
+        ).sum() / no_conf_denominator
+        if not bool(torch.isfinite(charbonnier_no_conf)):
+            raise FloatingPointError("RGB render loss without confidence is non-finite")
+        logs.update(
+            {
+                "loss_rgb_render_no_conf": float(
+                    charbonnier_no_conf.detach().item()
+                ),
+                "rgb_render_conf_weight_mean": float(
+                    conf_factor_mean.detach().item()
+                ),
+            }
+        )
     zero = z_clean_pred_n.sum() * 0.0
     level_loss = zero if feedback is None else feedback.level_loss
     head_loss = zero if feedback is None else feedback.head_loss
