@@ -137,7 +137,7 @@ FORMAL_FLOW_DOMAIN_VERSION = "hard_binary_edit_domain_v1"
 FORMAL_SCENE_FPS = 10.0
 FORMAL_DGGT_CONTEXT_LENGTH = 29
 FORMAL_TOKENIZER_WINDOW_LEN = 10
-DEFAULT_FORMAL_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_75e566ef.json"
+DEFAULT_FORMAL_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_d63b34f7.json"
 FORMAL_METRIC_GAUGE_CONTRACT_SCHEMA = "formal_scene_flow_metric_gauge_contract"
 FORMAL_METRIC_GAUGE_CONTRACT_VERSION = "1.0.0"
 
@@ -218,6 +218,7 @@ def validate_metric_gauge_provenance(
     config: Any,
     expected_dggt_sha256: str | None = None,
     expected_tokenizer_sha256: str | None = None,
+    expected_pullback_runtime_contract_version: str | None = None,
     expected_window_len: int = FORMAL_TOKENIZER_WINDOW_LEN,
     expected_patch_grid: Sequence[int] | None = None,
 ) -> dict[str, Any]:
@@ -258,16 +259,35 @@ def validate_metric_gauge_provenance(
         raise ValueError(
             f"SceneFlow config patch_grid={config_grid} != runtime patch_grid={runtime_grid}"
         )
+    runtime_contract_version = provenance["pullback_runtime_contract_version"]
+    if runtime_contract_version != PULLBACK_RUNTIME_CONTRACT_VERSION:
+        raise ValueError(
+            "metric_gauge_provenance.pullback_runtime_contract_version is unsupported: "
+            f"{runtime_contract_version!r}"
+        )
+    if (
+        expected_pullback_runtime_contract_version is not None
+        and expected_pullback_runtime_contract_version
+        != PULLBACK_RUNTIME_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "expected_pullback_runtime_contract_version is unsupported: "
+            f"{expected_pullback_runtime_contract_version!r}"
+        )
+
     expected_values = {
         "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
         "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
-        "pullback_runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
         "pullback_window_len": expected_window,
         "pullback_patch_grid_hw": list(runtime_grid),
         "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
         "camera_target_space": CAMERA_TARGET_SPACE,
         "camera_target_source": CAMERA_TARGET_SOURCE,
     }
+    if expected_pullback_runtime_contract_version is not None:
+        expected_values["pullback_runtime_contract_version"] = (
+            expected_pullback_runtime_contract_version
+        )
     if expected_dggt_sha256 is not None:
         expected_values["dggt_checkpoint_sha256"] = _require_sha256(
             expected_dggt_sha256, name="runtime DGGT checkpoint SHA-256"
@@ -444,6 +464,7 @@ def validate_metric_gauge_checkpoint_payload(
     require_formal_contract: bool,
     expected_dggt_sha256: str | None = None,
     expected_tokenizer_sha256: str | None = None,
+    expected_pullback_runtime_contract_version: str | None = None,
     expected_feature_stats_sha256: str | None = None,
     expected_window_len: int = FORMAL_TOKENIZER_WINDOW_LEN,
     expected_patch_grid: Sequence[int] | None = None,
@@ -461,6 +482,9 @@ def validate_metric_gauge_checkpoint_payload(
         config=config,
         expected_dggt_sha256=expected_dggt_sha256,
         expected_tokenizer_sha256=expected_tokenizer_sha256,
+        expected_pullback_runtime_contract_version=(
+            expected_pullback_runtime_contract_version
+        ),
         expected_window_len=expected_window_len,
         expected_patch_grid=expected_patch_grid,
     )
@@ -1241,7 +1265,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--feature_stats_path", type=str, default=str(DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH),
                         help=(
                             "Metric-gauge v4 latent/camera/gauge/placement stats contract; "
-                            "defaults to feature_stats_pretrain_v4.pt. "
+                            "defaults to the full-pass tokenizer-v2 v5 stats artifact. "
                             "The file must exactly match the "
                             "buffers stored in the warm-start/resume checkpoint; mismatches fail fast."
                         ))
@@ -1321,6 +1345,22 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Fixed number of frames sampled from each cache clip.")
     parser.add_argument("--batch_size", type=int, default=1, help="Per-process cache items per micro-batch.")
     parser.add_argument("--grad_accum_steps", type=int, default=1)
+    gradient_checkpointing_group = parser.add_mutually_exclusive_group()
+    gradient_checkpointing_group.add_argument(
+        "--gradient_checkpointing",
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_true",
+        help="Enable SceneFlow activation checkpointing to reduce training memory.",
+    )
+    gradient_checkpointing_group.add_argument(
+        "--no_gradient_checkpointing",
+        "--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable SceneFlow activation checkpointing to avoid backward recomputation.",
+    )
+    parser.set_defaults(gradient_checkpointing=True)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--prefetch_factor", type=int, default=1,
                         help="DataLoader batches prefetched per worker. Keep low because each cache item is large.")
@@ -2538,10 +2578,10 @@ def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor
 def require_formal_pullback_calibration(scene_flow: nn.Module) -> PullbackCalibration:
     """Return the validated formal pullback contract or fail closed.
 
-    Formal editing currently uses the render boundary, which is numerically an
-    identity for tokenizer v1.  Requiring the artifact anyway prevents a later
-    tokenizer or calibration swap from silently bypassing the checkpoint-bound
-    contract merely because today's coefficients happen to be one.
+    Formal editing uses the v2 render boundary, which is numerically identity.
+    Requiring the artifact prevents a tokenizer or calibration swap from
+    silently bypassing the checkpoint-bound contract merely because the
+    accepted Scheme-A coefficients happen to be one.
     """
 
     calibration = getattr(unwrap_ddp(scene_flow), "_pullback_calibration", None)
@@ -4476,6 +4516,15 @@ def main() -> None:
         expected_patch_grid=patch_grid,
         expected_artifact_sha256=base_provenance["pullback_artifact_sha256"],
     )
+    if (
+        base_provenance["pullback_runtime_contract_version"]
+        != pullback_calibration.runtime_contract_version
+    ):
+        raise ValueError(
+            "checkpoint pullback runtime contract does not match the loaded artifact: "
+            f"checkpoint={base_provenance['pullback_runtime_contract_version']!r}, "
+            f"artifact={pullback_calibration.runtime_contract_version!r}"
+        )
     scene_flow._metric_gauge_provenance = copy.deepcopy(base_provenance)
     scene_flow._formal_metric_gauge_contract = copy.deepcopy(
         formal_metric_gauge_contract
@@ -4493,7 +4542,16 @@ def main() -> None:
             f"checkpoint asset_position_mode={scene_flow.config.asset_position_mode!r} "
             f"!= --asset_position_mode={args.asset_position_mode!r}"
         )
-    scene_flow.enable_gradient_checkpointing()
+    if bool(args.gradient_checkpointing):
+        scene_flow.enable_gradient_checkpointing()
+    else:
+        scene_flow.disable_gradient_checkpointing()
+    if is_main_process():
+        print(
+            "[memory] SceneFlow gradient checkpointing "
+            f"{'enabled' if scene_flow.gradient_checkpointing else 'disabled'}",
+            flush=True,
+        )
     text_encoder = setup_text_encoder(args, device)
     warm_start_info = load_scene_flow_warm_start(
         scene_flow,
@@ -4826,6 +4884,7 @@ def _save_checkpoint(
     )
     flow_domain_config = formal_flow_domain_config(args)
     provenance = copy.deepcopy(getattr(sf, "_metric_gauge_provenance", None))
+    pullback_calibration = require_formal_pullback_calibration(sf)
     formal_metric_gauge_contract = copy.deepcopy(
         getattr(sf, "_formal_metric_gauge_contract", None)
     )
@@ -4835,6 +4894,9 @@ def _save_checkpoint(
         expected_dggt_sha256=getattr(args, "dggt_checkpoint_sha256", None),
         expected_tokenizer_sha256=getattr(
             args, "tokenizer_checkpoint_sha256", None
+        ),
+        expected_pullback_runtime_contract_version=(
+            pullback_calibration.runtime_contract_version
         ),
         expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
         expected_patch_grid=scene_flow_config.get("patch_grid"),

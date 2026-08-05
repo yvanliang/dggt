@@ -37,11 +37,12 @@ export EXPECTED_NPROC_PER_NODE=16
 export BATCH_SIZE_PER_PPU=1
 export GRAD_ACCUM_STEPS=1
 export EXPECTED_GLOBAL_BATCH_SIZE=64
+export GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
 
 # 与双机任务分开保存每个 DLC 节点的 torchrun 启动日志。
 export LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_dlc_four_nodes_launch}"
 
-# metric-gauge v4 固定从 step 0 开始，公共启动器不会 resume 旧 run。
-export WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v4}"
+# metric-gauge v5 固定从 step 0 开始，公共启动器不会 resume 旧 run。
+export WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v5}"
 
 exec bash "${BASE_DLC_LAUNCHER}"

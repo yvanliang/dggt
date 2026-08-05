@@ -91,7 +91,11 @@ from datasets.dataset import WaymoOpenDataset
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.models.canonical_asset_encoder import CanonicalAssetEncoder
 from dggt.losses.rgb_render_loss import decode_generated_dggt_geometry
-from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers
+from dggt.utils.feature_stats import (
+    DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
+    checkpoint_sha256,
+    load_all_stats_into_buffers,
+)
 from dggt.utils.camera_generation import (
     CAMERA_GENERATION_DIM,
     CAMERA_GENERATION_REPRESENTATION,
@@ -173,13 +177,13 @@ from train_scene_flow_pretrain import (
 )
 
 
-DEFAULT_WEIGHTS = "logs/scene_flow_pretrain_1024/ckpt/pretrain_step048000_ema_weights_only.pt"
+DEFAULT_WEIGHTS = None
 DEFAULT_VAL_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt/validation"
 DEFAULT_CAPTION_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions"
 DEFAULT_DGGT_CKPT = "/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt"
-DEFAULT_TOKENIZER_CKPT = "logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
+DEFAULT_TOKENIZER_CKPT = "logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt"
 DEFAULT_VAL_SCENE_GAUGE = "data/scene_gauge/validation.json"
-DEFAULT_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_75e566ef.json"
+DEFAULT_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_d63b34f7.json"
 DEFAULT_TEXT_ENCODER = "/home/dancer/model/Qwen/Qwen3-0.6B"
 CONDITION_MODES = ("none", "cam", "asset_cam")
 GENERATED_METRIC_CAMERA_SCHEMA = "generated_metric_camera_trajectory_v1"
@@ -223,6 +227,7 @@ def validate_metric_gauge_provenance(
     scene_flow: nn.Module,
     dggt_sha256: str,
     tokenizer_sha256: str,
+    expected_pullback_runtime_contract_version: str | None = None,
     expected_window_len: int,
     expected_patch_grid: Sequence[int],
 ) -> dict[str, Any]:
@@ -257,18 +262,37 @@ def validate_metric_gauge_provenance(
             "metric_gauge_provenance.pullback_patch_grid_hw must be a two-item positive integer list"
         )
     config = getattr(unwrap_ddp(scene_flow), "config", None)
+    runtime_contract_version = provenance["pullback_runtime_contract_version"]
+    if runtime_contract_version != PULLBACK_RUNTIME_CONTRACT_VERSION:
+        raise ValueError(
+            "metric_gauge_provenance.pullback_runtime_contract_version is unsupported: "
+            f"{runtime_contract_version!r}."
+        )
+    if (
+        expected_pullback_runtime_contract_version is not None
+        and expected_pullback_runtime_contract_version
+        != PULLBACK_RUNTIME_CONTRACT_VERSION
+    ):
+        raise ValueError(
+            "expected_pullback_runtime_contract_version is unsupported: "
+            f"{expected_pullback_runtime_contract_version!r}."
+        )
+
     expected_values = {
         "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
         "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
         "tokenizer_sha256": _require_sha256(tokenizer_sha256, name="tokenizer checkpoint SHA-256"),
         "dggt_checkpoint_sha256": _require_sha256(dggt_sha256, name="DGGT checkpoint SHA-256"),
-        "pullback_runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
         "pullback_window_len": int(expected_window_len),
         "pullback_patch_grid_hw": list(expected_grid),
         "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
         "camera_target_space": CAMERA_TARGET_SPACE,
         "camera_target_source": CAMERA_TARGET_SOURCE,
     }
+    if expected_pullback_runtime_contract_version is not None:
+        expected_values["pullback_runtime_contract_version"] = (
+            expected_pullback_runtime_contract_version
+        )
     for field, expected in expected_values.items():
         if provenance[field] != expected:
             raise ValueError(
@@ -867,7 +891,7 @@ def prepare_generated_geometry_boundaries(
     ):
         raise ValueError(f"generated gauge must be [B,1,{SCENE_GAUGE_DIM}], got {getattr(gauge, 'shape', None)}")
     if float(calibration.c_gs) != 1.0:
-        raise ValueError(f"v1 metric inference requires c_gs=1.0, got {calibration.c_gs!r}")
+        raise ValueError(f"v2 metric inference requires c_gs=1.0, got {calibration.c_gs!r}")
     log_metric_scale = gauge[..., 0]
     render_geometry = apply_pullback_calibration(
         depth,
@@ -1206,7 +1230,11 @@ def export_generated_pointclouds(
         if factors.numel() == 0 or not bool(torch.isfinite(factors).all()):
             raise ValueError("c_depth_factor must be finite and non-empty")
         c_depth_summary = {
-            "form": "loglinear" if export_units == "metric" else "identity",
+            "form": (
+                calibration.depth_form
+                if export_units == "metric" and calibration is not None
+                else "identity"
+            ),
             "factor_min": float(factors.min().item()),
             "factor_median": float(factors.median().item()),
             "factor_max": float(factors.max().item()),
@@ -1247,6 +1275,9 @@ def export_generated_pointclouds(
             PULLBACK_METRIC_BOUNDARY if export_units == "metric" else PULLBACK_RENDER_BOUNDARY
         ),
         "pullback_artifact_sha256": None if calibration is None else calibration.artifact_sha256,
+        "pullback_runtime_contract_version": (
+            None if calibration is None else calibration.runtime_contract_version
+        ),
         "tokenizer_sha256": None if calibration is None else calibration.tokenizer_sha256,
         "merged_ply_saved": False,
         "meshlab_note": "Open one frame PLY at a time; merged multi-frame clouds visually over-densify points.",
@@ -1639,7 +1670,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--scene_flow_ckpt_path",
         dest="weights",
         default=DEFAULT_WEIGHTS,
-        help="Pretrain full/EMA-only checkpoint. Default is the requested step-048000 EMA path.",
+        help="Required v2-only pretrain full/EMA checkpoint; v1-bound checkpoints are rejected.",
     )
     parser.add_argument("--dggt_ckpt_path", default=DEFAULT_DGGT_CKPT)
     parser.add_argument("--tokenizer_ckpt_path", default=DEFAULT_TOKENIZER_CKPT)
@@ -1650,8 +1681,11 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--feature_stats_path",
-        default=None,
-        help="Optional override; by default mu_z/sigma_z are loaded from the SceneFlow checkpoint.",
+        default=str(DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH),
+        help=(
+            "Tokenizer-v2 v5 stats contract; it must exactly match the SceneFlow "
+            "checkpoint buffers."
+        ),
     )
     parser.add_argument("--val_image_dir", "--image_dir", dest="val_image_dir", default=DEFAULT_VAL_ROOT)
     parser.add_argument(
@@ -1851,6 +1885,11 @@ def main() -> None:
         raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {device}")
     seed_everything(int(args.seed))
 
+    if not args.weights:
+        raise ValueError(
+            "--weights is required; no v1-bound SceneFlow checkpoint is accepted as a default"
+        )
+
     scene_flow, checkpoint_info = build_scene_flow_from_checkpoint(
         args.weights,
         device=device,
@@ -1890,6 +1929,9 @@ def main() -> None:
         scene_flow=scene_flow,
         dggt_sha256=pullback_calibration.dggt_sha256,
         tokenizer_sha256=pullback_calibration.tokenizer_sha256,
+        expected_pullback_runtime_contract_version=(
+            pullback_calibration.runtime_contract_version
+        ),
         expected_window_len=int(args.val_sliding_window),
         expected_patch_grid=args.patch_grid,
     )
@@ -2014,9 +2056,11 @@ def main() -> None:
                 "artifact_sha256": pullback_calibration.artifact_sha256,
                 "tokenizer_sha256": pullback_calibration.tokenizer_sha256,
                 "dggt_checkpoint_sha256": pullback_calibration.dggt_sha256,
-                "runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+                "runtime_contract_version": (
+                    pullback_calibration.runtime_contract_version
+                ),
                 "c_depth": {
-                    "form": "loglinear",
+                    "form": pullback_calibration.depth_form,
                     "a": pullback_calibration.depth_a,
                     "b": pullback_calibration.depth_b,
                 },
@@ -2266,9 +2310,15 @@ def main() -> None:
                 "artifact_sha256": pullback_calibration.artifact_sha256,
                 "tokenizer_sha256": pullback_calibration.tokenizer_sha256,
                 "dggt_checkpoint_sha256": pullback_calibration.dggt_sha256,
-                "runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+                "runtime_contract_version": (
+                    pullback_calibration.runtime_contract_version
+                ),
                 "c_depth": {
-                    "form": "loglinear" if args.export_units == "metric" else "identity",
+                    "form": (
+                        pullback_calibration.depth_form
+                        if args.export_units == "metric"
+                        else "identity"
+                    ),
                     "a": pullback_calibration.depth_a,
                     "b": pullback_calibration.depth_b,
                 },
@@ -2297,9 +2347,15 @@ def main() -> None:
         "tokenizer_sha256": pullback_calibration.tokenizer_sha256,
         "dggt_checkpoint_sha256": pullback_calibration.dggt_sha256,
         "pullback_artifact_sha256": pullback_calibration.artifact_sha256,
-        "pullback_runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+        "pullback_runtime_contract_version": (
+            pullback_calibration.runtime_contract_version
+        ),
         "c_depth": {
-            "form": "loglinear" if args.export_units == "metric" else "identity",
+            "form": (
+                pullback_calibration.depth_form
+                if args.export_units == "metric"
+                else "identity"
+            ),
             "a": pullback_calibration.depth_a,
             "b": pullback_calibration.depth_b,
         },

@@ -613,37 +613,34 @@ detach。主 RGB renderer 的接口不接受 teacher depth。
   CameraHead。天空像素用 GT sky mask 从原输入保留，非天空区域只用 edited
   3DGS render。
 
-### 15.1 Tokenizer v1 production pullback
+### 15.1 Tokenizer v2 production pullback（v1 仅作历史审计）
 
-冻结 tokenizer 的 direct→reconstruction 往返偏差与 scene gauge 是两个正交问题。当前
-tokenizer v1 的正式 artifact 是 `data/scene_gauge/pullback_75e566ef.json`，其运行合同为：
+冻结 tokenizer 的 direct→reconstruction 往返偏差与 scene gauge 是两个正交问题。当前唯一
+production artifact 是 `data/scene_gauge/pullback_d63b34f7.json`：
 
 | 字段 | 冻结值 |
 |---|---|
-| artifact SHA256 | `1bb159e374e2b1d00af5020f780ada9f74d84a1365a525bc484fccb6a4e34693` |
-| tokenizer SHA256 | `75e566efa3b66baa43f82cb9999c2de60a9f3feeb0f714e1caf38d1f6e8137eb` |
+| tokenizer SHA256 | `d63b34f7b1193ed7da399f953db504cfadb4f98dce2519854227a0f44714c8e8` |
 | DGGT SHA256 | `352652738a5480b8d3ee9dd521ce07b528e5a297bd3feca4d07427dac6d87def` |
 | tokenizer window / patch grid | `10` / `25x37` |
-| runtime contract | `metric_depth_gs_same_factor_render_identity_v1` |
+| runtime contract | `metric_depth_profile_gs_same_factor_render_identity_v2` |
+| Phase 1b 方案 | A：render identity、metric identity、`c_gs=1.0` |
 
-两个 boundary 必须由共享 helper 的显式 `boundary` 参数区分：
+两个 boundary 仍由共享 helper 的显式 `boundary` 参数区分，但 v2 方案 A 下都必须是精确 no-op：
 
-- `boundary="render"`：depth 和 GS 完全 identity。渲染必须保持 tokenizer 原生 recon
-  几何，禁止把 metric 标定系数接入 `rgb_render_loss`。
-- `boundary="metric"`：先在未校正米制深度
-  `z0 = depth_recon * exp(log_metric_scale)` 上评估
-  `c_depth(z0) = exp(-0.0405706428 + 0.0146570329 * log(clamp(z0,0.5,80)/20))`，
-  再将 `depth_recon` 与 GS scale 的 `4:7` 通道同乘该 factor，最后把 point means
-  和 Gaussian scales 乘 `exp(log_metric_scale)` 进入米制边界。独立
-  `c_gs=1.0`；该策略只修正 v1 米制 depth 的 LiDAR 偏差，不宣称已修复
-  tokenizer v1 的 `GS/depth≈0.796` 限制。
+- `boundary="render"`：depth 和 GS 返回 tokenizer 原生 reconstruction tensor；禁止在
+  `rgb_render_loss` 中接入 metric profile。
+- `boundary="metric"`：`c_depth=1`、`c_gs=1`；只在米制边界按
+  `exp(log_metric_scale)` 转换 point means、depth 与 Gaussian scale，不再施加 tokenizer
+  round-trip 校正。
 
-pretrain、formal train、validation 和两个 offline inference 入口都必须通过严格 loader
-验证 artifact schema、`eligible_for_training`、tokenizer/DGGT/artifact SHA、window length、
-patch grid 和 gauge representation。feature stats 记录 tokenizer 与 gauge table SHA；SceneFlow
-checkpoint 在此基础上另记录 pullback artifact SHA/provenance。各自必需字段缺失、哈希不匹配或
-使用旧 11D camera checkpoint 都直接拒绝加载。更换 tokenizer（例如 v2）必须重跑 pullback 审计与 LiDAR gate、产生新的
-hash-bound artifact 并重算 feature stats，不能沿用 v1 系数。
+pretrain、formal train、validation 和 offline inference 入口都必须通过严格 loader 验证
+artifact schema、`eligible_for_training`、tokenizer/DGGT/artifact SHA、window length、patch grid
+和 gauge representation。loader 只接受 `tokenizer_generation=t0_v2`、schema `2.0.0` 与上述 v2
+runtime contract；`pullback_75e566ef.json` 及其 v1 loglinear 系数仅保留为不可变历史证据，不能进入
+训练或推理。绑定 v1 tokenizer 的旧 feature stats 同样禁止复用；当前 v2 全量统计为
+`logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt`，且没有复用 v1 latent moments。
+SceneFlow checkpoint 必须继续绑定该 stats 与 pullback provenance。
 
 gsplat 在无 background 时返回 premultiplied RGB，因此合成公式固定为 `rendered_rgb + (1-alpha)*background`，禁止再次乘 alpha。LPIPS 使用 spatial 输出并应用与 Charbonnier 相同的 edit/sky 权重；正式训练 `sky_weight=0` 时天空不参与 LPIPS。
 

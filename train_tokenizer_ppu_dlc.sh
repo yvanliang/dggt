@@ -15,6 +15,8 @@ umask 000
 #   - 启动命令：
 #       Stage-A:  bash /mnt/workspace/dggt/train_tokenizer_ppu_dlc.sh a
 #       Stage-B:  bash /mnt/workspace/dggt/train_tokenizer_ppu_dlc.sh b
+#       Stage-A 余弦重启延训（可选，默认关闭，见下方 EXTEND_STAGE_A 一节）：
+#                 EXTEND_STAGE_A=1 bash /mnt/workspace/dggt/train_tokenizer_ppu_dlc.sh a
 #
 # DLC 会在每个节点分别执行同一条启动命令，并自动注入：
 #   MASTER_ADDR、MASTER_PORT、WORLD_SIZE、RANK、NPROC_PER_NODE
@@ -139,12 +141,80 @@ STAGE_A_STEPS="${STAGE_A_STEPS:-100000}"
 STAGE_B_STEPS="${STAGE_B_STEPS:-40000}"   # A + B = 100000，与「总 iter 10w」一致
 STAGE_A_FINAL_CKPT="${STAGE_A_FINAL_CKPT:-${STAGE_A_LOG_DIR}/ckpt/scene_tokenizer_step_$(printf '%06d' "${STAGE_A_STEPS}").pt}"
 
+# ============================================================
+# Stage-A 余弦重启延训（EXTEND_STAGE_A=1 时启用，默认关闭）
+#
+# 背景：step 100000 不是「被中断」，而是**跑完了整条 schedule**。
+#   lr_lambda = warmup × 0.5(1+cos(π·step/max_steps))，max_steps=100000
+#   ⇒ step 80k 时 LR 已只剩峰值的 9.5%，90k 剩 2.4%，95k 剩 0.6%，100k 精确为 0。
+#   round2 评测里 80k→100k 的曲线因此是「退火收敛」，不是「还没学完」。
+#
+# 因此本块默认关闭：正常路径仍然是 `bash train_tokenizer_ppu_dlc.sh a`
+# 从 0 重训，或直接进 Stage-B。只有在明确想做 SGDR 式暖重启时才打开：
+#
+#   EXTEND_STAGE_A=1 bash train_tokenizer_ppu_dlc.sh a
+#
+# 重要机制（已在 torch 2.7 上实测确认）：
+#   --resume_path 会 scheduler.load_state_dict()，而 LambdaLR 的 state_dict
+#   **包含 base_lrs**、且 lr_lambdas 存为 [None]。所以：
+#     · 新传的 --lr 会被 checkpoint 里的 base_lrs 静默覆盖 → 调 --lr 无效；
+#     · 新的 max_steps 会生效（lambda 是新的闭包）。
+#   ⇒ 重启 LR 的唯一旋钮就是 EXTEND_EXTRA_STEPS（决定 cosine 的落点）：
+#        +10000 → 峰值的 2.02%
+#        +15000 → 峰值的 4.14%
+#        +20000 → 峰值的 6.70%
+#        +25000 → 峰值的 9.55%（≈ 回到 step 80k 当时的 LR，默认值）
+#   默认取 +25000：既然要付重启的代价，就得跳得够高才可能跳出当前盆地；
+#   跳太低只是白烧卡时。之后仍按 cosine 退火到 0。
+#
+# 另外两点：
+#   · 写到独立的 EXTEND_LOG_DIR，避免覆盖原 Stage-A 的 config.json 与 ckpt 记录；
+#   · 用 --feature_stats_path 复用原 run 的 feature_stats.pt，
+#     否则会在新目录重算归一化统计量，latent 尺度一变，resume 就没有意义了。
+# ============================================================
+EXTEND_STAGE_A="${EXTEND_STAGE_A:-0}"
+# 实跑的 Stage-A 日志目录（注意不是本脚本 STAGE_A_LOG_DIR 的默认值：
+# round2 评测的 checkpoint_sha256 显示实跑用的是 /mnt/workspace/logs/...，
+# 而非 ${PROJECT_ROOT}/logs/...）。
+EXTEND_SOURCE_LOG_DIR="${EXTEND_SOURCE_LOG_DIR:-/mnt/workspace/logs/tokenizer_t0_v2_stageA}"
+EXTEND_FROM_STEP="${EXTEND_FROM_STEP:-100000}"
+EXTEND_EXTRA_STEPS="${EXTEND_EXTRA_STEPS:-25000}"
+EXTEND_LOG_DIR="${EXTEND_LOG_DIR:-${EXTEND_SOURCE_LOG_DIR}_ext${EXTEND_EXTRA_STEPS}}"
+EXTEND_WANDB_RUN_ID="${EXTEND_WANDB_RUN_ID:-wpdn1ft5}"
+
+RESUME_PATH=""
+FEATURE_STATS_PATH=""
+WANDB_RUN_ID=""
+
 if [[ "${STAGE}" == "a" ]]; then
     LOG_DIR="${STAGE_A_LOG_DIR}"
     MAX_STEPS="${STAGE_A_STEPS}"
 else
     LOG_DIR="${STAGE_B_LOG_DIR}"
     MAX_STEPS="${STAGE_B_STEPS}"
+fi
+
+if [[ "${EXTEND_STAGE_A}" == "1" ]]; then
+    if [[ "${STAGE}" != "a" ]]; then
+        echo "[错误] EXTEND_STAGE_A=1 只能配合 stage a 使用，当前 stage=${STAGE}。" >&2
+        exit 2
+    fi
+    for integer_value in "${EXTEND_FROM_STEP}" "${EXTEND_EXTRA_STEPS}"; do
+        if [[ ! "${integer_value}" =~ ^[0-9]+$ ]]; then
+            echo "[错误] EXTEND_FROM_STEP / EXTEND_EXTRA_STEPS 必须是非负整数，收到：${integer_value}" >&2
+            exit 1
+        fi
+    done
+    if (( EXTEND_EXTRA_STEPS < 1 )); then
+        echo "[错误] EXTEND_EXTRA_STEPS 必须为正，收到：${EXTEND_EXTRA_STEPS}" >&2
+        exit 1
+    fi
+
+    RESUME_PATH="${RESUME_PATH_OVERRIDE:-${EXTEND_SOURCE_LOG_DIR}/ckpt/scene_tokenizer_step_$(printf '%06d' "${EXTEND_FROM_STEP}").pt}"
+    FEATURE_STATS_PATH="${FEATURE_STATS_PATH_OVERRIDE:-${EXTEND_SOURCE_LOG_DIR}/feature_stats.pt}"
+    LOG_DIR="${EXTEND_LOG_DIR}"
+    MAX_STEPS=$(( EXTEND_FROM_STEP + EXTEND_EXTRA_STEPS ))
+    WANDB_RUN_ID="${EXTEND_WANDB_RUN_ID}"
 fi
 
 # ============================================================
@@ -212,7 +282,14 @@ fi
 
 WANDB_PROJECT="${WANDB_PROJECT:-dggt-tokenizer}"
 WANDB_NAME="${WANDB_NAME:-t0_v2_stage${STAGE^^}_dz1024_ppu_gb${ACTUAL_GLOBAL_BATCH}}"
-WANDB_RESUME="never"
+# train_tokenizer.py 在收到 --wandb_run_id 时会自动带上 resume="allow"。
+# 注意：WANDB_RUN_DESC 只是给下面 banner 打印用的展示值，并没有 export 任何
+# WANDB_* 变量，不会和 wandb.init(resume=...) 冲突。
+if [[ -n "${WANDB_RUN_ID}" ]]; then
+    WANDB_RUN_DESC="resume=allow, id=${WANDB_RUN_ID}"
+else
+    WANDB_RUN_DESC="new run (resume=never)"
+fi
 
 # ============================================================
 # 运行环境（PPU / ACCL-P）
@@ -282,6 +359,12 @@ check_required_paths() {
         check_file "STAGE_A_FINAL_CKPT" "${STAGE_A_FINAL_CKPT}"
     fi
 
+    if [[ -n "${RESUME_PATH}" ]]; then
+        check_file "RESUME_PATH"         "${RESUME_PATH}"
+        # 必须复用原 run 的 feature_stats.pt：新目录下重算会改变 latent 归一化尺度。
+        check_file "FEATURE_STATS_PATH"  "${FEATURE_STATS_PATH}"
+    fi
+
     # render_anchor 用 LPIPS，两个 stage 都需要（Stage-B 从 step 0 就开着）。
     if [[ ! -f "${ALEXNET_CKPT}" ]]; then
         echo "[错误] 缺少 LPIPS AlexNet 本地权重：" >&2
@@ -329,6 +412,55 @@ PY
     "${PYTHON_BIN}" -m torch.distributed.run --help >/dev/null
 }
 
+# 读出 resume checkpoint 里真实的 global_step 与 scheduler.base_lrs，
+# 据此算出重启瞬间的实际 LR。不要靠猜：resume 时 --lr 会被 base_lrs 覆盖，
+# 只有把 base_lrs 打印出来，日志里的 LR 才是可信的。
+inspect_resume_checkpoint() {
+    RESUME_PATH="${RESUME_PATH}" \
+    EXPECT_STEP="${EXTEND_FROM_STEP}" \
+    EXTEND_MAX_STEPS="${MAX_STEPS}" \
+    NOMINAL_LR="${SCALED_LR}" \
+        "${PYTHON_BIN}" - <<'PY'
+import math
+import os
+import torch
+
+path = os.environ["RESUME_PATH"]
+expect_step = int(os.environ["EXPECT_STEP"])
+max_steps = int(os.environ["EXTEND_MAX_STEPS"])
+nominal_lr = float(os.environ["NOMINAL_LR"])
+
+payload = torch.load(path, map_location="cpu", weights_only=False)
+required = {"scene_tokenizer", "optimizer", "scheduler", "global_step"}
+missing = sorted(required.difference(payload))
+if missing:
+    raise RuntimeError(f"{path} 不是完整训练 checkpoint，缺少 {missing}，无法用于 --resume_path")
+
+step = int(payload["global_step"])
+if step != expect_step:
+    raise RuntimeError(f"checkpoint global_step={step}，与 EXTEND_FROM_STEP={expect_step} 不一致")
+if step >= max_steps:
+    raise RuntimeError(f"global_step={step} 已达 max_steps={max_steps}，训练循环会直接退出，不会跑任何一步")
+
+base_lr = float(payload["scheduler"]["base_lrs"][0])
+factor = 0.5 * (1.0 + math.cos(math.pi * min(step / max(max_steps, 1), 1.0)))
+
+print(f"[extend] resume checkpoint : {path}")
+print(f"[extend] global_step       : {step}  →  max_steps {max_steps}（新增 {max_steps - step} 步）")
+print(f"[extend] scheduler base_lr : {base_lr:.6g}   ← resume 时以它为准")
+print(f"[extend] 本次传入的 --lr   : {nominal_lr:.6g}   ← 会被上面的 base_lr 覆盖，仅作记录")
+print(f"[extend] 重启瞬间 LR       : {base_lr * factor:.6g}  = base_lr × {factor:.4f}（峰值的 {factor * 100:.2f}%）")
+print(f"[extend] 之后按 cosine 退火，到 step {max_steps} 归零")
+
+if abs(base_lr - nominal_lr) / max(base_lr, 1e-12) > 0.01:
+    print(
+        "[extend][警告] checkpoint 的 base_lr 与本次反推的 SCALED_LR 相差超过 1%，"
+        "通常意味着这次的节点数/全局 batch 与原 run 不同。"
+        "LR 会沿用原 run 的值，与新 batch 不匹配 —— 请把节点数改回原配置。"
+    )
+PY
+}
+
 # ============================================================
 # 训练参数
 # 除 batch/accum/lr/max_steps 与三项新损失外，逐项对齐
@@ -365,6 +497,18 @@ build_train_args() {
         --wandb_project "${WANDB_PROJECT}"
         --wandb_name "${WANDB_NAME}"
     )
+
+    if [[ -n "${RESUME_PATH}" ]]; then
+        # --resume_path 会一并恢复 optimizer / scheduler / global_step，
+        # wandb 的 step 因此从 100000 继续递增，不会被 wandb 当作回退而丢弃。
+        common+=(
+            --resume_path "${RESUME_PATH}"
+            --feature_stats_path "${FEATURE_STATS_PATH}"
+        )
+    fi
+    if [[ -n "${WANDB_RUN_ID}" ]]; then
+        common+=(--wandb_run_id "${WANDB_RUN_ID}")
+    fi
 
     if [[ "${STAGE}" == "a" ]]; then
         TRAIN_ARGS=(
@@ -433,6 +577,9 @@ build_train_args() {
 setup_common_env
 check_required_paths
 check_python_and_ppu
+if [[ -n "${RESUME_PATH}" ]]; then
+    inspect_resume_checkpoint
+fi
 
 if [[ -z "${WANDB_API_KEY:-}" ]]; then
     echo "[警告] 未检测到 WANDB_API_KEY；仅当镜像中已有 wandb 登录凭证时才能正常上传。" >&2
@@ -445,7 +592,11 @@ build_train_args
 LAUNCH_LOG="${LAUNCH_LOG_DIR}/tokenizer_v2_stage${STAGE}_rank${DLC_NODE_RANK}.log"
 
 echo "============================================================"
-echo "PAI-DLC ${DLC_NNODES} 节点 PPU：JointSceneTokenizer T0 v2 Stage-${STAGE^^}"
+if [[ -n "${RESUME_PATH}" ]]; then
+    echo "PAI-DLC ${DLC_NNODES} 节点 PPU：Tokenizer T0 v2 Stage-A **余弦重启延训**"
+else
+    echo "PAI-DLC ${DLC_NNODES} 节点 PPU：JointSceneTokenizer T0 v2 Stage-${STAGE^^}"
+fi
 echo "DLC node rank: ${DLC_NODE_RANK}/${DLC_NNODES}"
 echo "master: ${DLC_MASTER_ADDR}:${DLC_MASTER_PORT}"
 echo "PPU per node: ${DLC_NPROC_PER_NODE}"
@@ -467,12 +618,26 @@ fi
 echo "------------------------------------------------------------"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG}"
-echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME}, new run (resume=${WANDB_RESUME})"
-echo
-echo "验收指标（wandb）："
-echo "  gs_scale_sim_ratio  应从 ~0.80 收敛到 1.0"
-echo "  depth_ratio         应从 ~1.03 收敛到 1.0"
-echo "  gs_anchor / geom_anchor / render_anchor 不应显著变差"
+echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME}, ${WANDB_RUN_DESC}"
+if [[ -n "${RESUME_PATH}" ]]; then
+    echo "resume_path: ${RESUME_PATH}"
+    echo "feature_stats（复用原 run，不重算）: ${FEATURE_STATS_PATH}"
+    echo
+    echo "验收指标（wandb，与 step 100000 的 round2 评测基线对比）："
+    echo "  守住不许退：gs_scale_sim_ratio 与 depth_ratio 已在 0.999，任何一个跌出"
+    echo "              [0.995, 1.005] 就说明重启把 v2 已经拿到的东西打坏了，应当停。"
+    echo "  期望改善：  gs_axis_anisotropy（占 recovery score 的 79%，基线 0.02855）"
+    echo "              以及 render_anchor / geom_anchor。"
+    echo "  注意：round2 里 80k→100k 的 render_gt_psnr/ssim/lpips 与 lidar_recon_*"
+    echo "        已经完全走平（甚至微降），所以这几项**不要**期待有提升；"
+    echo "        延训若在这些指标上无变化，属于预期内，不代表跑错。"
+else
+    echo
+    echo "验收指标（wandb）："
+    echo "  gs_scale_sim_ratio  应从 ~0.80 收敛到 1.0"
+    echo "  depth_ratio         应从 ~1.03 收敛到 1.0"
+    echo "  gs_anchor / geom_anchor / render_anchor 不应显著变差"
+fi
 echo "============================================================"
 
 "${PYTHON_BIN}" -m torch.distributed.run \

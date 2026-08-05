@@ -12,10 +12,12 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
+import dggt.losses.reconstruction_feedback_loss as feedback_loss_module
+import dggt.losses.rgb_render_loss as rgb_render_module
+import train_scene_flow_pretrain as pretrain_train
 from dggt.losses.reconstruction_feedback_loss import (
     compute_reconstruction_feedback_losses,
 )
-import dggt.losses.rgb_render_loss as rgb_render_module
 from dggt.losses.rgb_render_loss import (
     RGBRenderLossResult,
     _masked_lpips,
@@ -56,6 +58,48 @@ PRETRAIN_LAUNCH_SCRIPTS = (
     "pretrain_two_nodes26.sh",
     "pretrain_two_nodes31.sh",
 )
+
+
+def _parse_pretrain_args(*extra: str):
+    return pretrain_train.build_argparser().parse_args(
+        [
+            "--image_dir",
+            "/tmp/training",
+            "--dggt_ckpt_path",
+            "/tmp/dggt.pt",
+            "--scene_gauge_path",
+            "/tmp/training_gauge.json",
+            "--pullback_calibration_path",
+            "/tmp/pullback.json",
+            "--log_dir",
+            "/tmp/run",
+            *extra,
+        ]
+    )
+
+
+def _parse_formal_args(*extra: str):
+    return formal_train.build_argparser().parse_args(
+        ["--ckpt_path", "/tmp/dggt.pt", "--log_dir", "/tmp/run", *extra]
+    )
+
+
+def test_scene_flow_training_gradient_checkpointing_cli() -> None:
+    assert _parse_pretrain_args().gradient_checkpointing is True
+    assert _parse_formal_args().gradient_checkpointing is True
+    assert _parse_pretrain_args("--no_gradient_checkpointing").gradient_checkpointing is False
+    assert _parse_formal_args("--no-gradient-checkpointing").gradient_checkpointing is False
+    assert _parse_pretrain_args("--gradient_checkpointing").gradient_checkpointing is True
+    assert _parse_formal_args("--gradient-checkpointing").gradient_checkpointing is True
+
+
+def test_dlc_launchers_disable_gradient_checkpointing_by_default() -> None:
+    common = (REPO_ROOT / "pretrain_ppu_two_nodes_dlc.sh").read_text()
+    four_node = (REPO_ROOT / "pretrain_ppu_four_nodes_dlc.sh").read_text()
+    assert 'GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"' in common
+    assert "TRAIN_ARGS+=(--no_gradient_checkpointing)" in common
+    assert "TRAIN_ARGS+=(--gradient_checkpointing)" in common
+    assert 'GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"' in four_node
 
 
 class _Tokenizer(nn.Module):
@@ -141,7 +185,7 @@ class _SceneFlow(nn.Module):
             artifact_sha256="a" * 64,
             tokenizer_sha256="b" * 64,
             dggt_sha256="c" * 64,
-            tokenizer_generation="test",
+            tokenizer_generation="t0_v2",
             window_len=10,
             patch_grid_hw=(25, 37),
             depth_a=0.0,
@@ -149,6 +193,7 @@ class _SceneFlow(nn.Module):
             reference_depth_m=20.0,
             runtime_depth_clamp_m=(0.5, 80.0),
             c_gs=1.0,
+            depth_form="identity",
         )
 
     def denormalize(self, z):

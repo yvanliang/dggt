@@ -67,24 +67,18 @@ elif [[ ! -f "${DEFAULT_DGGT_CKPT}" && -f /data/disk2/lyy_dataset/model/dggt/mod
   DEFAULT_DGGT_CKPT=/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt
 fi
 DGGT_CKPT="${DGGT_CKPT:-${DEFAULT_DGGT_CKPT}}"
-TOKENIZER_CKPT="${TOKENIZER_CKPT:-${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt}"
-FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v4.pt}"
+TOKENIZER_CKPT="${TOKENIZER_CKPT:-${PROJECT_ROOT}/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt}"
+FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt}"
 SCENE_GAUGE_PATH="${SCENE_GAUGE_PATH:-${PROJECT_ROOT}/data/scene_gauge/training.json}"
 VAL_SCENE_GAUGE_PATH="${VAL_SCENE_GAUGE_PATH:-${PROJECT_ROOT}/data/scene_gauge/validation.json}"
-PULLBACK_CALIBRATION_PATH="${PULLBACK_CALIBRATION_PATH:-${PROJECT_ROOT}/data/scene_gauge/pullback_75e566ef.json}"
+PULLBACK_CALIBRATION_PATH="${PULLBACK_CALIBRATION_PATH:-${PROJECT_ROOT}/data/scene_gauge/pullback_d63b34f7.json}"
 SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${LIANGYY_ROOT}/model/Qwen/Qwen3-0.6B}"
 
 # 双机训练使用独立目录，避免覆盖单机训练的 checkpoint、验证结果和状态文件。
-LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_v4}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_tokenizer_v2}"
 LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/distributed_launch"
-
-# 以下变量在原脚本中定义，但当前训练命令没有使用。
-# 如果 train_scene_flow_pretrain.py 确实需要它们，请按实际参数名加入 TRAIN_ARGS。
-SCENE_FLOW_PRETRAIN_CKPT="${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/ckpt/pretrain_step100000.pt"
-SCENE_FLOW_TRAIN_MANIFEST="${DATASET_ROOT}/waymo_edit_cache/manifests/training/training_manifest.jsonl"
-SCENE_FLOW_VAL_MANIFEST="${DATASET_ROOT}/waymo_edit_cache/manifests/validation/validation_manifest.jsonl"
 
 # ============================================================
 # 训练配置
@@ -106,7 +100,7 @@ ASSET_CONTROL_GUIDANCE_SCALE=1.0
 CAMERA_GUIDANCE_SCALE=1.0
 VAL_GUIDANCE_SCALES="1.0,2.0,4.0"
 
-WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v4}"
+WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v5}"
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
 
 # ============================================================

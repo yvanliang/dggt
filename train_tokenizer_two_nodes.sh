@@ -80,7 +80,7 @@ STAGE_A_FINAL_CKPT="${STAGE_A_FINAL_CKPT:-${STAGE_A_LOG_DIR}/ckpt/scene_tokenize
 # ============================================================
 # Batch 规划
 #
-# 数值取自**实跑的** logs/tokenizer_t0_stage{A,B}/config.json，不是 train_tokenizer.py
+# 数值取自**实跑的** logs/tokenizer_t0_v2_stage{A,B}/config.json，不是 train_tokenizer.py
 # docstring 里的示例 —— 那份示例的 Stage-B 写的是 batch 4 / accum 2，与实跑不符。
 #   Stage-A 实跑: 2 gpu × batch 1 × accum 8 = 16
 #   Stage-B 实跑: 2 gpu × batch 1 × accum 8 = 16

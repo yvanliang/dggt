@@ -32,8 +32,8 @@ Environment (see docs/scene_flow_cmd.md §0 and docs/flow_cache_validation_cmd.m
 
     conda activate dggt
     export DGGT_CKPT=/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt
-    export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_waymo_views1/ckpt/scene_tokenizer_step_014000.pt
-    export FEATURE_STATS=logs/scene_flow_pretrain/feature_stats_pretrain.pt
+    export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt
+    export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt
     export VAL_MANIFEST=/data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/validation/validation_manifest.jsonl
     export VAL_SCENE_GAUGE_SHA256=<sha256-of-production-validation-gauge-table>
     export SCENE_CAPTION_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions
@@ -55,7 +55,7 @@ A) Validation manifest, formal-training (T1) checkpoint, all entries:
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
         --ckpt_path $DGGT_CKPT \
         --tokenizer_ckpt_path $TOKENIZER_CKPT \
-        --scene_flow_ckpt_path logs/scene_flow_t1/ckpt/flow_step040000.pt \
+        --scene_flow_ckpt_path logs/scene_flow_t1_v2/ckpt/flow_step040000.pt \
         --feature_stats_path $FEATURE_STATS \
         --manifest_path $VAL_MANIFEST \
         --split validation \
@@ -72,7 +72,7 @@ Single-entry smoke (entry 0 -> manifest index 0, combined variant):
 
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
         --ckpt_path $DGGT_CKPT --tokenizer_ckpt_path $TOKENIZER_CKPT \
-        --scene_flow_ckpt_path logs/scene_flow_t1/ckpt/flow_step040000_ema_weights_only.pt \
+        --scene_flow_ckpt_path logs/scene_flow_t1_v2/ckpt/flow_step040000_ema_weights_only.pt \
         --feature_stats_path $FEATURE_STATS \
         --manifest_path $VAL_MANIFEST --split validation \
         --cache_scene_gauge_sha256 $VAL_SCENE_GAUGE_SHA256 \
@@ -95,8 +95,8 @@ Notes:
     training. Checkpoints that record a different prediction type are rejected
     before weights are loaded; pass ``--prediction_type v`` only for explicit
     velocity-prediction checkpoints.
-  * ``--feature_stats_path`` is optional because the checkpoint already carries
-    its stats buffers. When supplied it is an exact consistency check; it cannot
+  * ``--feature_stats_path`` defaults to the tokenizer-v2 v5 production stats.
+    It is an exact consistency check against the checkpoint buffers and cannot
     override or change the checkpoint coordinate system.
   * Memory: the default single 29-frame render does one VGGT-L pass on the
     full clip (~25GB free, same as the validation-cache precompute). Use
@@ -138,7 +138,11 @@ from dggt.losses.flow_losses import (
 )
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
-from dggt.utils.feature_stats import checkpoint_sha256, load_all_stats_into_buffers
+from dggt.utils.feature_stats import (
+    DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
+    checkpoint_sha256,
+    load_all_stats_into_buffers,
+)
 from dggt.utils.flow_cache_io import (
     is_chunked_flow_cache,
     load_chunked_flow_cache_probe,
@@ -263,9 +267,9 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--scene_flow_ckpt_path", type=str, required=True,
                    help="Formal T1 WanSceneFlow checkpoint with trained scaffold_packer.")
-    p.add_argument("--feature_stats_path", type=str, default=None,
+    p.add_argument("--feature_stats_path", type=str, default=str(DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH),
                    help=(
-                       "Optional latent+camera stats contract. It must exactly match the buffers "
+                       "Tokenizer-v2 v5 latent+camera stats contract. It must exactly match the buffers "
                        "stored inside --scene_flow_ckpt_path; the checkpoint remains authoritative."
                    ))
     p.add_argument(
@@ -1310,6 +1314,15 @@ def main() -> None:
         expected_patch_grid=patch_grid,
         expected_artifact_sha256=provenance["pullback_artifact_sha256"],
     )
+    if (
+        provenance["pullback_runtime_contract_version"]
+        != pullback_calibration.runtime_contract_version
+    ):
+        raise ValueError(
+            "checkpoint pullback runtime contract does not match the loaded artifact: "
+            f"checkpoint={provenance['pullback_runtime_contract_version']!r}, "
+            f"artifact={pullback_calibration.runtime_contract_version!r}"
+        )
     scene_flow._pullback_calibration = pullback_calibration
     print(
         "[pullback] verified formal render identity contract "

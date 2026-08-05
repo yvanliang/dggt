@@ -106,16 +106,16 @@ elif [[ ! -f "${DEFAULT_DGGT_CKPT}" && -f /data/disk2/lyy_dataset/model/dggt/mod
   DEFAULT_DGGT_CKPT=/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt
 fi
 DGGT_CKPT="${DGGT_CKPT:-${DEFAULT_DGGT_CKPT}}"
-TOKENIZER_CKPT="${TOKENIZER_CKPT:-${PROJECT_ROOT}/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt}"
-FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v4.pt}"
+TOKENIZER_CKPT="${TOKENIZER_CKPT:-${PROJECT_ROOT}/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt}"
+FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt}"
 SCENE_GAUGE_PATH="${SCENE_GAUGE_PATH:-${PROJECT_ROOT}/data/scene_gauge/training.json}"
 VAL_SCENE_GAUGE_PATH="${VAL_SCENE_GAUGE_PATH:-${PROJECT_ROOT}/data/scene_gauge/validation.json}"
-PULLBACK_CALIBRATION_PATH="${PULLBACK_CALIBRATION_PATH:-${PROJECT_ROOT}/data/scene_gauge/pullback_75e566ef.json}"
+PULLBACK_CALIBRATION_PATH="${PULLBACK_CALIBRATION_PATH:-${PROJECT_ROOT}/data/scene_gauge/pullback_d63b34f7.json}"
 SCENE_CAPTION_ROOT="${SCENE_CAPTION_ROOT:-${DATASET_ROOT}/training_captions}"
 SCENE_CAPTION_VAL_ROOT="${SCENE_CAPTION_VAL_ROOT:-${DATASET_ROOT}/validation_captions}"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${MODEL_ROOT}/Qwen/Qwen3-0.6B}"
 
-LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024_v4}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_tokenizer_v2}"
 LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_dlc_launch}"
 
 # ============================================================
@@ -128,6 +128,13 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 EXPECTED_GLOBAL_BATCH_SIZE="${EXPECTED_GLOBAL_BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+# 0 avoids activation recomputation and is the temporary DLC default. Set to 1
+# when per-PPU peak memory is insufficient without checkpointing.
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
+if [[ "${GRADIENT_CHECKPOINTING}" != "0" && "${GRADIENT_CHECKPOINTING}" != "1" ]]; then
+    echo "[错误] GRADIENT_CHECKPOINTING 必须是 0 或 1，当前值：${GRADIENT_CHECKPOINTING}" >&2
+    exit 1
+fi
 
 TEXT_UNCOND_DROP_PROB="${TEXT_UNCOND_DROP_PROB:-0.1}"
 JOINT_GENERATION_PROB="${JOINT_GENERATION_PROB:-0.2}"
@@ -139,9 +146,9 @@ ASSET_CONTROL_GUIDANCE_SCALE="${ASSET_CONTROL_GUIDANCE_SCALE:-1.0}"
 CAMERA_GUIDANCE_SCALE="${CAMERA_GUIDANCE_SCALE:-1.0}"
 VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
 
-# metric-gauge v4 使用独立的新 wandb run，不续接旧 v3 run。
+# metric-gauge v5 使用独立的新 wandb run，不续接旧 run。
 WANDB_PROJECT="${WANDB_PROJECT:-dggt-flow}"
-WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v4}"
+WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v5}"
 WANDB_RESUME="never"
 
 GLOBAL_BATCH_SIZE=$((DLC_NNODES * DLC_NPROC_PER_NODE * BATCH_SIZE_PER_PPU * GRAD_ACCUM_STEPS))
@@ -351,6 +358,11 @@ build_train_args() {
         --wandb_name "${WANDB_NAME}"
         --wandb_resume "${WANDB_RESUME}"
     )
+    if [[ "${GRADIENT_CHECKPOINTING}" == "1" ]]; then
+        TRAIN_ARGS+=(--gradient_checkpointing)
+    else
+        TRAIN_ARGS+=(--no_gradient_checkpointing)
+    fi
 }
 
 setup_common_env
@@ -379,6 +391,7 @@ echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
 echo "NCCL_IB_DISABLE: ${NCCL_IB_DISABLE}"
 echo "DGGT_DEVICE_BACKEND: ${DGGT_DEVICE_BACKEND}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${DLC_NNODES} nodes × ${DLC_NPROC_PER_NODE} ppu/node × ${BATCH_SIZE_PER_PPU} batch/ppu × ${GRAD_ACCUM_STEPS} accum"
+echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, 1=enabled)"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG}"
 echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME}, new run (resume=${WANDB_RESUME})"

@@ -13,14 +13,14 @@
 export WAYMO_DGGT_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/training
 export WAYMO_DGGT_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation
 export DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
-export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt
-export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain_v4.pt
+export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt
+export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt
 export SCENE_GAUGE_PATH=data/scene_gauge/training.json
 export VAL_SCENE_GAUGE_PATH=data/scene_gauge/validation.json
 export VAL_SCENE_GAUGE_SHA256="$(sha256sum "$VAL_SCENE_GAUGE_PATH" | awk '{print $1}')"
-export PULLBACK_CALIBRATION_PATH=data/scene_gauge/pullback_75e566ef.json
-# 由新的 metric-gauge v4 pretrain 从头训练后产生；不是启动前已有输入。
-export SCENE_FLOW_PRETRAIN_CKPT=logs/scene_flow_pretrain_1024_v4/ckpt/pretrain_step100000.pt
+export PULLBACK_CALIBRATION_PATH=data/scene_gauge/pullback_d63b34f7.json
+# Phase 2 尚未开始；v2 stats 已生成，pretrain checkpoint 仍必须由 v2 训练产生。
+export SCENE_FLOW_PRETRAIN_CKPT=logs/scene_flow_pretrain_tokenizer_v2/ckpt/pretrain_step100000.pt
 export SCENE_CAPTION_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/training_captions
 export SCENE_CAPTION_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions
 export SCENE_FLOW_TRAIN_MANIFEST=/data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl
@@ -38,20 +38,20 @@ export QWEN_TEXT_ENCODER=/home/dancer/model/Qwen/Qwen3-0.6B
   双下划线，实际文件是单下划线的 `model_latest_waymo.pt`）。本机调试请直接用上面的绝对路径
   `$DGGT_CKPT`；集群上 `${PROJECT_ROOT}/pretrained/model_latest_waymo.pt` 是有效文件，启动器用的就是它。
 * 这份 DGGT Waymo 数据的 tokenizer patch grid 是 `25x37`，pretrain 必须传 `--patch_grid_h 25 --patch_grid_w 37`。
-* `logs/tokenizer_t0_waymo_views1/feature_stats.pt` 是 tokenizer 训练用的 `4x3072` aggregator stats，不能直接给 SceneFlow pretrain；SceneFlow 需要下面重新计算的 latent stats（维度 = tokenizer latent dim）。
-* **正式统计是修复后的 `feature_stats_pretrain_v4.pt`**，与所有正式 `pretrain*.sh` 一致。
-  2026-08-02 的 training full-pass 产物已完成独立验收并原子发布，SHA-256 为
-  `f5177c9262c878c1595c0f0e41ebd9cf42680de3676f0fccb789ed3cbc7a9111`；它包含 tokenizer latent、
-  9D 米制 Waymo camera、3D scene gauge、factorized-v3 16D placement 的统计与版本/SHA provenance。
-  旧 v1-v3 stats 会被干净切断校验拒绝；更换 tokenizer 后必须重新生成，不能只改文件名。
+* tokenizer 自身的 aggregator stats 不能直接给 SceneFlow pretrain；SceneFlow 需要重新计算
+  latent/camera/gauge/placement stats。当前 `$FEATURE_STATS` 已用 tokenizer v2 对完整 training split
+  从头计算：4787/4787 trunks、44,279,750/44,279,750 latent，`stats_status=complete`，
+  `latent_stats_path=null`，没有复用 v1 latent moments。
+  2026-08-02 的 `feature_stats_pretrain_v4.pt` 绑定 tokenizer v1 SHA `75e566ef...`，只保留为历史证据，
+  v2-only loader 会拒绝它，不能复制或重命名旧文件。
 * camera stats 来自 Waymo 米制 camera target，不再来自 DGGT CameraHead。`$DGGT_CKPT` 仍用于
   tokenizer latent 提取及 provenance，`$TOKENIZER_CKPT` 必须显式传入。
 * 训练 split 的完整 `$SCENE_GAUGE_PATH` 必须先由 29 帧离线 gauge 工具生成，才能计算训练用 v4
   feature stats；`training_shard_*.json` 不等价于完整 `training.json`。`$VAL_SCENE_GAUGE_PATH`
   独立阻塞 validation/pretrain inference 与 validation cache provenance，不是训练 stats 的输入。
   启动器会用 `check_file` 直接阻止误启动，不会创建占位文件。
-* `$PULLBACK_CALIBRATION_PATH` 是与 tokenizer/DGGT checkpoint SHA 绑定的冻结标定 artifact；
-  更换 tokenizer（例如 v2）后必须重新标定，不能沿用 v1 artifact。
+* `$PULLBACK_CALIBRATION_PATH` 是与 v2 tokenizer/DGGT checkpoint SHA 绑定的 Scheme-A artifact；
+  v1 schema/runtime/artifact 一律拒绝加载。
 * **正式 pretrain 和正式训练统一使用 1024-dim tokenizer latent**：`$TOKENIZER_CKPT`、`$FEATURE_STATS`、`--latent_dim 1024`、`$SCENE_FLOW_PRETRAIN_CKPT` 必须来自同一套 1024 tokenizer / SceneFlow pretrain。pretrain→formal warm-start 会校验源 checkpoint 的 `pretrain_feature_stats_contract`（stats SHA、sequence length 10、DGGT context 29、grid 25×37）；formal resume/inference 再由 formal metric contract 保护自己的坐标系。任何不一致都会直接报错，不允许用新 stats 静默改变 checkpoint 的坐标系。
 * `--tokenizer_ckpt_path` 在 metric-gauge pretrain 中必须显式提供，以便校验 pullback artifact
   的 tokenizer SHA；即使基础 DGGT checkpoint 内嵌 tokenizer 也不能省略。
@@ -93,7 +93,9 @@ CUDA_VISIBLE_DEVICES=0 python -u tools/compute_pretrain_feature_stats.py \
     --log_every 20
 ```
 
-### 1.0.1 2026-08-02 production artifact 与线路验收
+### 1.0.1 2026-08-02 tokenizer-v1 历史 artifact 与线路验收
+
+本小节只保留不可变历史证据；其中 stats、smoke checkpoint 和 SHA 均不属于当前 v2 运行输入。
 
 - training gauge：`data/scene_gauge/training.json`，4787/4787 trunks、798 scenes、0 errors，
   metric-scale/FOVx/FOVy valid counts `[4216,4787,4787]`，actor coverage 1662；SHA-256
@@ -156,7 +158,7 @@ torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
     --scene_gauge_path $SCENE_GAUGE_PATH \
     --val_scene_gauge_path $VAL_SCENE_GAUGE_PATH \
     --pullback_calibration_path $PULLBACK_CALIBRATION_PATH \
-    --log_dir logs/scene_flow_pretrain_1024_v4 \
+    --log_dir logs/scene_flow_pretrain_tokenizer_v2 \
     --caption_root $SCENE_CAPTION_ROOT \
     --val_caption_root $SCENE_CAPTION_VAL_ROOT \
     --text_encoder_path $QWEN_TEXT_ENCODER \
@@ -245,9 +247,10 @@ torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
 
 | 项 | 取值 | 结论 |
 |---|---|---|
-| metric-gauge 输入 | v4 stats + training/validation gauge table + pullback artifact | ✅ 四者都由启动器逐文件检查；任何一项缺失都会在 `torchrun` 前失败 |
-| `--feature_stats_path` | `feature_stats_pretrain_v4.pt` | ✅ 必须包含 9D metric camera、3D gauge、factorized-v3 16D placement 统计和匹配 provenance |
+| metric-gauge 输入 | v5 stats artifact（schema v4）+ training/validation gauge table + pullback artifact | ✅ 四者都由启动器逐文件检查；任何一项缺失都会在 `torchrun` 前失败 |
+| `--feature_stats_path` | `feature_stats_pretrain_v5.pt` | tokenizer v2 正式统计；必须包含 9D metric camera、3D gauge、factorized-v3 16D placement 统计和 v2 tokenizer provenance |
 | `--latent_dim 1024` / `--patch_grid_h 25 --patch_grid_w 37` | — | ✅ 与 tokenizer / 数据一致 |
+| gradient checkpointing | DLC 默认关闭 | ✅ 公共 DLC launcher 传 `--no_gradient_checkpointing`，避免 backward 重算；若单卡显存不足，用 `GRADIENT_CHECKPOINTING=1` 恢复 |
 | `--shift 10 --weighting_scheme waver --mode_scale 1.29 --prediction_type x` | — | ✅ 与 RAEv2 数值对拍一致；`--val_sample_steps 35` 满足 `steps ≤ shift/t_eps-shift+1 = 191` |
 | 全局 batch | 64（3 节点为 72） | ✅ 但 3 节点的 72 与其它拓扑不可严格互比，`WANDB_NAME` 已按 `gb72` 区分 |
 | `--lr 1e-4 --final_lr 1e-5` | — | ✅ 可用。RAEv2 t2i 在 gmuon + 全局 batch 1024 下用 2e-4；这里 batch 64 用 1e-4 偏保守，若前 2 万步 loss 下降过慢可以试 2e-4 |
@@ -262,7 +265,7 @@ torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
 | `--pin_memory` | `True` | ✅ 所有正式 pretrain 启动器均显式开启；CUDA 0 实测将中位 H2D 从 10.35 ms 降到 2.43 ms |
 | `--resume_path` | 启动器不传 | ✅ metric-gauge v4 按 clean cut 从头训练；旧 v3 checkpoint 会被入口拒绝 |
 | wandb resume | 多机启动器不传旧 run id | ✅ clean-cut 训练会创建独立 v4 run；PPU DLC 显式使用 `resume=never` |
-| `LOG_DIR` | `logs/scene_flow_pretrain_1024_v4`（可由环境变量覆盖） | ✅ 与旧 v3 输出隔离；并行跑多个拓扑时仍应各自覆盖成不同目录 |
+| `LOG_DIR` | `logs/scene_flow_pretrain_tokenizer_v2`（可由环境变量覆盖） | ✅ 与所有 v1-bound run 隔离；并行跑多个拓扑时仍应各自覆盖成不同目录 |
 | `--optimizer_type gmuon` | — | ✅ 与 RAEv2 t2i 一致；`gmuon` 不可用时代码会显式报错而不是静默回退 AdamW |
 
 **数据吞吐（2026-08-02，真实 training scenes 300–305，CUDA 0）**：旧版文档记录的
@@ -330,7 +333,7 @@ Pinned-memory 预算约为每 rank `8 workers × 2 prefetch × 50 MiB ≈ 0.8 Gi
 * 默认训练 sky generation；如需关闭，加 `--no_sky_generation`。
 * sky target 是 `32×64` 上半球 RGB atlas，每个方向选置信度最高的可见帧；未观测区域 observation weight 为零，不再填全局均色。通过固定 `2×2` pixel-unshuffle 打包为 `16×32×12`，SceneFlow 仍只处理 512 个 sky token，不需要独立 sky tokenizer 或额外 checkpoint。
 * validation 图像会保存到 `${LOG_DIR}/validation/step_xxxxxx/`（默认启动器目录为
-  `logs/scene_flow_pretrain_1024_v4`）；默认包含生成渲染、sky、mask、latent PCA
+  `logs/scene_flow_pretrain_tokenizer_v2`）；默认包含生成渲染、sky、mask、latent PCA
   和误差图。额外 CFG scale 会追加 `*_cfg{scale}` 后缀。相邻 validation event 按
   `joint_generation -> camera_controlled -> asset_camera_controlled` 循环结构条件任务；
   同一次 event 的全部 CFG scale 保持相同任务和初始噪声，便于直接比较。

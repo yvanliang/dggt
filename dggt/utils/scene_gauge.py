@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
+import numpy as np
 import torch
 
 from dggt.utils.rotation import mat_to_quat
@@ -41,10 +42,10 @@ SCENE_GAUGE_TABLE_SCHEMA_VERSION = "1.0.0"
 SCENE_GAUGE_EXTRACTOR_IMPLEMENTATION_VERSION = "lean_full29_teacher_v2"
 
 PULLBACK_SCHEMA_NAME = "dggt_tokenizer_pullback"
-PULLBACK_SCHEMA_VERSION = "1.0.0"
+PULLBACK_SCHEMA_VERSION = "2.0.0"
 PULLBACK_ARTIFACT_ROLE = "production_pullback"
 PULLBACK_RUNTIME_CONTRACT_VERSION = (
-    "metric_depth_gs_same_factor_render_identity_v1"
+    "metric_depth_profile_gs_same_factor_render_identity_v2"
 )
 PULLBACK_LOG_METRIC_SCALE_UNITS = "log_metres_per_dggt_unit"
 PULLBACK_DEPTH_EVALUATION = (
@@ -54,6 +55,30 @@ PULLBACK_GS_SCALE_RULE = "multiply_channels_4_7_by_same_depth_factor"
 PULLBACK_RENDER_BOUNDARY = "render"
 PULLBACK_METRIC_BOUNDARY = "metric"
 PULLBACK_BOUNDARIES = (PULLBACK_RENDER_BOUNDARY, PULLBACK_METRIC_BOUNDARY)
+PULLBACK_DEPTH_FORMS = ("identity", "constant", "loglinear")
+PULLBACK_DEPTH_VARIABLE_CONTRACT = {
+    "name": "uncorrected_reconstructed_metric_depth_m",
+    "source_tensor": "reconstructed_depth",
+    "metric_conversion": "divide_by_full_29f_direct_units_per_metre",
+    "correction_state": "uncorrected",
+    "runtime_clamp_m": [0.5, 80.0],
+    "reference_depth_m": 20.0,
+}
+PULLBACK_V2_SMOKE_THRESHOLDS = {
+    "render_direct_psnr_min_db": 30.0,
+    "render_direct_ssim_min": 0.95,
+    "render_direct_lpips_max": 0.05,
+    "render_gt_psnr_drop_max_db": 0.25,
+    "render_gt_ssim_drop_max": 0.02,
+    "render_gt_lpips_increase_max": 0.02,
+    "depth_recon_over_direct_range": [0.95, 1.05],
+    "depth_recon_vs_direct_absrel_max": 0.05,
+    "point_xyz_relative_error_max": 0.05,
+    "gs_recon_over_direct_range": [0.95, 1.05],
+    "paired_gs_over_depth_range": [0.95, 1.05],
+    "gs_axis_anisotropy_log_rms_max": 0.1,
+    "support_pixels_median_per_frame_min": 1000,
+}
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -410,6 +435,59 @@ class PullbackCalibration:
     reference_depth_m: float
     runtime_depth_clamp_m: tuple[float, float]
     c_gs: float
+    runtime_contract_version: str = PULLBACK_RUNTIME_CONTRACT_VERSION
+    depth_form: Literal["identity", "constant", "loglinear"] = "identity"
+
+    def __post_init__(self) -> None:
+        if self.tokenizer_generation != "t0_v2":
+            raise ValueError("PullbackCalibration only supports tokenizer generation t0_v2")
+        if self.runtime_contract_version != PULLBACK_RUNTIME_CONTRACT_VERSION:
+            raise ValueError("PullbackCalibration runtime contract is not the current v2 contract")
+        for name, value in (
+            ("artifact_sha256", self.artifact_sha256),
+            ("tokenizer_sha256", self.tokenizer_sha256),
+            ("dggt_sha256", self.dggt_sha256),
+        ):
+            if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+                raise ValueError(f"PullbackCalibration {name} must be a lowercase SHA-256")
+        if isinstance(self.window_len, bool) or not isinstance(self.window_len, int):
+            raise ValueError("PullbackCalibration window_len must be an integer")
+        if self.window_len != 10:
+            raise ValueError("PullbackCalibration window_len must be 10")
+        if (
+            not isinstance(self.patch_grid_hw, tuple)
+            or len(self.patch_grid_hw) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in self.patch_grid_hw
+            )
+        ):
+            raise ValueError("PullbackCalibration patch_grid_hw must contain two positive integers")
+        if self.depth_form not in PULLBACK_DEPTH_FORMS:
+            raise ValueError("PullbackCalibration depth_form is unsupported")
+        if (
+            not isinstance(self.runtime_depth_clamp_m, tuple)
+            or len(self.runtime_depth_clamp_m) != 2
+        ):
+            raise ValueError("PullbackCalibration runtime_depth_clamp_m must contain two values")
+        numeric_values = {
+            "depth_a": self.depth_a,
+            "depth_b": self.depth_b,
+            "reference_depth_m": self.reference_depth_m,
+            "c_gs": self.c_gs,
+            "runtime_depth_clamp_min_m": self.runtime_depth_clamp_m[0],
+            "runtime_depth_clamp_max_m": self.runtime_depth_clamp_m[1],
+        }
+        if any(not math.isfinite(float(value)) for value in numeric_values.values()):
+            raise ValueError("PullbackCalibration numeric fields must be finite")
+        if self.reference_depth_m != 20.0 or self.runtime_depth_clamp_m != (0.5, 80.0):
+            raise ValueError("PullbackCalibration depth variable contract mismatch")
+        if self.c_gs != 1.0:
+            raise ValueError("PullbackCalibration v2 requires c_gs=1.0")
+        if self.depth_form == "identity" and (self.depth_a != 0.0 or self.depth_b != 0.0):
+            raise ValueError("PullbackCalibration identity form requires depth_a=depth_b=0")
+        if self.depth_form == "constant" and self.depth_b != 0.0:
+            raise ValueError("PullbackCalibration constant form requires depth_b=0")
 
 
 @dataclass(frozen=True)
@@ -482,6 +560,827 @@ def _require_equal(actual: Any, expected: Any, *, name: str) -> None:
         raise ValueError(f"{name} mismatch: artifact={actual!r}, expected={expected!r}")
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _scene_bootstrap_median_exp_ci(
+    log_values: Sequence[float],
+    *,
+    samples: int,
+    seed: int,
+) -> tuple[float, float]:
+    values = np.asarray(log_values, dtype=np.float64)
+    if values.size < 2 or not np.isfinite(values).all():
+        raise ValueError("Gaussian scene bootstrap requires at least two finite values")
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, values.size, size=(samples, values.size), endpoint=False)
+    medians = np.median(values[indices], axis=1)
+    ci_log = np.quantile(medians, (0.025, 0.975))
+    return math.exp(float(ci_log[0])), math.exp(float(ci_log[1]))
+
+
+def _scene_bootstrap_mean_ci(
+    values: Sequence[float],
+    *,
+    samples: int,
+    seed: int,
+) -> tuple[float, float]:
+    ordered = np.sort(np.asarray(values, dtype=np.float64))
+    if ordered.size < 2 or not np.isfinite(ordered).all():
+        raise ValueError("LiDAR scene bootstrap requires at least two finite values")
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, ordered.size, size=(samples, ordered.size))
+    means = ordered[indices].mean(axis=1)
+    ci = np.quantile(means, (0.025, 0.975))
+    return float(ci[0]), float(ci[1])
+
+
+def _validate_v2_smoke_evidence(root: Mapping[str, Any]) -> None:
+    smoke = _require_mapping(
+        root["evidence"]["reconstruction_render_smoke"],
+        name="reconstruction_render_smoke",
+    )
+    _require_exact_keys(
+        smoke,
+        {
+            "path",
+            "sha256",
+            "selection_manifest",
+            "visual",
+            "device",
+            "precision",
+            "depth_gaussian_heads_precision",
+            "case",
+            "thresholds",
+            "observed",
+            "passed",
+        },
+        name="evidence.reconstruction_render_smoke",
+    )
+    if not isinstance(smoke["path"], str) or not smoke["path"]:
+        raise ValueError("reconstruction/render smoke path must be non-empty")
+    _require_sha256(smoke["sha256"], name="reconstruction/render smoke SHA-256")
+    for record_name in ("selection_manifest", "visual"):
+        record = _require_mapping(smoke[record_name], name=f"smoke {record_name}")
+        expected = {"path", "sha256"}
+        if record_name == "visual":
+            expected |= {"format", "mode", "size_wh"}
+        _require_exact_keys(record, expected, name=f"smoke {record_name}")
+        if not isinstance(record["path"], str) or not record["path"]:
+            raise ValueError(f"smoke {record_name} path must be non-empty")
+        _require_sha256(record["sha256"], name=f"smoke {record_name} SHA-256")
+    visual = smoke["visual"]
+    _require_equal(visual["format"], "JPEG", name="smoke visual format")
+    _require_equal(visual["mode"], "RGB", name="smoke visual mode")
+    size_wh = visual["size_wh"]
+    if (
+        not isinstance(size_wh, list)
+        or len(size_wh) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in size_wh)
+    ):
+        raise ValueError("smoke visual size_wh must contain two positive integers")
+    _require_equal(smoke["device"], "cuda:0", name="smoke device")
+    _require_equal(smoke["precision"], "bf16", name="smoke precision")
+    _require_equal(
+        smoke["depth_gaussian_heads_precision"],
+        "fp32",
+        name="smoke DepthHead/GaussianHead precision",
+    )
+
+    case = _require_mapping(smoke["case"], name="smoke case")
+    _require_exact_keys(
+        case,
+        {
+            "config",
+            "step",
+            "frame_count",
+            "dataset_index",
+            "scene",
+            "clip",
+            "frame_indices",
+        },
+        name="smoke case",
+    )
+    _require_equal(case["config"], "step_100000_frames_10", name="smoke config")
+    _require_equal(case["step"], 100000, name="smoke checkpoint step")
+    _require_equal(case["frame_count"], 10, name="smoke frame count")
+    if isinstance(case["dataset_index"], bool) or not isinstance(case["dataset_index"], int):
+        raise ValueError("smoke dataset_index must be an integer")
+    for key in ("scene", "clip"):
+        if not isinstance(case[key], str) or not case[key]:
+            raise ValueError(f"smoke case {key} must be non-empty")
+    frame_indices = case["frame_indices"]
+    if (
+        not isinstance(frame_indices, list)
+        or len(frame_indices) != 10
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in frame_indices)
+        or frame_indices != sorted(set(frame_indices))
+    ):
+        raise ValueError("smoke frame_indices must be ten unique sorted integers")
+
+    _require_equal(
+        smoke["thresholds"],
+        PULLBACK_V2_SMOKE_THRESHOLDS,
+        name="smoke thresholds",
+    )
+    observed = _require_mapping(smoke["observed"], name="smoke observed metrics")
+    metric_names = {
+        "render_gt_psnr_db",
+        "render_gt_ssim",
+        "render_gt_lpips",
+        "direct_gt_psnr_db",
+        "direct_gt_ssim",
+        "direct_gt_lpips",
+        "render_direct_psnr_db",
+        "render_direct_ssim",
+        "render_direct_lpips",
+        "depth_recon_over_direct",
+        "depth_recon_vs_direct_absrel",
+        "point_xyz_relative_error",
+        "gs_recon_over_direct",
+        "paired_gs_over_depth",
+        "gs_axis_anisotropy_log_rms",
+        "support_pixels_median_per_frame",
+    }
+    _require_exact_keys(observed, metric_names, name="smoke observed metrics")
+    values = {name: _finite_float(observed[name], name=f"smoke {name}") for name in metric_names}
+    thresholds = PULLBACK_V2_SMOKE_THRESHOLDS
+
+    def inside(name: str, range_name: str) -> bool:
+        lower, upper = thresholds[range_name]
+        return float(lower) <= values[name] <= float(upper)
+
+    passed = (
+        values["render_direct_psnr_db"] >= thresholds["render_direct_psnr_min_db"]
+        and values["render_direct_ssim"] >= thresholds["render_direct_ssim_min"]
+        and values["render_direct_lpips"] <= thresholds["render_direct_lpips_max"]
+        and values["render_gt_psnr_db"]
+        >= values["direct_gt_psnr_db"] - thresholds["render_gt_psnr_drop_max_db"]
+        and values["render_gt_ssim"]
+        >= values["direct_gt_ssim"] - thresholds["render_gt_ssim_drop_max"]
+        and values["render_gt_lpips"]
+        <= values["direct_gt_lpips"] + thresholds["render_gt_lpips_increase_max"]
+        and inside("depth_recon_over_direct", "depth_recon_over_direct_range")
+        and values["depth_recon_vs_direct_absrel"]
+        <= thresholds["depth_recon_vs_direct_absrel_max"]
+        and values["point_xyz_relative_error"] <= thresholds["point_xyz_relative_error_max"]
+        and inside("gs_recon_over_direct", "gs_recon_over_direct_range")
+        and inside("paired_gs_over_depth", "paired_gs_over_depth_range")
+        and values["gs_axis_anisotropy_log_rms"]
+        <= thresholds["gs_axis_anisotropy_log_rms_max"]
+        and values["support_pixels_median_per_frame"]
+        >= thresholds["support_pixels_median_per_frame_min"]
+    )
+    _require_equal(smoke["passed"], passed, name="reconstruction/render smoke passed")
+    _require_equal(smoke["passed"], True, name="reconstruction/render smoke acceptance")
+
+
+def _validate_v2_evidence_and_limits(
+    root: Mapping[str, Any],
+    *,
+    metric_depth: Mapping[str, Any],
+) -> None:
+    evidence = _require_mapping(root["evidence"], name="evidence")
+    _require_exact_keys(
+        evidence,
+        {
+            "source_metric_gate",
+            "gaussian_roundtrip_audit",
+            "metric_reference",
+            "reconstruction_render_smoke",
+            "fit_scenes",
+            "selection_scenes",
+            "frozen_profile",
+            "formal_coverage",
+            "gaussian_practical_equivalence_gate",
+            "primary_lidar_gate",
+        },
+        name="evidence",
+    )
+    _validate_v2_smoke_evidence(root)
+    evidence_record_keys = {
+        "source_metric_gate": {
+            "path",
+            "sha256",
+            "script_sha256",
+            "result_sha256_excluding_self",
+        },
+        "gaussian_roundtrip_audit": {"path", "sha256", "script_sha256"},
+        "metric_reference": {
+            "path",
+            "sha256",
+            "script_sha256",
+            "resume_signature_sha256",
+        },
+    }
+    for evidence_name, expected_keys in evidence_record_keys.items():
+        record = _require_mapping(evidence[evidence_name], name=evidence_name)
+        _require_exact_keys(record, expected_keys, name=f"evidence.{evidence_name}")
+        if not isinstance(record["path"], str) or not record["path"]:
+            raise ValueError(f"evidence.{evidence_name}.path must be non-empty")
+        for key in expected_keys - {"path"}:
+            _require_sha256(record[key], name=f"evidence.{evidence_name}.{key}")
+    fit_scenes = list(range(300, 320))
+    selection_scenes = list(range(320, 330))
+    _require_equal(evidence["fit_scenes"], fit_scenes, name="evidence.fit_scenes")
+    _require_equal(
+        evidence["selection_scenes"],
+        selection_scenes,
+        name="evidence.selection_scenes",
+    )
+
+    frozen = _require_mapping(evidence["frozen_profile"], name="frozen_profile")
+    _require_exact_keys(frozen, {"sha256", "payload"}, name="evidence.frozen_profile")
+    profile_sha256 = _require_sha256(
+        frozen["sha256"], name="evidence.frozen_profile.sha256"
+    )
+    profile = _require_mapping(frozen["payload"], name="frozen_profile.payload")
+    _require_exact_keys(
+        profile,
+        {
+            "form",
+            "equation",
+            "fit_variable",
+            "runtime_variable",
+            "evaluate_on",
+            "boundary_scope",
+            "a",
+            "b",
+            "c_at_20m",
+            "reference_depth_m",
+            "runtime_depth_clamp_m",
+            "fit_scenes",
+            "selection_scenes",
+            "calibration_candidate_forms",
+            "calibration_candidate_fits",
+            "calibration_decision_sha256",
+            "reference_json_sha256",
+            "window_contract",
+        },
+        name="evidence.frozen_profile.payload",
+    )
+    _require_equal(
+        _canonical_json_sha256(profile),
+        profile_sha256,
+        name="evidence.frozen_profile self SHA-256",
+    )
+    profile_form = profile["form"]
+    if profile_form not in PULLBACK_DEPTH_FORMS:
+        raise ValueError("frozen_profile.payload.form is unsupported")
+    profile_a = _finite_float(profile["a"], name="frozen profile a")
+    profile_b = _finite_float(profile["b"], name="frozen profile b")
+    if profile_form == "identity" and (profile_a != 0.0 or profile_b != 0.0):
+        raise ValueError("identity frozen profile requires a=b=0")
+    if profile_form == "constant" and profile_b != 0.0:
+        raise ValueError("constant frozen profile requires b=0")
+    _require_equal(
+        profile["evaluate_on"],
+        "uncorrected_reconstructed_metric_depth_m",
+        name="frozen profile evaluate_on",
+    )
+    _require_equal(
+        _finite_float(profile["reference_depth_m"], name="frozen reference depth"),
+        20.0,
+        name="frozen profile reference_depth_m",
+    )
+    _require_equal(
+        profile["runtime_depth_clamp_m"],
+        [0.5, 80.0],
+        name="frozen profile runtime_depth_clamp_m",
+    )
+    c_at_20m = _finite_float(profile["c_at_20m"], name="frozen c_at_20m")
+    if not math.isclose(c_at_20m, math.exp(profile_a), rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError("frozen profile c_at_20m does not match exp(a)")
+    _require_equal(profile["fit_scenes"], fit_scenes, name="frozen profile fit_scenes")
+    _require_equal(
+        profile["selection_scenes"],
+        selection_scenes,
+        name="frozen profile selection_scenes",
+    )
+    _require_equal(
+        profile["calibration_candidate_forms"],
+        list(PULLBACK_DEPTH_FORMS),
+        name="frozen profile candidate forms",
+    )
+    candidate_fits = _require_mapping(
+        profile["calibration_candidate_fits"], name="frozen candidate fits"
+    )
+    _require_exact_keys(
+        candidate_fits,
+        set(PULLBACK_DEPTH_FORMS),
+        name="frozen calibration_candidate_fits",
+    )
+    for candidate_form in PULLBACK_DEPTH_FORMS:
+        fit = _require_mapping(
+            candidate_fits[candidate_form], name=f"frozen {candidate_form} fit"
+        )
+        _require_exact_keys(
+            fit, {"a", "b", "c_at_20m"}, name=f"frozen {candidate_form} fit"
+        )
+        fit_a = _finite_float(fit["a"], name=f"frozen {candidate_form} a")
+        fit_b = _finite_float(fit["b"], name=f"frozen {candidate_form} b")
+        fit_c = _finite_float(
+            fit["c_at_20m"], name=f"frozen {candidate_form} c_at_20m"
+        )
+        if candidate_form == "identity" and (fit_a != 0.0 or fit_b != 0.0):
+            raise ValueError("frozen identity candidate requires a=b=0")
+        if candidate_form == "constant" and fit_b != 0.0:
+            raise ValueError("frozen constant candidate requires b=0")
+        if not math.isclose(fit_c, math.exp(fit_a), rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError(f"frozen {candidate_form} c_at_20m does not match exp(a)")
+    selected_fit = candidate_fits[profile_form]
+    _require_equal(selected_fit["a"], profile_a, name="frozen selected profile a")
+    _require_equal(selected_fit["b"], profile_b, name="frozen selected profile b")
+    _require_sha256(
+        profile["calibration_decision_sha256"],
+        name="frozen profile calibration_decision_sha256",
+    )
+    profile_reference_sha = _require_sha256(
+        profile["reference_json_sha256"],
+        name="frozen profile reference_json_sha256",
+    )
+    _require_equal(
+        profile_reference_sha,
+        evidence["metric_reference"]["sha256"],
+        name="frozen profile/reference evidence SHA-256",
+    )
+    _require_equal(
+        profile["fit_variable"],
+        PULLBACK_DEPTH_VARIABLE_CONTRACT,
+        name="frozen profile fit_variable",
+    )
+    _require_equal(
+        profile["runtime_variable"],
+        PULLBACK_DEPTH_VARIABLE_CONTRACT,
+        name="frozen profile runtime_variable",
+    )
+    _require_equal(
+        profile["boundary_scope"],
+        "metric_only; render is forced identity",
+        name="frozen profile boundary_scope",
+    )
+    profile_window = _require_mapping(
+        profile["window_contract"], name="frozen profile window_contract"
+    )
+    _require_equal(
+        profile_window.get("expected_window_length"),
+        10,
+        name="frozen profile window length",
+    )
+    _require_equal(
+        profile_window.get("expected_window_starts"),
+        [0, 5, 10, 14, 19],
+        name="frozen profile window starts",
+    )
+
+    coverage = _require_mapping(evidence["formal_coverage"], name="formal_coverage")
+    _require_exact_keys(
+        coverage,
+        {
+            "scene_count",
+            "trunk_count",
+            "calibration_scene_count",
+            "selection_scene_count",
+            "required_scenes",
+            "required_trunks",
+            "window_starts",
+            "window_length",
+            "data_root",
+        },
+        name="evidence.formal_coverage",
+    )
+    _require_equal(coverage["scene_count"], 30, name="formal coverage scene_count")
+    _require_equal(coverage["trunk_count"], 90, name="formal coverage trunk_count")
+    _require_equal(
+        coverage["calibration_scene_count"],
+        20,
+        name="formal coverage calibration_scene_count",
+    )
+    _require_equal(
+        coverage["selection_scene_count"],
+        10,
+        name="formal coverage selection_scene_count",
+    )
+    _require_equal(
+        coverage["required_scenes"],
+        list(range(300, 330)),
+        name="formal coverage scenes",
+    )
+    _require_equal(coverage["required_trunks"], [0, 1, 2], name="formal coverage trunks")
+    _require_equal(coverage["window_starts"], [0, 5, 10, 14, 19], name="window starts")
+    _require_equal(coverage["window_length"], 10, name="formal coverage window length")
+    if not isinstance(coverage["data_root"], str) or not coverage["data_root"]:
+        raise ValueError("formal coverage data_root must be non-empty")
+
+    gs_gate = _require_mapping(
+        evidence["gaussian_practical_equivalence_gate"], name="Gaussian gate"
+    )
+    _require_exact_keys(
+        gs_gate,
+        {
+            "passed",
+            "margin",
+            "point_estimate",
+            "scene_bootstrap_95_ci",
+            "scene_count",
+            "c_gs_recommendation",
+            "support",
+            "analysis_unit",
+            "bootstrap",
+            "per_scene",
+        },
+        name="evidence.gaussian_practical_equivalence_gate",
+    )
+    _require_equal(gs_gate["passed"], True, name="Gaussian practical-equivalence passed")
+    _require_equal(gs_gate["margin"], [0.95, 1.05], name="Gaussian equivalence margin")
+    _require_equal(gs_gate["scene_count"], 30, name="Gaussian gate scene_count")
+    c_gs_recommendation = _require_mapping(
+        gs_gate["c_gs_recommendation"], name="Gaussian c_gs recommendation"
+    )
+    _require_exact_keys(
+        c_gs_recommendation,
+        {"form", "value"},
+        name="Gaussian c_gs recommendation",
+    )
+    _require_equal(
+        c_gs_recommendation["form"],
+        "identity",
+        name="Gaussian c_gs recommendation form",
+    )
+    _require_equal(
+        _finite_float(
+            c_gs_recommendation["value"], name="Gaussian c_gs recommendation value"
+        ),
+        1.0,
+        name="Gaussian c_gs recommendation value",
+    )
+    _require_equal(
+        gs_gate["support"],
+        "primary_static_nonsky_opacity_0p05",
+        name="Gaussian gate support",
+    )
+    _require_equal(
+        gs_gate["analysis_unit"],
+        "Waymo scene; bootstrap resamples scenes only",
+        name="Gaussian gate analysis unit",
+    )
+    gs_bootstrap = _require_mapping(gs_gate["bootstrap"], name="Gaussian gate bootstrap")
+    _require_exact_keys(
+        gs_bootstrap,
+        {"unit", "samples", "seed", "confidence_level"},
+        name="Gaussian gate bootstrap",
+    )
+    _require_equal(gs_bootstrap["unit"], "scene", name="Gaussian bootstrap unit")
+    _require_equal(gs_bootstrap["samples"], 10000, name="Gaussian bootstrap samples")
+    _require_equal(gs_bootstrap["seed"], 20260805, name="Gaussian bootstrap seed")
+    _require_equal(
+        _finite_float(gs_bootstrap["confidence_level"], name="Gaussian confidence level"),
+        0.95,
+        name="Gaussian confidence level",
+    )
+    point = _finite_float(gs_gate["point_estimate"], name="Gaussian gate point")
+    gs_ci = gs_gate["scene_bootstrap_95_ci"]
+    if not isinstance(gs_ci, list) or len(gs_ci) != 2:
+        raise ValueError("Gaussian gate CI must contain two values")
+    gs_ci_values = (
+        _finite_float(gs_ci[0], name="Gaussian gate CI lower"),
+        _finite_float(gs_ci[1], name="Gaussian gate CI upper"),
+    )
+    if not (0.95 <= point <= 1.05 and 0.95 <= gs_ci_values[0] <= gs_ci_values[1] <= 1.05):
+        raise ValueError("Gaussian practical-equivalence evidence is outside its frozen margin")
+    gs_per_scene = gs_gate["per_scene"]
+    if not isinstance(gs_per_scene, list) or len(gs_per_scene) != 30:
+        raise ValueError("Gaussian gate per_scene must contain 30 rows")
+    gs_logs: list[float] = []
+    for expected_scene, raw_row in zip(range(300, 330), gs_per_scene):
+        row = _require_mapping(raw_row, name=f"Gaussian scene {expected_scene}")
+        _require_exact_keys(
+            row,
+            {"scene", "trunk_count", "paired_log_gs_over_depth", "paired_gs_over_depth_ratio"},
+            name=f"Gaussian scene {expected_scene}",
+        )
+        _require_equal(row["scene"], expected_scene, name="Gaussian per-scene order")
+        _require_equal(row["trunk_count"], 3, name="Gaussian per-scene trunk count")
+        log_ratio = _finite_float(
+            row["paired_log_gs_over_depth"], name="Gaussian per-scene paired log ratio"
+        )
+        ratio = _finite_float(
+            row["paired_gs_over_depth_ratio"], name="Gaussian per-scene paired ratio"
+        )
+        if not math.isclose(ratio, math.exp(log_ratio), rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError("Gaussian per-scene ratio does not match exp(log ratio)")
+        gs_logs.append(log_ratio)
+    ordered_logs = sorted(gs_logs)
+    median_log = 0.5 * (ordered_logs[14] + ordered_logs[15])
+    if not math.isclose(point, math.exp(median_log), rel_tol=0.0, abs_tol=1.0e-12):
+        raise ValueError("Gaussian gate point does not match the 30-scene median")
+    recomputed_gs_ci = _scene_bootstrap_median_exp_ci(
+        gs_logs,
+        samples=10000,
+        seed=20260805,
+    )
+    if any(
+        not math.isclose(recorded, recomputed, rel_tol=0.0, abs_tol=1.0e-12)
+        for recorded, recomputed in zip(gs_ci_values, recomputed_gs_ci)
+    ):
+        raise ValueError("Gaussian gate CI does not match the recorded per-scene rows")
+
+    lidar = _require_mapping(evidence["primary_lidar_gate"], name="primary LiDAR gate")
+    _require_exact_keys(
+        lidar,
+        {
+            "candidate_form",
+            "selected_form",
+            "case_count",
+            "scene_count",
+            "identity_absrel",
+            "candidate_absrel",
+            "scene_delta_mean",
+            "scene_delta_bootstrap_95_ci",
+            "improved_scene_count",
+            "gate_pass",
+            "support",
+            "gauge_valid_cases_only",
+            "bootstrap",
+            "scene_rows",
+            "exact_sign_flip",
+            "sensitivities",
+        },
+        name="evidence.primary_lidar_gate",
+    )
+    _require_equal(lidar["candidate_form"], profile_form, name="LiDAR candidate form")
+    _require_equal(lidar["support"], "all_lidar", name="LiDAR primary support")
+    _require_equal(
+        lidar["gauge_valid_cases_only"], True, name="LiDAR primary gauge-valid filter"
+    )
+    selected_form = lidar["selected_form"]
+    if selected_form not in {"identity", profile_form}:
+        raise ValueError("LiDAR selected form must be identity or the frozen candidate")
+    _require_equal(metric_depth["form"], selected_form, name="metric depth selected form")
+    _require_equal(lidar["scene_count"], 10, name="LiDAR gate scene_count")
+    case_count = lidar["case_count"]
+    if isinstance(case_count, bool) or not isinstance(case_count, int) or not 1 <= case_count <= 30:
+        raise ValueError("LiDAR gate case_count must be an integer in [1,30]")
+    identity_absrel = _finite_float(lidar["identity_absrel"], name="identity AbsRel")
+    candidate_absrel = _finite_float(lidar["candidate_absrel"], name="candidate AbsRel")
+    delta = _finite_float(lidar["scene_delta_mean"], name="LiDAR scene delta mean")
+    lidar_ci = lidar["scene_delta_bootstrap_95_ci"]
+    if not isinstance(lidar_ci, list) or len(lidar_ci) != 2:
+        raise ValueError("LiDAR gate CI must contain two values")
+    lidar_ci_values = (
+        _finite_float(lidar_ci[0], name="LiDAR gate CI lower"),
+        _finite_float(lidar_ci[1], name="LiDAR gate CI upper"),
+    )
+    if lidar_ci_values[0] > lidar_ci_values[1]:
+        raise ValueError("LiDAR gate CI must be ordered")
+    introduced = delta > 0.0 and lidar_ci_values[0] > 0.0
+    _require_equal(lidar["gate_pass"], introduced, name="LiDAR gate pass")
+    _require_equal(
+        selected_form,
+        profile_form if introduced else "identity",
+        name="LiDAR gate selected form",
+    )
+    if not math.isclose(
+        identity_absrel - candidate_absrel, delta, rel_tol=0.0, abs_tol=1.0e-10
+    ):
+        raise ValueError("LiDAR AbsRel values do not match the recorded scene delta")
+    improved = lidar["improved_scene_count"]
+    if isinstance(improved, bool) or not isinstance(improved, int) or not 0 <= improved <= 10:
+        raise ValueError("LiDAR improved_scene_count must be an integer in [0,10]")
+    lidar_bootstrap = _require_mapping(lidar["bootstrap"], name="LiDAR bootstrap")
+    _require_exact_keys(
+        lidar_bootstrap,
+        {"unit", "samples", "seed", "confidence_level"},
+        name="LiDAR bootstrap",
+    )
+    _require_equal(lidar_bootstrap["unit"], "scene", name="LiDAR bootstrap unit")
+    _require_equal(lidar_bootstrap["samples"], 10000, name="LiDAR bootstrap samples")
+    _require_equal(lidar_bootstrap["seed"], 20260801, name="LiDAR bootstrap seed")
+    _require_equal(
+        _finite_float(lidar_bootstrap["confidence_level"], name="LiDAR confidence level"),
+        0.95,
+        name="LiDAR confidence level",
+    )
+    scene_rows = lidar["scene_rows"]
+    if not isinstance(scene_rows, list) or len(scene_rows) != 10:
+        raise ValueError("LiDAR primary scene_rows must contain scenes 320-329")
+    scene_identity: list[float] = []
+    scene_candidate: list[float] = []
+    scene_deltas: list[float] = []
+    for expected_scene, raw_row in zip(range(320, 330), scene_rows):
+        row = _require_mapping(raw_row, name=f"LiDAR scene {expected_scene}")
+        _require_exact_keys(
+            row,
+            {
+                "scene",
+                "trunk_count",
+                "trunks",
+                "candidate_form",
+                "identity_absrel",
+                "candidate_absrel",
+                "identity_minus_candidate",
+            },
+            name=f"LiDAR scene {expected_scene}",
+        )
+        _require_equal(row["scene"], expected_scene, name="LiDAR per-scene order")
+        _require_equal(row["candidate_form"], profile_form, name="LiDAR per-scene form")
+        trunk_count = row["trunk_count"]
+        trunks = row["trunks"]
+        if (
+            isinstance(trunk_count, bool)
+            or not isinstance(trunk_count, int)
+            or not 1 <= trunk_count <= 3
+            or not isinstance(trunks, list)
+            or trunks != sorted(set(trunks))
+            or any(trunk not in {0, 1, 2} for trunk in trunks)
+            or len(trunks) != trunk_count
+        ):
+            raise ValueError("LiDAR primary scene trunk coverage is invalid")
+        row_identity = _finite_float(row["identity_absrel"], name="scene identity AbsRel")
+        row_candidate = _finite_float(row["candidate_absrel"], name="scene candidate AbsRel")
+        row_delta = _finite_float(row["identity_minus_candidate"], name="scene delta")
+        if not math.isclose(
+            row_identity - row_candidate, row_delta, rel_tol=0.0, abs_tol=1.0e-12
+        ):
+            raise ValueError("LiDAR per-scene AbsRel values do not match the delta")
+        scene_identity.append(row_identity)
+        scene_candidate.append(row_candidate)
+        scene_deltas.append(row_delta)
+    for observed_value, recomputed_value, name in (
+        (identity_absrel, sum(scene_identity) / 10.0, "identity AbsRel"),
+        (candidate_absrel, sum(scene_candidate) / 10.0, "candidate AbsRel"),
+        (delta, sum(scene_deltas) / 10.0, "scene delta mean"),
+    ):
+        if not math.isclose(observed_value, recomputed_value, rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError(f"LiDAR {name} does not match scene_rows")
+    _require_equal(
+        improved,
+        sum(value > 0.0 for value in scene_deltas),
+        name="LiDAR improved scene count",
+    )
+    recomputed_lidar_ci = _scene_bootstrap_mean_ci(
+        scene_deltas,
+        samples=10000,
+        seed=20260801,
+    )
+    if any(
+        not math.isclose(recorded, recomputed, rel_tol=0.0, abs_tol=1.0e-12)
+        for recorded, recomputed in zip(lidar_ci_values, recomputed_lidar_ci)
+    ):
+        raise ValueError("LiDAR gate CI does not match the recorded per-scene rows")
+    sign_flip = _require_mapping(lidar["exact_sign_flip"], name="LiDAR exact sign flip")
+    _require_exact_keys(
+        sign_flip,
+        {
+            "scene_count",
+            "permutation_count",
+            "observed_mean_delta",
+            "one_sided_positive_p",
+            "two_sided_p",
+            "role",
+        },
+        name="LiDAR exact sign flip",
+    )
+    _require_equal(sign_flip["scene_count"], 10, name="sign-flip scene count")
+    _require_equal(sign_flip["permutation_count"], 1024, name="sign-flip permutation count")
+    _require_equal(
+        sign_flip["role"],
+        "sensitivity only; the preregistered gate is the scene-bootstrap CI",
+        name="sign-flip role",
+    )
+    if not math.isclose(
+        _finite_float(sign_flip["observed_mean_delta"], name="sign-flip mean"),
+        delta,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        raise ValueError("sign-flip observed mean does not match the LiDAR gate")
+    for key in ("one_sided_positive_p", "two_sided_p"):
+        value = _finite_float(sign_flip[key], name=f"sign-flip {key}")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"sign-flip {key} must lie in [0,1]")
+    sensitivities = _require_mapping(lidar["sensitivities"], name="LiDAR sensitivities")
+    _require_exact_keys(
+        sensitivities,
+        {"all_30_trunks", "phase1a_valid_static_nonsky"},
+        name="LiDAR sensitivities",
+    )
+    for sensitivity_name, expected_support, expected_filter in (
+        ("all_30_trunks", "all_lidar", False),
+        ("phase1a_valid_static_nonsky", "static_nonsky", True),
+    ):
+        sensitivity = _require_mapping(
+            sensitivities[sensitivity_name], name=f"LiDAR {sensitivity_name}"
+        )
+        _require_exact_keys(
+            sensitivity,
+            {
+                "support",
+                "gauge_valid_cases_only",
+                "candidate_form",
+                "selected_form",
+                "case_count",
+                "scene_count",
+                "scene_delta_mean",
+                "scene_delta_bootstrap_95_ci",
+                "improved_scene_count",
+                "gate_pass",
+                "exact_sign_flip",
+            },
+            name=f"LiDAR {sensitivity_name}",
+        )
+        _require_equal(sensitivity["support"], expected_support, name="sensitivity support")
+        _require_equal(
+            sensitivity["gauge_valid_cases_only"],
+            expected_filter,
+            name="sensitivity gauge-valid filter",
+        )
+        _require_equal(sensitivity["candidate_form"], profile_form, name="sensitivity form")
+        _require_equal(sensitivity["scene_count"], 10, name="sensitivity scene count")
+        sensitivity_count = sensitivity["case_count"]
+        if sensitivity_name == "all_30_trunks":
+            _require_equal(sensitivity_count, 30, name="all-trunk sensitivity case count")
+        elif (
+            isinstance(sensitivity_count, bool)
+            or not isinstance(sensitivity_count, int)
+            or not 1 <= sensitivity_count <= 30
+        ):
+            raise ValueError("static/non-sky sensitivity case_count must be in [1,30]")
+        sensitivity_delta = _finite_float(
+            sensitivity["scene_delta_mean"], name="sensitivity scene delta"
+        )
+        sensitivity_ci = sensitivity["scene_delta_bootstrap_95_ci"]
+        if not isinstance(sensitivity_ci, list) or len(sensitivity_ci) != 2:
+            raise ValueError("sensitivity CI must contain two values")
+        sensitivity_ci_values = [
+            _finite_float(value, name="sensitivity CI") for value in sensitivity_ci
+        ]
+        if sensitivity_ci_values[0] > sensitivity_ci_values[1]:
+            raise ValueError("sensitivity CI must be ordered")
+        sensitivity_pass = sensitivity_delta > 0.0 and sensitivity_ci_values[0] > 0.0
+        _require_equal(sensitivity["gate_pass"], sensitivity_pass, name="sensitivity gate")
+        _require_equal(
+            sensitivity["selected_form"],
+            profile_form if sensitivity_pass else "identity",
+            name="sensitivity selected form",
+        )
+        sensitivity_improved = sensitivity["improved_scene_count"]
+        if (
+            isinstance(sensitivity_improved, bool)
+            or not isinstance(sensitivity_improved, int)
+            or not 0 <= sensitivity_improved <= 10
+        ):
+            raise ValueError("sensitivity improved_scene_count must be in [0,10]")
+        sensitivity_sign_flip = _require_mapping(
+            sensitivity["exact_sign_flip"], name="sensitivity exact sign flip"
+        )
+        _require_equal(
+            sensitivity_sign_flip.get("scene_count"), 10, name="sensitivity sign-flip scenes"
+        )
+        _require_equal(
+            sensitivity_sign_flip.get("permutation_count"),
+            1024,
+            name="sensitivity sign-flip permutations",
+        )
+    if selected_form != "identity":
+        _require_equal(metric_depth["a"], profile_a, name="metric depth profile a")
+        _require_equal(metric_depth["b"], profile_b, name="metric depth profile b")
+
+    limitations = _require_mapping(root["limitations"], name="limitations")
+    _require_exact_keys(
+        limitations,
+        {
+            "phase1b_scheme",
+            "similarity_consistent",
+            "c_gs",
+            "render_scope",
+            "metric_scope",
+            "residual_limits",
+        },
+        name="limitations",
+    )
+    expected_scheme = "A" if selected_form == "identity" else "B"
+    _require_equal(limitations["phase1b_scheme"], expected_scheme, name="Phase 1b scheme")
+    _require_equal(limitations["similarity_consistent"], True, name="similarity_consistent")
+    _require_equal(limitations["c_gs"], "identity", name="limitations.c_gs")
+    _require_equal(limitations["render_scope"], "identity_only", name="render scope")
+    expected_metric_scope = "identity" if selected_form == "identity" else "depth_profile_only"
+    _require_equal(limitations["metric_scope"], expected_metric_scope, name="metric scope")
+    residual_limits = limitations["residual_limits"]
+    if not isinstance(residual_limits, list) or not residual_limits or any(
+        not isinstance(value, str) or not value for value in residual_limits
+    ):
+        raise ValueError("limitations.residual_limits must contain non-empty strings")
+
+
 def load_pullback_calibration(
     path: str | Path,
     *,
@@ -539,7 +1438,6 @@ def load_pullback_calibration(
     schema = _require_mapping(root["schema"], name="schema")
     _require_exact_keys(schema, {"name", "version", "strict"}, name="schema")
     _require_equal(schema["name"], PULLBACK_SCHEMA_NAME, name="schema.name")
-    _require_equal(schema["version"], PULLBACK_SCHEMA_VERSION, name="schema.version")
     _require_equal(schema["strict"], True, name="schema.strict")
     _require_equal(
         root["artifact_role"], PULLBACK_ARTIFACT_ROLE, name="artifact_role"
@@ -547,10 +1445,13 @@ def load_pullback_calibration(
     _require_equal(
         root["eligible_for_training"], True, name="eligible_for_training"
     )
-    if not isinstance(root["tokenizer_generation"], str) or not root[
-        "tokenizer_generation"
-    ]:
-        raise ValueError("tokenizer_generation must be a non-empty string")
+    tokenizer_generation = root["tokenizer_generation"]
+    _require_equal(
+        tokenizer_generation,
+        "t0_v2",
+        name="tokenizer_generation",
+    )
+    _require_equal(schema["version"], PULLBACK_SCHEMA_VERSION, name="schema.version")
 
     tokenizer = _require_mapping(root["tokenizer"], name="tokenizer")
     _require_exact_keys(tokenizer, {"sha256", "sha8"}, name="tokenizer")
@@ -603,19 +1504,26 @@ def load_pullback_calibration(
         PULLBACK_LOG_METRIC_SCALE_UNITS,
         name="runtime_contract.log_metric_scale_units",
     )
-    if isinstance(expected_window_len, bool) or int(expected_window_len) <= 0:
+    if (
+        isinstance(expected_window_len, bool)
+        or not isinstance(expected_window_len, int)
+        or expected_window_len <= 0
+    ):
         raise ValueError("expected_window_len must be a positive integer")
     window_len = runtime["window_len"]
     if isinstance(window_len, bool) or not isinstance(window_len, int):
         raise ValueError("runtime_contract.window_len must be an integer")
     _require_equal(
-        window_len, int(expected_window_len), name="runtime_contract.window_len"
+        window_len, expected_window_len, name="runtime_contract.window_len"
     )
     try:
-        expected_grid = tuple(int(value) for value in expected_patch_grid)
-    except (TypeError, ValueError) as error:
+        expected_grid = tuple(expected_patch_grid)
+    except TypeError as error:
         raise ValueError("expected_patch_grid must contain two positive integers") from error
-    if len(expected_grid) != 2 or any(value <= 0 for value in expected_grid):
+    if len(expected_grid) != 2 or any(
+        isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        for value in expected_grid
+    ):
         raise ValueError("expected_patch_grid must contain two positive integers")
     artifact_grid_raw = runtime["patch_grid_hw"]
     if not isinstance(artifact_grid_raw, list) or any(
@@ -667,50 +1575,67 @@ def load_pullback_calibration(
     metric_depth = _require_mapping(
         metric["depth"], name="boundaries.metric.depth"
     )
-    _require_exact_keys(
-        metric_depth,
-        {
-            "form",
-            "a",
-            "b",
-            "reference_depth_m",
-            "runtime_depth_clamp_m",
-            "evaluate_on",
-        },
-        name="boundaries.metric.depth",
-    )
-    _require_equal(
-        metric_depth["form"], "loglinear", name="boundaries.metric.depth.form"
-    )
-    _require_equal(
-        metric_depth["evaluate_on"],
-        PULLBACK_DEPTH_EVALUATION,
-        name="boundaries.metric.depth.evaluate_on",
-    )
-    depth_a = _finite_float(metric_depth["a"], name="metric depth a")
-    depth_b = _finite_float(metric_depth["b"], name="metric depth b")
-    reference_depth_m = _finite_float(
-        metric_depth["reference_depth_m"], name="metric reference_depth_m"
-    )
-    _require_equal(
-        reference_depth_m,
-        20.0,
-        name="boundaries.metric.depth.reference_depth_m",
-    )
-    clamp_raw = metric_depth["runtime_depth_clamp_m"]
-    if not isinstance(clamp_raw, list) or len(clamp_raw) != 2:
-        raise ValueError("metric runtime_depth_clamp_m must be a two-item JSON list")
-    clamp_m = (
-        _finite_float(clamp_raw[0], name="metric depth clamp minimum"),
-        _finite_float(clamp_raw[1], name="metric depth clamp maximum"),
-    )
-    if not 0.0 < clamp_m[0] < clamp_m[1]:
-        raise ValueError("metric runtime_depth_clamp_m must satisfy 0 < min < max")
-    _require_equal(
-        clamp_m,
-        (0.5, 80.0),
-        name="boundaries.metric.depth.runtime_depth_clamp_m",
-    )
+    depth_form = metric_depth.get("form")
+    if depth_form not in PULLBACK_DEPTH_FORMS:
+        raise ValueError(
+            "boundaries.metric.depth.form must be identity, constant, or loglinear"
+        )
+    if depth_form == "identity":
+        _require_exact_keys(
+            metric_depth, {"form"}, name="boundaries.metric.depth"
+        )
+        depth_a = 0.0
+        depth_b = 0.0
+        reference_depth_m = 20.0
+        clamp_m = (0.5, 80.0)
+    else:
+        _require_exact_keys(
+            metric_depth,
+            {
+                "form",
+                "a",
+                "b",
+                "reference_depth_m",
+                "runtime_depth_clamp_m",
+                "evaluate_on",
+            },
+            name="boundaries.metric.depth",
+        )
+        _require_equal(
+            metric_depth["evaluate_on"],
+            PULLBACK_DEPTH_EVALUATION,
+            name="boundaries.metric.depth.evaluate_on",
+        )
+        depth_a = _finite_float(metric_depth["a"], name="metric depth a")
+        depth_b = _finite_float(metric_depth["b"], name="metric depth b")
+        if depth_form == "constant":
+            _require_equal(depth_b, 0.0, name="constant metric depth b")
+        reference_depth_m = _finite_float(
+            metric_depth["reference_depth_m"], name="metric reference_depth_m"
+        )
+        _require_equal(
+            reference_depth_m,
+            20.0,
+            name="boundaries.metric.depth.reference_depth_m",
+        )
+        clamp_raw = metric_depth["runtime_depth_clamp_m"]
+        if not isinstance(clamp_raw, list) or len(clamp_raw) != 2:
+            raise ValueError(
+                "metric runtime_depth_clamp_m must be a two-item JSON list"
+            )
+        clamp_m = (
+            _finite_float(clamp_raw[0], name="metric depth clamp minimum"),
+            _finite_float(clamp_raw[1], name="metric depth clamp maximum"),
+        )
+        if not 0.0 < clamp_m[0] < clamp_m[1]:
+            raise ValueError(
+                "metric runtime_depth_clamp_m must satisfy 0 < min < max"
+            )
+        _require_equal(
+            clamp_m,
+            (0.5, 80.0),
+            name="boundaries.metric.depth.runtime_depth_clamp_m",
+        )
 
     metric_gs = _require_mapping(
         metric["gaussian_scale"], name="boundaries.metric.gaussian_scale"
@@ -733,130 +1658,13 @@ def load_pullback_calibration(
     c_gs = _finite_float(metric_gs["c_gs"], name="metric c_gs")
     _require_equal(c_gs, 1.0, name="boundaries.metric.gaussian_scale.c_gs")
 
-    evidence = _require_mapping(root["evidence"], name="evidence")
-    _require_exact_keys(
-        evidence,
-        {
-            "source_metric_gate",
-            "d4_renderer_gate",
-            "phase1a_reference",
-            "fit_scenes",
-            "selection_scenes",
-            "primary_lidar_gate",
-        },
-        name="evidence",
-    )
-    for evidence_name in (
-        "source_metric_gate",
-        "d4_renderer_gate",
-        "phase1a_reference",
-    ):
-        record = _require_mapping(evidence[evidence_name], name=evidence_name)
-        keys = {"path", "sha256"}
-        if evidence_name == "source_metric_gate":
-            keys.add("result_sha256_excluding_self")
-        _require_exact_keys(record, keys, name=f"evidence.{evidence_name}")
-        if not isinstance(record["path"], str) or not record["path"]:
-            raise ValueError(f"evidence.{evidence_name}.path must be non-empty")
-        _require_sha256(record["sha256"], name=f"evidence.{evidence_name}.sha256")
-        if evidence_name == "source_metric_gate":
-            _require_sha256(
-                record["result_sha256_excluding_self"],
-                name="evidence.source_metric_gate.result_sha256_excluding_self",
-            )
-    if evidence["fit_scenes"] != list(range(300, 320)):
-        raise ValueError("evidence.fit_scenes must be the frozen scenes 300-319")
-    if evidence["selection_scenes"] != list(range(320, 330)):
-        raise ValueError("evidence.selection_scenes must be the frozen scenes 320-329")
-    primary = _require_mapping(
-        evidence["primary_lidar_gate"], name="evidence.primary_lidar_gate"
-    )
-    _require_exact_keys(
-        primary,
-        {
-            "case_count",
-            "scene_count",
-            "identity_absrel",
-            "loglinear_absrel",
-            "relative_improvement",
-            "scene_delta_mean",
-            "scene_delta_bootstrap_95_ci",
-            "improved_scene_count",
-            "gate_pass",
-        },
-        name="evidence.primary_lidar_gate",
-    )
-    _require_equal(primary["gate_pass"], True, name="primary_lidar_gate.gate_pass")
-    _require_equal(primary["scene_count"], 10, name="primary_lidar_gate.scene_count")
-    _require_equal(primary["case_count"], 26, name="primary_lidar_gate.case_count")
-    identity_absrel = _finite_float(
-        primary["identity_absrel"], name="primary identity AbsRel"
-    )
-    loglinear_absrel = _finite_float(
-        primary["loglinear_absrel"], name="primary loglinear AbsRel"
-    )
-    relative_improvement = _finite_float(
-        primary["relative_improvement"], name="primary relative improvement"
-    )
-    scene_delta_mean = _finite_float(
-        primary["scene_delta_mean"], name="primary scene delta mean"
-    )
-    improved_scene_count = primary["improved_scene_count"]
-    if (
-        isinstance(improved_scene_count, bool)
-        or not isinstance(improved_scene_count, int)
-        or not 0 <= improved_scene_count <= 10
-    ):
-        raise ValueError("primary improved_scene_count must be an integer in [0,10]")
-    if not (
-        0.0 <= loglinear_absrel < identity_absrel
-        and relative_improvement > 0.0
-        and scene_delta_mean > 0.0
-        and improved_scene_count > 5
-    ):
-        raise ValueError("primary LiDAR gate summary is inconsistent with a passing loglinear gate")
-    ci = primary["scene_delta_bootstrap_95_ci"]
-    if not isinstance(ci, list) or len(ci) != 2:
-        raise ValueError("primary LiDAR gate CI must contain two values")
-    ci_values = (
-        _finite_float(ci[0], name="primary LiDAR gate CI lower"),
-        _finite_float(ci[1], name="primary LiDAR gate CI upper"),
-    )
-    if not 0.0 < ci_values[0] <= ci_values[1]:
-        raise ValueError("primary LiDAR gate CI lower bound must be strictly positive")
-
-    limitations = _require_mapping(root["limitations"], name="limitations")
-    _require_exact_keys(
-        limitations,
-        {
-            "paired_gaussian_scale_over_depth_ratio",
-            "similarity_consistent",
-            "c_gs",
-            "scope",
-        },
-        name="limitations",
-    )
-    ratio = _finite_float(
-        limitations["paired_gaussian_scale_over_depth_ratio"],
-        name="paired Gaussian-scale/depth ratio",
-    )
-    if not 0.0 < ratio < 1.0:
-        raise ValueError("v1 paired Gaussian-scale/depth ratio must remain in (0, 1)")
-    _require_equal(
-        limitations["similarity_consistent"],
-        False,
-        name="limitations.similarity_consistent",
-    )
-    _require_equal(limitations["c_gs"], "identity", name="limitations.c_gs")
-    if not isinstance(limitations["scope"], str) or not limitations["scope"]:
-        raise ValueError("limitations.scope must be non-empty")
-
+    _validate_v2_evidence_and_limits(root, metric_depth=metric_depth)
     return PullbackCalibration(
         path=artifact_path,
         artifact_sha256=artifact_sha256,
         tokenizer_sha256=tokenizer_sha256,
         dggt_sha256=dggt_sha256,
-        tokenizer_generation=str(root["tokenizer_generation"]),
+        tokenizer_generation=tokenizer_generation,
         window_len=window_len,
         patch_grid_hw=artifact_grid,
         depth_a=depth_a,
@@ -864,6 +1672,8 @@ def load_pullback_calibration(
         reference_depth_m=reference_depth_m,
         runtime_depth_clamp_m=clamp_m,
         c_gs=c_gs,
+        runtime_contract_version=PULLBACK_RUNTIME_CONTRACT_VERSION,
+        depth_form=depth_form,
     )
 
 
@@ -1315,16 +2125,26 @@ def metric_depth_correction_factor(
 ) -> torch.Tensor:
     """Evaluate the checkpoint-bound metric depth factor exactly once.
 
-    ``depth_recon`` stays in DGGT units. The log-linear profile is evaluated
-    on its *uncorrected metric* value, matching the frozen LiDAR selection
-    protocol. This helper is shared by export and the end-to-end metric-depth
-    diagnostic; rendering must use :func:`apply_pullback_calibration` with the
+    ``depth_recon`` stays in DGGT units. A log-linear profile is evaluated on
+    its *uncorrected metric* value, matching the frozen LiDAR selection
+    protocol. Identity is an exact no-op and constant profiles do not read the
+    scene gauge. Rendering must use :func:`apply_pullback_calibration` with the
     explicit ``render`` boundary instead.
     """
 
     if not isinstance(calibration, PullbackCalibration):
         raise TypeError("calibration must come from load_pullback_calibration")
     depth, _ = _validate_depth_pullback_input(depth_recon)
+    if calibration.depth_form == "identity":
+        return torch.ones_like(depth, dtype=torch.float32)
+    if calibration.depth_form == "constant":
+        return torch.full_like(
+            depth,
+            math.exp(calibration.depth_a),
+            dtype=torch.float32,
+        )
+    if calibration.depth_form != "loglinear":
+        raise ValueError(f"unsupported metric depth form: {calibration.depth_form!r}")
     batch_prefix = (int(depth.shape[0]),) if depth.ndim == 4 else ()
     metres_per_unit = _scene_scale_for_prefix(
         log_metric_scale,
@@ -1387,6 +2207,8 @@ def apply_depth_pullback_calibration(
                 raise ValueError("depth_has_channel=False conflicts with rank-5 singleton depth")
     if boundary == PULLBACK_RENDER_BOUNDARY:
         return depth_recon, torch.ones_like(depth, dtype=torch.float32)
+    if calibration.depth_form == "identity":
+        return depth_recon, torch.ones_like(depth, dtype=torch.float32)
     factor = metric_depth_correction_factor(
         depth if has_depth_channel else depth_recon,
         log_metric_scale=log_metric_scale,
@@ -1426,12 +2248,12 @@ def apply_pullback_calibration(
         boundary=boundary,
         depth_has_channel=has_depth_channel,
     )
-    if boundary == PULLBACK_RENDER_BOUNDARY:
+    if boundary == PULLBACK_RENDER_BOUNDARY or calibration.depth_form == "identity":
         return PullbackResult(
             depth_dggt=corrected_depth,
             gs_map_dggt=gs_map,
             c_depth_factor=factor,
-            boundary=PULLBACK_RENDER_BOUNDARY,
+            boundary=boundary,
         )
     scale_factor = factor.to(dtype=gs_map.dtype).unsqueeze(-1)
     corrected_gs = torch.cat(
@@ -1455,6 +2277,8 @@ __all__ = [
     "PULLBACK_ARTIFACT_ROLE",
     "PULLBACK_BOUNDARIES",
     "PULLBACK_DEPTH_EVALUATION",
+    "PULLBACK_DEPTH_FORMS",
+    "PULLBACK_DEPTH_VARIABLE_CONTRACT",
     "PULLBACK_GS_SCALE_RULE",
     "PULLBACK_LOG_METRIC_SCALE_UNITS",
     "PULLBACK_METRIC_BOUNDARY",
@@ -1462,6 +2286,7 @@ __all__ = [
     "PULLBACK_RUNTIME_CONTRACT_VERSION",
     "PULLBACK_SCHEMA_NAME",
     "PULLBACK_SCHEMA_VERSION",
+    "PULLBACK_V2_SMOKE_THRESHOLDS",
     "PullbackCalibration",
     "PullbackResult",
     "SCENE_GAUGE_DIM",

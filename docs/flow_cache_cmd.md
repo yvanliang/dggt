@@ -51,15 +51,19 @@ chunked v10 包含：
 conda activate dggt
 
 export DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
-export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt
-export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain_v4.pt
-export PULLBACK_CALIBRATION=data/scene_gauge/pullback_75e566ef.json
-export SCENE_FLOW_PRETRAIN_CKPT=logs/scene_flow_pretrain_1024_v4/ckpt/pretrain_step100000.pt
+export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt
+export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt
+export PULLBACK_CALIBRATION=data/scene_gauge/pullback_d63b34f7.json
+export SCENE_FLOW_PRETRAIN_CKPT=logs/scene_flow_pretrain_tokenizer_v2/ckpt/pretrain_step100000.pt
 export TRAIN_SCENE_GAUGE=data/scene_gauge/training.json
 export VALIDATION_SCENE_GAUGE=data/scene_gauge/validation.json
 export DGGT_SHA256="$(sha256sum "$DGGT_CKPT" | awk '{print $1}')"
 export VALIDATION_SCENE_GAUGE_SHA256="$(sha256sum "$VALIDATION_SCENE_GAUGE" | awk '{print $1}')"
 ```
+
+`$FEATURE_STATS` 与 `$SCENE_FLOW_PRETRAIN_CKPT` 是 Phase 2 的 v2-only 未来产物，当前尚未生成；
+依赖它们的 cache/pretrain 命令必须 fail closed。禁止使用绑定 tokenizer v1 SHA `75e566ef...`
+的旧 stats 或旧 SceneFlow checkpoint 代替。
 
 `tools/precompute_flow_features*.py` 会自己 hash `--ckpt_path` 实际指向的文件，
 `--expected_scene_gauge_dggt_sha256` 只是额外断言，不会代替这次实测。scene-gauge

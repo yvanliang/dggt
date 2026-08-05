@@ -34,7 +34,7 @@ DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH = (
     Path(__file__).resolve().parents[2]
     / "logs"
     / "scene_flow_pretrain_1024"
-    / "feature_stats_pretrain_v4.pt"
+    / "feature_stats_pretrain_v5.pt"
 )
 
 FEATURE_STATS_SCHEMA = "scene_flow_metric_gauge_feature_stats"

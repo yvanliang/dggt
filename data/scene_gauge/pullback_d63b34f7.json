@@ -1,0 +1,786 @@
+{
+  "artifact_role": "production_pullback",
+  "boundaries": {
+    "metric": {
+      "depth": {
+        "form": "identity"
+      },
+      "gaussian_scale": {
+        "c_gs": 1.0,
+        "channels_half_open": [
+          4,
+          7
+        ],
+        "rule": "multiply_channels_4_7_by_same_depth_factor"
+      }
+    },
+    "render": {
+      "depth": {
+        "form": "identity"
+      },
+      "gaussian_scale": {
+        "c_gs": 1.0,
+        "form": "identity"
+      }
+    }
+  },
+  "dggt": {
+    "sha256": "352652738a5480b8d3ee9dd521ce07b528e5a297bd3feca4d07427dac6d87def"
+  },
+  "eligible_for_training": true,
+  "evidence": {
+    "fit_scenes": [
+      300,
+      301,
+      302,
+      303,
+      304,
+      305,
+      306,
+      307,
+      308,
+      309,
+      310,
+      311,
+      312,
+      313,
+      314,
+      315,
+      316,
+      317,
+      318,
+      319
+    ],
+    "formal_coverage": {
+      "calibration_scene_count": 20,
+      "data_root": "/data/disk2/lyy_dataset/waymo_processed_dggt/training",
+      "required_scenes": [
+        300,
+        301,
+        302,
+        303,
+        304,
+        305,
+        306,
+        307,
+        308,
+        309,
+        310,
+        311,
+        312,
+        313,
+        314,
+        315,
+        316,
+        317,
+        318,
+        319,
+        320,
+        321,
+        322,
+        323,
+        324,
+        325,
+        326,
+        327,
+        328,
+        329
+      ],
+      "required_trunks": [
+        0,
+        1,
+        2
+      ],
+      "scene_count": 30,
+      "selection_scene_count": 10,
+      "trunk_count": 90,
+      "window_length": 10,
+      "window_starts": [
+        0,
+        5,
+        10,
+        14,
+        19
+      ]
+    },
+    "frozen_profile": {
+      "payload": {
+        "a": -0.028007614619865877,
+        "b": -0.04383812022323029,
+        "boundary_scope": "metric_only; render is forced identity",
+        "c_at_20m": 0.9723809624616624,
+        "calibration_candidate_fits": {
+          "constant": {
+            "a": -0.022538086121785452,
+            "b": 0.0,
+            "c_at_20m": 0.9777139991497715
+          },
+          "identity": {
+            "a": 0.0,
+            "b": 0.0,
+            "c_at_20m": 1.0
+          },
+          "loglinear": {
+            "a": -0.028007614619865877,
+            "b": -0.04383812022323029,
+            "c_at_20m": 0.9723809624616624
+          }
+        },
+        "calibration_candidate_forms": [
+          "identity",
+          "constant",
+          "loglinear"
+        ],
+        "calibration_decision_sha256": "e824a457b9e82b48cb04a4689aff4885843df4550f7a72ea427865e8da3f0c0f",
+        "equation": "log c(z0) = a + b * log(clamp(z0,0.5m,80m)/20m)",
+        "evaluate_on": "uncorrected_reconstructed_metric_depth_m",
+        "fit_scenes": [
+          300,
+          301,
+          302,
+          303,
+          304,
+          305,
+          306,
+          307,
+          308,
+          309,
+          310,
+          311,
+          312,
+          313,
+          314,
+          315,
+          316,
+          317,
+          318,
+          319
+        ],
+        "fit_variable": {
+          "correction_state": "uncorrected",
+          "metric_conversion": "divide_by_full_29f_direct_units_per_metre",
+          "name": "uncorrected_reconstructed_metric_depth_m",
+          "reference_depth_m": 20.0,
+          "runtime_clamp_m": [
+            0.5,
+            80.0
+          ],
+          "source_tensor": "reconstructed_depth"
+        },
+        "form": "loglinear",
+        "reference_depth_m": 20.0,
+        "reference_json_sha256": "2416f97b4afed0d9bf33556841cd419574b70dde1598474c5e4cd03899cf112b",
+        "runtime_depth_clamp_m": [
+          0.5,
+          80.0
+        ],
+        "runtime_variable": {
+          "correction_state": "uncorrected",
+          "metric_conversion": "divide_by_full_29f_direct_units_per_metre",
+          "name": "uncorrected_reconstructed_metric_depth_m",
+          "reference_depth_m": 20.0,
+          "runtime_clamp_m": [
+            0.5,
+            80.0
+          ],
+          "source_tensor": "reconstructed_depth"
+        },
+        "selection_scenes": [
+          320,
+          321,
+          322,
+          323,
+          324,
+          325,
+          326,
+          327,
+          328,
+          329
+        ],
+        "window_contract": {
+          "expected_window_length": 10,
+          "expected_window_starts": [
+            0,
+            5,
+            10,
+            14,
+            19
+          ],
+          "length_declarations": {
+            "method.d4_holdout_renderer.window_length": 10,
+            "method.window_overlap.window_length": 10
+          },
+          "start_declarations": {
+            "method.window_overlap.starts": [
+              0,
+              5,
+              10,
+              14,
+              19
+            ]
+          }
+        }
+      },
+      "sha256": "1c8046f0265a8126db31a702625468e52ebd6ea35e5dd90c1fb9643d4657b9fa"
+    },
+    "gaussian_practical_equivalence_gate": {
+      "analysis_unit": "Waymo scene; bootstrap resamples scenes only",
+      "bootstrap": {
+        "confidence_level": 0.95,
+        "samples": 10000,
+        "seed": 20260805,
+        "unit": "scene"
+      },
+      "margin": [
+        0.95,
+        1.05
+      ],
+      "passed": true,
+      "per_scene": [
+        {
+          "paired_gs_over_depth_ratio": 1.0060290218734271,
+          "paired_log_gs_over_depth": 0.006010920042172074,
+          "scene": 300,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9718138817519731,
+          "paired_log_gs_over_depth": -0.028590972535312176,
+          "scene": 301,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9786941298357673,
+          "paired_log_gs_over_depth": -0.021536116488277912,
+          "scene": 302,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9920242558063915,
+          "paired_log_gs_over_depth": -0.008007720578461885,
+          "scene": 303,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9993079204726525,
+          "paired_log_gs_over_depth": -0.0006923191249370575,
+          "scene": 304,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9741670747488655,
+          "paired_log_gs_over_depth": -0.0261724554002285,
+          "scene": 305,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.1008792901475821,
+          "paired_log_gs_over_depth": 0.09610921517014503,
+          "scene": 306,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0004014806014314,
+          "paired_log_gs_over_depth": 0.00040140002965927124,
+          "scene": 307,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0319777884293904,
+          "paired_log_gs_over_depth": 0.03147714398801327,
+          "scene": 308,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0282582528537538,
+          "paired_log_gs_over_depth": 0.02786635421216488,
+          "scene": 309,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.953108049778009,
+          "paired_log_gs_over_depth": -0.048027003183960915,
+          "scene": 310,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0246985608929782,
+          "paired_log_gs_over_depth": 0.024398482404649258,
+          "scene": 311,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9803719977282034,
+          "paired_log_gs_over_depth": -0.019823189824819565,
+          "scene": 312,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0027200289837108,
+          "paired_log_gs_over_depth": 0.0027163363993167877,
+          "scene": 313,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0023596777071326,
+          "paired_log_gs_over_depth": 0.0023568980395793915,
+          "scene": 314,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0090409460639551,
+          "paired_log_gs_over_depth": 0.009000321384519339,
+          "scene": 315,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0223400371375755,
+          "paired_log_gs_over_depth": 0.02209415379911661,
+          "scene": 316,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0099840719636317,
+          "paired_log_gs_over_depth": 0.009934560395777225,
+          "scene": 317,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0037041593167517,
+          "paired_log_gs_over_depth": 0.0036973158130422235,
+          "scene": 318,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9946221049352967,
+          "paired_log_gs_over_depth": -0.00539240799844265,
+          "scene": 319,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9829237635618236,
+          "paired_log_gs_over_depth": -0.017223716713488102,
+          "scene": 320,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0101779981803114,
+          "paired_log_gs_over_depth": 0.010126551147550344,
+          "scene": 321,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9988350370429917,
+          "paired_log_gs_over_depth": -0.0011656420538201928,
+          "scene": 322,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9817638792147919,
+          "paired_log_gs_over_depth": -0.01840444840490818,
+          "scene": 323,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.973534099266999,
+          "paired_log_gs_over_depth": -0.026822427287697792,
+          "scene": 324,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9894423045604699,
+          "paired_log_gs_over_depth": -0.010613823309540749,
+          "scene": 325,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9908658302639433,
+          "paired_log_gs_over_depth": -0.009176142048090696,
+          "scene": 326,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0244739078568506,
+          "paired_log_gs_over_depth": 0.02417922019958496,
+          "scene": 327,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 1.0143843770342251,
+          "paired_log_gs_over_depth": 0.014281903393566608,
+          "scene": 328,
+          "trunk_count": 3
+        },
+        {
+          "paired_gs_over_depth_ratio": 0.9618902936633027,
+          "paired_log_gs_over_depth": -0.038854874670505524,
+          "scene": 329,
+          "trunk_count": 3
+        }
+      ],
+      "point_estimate": 0.9998545510310882,
+      "c_gs_recommendation": {
+        "form": "identity",
+        "value": 1.0
+      },
+      "scene_bootstrap_95_ci": [
+        0.9901538115901889,
+        1.0075338584876234
+      ],
+      "scene_count": 30,
+      "support": "primary_static_nonsky_opacity_0p05"
+    },
+    "gaussian_roundtrip_audit": {
+      "path": "runs/metric_gauge_retest/v2_gaussian_gauge_300_329_trunks012_d63b34f7.json",
+      "script_sha256": "ebe3e49867fde426908a393fe3774b6e36fa6a6ff5ec35e7876dfac91984d10d",
+      "sha256": "8676b7767f3ddda6097331466dc0db30f0fc8d35ce7e09ecb82a8550b27b95d6"
+    },
+    "metric_reference": {
+      "path": "runs/metric_gauge_retest/v2_metric_reference_300_329_trunks012_d63b34f7.json",
+      "resume_signature_sha256": "08ce82f29244395341397f68fa0f47120db8ce7461d0ac085bed1ce386d279d7",
+      "script_sha256": "9e91dd09c7057d5cf2a04a6027e2bf8088aee6ce400c1121a71ff1c4ae15a3e1",
+      "sha256": "2416f97b4afed0d9bf33556841cd419574b70dde1598474c5e4cd03899cf112b"
+    },
+    "primary_lidar_gate": {
+      "bootstrap": {
+        "confidence_level": 0.95,
+        "samples": 10000,
+        "seed": 20260801,
+        "unit": "scene"
+      },
+      "candidate_absrel": 0.08506854744628072,
+      "candidate_form": "loglinear",
+      "case_count": 26,
+      "exact_sign_flip": {
+        "observed_mean_delta": -0.007453267741948366,
+        "one_sided_positive_p": 0.9345703125,
+        "permutation_count": 1024,
+        "role": "sensitivity only; the preregistered gate is the scene-bootstrap CI",
+        "scene_count": 10,
+        "two_sided_p": 0.1328125
+      },
+      "gate_pass": false,
+      "gauge_valid_cases_only": true,
+      "identity_absrel": 0.07761527970433235,
+      "improved_scene_count": 3,
+      "scene_count": 10,
+      "scene_delta_bootstrap_95_ci": [
+        -0.01552581081399694,
+        0.0011317621450871165
+      ],
+      "scene_delta_mean": -0.007453267741948366,
+      "scene_rows": [
+        {
+          "candidate_absrel": 0.040501875802874565,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.034126121550798416,
+          "identity_minus_candidate": -0.006375754252076149,
+          "scene": 320,
+          "trunk_count": 3,
+          "trunks": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "candidate_absrel": 0.12240789458155632,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.10507345199584961,
+          "identity_minus_candidate": -0.01733444258570671,
+          "scene": 321,
+          "trunk_count": 3,
+          "trunks": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "candidate_absrel": 0.022855591028928757,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.04126181825995445,
+          "identity_minus_candidate": 0.018406227231025696,
+          "scene": 322,
+          "trunk_count": 3,
+          "trunks": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "candidate_absrel": 0.043541714549064636,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.05273636244237423,
+          "identity_minus_candidate": 0.009194647893309593,
+          "scene": 323,
+          "trunk_count": 3,
+          "trunks": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "candidate_absrel": 0.15038001909852028,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.1225128285586834,
+          "identity_minus_candidate": -0.027867190539836884,
+          "scene": 324,
+          "trunk_count": 2,
+          "trunks": [
+            0,
+            1
+          ]
+        },
+        {
+          "candidate_absrel": 0.03786740079522133,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.04313338175415993,
+          "identity_minus_candidate": 0.005265980958938599,
+          "scene": 325,
+          "trunk_count": 3,
+          "trunks": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "candidate_absrel": 0.05978289898484945,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.05191371031105518,
+          "identity_minus_candidate": -0.00786918867379427,
+          "scene": 326,
+          "trunk_count": 2,
+          "trunks": [
+            1,
+            2
+          ]
+        },
+        {
+          "candidate_absrel": 0.17126424610614777,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.15252818167209625,
+          "identity_minus_candidate": -0.018736064434051514,
+          "scene": 327,
+          "trunk_count": 3,
+          "trunks": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "candidate_absrel": 0.10906253010034561,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.09137102216482162,
+          "identity_minus_candidate": -0.017691507935523987,
+          "scene": 328,
+          "trunk_count": 3,
+          "trunks": [
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "candidate_absrel": 0.09302130341529846,
+          "candidate_form": "loglinear",
+          "identity_absrel": 0.08149591833353043,
+          "identity_minus_candidate": -0.011525385081768036,
+          "scene": 329,
+          "trunk_count": 1,
+          "trunks": [
+            2
+          ]
+        }
+      ],
+      "selected_form": "identity",
+      "sensitivities": {
+        "all_30_trunks": {
+          "candidate_form": "loglinear",
+          "case_count": 30,
+          "exact_sign_flip": {
+            "observed_mean_delta": -0.007233168371021748,
+            "one_sided_positive_p": 0.9287109375,
+            "permutation_count": 1024,
+            "role": "sensitivity only; the preregistered gate is the scene-bootstrap CI",
+            "scene_count": 10,
+            "two_sided_p": 0.14453125
+          },
+          "gate_pass": false,
+          "gauge_valid_cases_only": false,
+          "improved_scene_count": 3,
+          "scene_count": 10,
+          "scene_delta_bootstrap_95_ci": [
+            -0.015214820601977408,
+            0.0013220256939530358
+          ],
+          "scene_delta_mean": -0.007233168371021748,
+          "selected_form": "identity",
+          "support": "all_lidar"
+        },
+        "phase1a_valid_static_nonsky": {
+          "candidate_form": "loglinear",
+          "case_count": 26,
+          "exact_sign_flip": {
+            "observed_mean_delta": -0.00801882492378354,
+            "one_sided_positive_p": 0.9443359375,
+            "permutation_count": 1024,
+            "role": "sensitivity only; the preregistered gate is the scene-bootstrap CI",
+            "scene_count": 10,
+            "two_sided_p": 0.11328125
+          },
+          "gate_pass": false,
+          "gauge_valid_cases_only": true,
+          "improved_scene_count": 3,
+          "scene_count": 10,
+          "scene_delta_bootstrap_95_ci": [
+            -0.016199760735034943,
+            0.0007268149894662154
+          ],
+          "scene_delta_mean": -0.00801882492378354,
+          "selected_form": "identity",
+          "support": "static_nonsky"
+        }
+      },
+      "support": "all_lidar"
+    },
+    "reconstruction_render_smoke": {
+      "case": {
+        "clip": "training_300_3",
+        "config": "step_100000_frames_10",
+        "dataset_index": 151,
+        "frame_count": 10,
+        "frame_indices": [
+          93,
+          95,
+          96,
+          97,
+          98,
+          99,
+          101,
+          103,
+          106,
+          107
+        ],
+        "scene": "training_300",
+        "step": 100000
+      },
+      "depth_gaussian_heads_precision": "fp32",
+      "device": "cuda:0",
+      "observed": {
+        "depth_recon_over_direct": 0.9992846426250039,
+        "depth_recon_vs_direct_absrel": 0.005908938590437174,
+        "direct_gt_lpips": 0.08181522786617279,
+        "direct_gt_psnr_db": 25.661609649658203,
+        "direct_gt_ssim": 0.8739693760871887,
+        "gs_axis_anisotropy_log_rms": 0.024165181443095207,
+        "gs_recon_over_direct": 1.0029865905890647,
+        "paired_gs_over_depth": 1.003170957403964,
+        "point_xyz_relative_error": 0.005908938590437174,
+        "render_direct_lpips": 0.01617569290101528,
+        "render_direct_psnr_db": 39.295841217041016,
+        "render_direct_ssim": 0.9789204001426697,
+        "render_gt_lpips": 0.08635998517274857,
+        "render_gt_psnr_db": 25.640975952148438,
+        "render_gt_ssim": 0.8689554333686829,
+        "support_pixels_median_per_frame": 92639.0
+      },
+      "passed": true,
+      "path": "runs/tokenizer_v2_cuda0_render_smoke_300_d63b34f7/smoke.json",
+      "precision": "bf16",
+      "selection_manifest": {
+        "path": "runs/tokenizer_v2_fixed_selection_300.json",
+        "sha256": "ce8290c997c2f9e5c9fd600ebd4178e86d40797077ae2874fb2774a7c1ca8cc6"
+      },
+      "sha256": "2519d4e3e21ed5f353fe4951d268f22f0c7d4eeae705b5cb6e29503e01690c89",
+      "thresholds": {
+        "depth_recon_over_direct_range": [
+          0.95,
+          1.05
+        ],
+        "depth_recon_vs_direct_absrel_max": 0.05,
+        "gs_axis_anisotropy_log_rms_max": 0.1,
+        "gs_recon_over_direct_range": [
+          0.95,
+          1.05
+        ],
+        "paired_gs_over_depth_range": [
+          0.95,
+          1.05
+        ],
+        "point_xyz_relative_error_max": 0.05,
+        "render_direct_lpips_max": 0.05,
+        "render_direct_psnr_min_db": 30.0,
+        "render_direct_ssim_min": 0.95,
+        "render_gt_lpips_increase_max": 0.02,
+        "render_gt_psnr_drop_max_db": 0.25,
+        "render_gt_ssim_drop_max": 0.02,
+        "support_pixels_median_per_frame_min": 1000
+      },
+      "visual": {
+        "format": "JPEG",
+        "mode": "RGB",
+        "path": "runs/tokenizer_v2_cuda0_render_smoke_300_d63b34f7/visuals/step_100000_frames_10/00_training_300.jpg",
+        "sha256": "c7db9b6a38821e7f7b0d9b1b5f1a83b30f27a07b047a15fdef0e103b13a857a2",
+        "size_wh": [
+          3367,
+          1400
+        ]
+      }
+    },
+    "selection_scenes": [
+      320,
+      321,
+      322,
+      323,
+      324,
+      325,
+      326,
+      327,
+      328,
+      329
+    ],
+    "source_metric_gate": {
+      "path": "runs/metric_gauge_retest/v2_tokenizer_lidar_metric_gate_320_329_d63b34f7.json",
+      "result_sha256_excluding_self": "46a7066881c07f2ecf6dda942bf3001966f537076c2d1cc2b88dde1040ea1046",
+      "script_sha256": "9a206db00f58cdce870f1c86c85bbe56560bd409cbfc2f8e37e1cdd33a33c0b4",
+      "sha256": "ab82b2884afd2d40aa6e02a78abcae27185942251288a497ca5bcf281615c2b8"
+    }
+  },
+  "limitations": {
+    "c_gs": "identity",
+    "metric_scope": "identity",
+    "phase1b_scheme": "A",
+    "render_scope": "identity_only",
+    "residual_limits": [
+      "Practical equivalence is established only for the preregistered paired GS/depth estimator and support.",
+      "LiDAR selection scenes 320-329 are validation/selection evidence, not an untouched test split.",
+      "The pullback does not establish absolute Gaussian covariance calibration beyond the recorded gates."
+    ],
+    "similarity_consistent": true
+  },
+  "runtime_contract": {
+    "gauge_representation": "dggt_teacher_log_metric_scale_logfov_v1",
+    "log_metric_scale_units": "log_metres_per_dggt_unit",
+    "patch_grid_hw": [
+      25,
+      37
+    ],
+    "version": "metric_depth_profile_gs_same_factor_render_identity_v2",
+    "window_len": 10
+  },
+  "schema": {
+    "name": "dggt_tokenizer_pullback",
+    "strict": true,
+    "version": "2.0.0"
+  },
+  "tokenizer": {
+    "sha256": "d63b34f7b1193ed7da399f953db504cfadb4f98dce2519854227a0f44714c8e8",
+    "sha8": "d63b34f7"
+  },
+  "tokenizer_generation": "t0_v2"
+}

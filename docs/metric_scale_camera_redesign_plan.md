@@ -1,14 +1,16 @@
 # 度量尺度显式生成 + 相机米制化改造
 
-> **v4 — 2026-08-02**。v1 写于 Phase 0 之前，其 Phase 1–8 建立在两条尚未验证的假设上。
+> **v5 — 2026-08-05**。v1 写于 Phase 0 之前，其 Phase 1–8 建立在两条尚未验证的假设上。
 > Phase 0（D1/D2，见 A.8.5/A.8.6）与独立复测（`docs/story_codex/scene_flow_metric_gauge_retest_2026-07-31.md`）
 > 已推翻其中一条、收窄另一条；D3/D4 与 Phase 1b-0 LiDAR gate 又冻结了 render/metric
-> 两个作用域。本版再纳入用户的执行冻结：**tokenizer v2 尚未完成时，tokenizer v1 的
-> checkpoint-bound pullback 是 Phase 1–8 的正式 production contract，而不是阻塞项**。
+> 两个作用域。v4 冻结过的 tokenizer v1 production contract 只保留为不可变历史证据；本版新增
+> tokenizer v2 的哈希隔离正式复测，并按预注册 gate 落到 **Phase 1b 方案 A**：render 与 metric
+> boundary 都是 identity，`c_gs=1.0`。最终 runtime 是 **v2-only clean cut**：代码、默认配置和 loader
+> 均拒绝 tokenizer v1 schema/checkpoint/pullback；Phase 2 未由本次工作启动。
 
-## 修订说明（v1 → v4）
+## 修订说明（v1 → v5）
 
-| # | v1 的说法 | 实测 | v4 的处理 |
+| # | v1 的说法 | 实测 | v5 的处理 |
 |---|---|---|---|
 | 1 | FOV 用哪套 K 待定（分支 A/B） | D1 判定 **Branch A**：`K_pred` 优于 `K_Waymo` +0.472 dB（CI [+0.253,+0.741]） | DGGT depth/render/sky 使用 gauge K；米制 bbox/`in_frustum` 保持 Waymo K，两条链路不交叉 |
 | 2 | 「DGGT 是米制世界的内部自洽相似缩放副本」 | **过强**。除以 `s_cam` 后仍余 camera-XYZ 2.452 m，其中 1.287 m 纯由 FOV 差异产生 | Context 收窄为「camera center + z-depth 共享一维 gauge」，不再宣称完整 Sim(3) |
@@ -17,6 +19,7 @@
 | 5 | 旋转 0.168°、轨迹形状 0.52%，故米制相机「几乎无代价」 | 独立估计器给 raw 0.371°（拟合常量 `Q` 后 0.201°）、形状 **1.334%**（max 4.066%） | 论据换成更强的那条（去掉不可观测噪声 vs 残留可测偏差），并新增 **D3** 实测该替换在渲染上的代价 |
 | 6 | `s_cam/s_depth = 1.0073 ± 0.0442` | 两个独立估计器在 29 帧口径下均给 ~2.5–2.6% | 数字更新；`±4.4%` 不再当作「最好情况下界」 |
 | 7 | 「米制 → DGGT 只差一个标量」，故 `target_bbox_patch` 应改用 gauge K、`in_frustum` 有视锥矛盾 | **两条都错**。映射是各向异性的（横向 ×0.748）；而 box 投影本就走全米制自洽链路，无矛盾 | **撤回该改动**：`target_bbox_patch`/`in_frustum` 保持 Waymo K；改为「两条链路各自一个 K，永不交叉」；编辑路径新增各向异性 `metric_box_to_dggt` |
+| 8 | v1 metric boundary 需要 loglinear、paired `GS/depth=0.796` 留作 tokenizer v2 根治 | v2 paired point `0.99985`、scene-bootstrap 95% CI `[0.99015,1.00753]` 均落在预冻结 `[0.95,1.05]`；v2 loglinear 在 LiDAR selection 上使 AbsRel `7.762%→8.507%` | **Phase 1b 方案 A**：v2 render/metric 都用 identity、`c_gs=1.0`；v1 artifact 与结论只作历史保留 |
 
 ---
 
@@ -122,10 +125,10 @@ camera 与 lidar 的有符号漂移 `Δlog s` 在 41/44 对上同向、Pearson 0
 - 相机生成目标改为**真实 Waymo 米制位姿**（确定性 GT、零尺度噪声），相机可控性变成恒等映射。
 - 新增 **scene-global gauge token**，显式生成 `[log_metric_scale, log tan(FOVx/2), log tan(FOVy/2)]`，
   作为 DGGT 几何 ↔ 米制的唯一桥梁。
-- **冻结解码器的 pullback 单独标定并按作用域冻结**：v1 在 metric boundary 使用 checkpoint-bound
-  loglinear `c_depth`，render 使用 identity，`c_gs=1.0`；其标定对象与 teacher gauge 表相互独立，
-  但 runtime factor 按下式在 gauge 给出的未校正米制深度上求值。该策略修正米制 depth
-  的系统偏差，**不修复** `GS/depth=0.796`。
+- **冻结解码器的 pullback 单独标定并按作用域冻结**：v1 历史 contract 曾在 metric boundary 使用
+  checkpoint-bound loglinear `c_depth`，render 使用 identity，`c_gs=1.0`；v2 正式 gate 选择
+  **方案 A**，两个 boundary 均为 identity、`c_gs=1.0`。runtime 只接受 v2 SHA/schema；v1 的
+  `GS/depth=0.796` limitation 不被改写，但其 artifact 不再可加载，v2 已从源头通过相似等价 gate。
 - 内参分成**两条永不交叉的链路**：DGGT 链路（depth 反投影 / render / sky atlas）统一到 gauge K；
   米制链路（box 投影 / `in_frustum` / `target_bbox_patch`）保持真实 Waymo K。
 - asset 条件重参数化为「无量纲方向 + log 幅值 + 尺度不变比值」；16 维中 5 个通道标准化、
@@ -143,9 +146,9 @@ camera 与 lidar 的有符号漂移 `Δlog s` 在 41/44 对上同向、Pearson 0
 | gauge 主尺 | **完整 29 帧 LiDAR 深度尺**（90/90 有效；相机尺在 20/90 静止 trunk 上按定义失效） | D2（A.8.6） |
 | actor 尺 | 仅诊断字段，不作 GT（29/90 可用，3 个灾难性离群 0.94/0.54/0.54） | D2（A.8.6） |
 | gauge GT 空间 | **teacher 空间**（与 tokenizer 无关）；tokenizer 偏差由独立、按作用域的标定/审计产物处理 | 模块化：换 tokenizer 只需重跑 pullback audit/gate，不用重算全表 |
-| tokenizer v1 过渡策略 | **正式启用** `data/scene_gauge/pullback_75e566ef.json`：metric loglinear、render identity、`c_gs=1.0` | v1 LiDAR gate 通过；artifact 与 tokenizer/DGGT/window/grid 哈希绑定 |
-| tokenizer v2 | **不是当前 Phase 1–8 阻塞项**；产出后重拟合、重测并允许按 gate 换方案 | v2 会改变 recon/direct pullback，但不改变 teacher gauge 表 |
-| 兼容性 | 干净切断，升版本号，旧 checkpoint 拒绝加载，从头重训 | 用户决定 |
+| tokenizer v1 过渡策略（历史） | `data/scene_gauge/pullback_75e566ef.json` 及数字只作审计记录；runtime/default/config/loader **必须拒绝** v1 schema/checkpoint/pullback | v1 LiDAR gate 当时通过；结论保留但不再形成兼容分支 |
+| tokenizer v2（当前） | **正式启用** `data/scene_gauge/pullback_d63b34f7.json`：render identity、metric identity、`c_gs=1.0`（方案 A） | 30-scene paired GS gate 通过；10-scene LiDAR gate 选择 identity；CUDA render smoke 通过 |
+| 兼容性 | **v2-only 干净切断**：升版本号，v1 tokenizer/pullback/checkpoint 与旧 Scene Flow checkpoint 全部拒绝加载 | 用户决定 |
 
 ---
 
@@ -282,7 +285,7 @@ teacher/metric 两臂可比，生成相机和生成几何仍可共同形成自�
   为 1.9833%（mean 3.0103%、p95 7.6039%、max 9.8653%），通过 5% 预注册阈值；固定 drift cohort
   为 44 pairs、mean 8.2020%、max 30.8056%。
 
-### 1b. 冻结解码器 pullback 标定（**2026-08-01 按 D4 + v1 LiDAR gate 重写**）
+### 1b. 冻结解码器 pullback 标定（**v1 历史保留；2026-08-05 由 v2 方案 A 收口**）
 
 > **D4 之后本节必须按作用域理解。** render 路径的两个常数都为 identity；
 > 米制边界另有独立 LiDAR 尺，可以且已经对 v1 的 `c_depth` 作出选择。
@@ -327,35 +330,43 @@ metric boundary 选择 loglinear**。精确符号翻转 sensitivity 为单侧 `p
 identity**。原始 gate 结果继续保留 `artifact_role=diagnostic_only_v1`、
 `eligible_for_training=false`，因为实验记录本身不能被 runtime 当作契约。用户随后冻结了 v1
 过渡策略：`tools/freeze_tokenizer_pullback.py` 将同一证据写成严格、哈希绑定的 production artifact
-`data/scene_gauge/pullback_75e566ef.json`；它才是 Phase 1–8 允许训练/推理加载的文件。
-v2 出来后仍必须在 300–319 重拟合并原样重跑 320–329，届时结论和系数都允许改变。
+`data/scene_gauge/pullback_75e566ef.json`；**这是 v4 当时的历史加载契约，不是 v5 runtime contract**。
+v5 clean cut 保留该文件作为审计记录，但生产代码和配置拒绝加载它。
+v4 对后续 v2 的要求是：在 300–319 重拟合并原样重跑 320–329，结论和系数允许改变；
+该要求现已按 1b-4 完成，且 v2 selection 改选 identity。
 
 #### 1b-1. 本节剩下的三个作用
 
 1. **审计记录 + 哈希绑定**：`pullback_*.json` 仍然要生成，记录配对比值、深度剖面、
-   tokenizer SHA-256、`window_len`。加载断言不变 —— v1/v2 两个 tokenizer 会同时存在，
-   这个断言现在比之前更重要。
-2. **`apply_pullback_calibration` 仍然要实现**，但必须显式传作用域：v1 metric boundary
-   使用上述 loglinear，render 强制 `c_depth=1.0`；`c_gs` 两处都为 1.0。保留函数是为了让常数**有唯一施加点**，
-   而不是散落在导出与损失里。
+   tokenizer SHA-256、`window_len`。v1 记录只读归档；runtime loader 只接受唯一 v2 SHA/schema，
+   任何 v1 tokenizer 或 pullback 都 fail-closed。
+2. **`apply_pullback_calibration` 仍然要实现**，并显式传作用域；当前 v2 的 render/metric 都是
+   identity、`c_gs=1.0`。保留函数是为了维持唯一施加点和 no-op/hash contract，而不是保留 v1
+   loglinear 运行时分支。
 3. **验证 tokenizer v2 是否成功的尺子**：见下。
 
-#### 1b-2. `c_gs` 被拒：明确 limitation；tokenizer v2 是根治路径、不是当前阻塞
+#### 1b-2. `c_gs` 被拒：v1 limitation 与 v2 根治路径（历史结论）
 
-`c_gs = 1.0` 意味着 **0.796 这个缺陷在本计划内完全没有被修复**：
-高斯相对其深度仍然偏小约 20%。硬伤 5 的后半段**依然存在**。
+对 tokenizer v1，`c_gs = 1.0` 意味着 **0.796 这个缺陷没有被 pullback 修复**：
+高斯相对其深度仍然偏小约 20%。这是 v1 production artifact 必须保留的 limitation；v2 的最终
+根治结果见 1b-4，不反向改写这段历史。
 
-根因已定位、修复已进代码（见附录 A）。要让配对比值从源头回到 1，剩余路径是 tokenizer v2
-重训；但用户已经决定在 v2 完成前按 v1 结果实现 Scene Flow，所以 **v2 不是 Phase 1–8 的当前
-阻塞依赖**。v1 production contract 保留这个缺陷并显式报告：
+根因已定位、修复已进代码（见附录 A）。当时让配对比值从源头回到 1 的剩余路径是 tokenizer v2
+重训；用户决定在 v2 完成前按 v1 结果实现 Scene Flow，所以 v4 将 v2 记为非阻塞并部署 v1。
+v1 production contract 保留这个缺陷并显式报告：
 
 | | 状态 |
 |---|---|
-| 若跑 v2 且 `gs_scale_sim_ratio → 1.0` | 缺陷从源头消除，`c_gs` 永远不需要 |
-| 当前用 v1 完成 Phase 1–8 | 正式启用 metric-depth loglinear；`c_gs=1.0`，0.796 缺陷保留并写进 limitation，且**不得声称渲染几何是相似一致的** |
-| v2 未收敛到 1.0 | 先按同一 LiDAR/paired-ratio gate 判定；只有仍需 renderer fallback 时，才用 **LPIPS/SSIM**（不是 PSNR）重扫 `c_gs` |
+| v4 的 v2 成功条件 | `gs_scale_sim_ratio → 1.0`，缺陷从源头消除，`c_gs` 永远不需要 |
+| v1 历史 production | metric-depth loglinear；`c_gs=1.0`，0.796 缺陷保留并写进 limitation，且**不得声称 v1 渲染几何是相似一致的** |
+| v2 失败分支（未触发） | 先按同一 LiDAR/paired-ratio gate 判定；只有仍需 renderer fallback 时，才用 **LPIPS/SSIM**（不是 PSNR）重扫 `c_gs` |
+| v2 正式结果 | paired gate 通过；LiDAR 选择 identity；采用方案 A，见 1b-4 |
 
-### 1b-3. 标定文件格式（依赖 tokenizer，独立文件）
+#### 1b-3. 标定文件格式（依赖 tokenizer，独立文件）
+
+> 本小节完整保留 v1 artifact 的历史语义，便于复核旧结果；它不再是 v5 的实现需求。
+> v2-only loader 必须拒绝该 schema/generation/path，即使文件内历史字段仍写着
+> `eligible_for_training=true`。
 
 `tools/calibrate_tokenizer_pullback.py` 的 v1 原始诊断写入
 `runs/metric_gauge_retest/v1_tokenizer_lidar_metric_gate_320_329.json`；
@@ -413,8 +424,140 @@ render_scales        = scale_recon                                           # i
 
 **标定实现只有一个，调用作用域必须显式**：`dggt/utils/scene_gauge.py` 提供共享 helper；
 米制导出、模块 C 与 metric 诊断调用 `boundary="metric"`，训练/推理 render 调用
-`boundary="render"` 并断言返回 identity。禁止把 v1 metric profile 静默接进
-`rgb_render_loss.py::_decode_geometry`。
+`boundary="render"`，v2 两者都断言返回 identity。v1 schema/profile 在 loader 层直接拒绝，
+更不得接进 `rgb_render_loss.py::_decode_geometry`。
+
+#### 1b-4. tokenizer v2 正式复测与最终分支（2026-08-05，方案 A）
+
+本节**只新增 v2 结论**；上面的 v1 数字、原始结果和
+`data/scene_gauge/pullback_75e566ef.json` 均不覆盖，但全部只读归档、不可被 runtime 加载。v2 checkpoint 是
+`logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt`，完整 SHA-256 为
+`d63b34f7b1193ed7da399f953db504cfadb4f98dce2519854227a0f44714c8e8`。预检确认
+`global_step=max_steps=100000`，当前 `JointSceneTokenizer` 严格加载 460 个 state key、
+741,022,336 个参数，模型和 optimizer tensor 全部 finite；DGGT checkpoint SHA-256 为
+`352652738a5480b8d3ee9dd521ce07b528e5a297bd3feca4d07427dac6d87def`。
+
+> **v2-only 收口说明（2026-08-05）**：下面的正式数值和 provenance 来自已经完成的
+> Gaussian schema 2.3.0 与 LiDAR schema 2.1.0 运行。随后只删除了 Gaussian 工具中未启用的
+> render/PSNR/`c_gs` 扫描路径，并把工具合同升级为 2.4.0；按用户决定没有再次执行 90-trunk audit
+> 或 LiDAR selection。新代码只做单元测试、CPU synthetic 和单 trunk CUDA 路径检查，不能把既有
+> JSON 说成由 2.4.0 脚本生成，也没有生成新的正式 result/script SHA。
+
+checkpoint 的训练参数保存了 `min_frames=10`、`max_frames=14`、`sample_window=20` 以及
+`lambda_head_anchor=0.6`、`lambda_gs_scale_sim=0.3`、`lambda_depth_log_bias=0.2`，但**没有显式保存
+objective/version 字段，也没有保存固定的 production tokenizer `window_len`**；因此不能把这两项描述成
+checkpoint 自证。正式结果和 production artifact 另行 fail-closed 绑定 10 帧窗口。更重要的 limitation 是：
+v2 训练日志/目录完全不在本机，无法复核 `gs_scale_sim_ratio`、depth log bias、有效 support
+count/fraction、三项新增 loss 的训练轨迹，也无法从日志排除 NaN、空 support 被记成 ratio=1 或
+raw/cache 混写；这里的接受依据是 strict-load/finite 检查和独立正式复测，**不是对缺失训练日志或
+trainer 日志实现的事后背书**。
+
+正式协议固定为 scenes 300–329 × trunks 0/1/2 = 90 个完整 29 帧 trunk；每个 trunk 只用起点
+`[0,5,10,14,19]` 的五个 10 帧 tokenizer 窗口，Aggregator 看完整 29 帧，DepthHead/GaussianHead
+关闭 autocast 后以 FP32 运行。calibration scenes 300–319 只拟合 identity/constant/loglinear，
+selection scenes 320–329 只在 identity 与冻结候选之间二选一；selection 不得回写 `a/b`、clamp、
+support、窗口或统计方式。GS practical-equivalence margin 在查看 v2 结果前冻结为 `[0.95,1.05]`，
+PSNR 未运行、也未用于 `c_gs`。
+
+主 support `primary_static_nonsky_opacity_0p05` 的 scene-balanced 结果如下。ratio 的 point 是
+30 个 scene 的 median-log；括号是 scene IQR。三轴行按同一 window→trunk→scene 层级分别聚合
+`axis_log_ratio_median_of_frame_medians`：
+
+| 量 | tokenizer v1（历史 D4） | tokenizer v2 | v2 判定 |
+|---|---:|---:|---|
+| `depth_recon/depth_direct` | 1.03989 | **1.04189**（IQR 1.00495–1.05669） | 仍有描述性偏移，不能据此越过 LiDAR gate |
+| Gaussian scale x/y/z | 0.83805 / 1.00000 / 0.76931 | **1.06666 / 1.00000 / 1.03631** | 三轴已不再呈 v1 的系统性缩小 |
+| Gaussian 三轴几何平均 `scale_recon/scale_direct` | 0.82894 | **1.03311**（IQR 1.01923–1.04466） | 描述性统计 |
+| 配对 `GS/depth` | **0.79640** | **0.99985**（IQR 0.98205–1.01013） | point 在 margin 内 |
+
+配对 ratio 的 scene-only bootstrap 95% CI 为 **`[0.99015,1.00753]`**；point 与整段 CI 都位于
+预冻结 `[0.95,1.05]`，故 GS/depth practical-equivalence gate **通过**。这是与 v1 最关键的逐项
+变化：v1 的 0.796 缺陷已由 v2 从源头修复，到 1 的误差减少约 99.93%；不需要、也不允许用
+PSNR 拟合 `c_gs`。30 个 per-scene ratio 的范围是 `[0.95311,1.10088]`，只有 scene 306 高于
+1.05、没有 scene 低于 0.95；等价结论来自预注册的跨 scene point + bootstrap CI gate，不表示每个
+scene 都逐一落入 margin。
+另一个 estimator 的 90-trunk same-cell case-balanced `depth_recon/depth_direct` mean/p50 为
+`1.03358/1.03685`（v1 mean 为 `1.03048`），说明 depth 描述性偏移没有改善，也未凭配对 gate
+自动消失，仍必须交给独立 LiDAR gate。
+
+calibration split 的 depth profile 在 identity/constant/loglinear 中冻结为 loglinear：
+`a=-0.028007614619865877`、`b=-0.04383812022323029`、`c(20m)=0.9723809624616624`，自变量仍是
+**未校正 reconstructed metric depth**，runtime clamp `[0.5m,80m]`。calibration depth 分层为：
+
+| 未校正 reconstructed metric depth | correction | `recon/direct` | scene count |
+|---|---:|---:|---:|
+| 0–5 m | 1.11662 | 0.89556 | 6 |
+| 5–10 m | 0.96736 | 1.03374 | 20 |
+| 10–20 m | 0.97372 | 1.02699 | 20 |
+| 20–40 m | 0.95624 | 1.04576 | 20 |
+| 40–80 m | 0.94300 | 1.06045 | 20 |
+
+近场 0–5 m 只有 6 个 scene 且方向反转，是 profile 的明确 limitation。`c_gs` 的 calibration
+constant/loglinear 分别为 `a=-0.0147907,b=0` 与 `a=-0.00793792,b=0.0549248`，但冻结候选相对
+identity 没有达到 2% LOSO 改善，因此 `c_gs` profile 自身也选择 identity。
+
+selection split 的正式 LiDAR 主口径（Phase-1a valid，all LiDAR）给出：
+
+| 口径 | case / scene | identity AbsRel | frozen loglinear AbsRel | scene mean `identity-candidate` | scene-bootstrap 95% CI | improved scenes |
+|---|---:|---:|---:|---:|---:|---:|
+| 主口径 | 26 / 10 | **7.762%** | 8.507% | **−0.745%** | **[−1.553%, +0.113%]** | 3/10 |
+| 全 30 trunk sensitivity | 30 / 10 | **7.705%** | 8.428% | −0.723% | [−1.521%, +0.132%] | 3/10 |
+| valid static/non-sky | 26 / 10 | **7.772%** | 8.573% | −0.802% | [−1.620%, +0.073%] | 3/10 |
+
+主口径 exact sign-flip sensitivity 为单侧 `p=0.93457`、双侧 `p=0.13281`。预注册规则要求
+point delta > 0 且 scene-bootstrap CI 下界严格 > 0；两者均不满足，故选择 **identity**。注意这不是
+把 calibration fit 改回 identity：冻结 profile 仍作为候选证据保留，只是 selection gate 拒绝部署它。
+与 v1 的方向相反：v1 主口径 delta 为 `+0.0066645`、CI `[0.0005170,0.0122477]`、8/10 scenes
+改善并选择 loglinear；其 `b=+0.0146570`，而 v2 是 `b=-0.0438381`。这既说明 v2 不需要 depth
+correction，也直接证明不得复用 v1 的 `a/b`。
+LiDAR result 本身保持 `artifact_role=candidate_v2`、`eligible_for_training=false`；只有下面经过全部 gate
+与 smoke 验证的 production freeze 才能把独立文件标成可训练加载。
+
+10 帧 CUDA 0 encode/decode + FP32 DepthHead/GaussianHead/render smoke 也通过：
+`depth_recon/direct=0.99928`、`GS_recon/direct=1.00299`、paired `1.00317`、
+render-vs-direct PSNR/SSIM/LPIPS 为 `39.296 dB / 0.97892 / 0.01618`，没有明显 reconstruction/render
+退化。三项 gate 因而落到**方案 A**：
+
+- render pullback = identity；
+- metric-boundary `c_depth` = identity；
+- `c_gs=1.0`；
+- shared helper 仍要求显式 `boundary="render"|"metric"`，并保留 tokenizer SHA/window/grid/artifact
+  hash 强制校验；identity 路径必须是精确 no-op，禁止接入 `rgb_render_loss.py::_decode_geometry`；
+- 唯一 v2 production artifact 是 `data/scene_gauge/pullback_d63b34f7.json`，
+  `artifact_role=production_pullback`、`eligible_for_training=true`、schema `2.0.0`；clean-cut 只把
+  旧的 PSNR 否定字段迁移成显式 `c_gs_recommendation={form: identity, value: 1}`，不改 gate 数值；
+- runtime、默认配置和 formal checkpoint provenance 只接受上述 v2 artifact/checkpoint；v1 schema、
+  checkpoint、pullback 与兼容 fallback 全部删除或显式拒绝。
+
+**正式证据与代码哈希**（大体积 `runs/*.json` 只保留为本地证据，不加入 git 暂存）：
+
+| 对象 | SHA-256 |
+|---|---|
+| tokenizer v2 checkpoint | `d63b34f7b1193ed7da399f953db504cfadb4f98dce2519854227a0f44714c8e8` |
+| DGGT checkpoint | `352652738a5480b8d3ee9dd521ce07b528e5a297bd3feca4d07427dac6d87def` |
+| metric reference JSON | `2416f97b4afed0d9bf33556841cd419574b70dde1598474c5e4cd03899cf112b` |
+| `tools/retest_scene_flow_metric_gauge.py` | `9e91dd09c7057d5cf2a04a6027e2bf8088aee6ce400c1121a71ff1c4ae15a3e1` |
+| Gaussian audit JSON | `8676b7767f3ddda6097331466dc0db30f0fc8d35ce7e09ecb82a8550b27b95d6` |
+| `tools/retest_scene_flow_gaussian_gauge.py` | `ebe3e49867fde426908a393fe3774b6e36fa6a6ff5ec35e7876dfac91984d10d` |
+| LiDAR selection JSON | `ab82b2884afd2d40aa6e02a78abcae27185942251288a497ca5bcf281615c2b8` |
+| LiDAR JSON canonical self-hash（排除 self 字段） | `46a7066881c07f2ecf6dda942bf3001966f537076c2d1cc2b88dde1040ea1046` |
+| `tools/calibrate_tokenizer_pullback.py` | `9a206db00f58cdce870f1c86c85bbe56560bd409cbfc2f8e37e1cdd33a33c0b4` |
+| CUDA render smoke JSON | `2519d4e3e21ed5f353fe4951d268f22f0c7d4eeae705b5cb6e29503e01690c89` |
+| fixed selection manifest | `ce8290c997c2f9e5c9fd600ebd4178e86d40797077ae2874fb2774a7c1ca8cc6` |
+| smoke visual | `c7db9b6a38821e7f7b0d9b1b5f1a83b30f27a07b047a15fdef0e103b13a857a2` |
+| `tools/freeze_tokenizer_pullback.py` | `3e96b000245fa74b81e1fa2794ab620d08e1c6e9305c8756430a804a3acce46f` |
+| v2 production artifact（clean-cut 前） | `d24e23f77bcd7b51cb022a591ac9cdee3a7108d233f00b2ae9a9ae8ea7d550fb` |
+
+reference JSON 对 DGGT/tokenizer checkpoint 作完整 content SHA-256；对 90 个原始数据输入只保存每 case
+的 `sha256(canonical JSON lines of path,size,mtime_ns)` stat manifest，**不是 raw file content hash**。
+因此既有正式结果对 checkpoint、当时的脚本和上游结果有完整 content hash，但不能声称原始
+Waymo/DGGT array 的每个字节都已 content-hash；这是当前可复现性 limitation。render smoke 还没有
+记录独立 script SHA-256 或 elapsed，只对固定 selection、结果 JSON 与 visual 作了 content hash。
+clean-cut 后的 production artifact 只做合同字段迁移，本轮按用户要求没有重新计算或登记文件 SHA；
+Phase 2 首次消费前必须重新绑定它的实际 artifact SHA。
+
+本次只验收并实施 Phase 1b；Phase 1a 的 teacher gauge 表保持已完成且无需重算。Phase 1c 及其后续
+阶段仍按各自 gate 推进，**不得据本节单独宣称整个 Phase 1 已完成**，也未进入 Phase 2。
 
 ### 1c. 数据集接线
 
@@ -627,9 +770,11 @@ pose_enc = assemble(c2w_dggt, fov_from_gauge)                                   
   FOV 从 gauge 取，用 `gauge_to_pose_enc_fov` 重组 9 维 `pose_enc` 供 `_predict_camera_mats` 使用；
   渲染前用 `metric_c2w_to_teacher_anchor_dggt` 重基并换算。
 - 解码几何本身保持原样；跨入米制导出时才调用 `scene_gauge.py` 的唯一 shared helper，
-  施加 checkpoint-bound `c_depth`，`c_gs=1.0`。render 调同一 helper 的 identity 分支并断言。
+  v2 方案 A 的 checkpoint-bound `c_depth=identity`、`c_gs=1.0`。render 调同一 helper 的 identity
+  分支并断言；两个 boundary 都是精确 no-op，但仍保留显式 scope 与 provenance 门。
 - > **v1 米制边界结论**：loglinear 将 scene-balanced LiDAR AbsRel 从 7.567% 降到 6.901%；
-  > 它只说明 v1 的米制导出应这样校正，不修复 GS/depth=0.796，也不是 v2 的最终常数。
+  > 它只记录 v1 当时的审计结论，不修复 GS/depth=0.796，也不是 v2 的最终常数；v2-only runtime
+  > 必须拒绝该 profile，不能保留兼容开关。
 - **`--export_units {dggt,metric}`（默认 metric）**：
   PLY 导出时 `means` 与高斯 `scales` **同乘** `exp(log_metric_scale)`；
   rotation / color / opacity **不变**。`export_generated_pointclouds`（`:660-754`）里那句写死的
@@ -641,9 +786,9 @@ pose_enc = assemble(c2w_dggt, fov_from_gauge)                                   
 
 `inference_scene_flow.py`（edit 路径）：不生成相机/sky/gauge，但仍需同步
 `SCENE_FLOW_CONFIG_COMPAT_FIELDS`（`:750-772`）并强制加载 hash 绑定的 pullback artifact。
-它的 tokenizer decode / render 必须显式走 `boundary="render"`，因此 v1 为 identity；只有真正跨入
-米制导出或米制断言时才走 `boundary="metric"` 的 depth loglinear profile。禁止把 metric profile
-静默施加到 formal edit render。
+它的 tokenizer decode / render 必须显式走 v2 `boundary="render"`，米制导出或米制断言走 v2
+`boundary="metric"`；方案 A 下两者都是 identity。tokenizer v1 checkpoint/pullback/provenance 在
+入口拒绝，不存在 legacy loglinear 或兼容 fallback。
 
 ---
 
@@ -751,9 +896,11 @@ gauge K；开放生成时，9D 米制相机先相对 `camera_trajectory_anchor_t
 
 ---
 
-## 附录 A — tokenizer 侧根治（**已实现，待重训**；本节 2026-08-01 更新）
+## 附录 A — tokenizer 侧根治（**v2 已训练并通过正式复测**；本节 2026-08-05 更新）
 
-> 上一版写「本次不做」。实际上根因已被定位、修复已进代码，只差重训 —— 本节据实更新。
+> 2026-08-01 版记录为「根因已定位、修复已进代码，只差重训」。该历史判断保留；2026-08-05
+> 已取得 step-100000 v2 checkpoint，并按 1b-4 完成哈希隔离复测。由于训练日志完全缺失，不能补写
+> loss/support 的训练轨迹；最终接受以 checkpoint finite/strict-load、CUDA smoke 与正式 gate 为准。
 
 **根因（都在 `train_tokenizer.py`，不是架构问题）**：
 
@@ -773,31 +920,34 @@ gauge K；开放生成时，9D 米制相机先相对 `camera_trajectory_anchor_t
 `--lambda_depth_log_bias`（惩罚 log 域的**偏移**而非逐像素误差）。
 架构不变，但旧 checkpoint 与新目标不可比 → **从 0 重训**
 （`train_tokenizer_ppu_dlc.sh`，Stage-A 100k + Stage-B 40k）。
-训练时盯 `gs_scale_sim_ratio`，它是被审计量的 `exp()`，**必须收敛到 1.0**。
+训练时应盯 `gs_scale_sim_ratio`，它是被审计量的 `exp()`，目标是收敛到 1.0。本机没有 v2 训练日志，
+所以该轨迹不可审计；独立 30-scene 复测得到 paired point `0.99985`、scene-bootstrap 95% CI
+`[0.99015,1.00753]`，通过预冻结 practical-equivalence gate。
 
 **与本计划的关系（这正是 Phase 1a/1b 拆分的回报）**：
 
 | | 受 tokenizer v2 影响吗 |
 |---|---|
 | gauge GT 表（Phase 1a，teacher 空间） | **完全不受影响，不需要重算** |
-| `c_depth` / `c_gs`（Phase 1b） | 需要对 v2 重新标定。若 v2 成功，两个常数应 ≈ 1，代码路径退化成 no-op |
+| `c_depth` / `c_gs`（Phase 1b） | v2 已重新标定并通过 selection：metric/render depth 均 identity，`c_gs=1.0`，代码路径退化成严格 no-op |
 | 相机 / placement / atlas（Phase 3/7/8） | 不受影响 |
 
 **因此 Phase 1b 的角色变了**：它从「修复手段」变成 **(a) v2 未完全收敛时的兜底，(b) 对任何
 已部署 tokenizer 的常设审计**。标定机器仍然要建 —— 它正是**验证 v2 是否真的成功**的那把尺子。
-计划中「加载时断言 tokenizer SHA-256 匹配」的要求现在**更重要**，因为 v1/v2 两个 checkpoint 会同时存在。
+计划中「加载时断言 tokenizer SHA-256 匹配」的要求现在是 clean-cut 门：只允许冻结的 v2 SHA，
+而不是为 v1/v2 双版本共存提供兼容性。
 
-**当前执行顺序已冻结**：Phase 1–8 使用 v1 production artifact 连续完成，**不等待 v2**。
-v2 重训可并行；checkpoint 落地后，把它视为一次新的、哈希隔离的标定对象，重跑 D4/Phase 1b
-LiDAR gate 与 paired `GS/depth` 审计。只有新 gate 通过后才生成
-`pullback_{v2_sha8}.json` 并替换 Scene Flow 的 provenance；v1 文件与旧 Scene Flow checkpoint
-不得被就地改写。
+**执行顺序更新**：v4 曾冻结「Phase 1–8 使用 v1 production artifact 连续完成、不等待 v2」作为过渡策略，
+该历史决定仍有效且不改写。现在 v2 已作为新的哈希隔离对象完成 D4/Phase 1b LiDAR gate 与 paired
+`GS/depth` 审计，并生成 `data/scene_gauge/pullback_d63b34f7.json`；新的 Scene Flow
+训练/推理 provenance 只使用 v2 artifact。v1 文件不就地改写、只作审计归档，所有 v1 tokenizer、
+pullback 和旧 Scene Flow checkpoint 都由生产入口 fail-closed 拒绝。
 
 ---
 
 ## 兼容性（干净切断）
 
-升版本号即可，现有 `validate_scene_flow_checkpoint_config`（`train_scene_flow_pretrain.py:492-560`）
+采用 **v2-only clean cut**。升版本号后，现有 `validate_scene_flow_checkpoint_config`（`train_scene_flow_pretrain.py:492-560`）
 会对旧 checkpoint 明确报错：`camera_generation_representation` 门（`:509`）、
 `metric_gauge_provenance` 块、必需 state-dict key 集合（需含 gauge 的 key）。旧的
 `camera_dggt_provenance` 不作兼容 fallback。
@@ -808,7 +958,8 @@ LiDAR gate 与 paired `GS/depth` 审计。只有新 gate 通过后才生成
 - `save_checkpoint`（`:1297-1356`）的 provenance 块加 **gauge 表哈希 + tokenizer SHA-256 + `pullback_*.json` 哈希**
 - **新增强制校验**：加载 `pullback_*.json` 时断言其 `tokenizer_sha256` 等于
   `--tokenizer_ckpt_path`（`:6169`、`:6800`，经 `load_scene_tokenizer_state_dict_strict` 于 `:289-297` 加载）
-  的实际哈希，且 `window_len` 等于当前窗口长度。**换 tokenizer 却沿用旧标定是最危险的静默失效模式。**
+  的实际哈希，且 `window_len` 等于当前窗口长度；此外 schema/generation 必须是 v2，SHA 必须是
+  `d63b34f7...`。v1 schema、`t0_v1`、`75e566ef...` 与旧 artifact path 无条件拒绝，不能 fallback。
 - feature stats 文件必须重算（相机降维+米制、gauge 新增、placement 重参数化）。
   **`target_bbox_patch` 的分布不变**（它保持 Waymo K），但它所在的 placement 向量整体重排，所以仍在重算范围内
 
@@ -824,27 +975,27 @@ LiDAR gate 与 paired `GS/depth` 审计。只有新 gate 通过后才生成
 
 | 文件 | 改动 |
 |---|---|
-| `dggt/utils/scene_gauge.py` | **新增** —— 常量、归一化、米制↔DGGT 换算、`gauge_to_pose_enc_fov`、**`apply_pullback_calibration`（唯一实现）** |
+| `dggt/utils/scene_gauge.py` | **新增** —— 常量、归一化、米制↔DGGT 换算、`gauge_to_pose_enc_fov`、**`apply_pullback_calibration`（唯一实现）**；runtime 只接受 v2 production schema，identity 为精确 no-op，v1 直接拒绝 |
 | `tools/compute_dggt_scene_gauge.py` | **新增** —— teacher 空间离线 GT 表 |
-| `tools/calibrate_tokenizer_pullback.py` | **新增** —— 审计记录 + 哈希绑定；`c_depth` 改用 **LiDAR** 判据（不是 PSNR），`c_gs` 恒为 1.0 |
-| `tools/freeze_tokenizer_pullback.py` | **新增** —— 将通过 gate 的证据冻结成严格 production artifact；v1 正式产物是 `data/scene_gauge/pullback_75e566ef.json` |
+| `tools/calibrate_tokenizer_pullback.py` | **新增** —— v2 支持 calibration split 选出的 identity/constant/loglinear；selection 只比较 identity 与冻结候选；输出 `candidate_v2` 且不可训练加载 |
+| `tools/freeze_tokenizer_pullback.py` | **新增** —— 只将通过 gate 的 v2 证据冻结成严格 production artifact；v1 文件仅作外部历史证据，不保留 v1 production 生成/授权分支 |
 | `lyy_tools/verify_fov_consistency.py` | ✅ **D3 已完成**（相机换算 arm） |
-| `tools/retest_scene_flow_gaussian_gauge.py` | ✅ **D4 已完成**（深度分层 + 标定/选择划分）；后续用于复测 tokenizer v2 |
-| `train_tokenizer.py` + `train_tokenizer_ppu_dlc.sh` | ✅ 三项新损失已实现，**待重训**（附录 A）—— `c_gs` 被拒后这是修复 0.796 的唯一出路 |
+| `tools/retest_scene_flow_gaussian_gauge.py` | ✅ 正式数值来自已归档的 2.3.0 运行；当前 2.4.0 工具保留 scene-only practical-equivalence CI，并已删除 render/PSNR/`c_gs` 扫描实现 |
+| `train_tokenizer.py` + `train_tokenizer_ppu_dlc.sh` | v2 step-100000 已用三项新损失训练并通过独立 gate；本轮不把额外 trainer/延训改动纳入 Phase 1b 交付，训练日志仍不可得 |
 | `dggt/losses/rgb_render_loss.py` | `render_pose_enc_dggt` **改用 teacher 位姿**（D3）；`_decode_geometry` 的 pullback 在 render 路径**恒为 identity**；删除失效的 `rgb_render_camera_grad_scale` CLI，底层兼容参数只接受 `0.0`，非零 fail-fast |
 | `dggt/utils/camera_generation.py` | 11→9 维、米制、删 FOV、推翻旧不变量 |
 | `dggt/utils/camera_condition.py` | 去 `translation_scale=10`，与生成共用统计 |
 | `dggt/models/scene_flow.py` | gauge 流 + RoPE + 序列偏移 + `cond` 耦合 + buffer |
 | `train_scene_flow_pretrain.py` | 目标构造、gauge 损失、两个采样器、sky atlas 内参、provenance 校验 |
 | `inference_scene_flow_pretrain.py` | gauge 解码、pullback、米制换算、`--export_units` |
-| `inference_scene_flow.py` | compat 字段；formal train/inference 的 decoder/render 始终显式走 `boundary="render"`（v1 identity），只有米制导出或米制断言走 `boundary="metric"` |
+| `inference_scene_flow.py` | compat 字段；formal train/inference 的 decoder/render 始终显式走 v2 `boundary="render"`，只有米制导出或米制断言走 v2 `boundary="metric"`；v1 provenance 拒绝 |
 | `dggt/utils/factorized_asset_condition.py` | placement v3（沿用 v2 的 12→16 布局，修复 z-depth stats 坐标系并将 motion ratio 有界化）。**`target_bbox_patch` / `in_frustum` 的 K 不动**（保持 Waymo，见 Phase 7） |
 | `dggt/utils/feature_stats.py` / `tools/compute_pretrain_feature_stats.py` | gauge 统计、相机统计重算、passthrough 索引 |
 | `datasets/dataset.py` | `scene_gauge_path` 查表输出 |
 
 ### 2026-08-02 当前实现/验证状态
 
-- v1 production pullback、scope-aware shared helper、严格 checkpoint/hash/window/grid loader，以及
+- **历史快照（已由 2026-08-05 clean cut 取代）**：当时 v1 production pullback、scope-aware shared helper、严格 checkpoint/hash/window/grid loader，以及
   dataset gauge 查表和 factorized-v3 placement 已进入当前实现。最新全套回归在 `conda dggt`、
   `CUDA_VISIBLE_DEVICES=0` 下为 **732 passed, 1 skipped**；另有 clean-cut 与定向 CUDA 审计通过。
 - 相机 condition 的 9:18 通道现在由同一个 role-aware helper 在 raw pretrain、formal T1、formal offline
@@ -870,6 +1021,11 @@ LiDAR gate 与 paired `GS/depth` 审计。只有新 gate 通过后才生成
   `f5177c9262c878c1595c0f0e41ebd9cf42680de3676f0fccb789ed3cbc7a9111`，sidecar SHA-256 为
   `e0767b8bb3b86116f3748144b7c306d73ba6229a5568d47eb18a62cdf5d40539`；source contract 明确绑定
   sequence 10、DGGT context 29、grid 25×37、tokenizer/DGGT/training-gauge 三个 SHA，且 `max_batches=null`。
+- tokenizer v2 已在同一 4787-trunk scope 从头重算 v5 stats，发布为
+  `logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt`：44,279,750/44,279,750 latent、
+  `stats_status=complete`、`exact_scene_gauge_scope=true`、`latent_stats_path=null`；不复用上述
+  tokenizer v1 latent moments。camera anchor/delta counts 为 `[2418,45452]`，gauge counts 为
+  `[4216,4787,4787]`，placement count 为 172183。
 - CUDA 0 米制导出 smoke 已重跑通过：camera round-trip max-abs=0、render pullback identity、
   depth factor 范围 `[0.694053,1.051988]`、means/scales 同比 2.0、静态 cycle EPE=0（support 0.8125）。
 - 生成相机/静态几何的诊断正式名称为
@@ -891,6 +1047,72 @@ LiDAR gate 与 paired `GS/depth` 审计。只有新 gate 通过后才生成
   `4daae958f043721f47a8e89c94cb5fe3a3b3e7ea7cfaf8586915c6e5ee85d9a6`。完整回归为
   **732 passed, 1 skipped**。
 
+### 2026-08-05 tokenizer v2 / Phase 1b 最终状态
+
+- checkpoint 预检、CPU synthetic、CUDA 0 真实 10 帧 encode/decode + FP32 heads/render smoke、正式
+  30-scene/90-trunk Gaussian audit 与 10-scene/30-trunk LiDAR selection 均已执行；v2 选择方案 A。
+  生产默认已切换到 `data/scene_gauge/pullback_d63b34f7.json` 并实施 v2-only clean cut；v1 artifact
+  和旧结论不覆盖但只作审计记录，不能进入任何训练/推理 runtime。
+- 上述正式 audit/LiDAR 运行发生在 v2-only 工具清理之前；清理后按用户决定不重跑正式结果链。
+  当前合并定向回归为 **218 passed**，另有 CPU synthetic 与 CUDA 单 trunk 路径检查通过；严格 loader
+  会从 per-scene rows 重算 primary Gaussian/LiDAR bootstrap CI，并拒绝手工构造的 v1 calibration；这些验证
+  不能登记为新的正式 audit provenance。当前 2.4 freeze 工具会拒绝归档的 2.3/2.1 输入，因此
+  production artifact 是对既有正式证据的合同字段迁移，不是由当前工具链重新生成的产物。
+- 环境固定为 repo `/home/dancer/code/dm/dggt`、branch `dev`、conda `dggt`、
+  `CUDA_VISIBLE_DEVICES=0`，Python 内使用 `cuda:0`。下面是既有正式结果绑定的历史命令；其中
+  `--skip-d4-render-scan` 只属于当时的 2.3.0 脚本，当前 2.4.0 parser 已删除该参数：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n dggt python -u \
+  tools/retest_scene_flow_metric_gauge.py \
+  --scenes 300-329 --trunks 0,1,2 --device cuda:0 --precision bf16 --depth-chunk 4 \
+  --checkpoint /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+  --tokenizer-checkpoint logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt \
+  --roundtrip-window-starts 0,5,10,14,19 --roundtrip-window-length 10 \
+  --bootstrap-repetitions 10000 \
+  --output-json runs/metric_gauge_retest/v2_metric_reference_300_329_trunks012_d63b34f7.json
+
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n dggt python -u \
+  tools/retest_scene_flow_gaussian_gauge.py \
+  --scenes 300-329 --trunks 0,1,2 --device cuda:0 --precision bf16 --depth-chunk 4 \
+  --checkpoint /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+  --tokenizer-checkpoint logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt \
+  --result-json runs/metric_gauge_retest/v2_metric_reference_300_329_trunks012_d63b34f7.json \
+  --skip-d4-render-scan --d4-form-bootstrap-samples 10000 \
+  --paired-equivalence-bootstrap-samples 10000 \
+  --output runs/metric_gauge_retest/v2_gaussian_gauge_300_329_trunks012_d63b34f7.json
+
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n dggt python -u \
+  tools/calibrate_tokenizer_pullback.py \
+  --device cuda:0 --precision bf16 --scenes 320-329 --trunks 0 1 2 \
+  --bootstrap-samples 10000 \
+  --checkpoint /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+  --tokenizer-checkpoint logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt \
+  --reference-json runs/metric_gauge_retest/v2_metric_reference_300_329_trunks012_d63b34f7.json \
+  --d4-json runs/metric_gauge_retest/v2_gaussian_gauge_300_329_trunks012_d63b34f7.json \
+  --output runs/metric_gauge_retest/v2_tokenizer_lidar_metric_gate_320_329_d63b34f7.json
+
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n dggt python \
+  tools/freeze_tokenizer_pullback.py --authorize-v2-production \
+  --diagnostic-json runs/metric_gauge_retest/v2_tokenizer_lidar_metric_gate_320_329_d63b34f7.json \
+  --gaussian-audit-json runs/metric_gauge_retest/v2_gaussian_gauge_300_329_trunks012_d63b34f7.json \
+  --reconstruction-smoke-json runs/tokenizer_v2_cuda0_render_smoke_300_d63b34f7/smoke.json \
+  --reconstruction-smoke-selection-manifest runs/tokenizer_v2_fixed_selection_300.json \
+  --reconstruction-smoke-visual runs/tokenizer_v2_cuda0_render_smoke_300_d63b34f7/visuals/step_100000_frames_10/00_training_300.jpg \
+  --reference-json runs/metric_gauge_retest/v2_metric_reference_300_329_trunks012_d63b34f7.json \
+  --tokenizer-checkpoint logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt \
+  --dggt-checkpoint /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
+  --output data/scene_gauge/pullback_d63b34f7.json
+```
+
+render smoke 的实际启动环境是
+`CUDA_VISIBLE_DEVICES=0 TORCH_HOME=/home/dancer/.cache/torch PYTHONPATH=/home/dancer/code/dm/dggt`
+加 `conda run --no-capture-output -n dggt python -u /dev/stdin`；内联程序调用
+`tools/evaluate_tokenizer_v2_ppu.py` 的同一 runtime，固定
+`training_300` / dataset index 151 / frames `[93,95,96,97,98,99,101,103,106,107]`，并写出上面
+已哈希的 selection manifest、smoke JSON 与 visual。它不是新增的可复用 CLI；正式输入选择和输出已由
+production freeze 作 content-hash 校验。
+
 ---
 
 ## Verification
@@ -904,12 +1126,17 @@ trunk `[0,3)` 的可靠 `s_cam` 相邻对（至少 20 对），复现 mean 8–1
 
 **标定文件（D4 + v1 LiDAR gate 实跑）**：
 - `c_gs`：**已判定 identity**，不再有 render 判据可用（PSNR 单调，见 Phase 0）。
-  取而代之的验收是 **tokenizer v2 训练日志里的 `gs_scale_sim_ratio` 必须收敛到 1.0**。
+  v1 的替代验收被定义为 tokenizer v2 的 `gs_scale_sim_ratio`/独立 paired gate；训练日志缺失，
+  但 v2 正式 paired gate 已用独立 CUDA 审计通过。
 - `c_depth`：v1 在 selection split 的主口径为 `7.567%→6.901%`，scene Δ bootstrap
   CI `[0.052%,1.225%]`，故 metric boundary 选择 loglinear；render 仍 identity。
   v1 的**原始诊断 JSON**不可训练加载；冻结后的
-  `data/scene_gauge/pullback_75e566ef.json` 是当前正式、`eligible_for_training=true` 的加载对象。
-  v2 必须重拟合并重跑同一 gate，且结果允许替换 v1 方案。
+  `data/scene_gauge/pullback_75e566ef.json` 曾是 v1 历史正式、`eligible_for_training=true` 的加载对象；
+  v5 production loader 无条件拒绝它，该字段只作为历史 payload 保留。
+- **v2 最终验收**：paired point/scene-bootstrap CI 为 `0.99985/[0.99015,1.00753]`，通过
+  `[0.95,1.05]` 等价 gate；calibration loglinear `a=-0.0280076,b=-0.0438381` 在 LiDAR selection
+  上得到 identity/candidate AbsRel `7.762%/8.507%`，delta CI `[−1.553%,+0.113%]`，故选择
+  identity。production 加载对象切换为 `data/scene_gauge/pullback_d63b34f7.json`（方案 A）。
 
 **单元测试**：
 
@@ -924,18 +1151,21 @@ trunk `[0,3)` 的可靠 `s_cam` 相邻对（至少 20 对），复现 mean 8–1
 - **`tests/test_gauge_similarity_invariance.py`（新，最重要的一个）** —— 分两层冻结语义：
   (a) pullback 前或 identity profile（`a=b=0`）把 `log_metric_scale` 加 `δ`，`means` 与 `scales`
   必须精确同乘 `exp(δ)`，`rotation` / `color` / `opacity` 逐元素不变；这是相似变换定义，也是
-  「导出米制时忘了缩放高斯 scale」的直接捕手；(b) v1 production loglinear profile 在非 clamp
-  区间必须复现 `exp((1+b)δ)`，且 means/scales 仍使用同一个 combined factor、非几何属性仍不变。
-  不能用 (a) 的 identity fixture 冒充 production profile 的数值响应。
+  「导出米制时忘了缩放高斯 scale」的直接捕手；(b) production fixture 必须绑定 v2 identity artifact，
+  并另测 v1 schema/profile 直接拒绝。旧 v1 loglinear 的数学响应只留在历史文档，不留 runtime 测试分支。
 - **`tests/test_metric_box_anisotropy.py`（新）** —— (a) `metric_box_to_dggt` 在 `FOV_dggt == FOV_waymo`
   时退化成纯标量 `1/s`；(b) 用实测 FOV 时横向压缩比落在 `[0.74, 0.78]`；
   (c) **回归护栏**：断言 `datasets/dataset.py` 的 box 投影用的仍是 Waymo K 而非 gauge K
   —— 上一版计划曾要求改掉它，这个测试防止那个错误被重新引入。
-- `tests/test_pullback_calibration.py`（新）—— tokenizer 哈希不匹配必须抛错；
-  `window_len` 不匹配必须抛错；训练、render、metric export 都调用 `scene_gauge.py` 中唯一的
-  correction-factor 核心，但调用方必须显式选择 `render` / `metric` boundary，不能把两者混为同一操作。
-- `tests/test_calibrate_tokenizer_pullback.py`（已完成，14 tests）—— 公式方向、严格 LiDAR
-  support、29 帧全局索引、分层聚合、scene bootstrap、冻结 split/系数及 v1 禁止冒充生产产物。
+- `tests/test_pullback_calibration.py` / `tests/test_freeze_tokenizer_pullback_v2.py` —— v2-only schema
+  与 v1 rejection、tokenizer/result/hash/window/grid mismatch fail-closed、identity/constant/loglinear candidate、显式
+  render/metric boundary、identity 精确 no-op，以及只有完整通过 Gaussian/LiDAR/render smoke gate 的
+  v2 candidate 才可 promotion 为 `eligible_for_training=true`。
+- `tests/test_calibrate_tokenizer_pullback.py` —— 公式方向、严格 LiDAR support、29 帧全局索引、
+  分层聚合、scene bootstrap、冻结 calibration/selection split、identity/constant/loglinear、哈希/window/
+  boundary/eligibility contract；candidate 结果禁止直接冒充 production artifact。
+- `tests/test_tokenizer_v2_losses.py` —— 三项新增 loss 的 finite/gradient、有效与空 support、混合 batch、
+  gradient-accum cache 聚合；空 support 必须报告 NaN + zero count，不能伪装成 ratio=1 或污染 raw 日志。
 - `tests/test_sliding_window_v2.py` —— 扩展到 gauge：覆盖 29 帧、window=10、stride=7、`x/v`
   prediction、CFG 1/2.5 与完整 modality namespace，验证 direct 与滑窗两份平行生成实现遵守同一契约。
 - `tests/test_inference_scene_flow_pretrain.py` —— 米制导出与单位标注测试。
@@ -971,9 +1201,9 @@ trunk `[0,3)` 的可靠 `s_cam` 相邻对（至少 20 对），复现 mean 8–1
 6. **~~渲染质量验收：施加 `c_depth`/`c_gs` 前后的 PSNR 对比~~ —— 此项已作废**（D4 证明 PSNR
    对尺寸类常数单调、无内点极值，扫到语义上界 2.5 仍在涨）。替代验收见上方「标定文件」两条。
    保留这行只为记录：**不要再用 PSNR 去定尺寸类常数。**
-7. **硬伤 5 后半段（高斯偏小 20%）在本计划内不会被修复。**
-   它的验收转移到 tokenizer v2：训练日志的 `gs_scale_sim_ratio` 收敛到 1.0，
-   再用 `tools/retest_scene_flow_gaussian_gauge.py` 对 v2 checkpoint 复测配对比值。
+7. **硬伤 5 后半段的 v1 结论保留，但 v2 根治 gate 已通过。** v1 paired ratio 仍是 0.796；
+   v2 正式复测为 `0.99985`、scene-bootstrap 95% CI `[0.99015,1.00753]`，整段位于
+   `[0.95,1.05]`。该结论只适用于预注册 support/estimator，不扩张成 Gaussian 绝对协方差标定。
 8. **generated static-geometry reprojection/cycle diagnostic（D3 的连带项）**：从生成的
    `depth_t` 用生成相机运动重投影到 `t+1`，在落点采样生成的 `depth_{t+1}`，再反投影回 `t`，
    报 flow-cycle EPE 与 z-depth log residual；显式排除 sky、dynamic、出视锥与遮挡 support。
@@ -990,7 +1220,7 @@ trunk `[0,3)` 的可靠 `s_cam` 相邻对（至少 20 对），复现 mean 8–1
 |---|---|---|
 | Context | 冻结 teacher 定义的 latent 世界带一个**逐 clip 不可观测的规范自由度**，它污染了所有混用米制与 latent 的下游量 | 1 单位 = 25–64 m，相邻 trunk 漂移 mean 8.2% / max 30.8%，camera 与 lidar 同向（41/44） |
 | 1a | 该自由度可以用一把独立的物理尺子（LiDAR）离线标定到 29 帧片段级 | 90/90 有效；逐帧 robust CV 0.688%；相机尺交叉验证 `0.99995 ± 0.026`，corr 0.993 |
-| 1b | **冻结解码器的 pullback 必须按作用域审计**：有 LiDAR 物理尺的 depth 可校正米制边界；没有独立尺寸尺的 GS 不能靠病态 PSNR 扫描救回 | v1 metric AbsRel `7.567%→6.901%`；但 GS/depth **0.796** 仍在，必须由 tokenizer v2 从源头修复 |
+| 1b | **冻结解码器的 pullback 必须按作用域、checkpoint 与独立物理尺审计**：GS 的相似性先从 tokenizer 目标修复，depth 候选再由 LiDAR selection 决定是否部署 | v1 metric `7.567%→6.901%` 但 GS/depth **0.796**；v2 paired **0.99985**、CI `[0.99015,1.00753]`，而 loglinear 使 LiDAR `7.762%→8.507%`，故方案 A（render/metric identity、`c_gs=1`） |
 | 2 | 把规范量做成**显式生成的 scene-global 变量**，与几何双向耦合；并检验它是否真能从图像内容推断 | `gauge_vs_prior_gain` 是可证伪的判据 |
 | 2/8 | teacher 的内参**不是要修的 bug，而是 gauge 的一部分** —— 我们用 leave-one-frame-out 渲染证明 teacher 自己的 K 比真实标定更好地解释它的几何 | **+0.472 dB，CI [+0.253, +0.741]**；trunk-mean K 相对 native 仅 −0.108 dB，通过 −0.2 dB 非劣界 |
 | 3 | gauge 一旦显式，其余每个量都能搬回它**天然的确定性空间**：相机 → 米制 Waymo | 目标从「乘一个 CV 23.5% 的随机数」变成恒等映射 |
@@ -998,5 +1228,6 @@ trunk `[0,3)` 的可靠 `s_cam` 相邻对（至少 20 对），复现 mean 8–1
 | 5 | 主动写出 limitation：长序列生成的全局尺度比 teacher 更自洽，但**不存在一致的 GT 可供评测** | 跨 trunk 漂移 8–31%，且 lidar 同步漂移 |
 
 这条线最耐审的地方在于：**每一步都由一个可复现的实测判据驱动，且每个判据都自带证伪条件**
-（D1 的非劣界、D4 的 renderer 病态拒绝、Phase 1b 的 LiDAR CI gate、Phase 4 的 prior baseline）。
+（D1 的非劣界、D4 的 renderer 病态拒绝、Phase 1b 的 paired-equivalence + LiDAR 双 gate、
+Phase 4 的 prior baseline）。
 Reviewer 换掉任何 baseline，这些数字都还在。

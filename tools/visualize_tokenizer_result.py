@@ -1,7 +1,7 @@
 """
 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u tools/visualize_tokenizer_result.py \
     --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
-    --tokenizer_ckpt_path /data/disk2/lyy_dataset/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt \
+    --tokenizer_ckpt_path /home/dancer/code/dm/dggt/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt \
     --processed_root /data/disk2/lyy_dataset/waymo_processed_dggt \
     --split validation \
     --start 0 \
@@ -46,7 +46,7 @@ from dggt.utils.tokens import (
 from train_tokenizer import render_scene_from_outputs
 
 
-TOKENIZER_CKPT_PATH = "/data/disk2/lyy_dataset/logs/tokenizer_t0_stageB/ckpt/scene_tokenizer_step_040000.pt"
+TOKENIZER_CKPT_PATH = "/home/dancer/code/dm/dggt/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt"
 DGGT_CKPT_PATH = "/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt"
 PROCESSED_ROOT = "/data/disk2/lyy_dataset/waymo_processed_dggt"
 TRANSFER_ROOT = "/data/disk2/lyy_dataset/waymo_transfer"

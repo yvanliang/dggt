@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import nullcontext
 import json
 import math
@@ -70,7 +71,7 @@ Root causes, both in this file:
      `--lambda_gs_scale_sim` paired same-pixel term.
 
 Watch `gs_scale_sim_ratio` in the logs: it is exp() of the audited quantity and must
-converge to 1.0.  Set `--lambda_gs_scale_sim 0` to reproduce the legacy objective.
+converge to 1.0.  The v2 objective requires all three geometry losses to stay active.
 
 Launch scripts: `train_tokenizer_two_nodes.sh` (GPU, SSH-orchestrated) and
 `train_tokenizer_ppu_dlc.sh` (Aliyun PAI-DLC).  Both derive batch/accum from the GPU
@@ -83,7 +84,7 @@ NCCL_P2P_DISABLE=1 torchrun \
     --master_port=29501 \
     train_tokenizer.py \
     --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
-    --log_dir logs/tokenizer_t0_stageA \
+    --log_dir logs/tokenizer_t0_v2_stageA \
     --processed_root /data/disk2/lyy_dataset/waymo_processed_dggt \
     --transfer_root /data/disk2/lyy_dataset/waymo_transfer \
     --raw_root /data/disk2/lyy_dataset/waymo \
@@ -129,7 +130,7 @@ NCCL_P2P_DISABLE=1 torchrun \
     --seed 0 \
     --wandb \
     --wandb_project dggt-tokenizer \
-    --wandb_name t0_stageA_dz1024_2x80g
+    --wandb_name t0_v2_stageA_dz1024_2x80g
 
 Stage-B (flow-cache fine-tuning, 2 x 80GB):
 
@@ -137,11 +138,11 @@ NCCL_P2P_DISABLE=1 torchrun \
     --nproc_per_node=2 \
     --master_port=29501 \
     train_tokenizer.py \
-    --init_tokenizer_path logs/tokenizer_t0_stageA/ckpt/scene_tokenizer_step_060000.pt \
+    --init_tokenizer_path logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt \
     --ckpt_path /data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt \
     --cache_manifest_path /data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/training/training_manifest.jsonl \
     --cache_split training \
-    --log_dir logs/tokenizer_t0_stageB \
+    --log_dir logs/tokenizer_t0_v2_stageB \
     --stage_b_mix_raw \
     --min_frames 10 \
     --max_frames 10 \
@@ -183,12 +184,20 @@ NCCL_P2P_DISABLE=1 torchrun \
     --seed 0 \
     --wandb \
     --wandb_project dggt-tokenizer \
-    --wandb_name t0_stageB_cached_dz1024
+    --wandb_name t0_v2_stageB_cached_dz1024
 
 For efficient cached training, recompress existing gzip flow caches to zstd
 with tools/recompress_flow_cache.py and write new caches with
 tools/precompute_flow_features.py --save_compression zstd --gzip_level 1.
 '''
+
+
+TOKENIZER_OBJECTIVE_VERSION = "t0_v2"
+TOKENIZER_V2_REQUIRED_LOSS_WEIGHTS = (
+    "lambda_head_anchor",
+    "lambda_gs_scale_sim",
+    "lambda_depth_log_bias",
+)
 
 
 def alpha_t(
@@ -352,8 +361,8 @@ def build_argparser() -> argparse.ArgumentParser:
         default=0.3,
         help=(
             "Paired same-pixel constraint that encode/decode be a similarity: "
-            "log(scale_s/scale_t) - log(depth_s/depth_t) -> 0. Set 0 to disable "
-            "(reproduces the legacy objective, whose paired ratio measured 0.796)."
+            "log(scale_s/scale_t) - log(depth_s/depth_t) -> 0. This v2 loss "
+            "must have a strictly positive weight."
         ),
     )
     parser.add_argument(
@@ -363,7 +372,7 @@ def build_argparser() -> argparse.ArgumentParser:
         help=(
             "Penalize the systematic multiplicative depth offset "
             "|mean(log(d_student/d_teacher))|. Audited at 1.0307 on the shipped "
-            "checkpoint. Set 0 to disable."
+            "checkpoint. This v2 loss must have a strictly positive weight."
         ),
     )
     parser.add_argument(
@@ -406,6 +415,55 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16"])
     return parser
+
+
+def validate_tokenizer_v2_objective_args(args: argparse.Namespace) -> None:
+    """Reject configurations that disable any required v2 geometry objective."""
+
+    for field in TOKENIZER_V2_REQUIRED_LOSS_WEIGHTS:
+        value = float(getattr(args, field))
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"{field} must be finite and strictly positive for "
+                f"{TOKENIZER_OBJECTIVE_VERSION}, got {value!r}"
+            )
+
+
+def require_tokenizer_v2_checkpoint(payload: Any, *, path: str) -> str:
+    """Require explicit v2 metadata or the audited pre-metadata v2 loss signature."""
+
+    if not isinstance(payload, Mapping):
+        raise ValueError(
+            f"{path} has no tokenizer objective metadata; unversioned weight-only "
+            "checkpoints are rejected"
+        )
+    version = payload.get("tokenizer_objective_version")
+    if version is not None and version != TOKENIZER_OBJECTIVE_VERSION:
+        raise ValueError(
+            f"{path} tokenizer_objective_version={version!r}; only "
+            f"{TOKENIZER_OBJECTIVE_VERSION!r} is supported"
+        )
+    saved_args = payload.get("args")
+    if not isinstance(saved_args, Mapping):
+        raise ValueError(
+            f"{path} lacks saved v2 objective arguments; tokenizer v1 and ambiguous "
+            "checkpoints are rejected"
+        )
+    for field in TOKENIZER_V2_REQUIRED_LOSS_WEIGHTS:
+        try:
+            value = float(saved_args[field])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"{path} lacks a valid v2 objective field {field}") from error
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f"{path} has {field}={value!r}; tokenizer v1 or a disabled-v2 "
+                "objective is rejected"
+            )
+    return (
+        TOKENIZER_OBJECTIVE_VERSION
+        if version is not None
+        else "t0_v2_inferred_from_positive_geometry_loss_weights"
+    )
 
 
 def get_default_processed_root() -> str:
@@ -870,6 +928,49 @@ def reduce_masked_per_sample(values: torch.Tensor, mask: torch.Tensor, eps: floa
     return (values * mask).sum(dim=1) / denom
 
 
+def _masked_sample_diagnostics(
+    values: torch.Tensor,
+    support: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Reduce supported values per sample and expose support coverage.
+
+    Empty samples remain in the returned tensors so callers can preserve the
+    computation graph, but ``valid_samples`` makes it explicit that they must
+    not participate in a batch mean.
+    """
+    if values.shape != support.shape:
+        raise ValueError(
+            f"values and support must share shape, got {tuple(values.shape)} and {tuple(support.shape)}"
+        )
+    values_flat = values.reshape(values.shape[0], -1)
+    support_flat = support.reshape(support.shape[0], -1)
+    support_per_sample = support_flat.sum(dim=1)
+    valid_samples = support_per_sample > 0
+    per_sample = (values_flat * support_flat.to(values.dtype)).sum(dim=1)
+    per_sample = per_sample / support_per_sample.clamp_min(1).to(values.dtype)
+    diagnostics = {
+        "support_count": support_per_sample.sum().detach(),
+        "support_total_count": support_per_sample.new_tensor(support.numel()).detach(),
+        "support_fraction": support_flat.float().mean().detach(),
+        "valid_sample_count": valid_samples.sum().detach(),
+        "sample_count": support_per_sample.new_tensor(support.shape[0]).detach(),
+        "valid_sample_fraction": valid_samples.float().mean().detach(),
+    }
+    return per_sample, valid_samples, diagnostics
+
+
+def _mean_over_valid_samples(
+    per_sample: torch.Tensor,
+    valid_samples: torch.Tensor,
+    *,
+    differentiable_zero: torch.Tensor,
+) -> torch.Tensor:
+    """Average valid samples without letting empty samples dilute the batch."""
+    if bool(valid_samples.any()):
+        return per_sample[valid_samples].mean()
+    return differentiable_zero.sum() * 0.0
+
+
 def dynamic_patch_weight(
     dynamic_mask: torch.Tensor,
     patch_grid: tuple[int, int],
@@ -1019,7 +1120,7 @@ def gaussian_scale_depth_similarity_loss(
     opacity_threshold: float = 0.05,
     scale_floor: float = 1e-5,
     depth_floor: float = 1e-3,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Paired same-pixel constraint that the encode/decode round trip be a similarity.
 
     If the round trip only rescaled the world by a common factor ``a``, then at
@@ -1031,8 +1132,10 @@ def gaussian_scale_depth_similarity_loss(
     is normalized independently, and the render loss does not pin it either --
     a too-small splat with a raised opacity renders almost the same.
 
-    Returns ``(loss, mean_log_ratio)``; ``mean_log_ratio`` is the diagnostic
-    that should converge to 0 (it starts near ``log(0.796) = -0.228``).
+    Returns ``(loss, diagnostics)``. ``diagnostics["mean_log_ratio"]`` should
+    converge to 0 (it starts near ``log(0.796) = -0.228``); it is NaN when the
+    whole batch has empty support. Support and valid-sample coverage are also
+    returned so an empty or partially empty batch is visible in training logs.
     """
     scale_s = student_gs_map[..., 4:7].float().clamp_min(scale_floor)
     scale_t = teacher_gs_map[..., 4:7].float().clamp_min(scale_floor)
@@ -1069,10 +1172,22 @@ def gaussian_scale_depth_similarity_loss(
         support = support & (dynamic_mask[:, :, 0].float() < 0.5)
 
     residual = torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
-    loss = reduce_masked_per_sample(residual.abs(), support).mean()
+    per_sample_loss, valid_samples, diagnostics = _masked_sample_diagnostics(
+        residual.abs(), support
+    )
+    loss = _mean_over_valid_samples(
+        per_sample_loss,
+        valid_samples,
+        differentiable_zero=residual,
+    )
     with torch.no_grad():
-        mean_log_ratio = reduce_masked_per_sample(residual.detach(), support).mean()
-    return loss, mean_log_ratio
+        per_sample_ratio, _, _ = _masked_sample_diagnostics(residual.detach(), support)
+        if bool(valid_samples.any()):
+            mean_log_ratio = per_sample_ratio[valid_samples].mean()
+        else:
+            mean_log_ratio = residual.new_tensor(float("nan"))
+    diagnostics["mean_log_ratio"] = mean_log_ratio
+    return loss, diagnostics
 
 
 def depth_log_bias_loss(
@@ -1081,7 +1196,7 @@ def depth_log_bias_loss(
     *,
     sky_mask: torch.Tensor | None = None,
     depth_floor: float = 1e-3,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Penalize only the *systematic multiplicative* depth offset.
 
     The audit measured ``depth_recon / depth_direct = 1.0307`` (CI [1.0208,
@@ -1096,8 +1211,10 @@ def depth_log_bias_loss(
     *bias*, not the per-pixel error.  Per-pixel accuracy remains ``geom_anchor``'s
     job; the two do not fight.
 
-    Returns ``(loss, signed_log_bias)``; ``exp(signed_log_bias)`` is the audited
-    ratio and must converge to 1.0.
+    Returns ``(loss, diagnostics)``. ``diagnostics["signed_log_bias"]`` is the
+    audited log ratio and must converge to 0. It is NaN when the whole batch
+    has empty support; support and valid-sample coverage are returned alongside
+    it so empty samples cannot silently dilute either the loss or diagnostic.
     """
     depth_s = student_depth.float()
     depth_t = teacher_depth.float()
@@ -1113,8 +1230,21 @@ def depth_log_bias_loss(
         support = support & (sky_mask[:, :, 0].float() < 0.5)
 
     log_ratio = torch.nan_to_num(log_ratio, nan=0.0, posinf=0.0, neginf=0.0)
-    per_sample_bias = reduce_masked_per_sample(log_ratio, support)
-    return per_sample_bias.abs().mean(), per_sample_bias.detach().mean()
+    per_sample_bias, valid_samples, diagnostics = _masked_sample_diagnostics(
+        log_ratio, support
+    )
+    loss = _mean_over_valid_samples(
+        per_sample_bias.abs(),
+        valid_samples,
+        differentiable_zero=log_ratio,
+    )
+    with torch.no_grad():
+        if bool(valid_samples.any()):
+            signed_log_bias = per_sample_bias.detach()[valid_samples].mean()
+        else:
+            signed_log_bias = log_ratio.new_tensor(float("nan"))
+    diagnostics["signed_log_bias"] = signed_log_bias
+    return loss, diagnostics
 
 
 def masked_huber_loss(
@@ -2015,8 +2145,20 @@ def compute_losses(
     losses["dynamic_bce"] = student["z"].new_tensor(0.0)
     losses["gs_lifespan"] = zero
     losses["ghost_static"] = student["z"].new_tensor(0.0)
-    gs_scale_sim_log_ratio = 0.0
-    depth_log_bias_value = 0.0
+    gs_scale_sim_log_ratio = float("nan")
+    gs_scale_sim_support_count = 0.0
+    gs_scale_sim_support_total_count = 0.0
+    gs_scale_sim_support_fraction = 0.0
+    gs_scale_sim_valid_sample_count = 0.0
+    gs_scale_sim_sample_count = 0.0
+    gs_scale_sim_valid_sample_fraction = 0.0
+    depth_log_bias_value = float("nan")
+    depth_log_bias_support_count = 0.0
+    depth_log_bias_support_total_count = 0.0
+    depth_log_bias_support_fraction = 0.0
+    depth_log_bias_valid_sample_count = 0.0
+    depth_log_bias_sample_count = 0.0
+    depth_log_bias_valid_sample_fraction = 0.0
     if head_targets_valid:
         gs_anchor = gs_channel_group_huber_loss(
             student["gs_map"], teacher["gs_map"]
@@ -2044,7 +2186,7 @@ def compute_losses(
         losses["head_anchor"] = gs_anchor + geom_anchor + dyn_anchor
         # Always measured, even when the weight is 0, so an ablation run still
         # reports the audited ratio instead of a misleading 1.0.
-        gs_scale_sim, gs_scale_sim_ratio = gaussian_scale_depth_similarity_loss(
+        gs_scale_sim, gs_scale_sim_diagnostics = gaussian_scale_depth_similarity_loss(
             student["gs_map"],
             teacher["gs_map"],
             student["depth"],
@@ -2054,13 +2196,41 @@ def compute_losses(
             opacity_threshold=float(args.gs_scale_sim_opacity),
         )
         losses["gs_scale_sim"] = gs_scale_sim
-        gs_scale_sim_log_ratio = float(gs_scale_sim_ratio.detach().item())
+        gs_scale_sim_log_ratio = float(gs_scale_sim_diagnostics["mean_log_ratio"].item())
+        gs_scale_sim_support_count = float(gs_scale_sim_diagnostics["support_count"].item())
+        gs_scale_sim_support_total_count = float(
+            gs_scale_sim_diagnostics["support_total_count"].item()
+        )
+        gs_scale_sim_support_fraction = float(
+            gs_scale_sim_diagnostics["support_fraction"].item()
+        )
+        gs_scale_sim_valid_sample_count = float(
+            gs_scale_sim_diagnostics["valid_sample_count"].item()
+        )
+        gs_scale_sim_sample_count = float(gs_scale_sim_diagnostics["sample_count"].item())
+        gs_scale_sim_valid_sample_fraction = float(
+            gs_scale_sim_diagnostics["valid_sample_fraction"].item()
+        )
 
-        depth_bias, depth_bias_signed = depth_log_bias_loss(
+        depth_bias, depth_bias_diagnostics = depth_log_bias_loss(
             student["depth"], teacher["depth"], sky_mask=sky_mask
         )
         losses["depth_log_bias"] = depth_bias
-        depth_log_bias_value = float(depth_bias_signed.item())
+        depth_log_bias_value = float(depth_bias_diagnostics["signed_log_bias"].item())
+        depth_log_bias_support_count = float(depth_bias_diagnostics["support_count"].item())
+        depth_log_bias_support_total_count = float(
+            depth_bias_diagnostics["support_total_count"].item()
+        )
+        depth_log_bias_support_fraction = float(
+            depth_bias_diagnostics["support_fraction"].item()
+        )
+        depth_log_bias_valid_sample_count = float(
+            depth_bias_diagnostics["valid_sample_count"].item()
+        )
+        depth_log_bias_sample_count = float(depth_bias_diagnostics["sample_count"].item())
+        depth_log_bias_valid_sample_fraction = float(
+            depth_bias_diagnostics["valid_sample_fraction"].item()
+        )
         if dynamic_mask is not None:
             losses["dynamic_bce"] = dynamic_mask_bce_loss(student["dynamic_conf"], dynamic_mask)
         losses["gs_lifespan"] = compute_lifespan_loss(
@@ -2233,11 +2403,23 @@ def compute_losses(
         # checkpoint; exp() of it is the paired GS/depth ratio being audited.
         "gs_scale_sim_log_ratio": gs_scale_sim_log_ratio,
         "gs_scale_sim_ratio": float(math.exp(gs_scale_sim_log_ratio)),
+        "gs_scale_sim_support_count": gs_scale_sim_support_count,
+        "gs_scale_sim_support_total_count": gs_scale_sim_support_total_count,
+        "gs_scale_sim_support_fraction": gs_scale_sim_support_fraction,
+        "gs_scale_sim_valid_sample_count": gs_scale_sim_valid_sample_count,
+        "gs_scale_sim_sample_count": gs_scale_sim_sample_count,
+        "gs_scale_sim_valid_sample_fraction": gs_scale_sim_valid_sample_fraction,
         "gs_scale_sim_weight": float(gs_scale_sim_weight),
         "depth_log_bias": float(losses["depth_log_bias"].detach().item()),
         # exp() of this is the audited depth_recon/depth_direct ratio (was 1.0307).
         "depth_log_bias_signed": depth_log_bias_value,
         "depth_ratio": float(math.exp(depth_log_bias_value)),
+        "depth_log_bias_support_count": depth_log_bias_support_count,
+        "depth_log_bias_support_total_count": depth_log_bias_support_total_count,
+        "depth_log_bias_support_fraction": depth_log_bias_support_fraction,
+        "depth_log_bias_valid_sample_count": depth_log_bias_valid_sample_count,
+        "depth_log_bias_sample_count": depth_log_bias_sample_count,
+        "depth_log_bias_valid_sample_fraction": depth_log_bias_valid_sample_fraction,
         "dynamic_bce": float(losses["dynamic_bce"].detach().item()),
         "gs_lifespan": float(losses["gs_lifespan"].detach().item()),
         "ghost_static": float(losses["ghost_static"].detach().item()),
@@ -2267,6 +2449,80 @@ def compute_losses(
     return total, scalar_logs, aux
 
 
+_V2_LOSS_DIAGNOSTIC_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("gs_scale_sim", "gs_scale_sim_log_ratio", "gs_scale_sim_ratio"),
+    ("depth_log_bias", "depth_log_bias_signed", "depth_ratio"),
+)
+_V2_LOSS_DIAGNOSTIC_LOG_KEYS = frozenset(
+    key
+    for prefix, signed_key, ratio_key in _V2_LOSS_DIAGNOSTIC_SPECS
+    for key in (
+        signed_key,
+        ratio_key,
+        f"{prefix}_support_count",
+        f"{prefix}_support_total_count",
+        f"{prefix}_support_fraction",
+        f"{prefix}_valid_sample_count",
+        f"{prefix}_sample_count",
+        f"{prefix}_valid_sample_fraction",
+    )
+)
+
+
+def _accumulate_v2_loss_diagnostics(
+    totals: dict[str, float],
+    scalar_logs: dict[str, float],
+) -> None:
+    """Accumulate supported diagnostics without cache-row NaN pollution."""
+    for prefix, signed_key, _ratio_key in _V2_LOSS_DIAGNOSTIC_SPECS:
+        for suffix in (
+            "support_count",
+            "support_total_count",
+            "valid_sample_count",
+            "sample_count",
+        ):
+            key = f"{prefix}_{suffix}"
+            totals[key] = totals.get(key, 0.0) + float(scalar_logs[key])
+
+        valid_sample_count = float(scalar_logs[f"{prefix}_valid_sample_count"])
+        if valid_sample_count > 0.0:
+            weighted_key = f"{signed_key}_weighted_sum"
+            totals[weighted_key] = totals.get(weighted_key, 0.0) + (
+                float(scalar_logs[signed_key]) * valid_sample_count
+            )
+
+
+def _finalize_v2_loss_diagnostics(totals: dict[str, float]) -> dict[str, float]:
+    """Finalize exact-count fractions and valid-sample-weighted log ratios."""
+    result: dict[str, float] = {}
+    for prefix, signed_key, ratio_key in _V2_LOSS_DIAGNOSTIC_SPECS:
+        support_count = totals.get(f"{prefix}_support_count", 0.0)
+        support_total_count = totals.get(f"{prefix}_support_total_count", 0.0)
+        valid_sample_count = totals.get(f"{prefix}_valid_sample_count", 0.0)
+        sample_count = totals.get(f"{prefix}_sample_count", 0.0)
+        if valid_sample_count > 0.0:
+            signed_value = (
+                totals.get(f"{signed_key}_weighted_sum", float("nan"))
+                / valid_sample_count
+            )
+        else:
+            signed_value = float("nan")
+
+        result[signed_key] = signed_value
+        result[ratio_key] = float(math.exp(signed_value))
+        result[f"{prefix}_support_count"] = support_count
+        result[f"{prefix}_support_total_count"] = support_total_count
+        result[f"{prefix}_support_fraction"] = (
+            support_count / support_total_count if support_total_count > 0.0 else 0.0
+        )
+        result[f"{prefix}_valid_sample_count"] = valid_sample_count
+        result[f"{prefix}_sample_count"] = sample_count
+        result[f"{prefix}_valid_sample_fraction"] = (
+            valid_sample_count / sample_count if sample_count > 0.0 else 0.0
+        )
+    return result
+
+
 def save_checkpoint(
     tokenizer_module: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -2278,6 +2534,7 @@ def save_checkpoint(
 ) -> None:
     state_dict = tokenizer_module.state_dict()
     payload = {
+        "tokenizer_objective_version": TOKENIZER_OBJECTIVE_VERSION,
         "scene_tokenizer": state_dict,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
@@ -2695,6 +2952,8 @@ def build_cached_dataset(
 
 def main() -> None:
     args = build_argparser().parse_args()
+    validate_tokenizer_v2_objective_args(args)
+    args.tokenizer_objective_version = TOKENIZER_OBJECTIVE_VERSION
 
     device, local_rank, world_size = setup_distributed(args)
     if int(args.num_workers) > 0:
@@ -2954,6 +3213,11 @@ def main() -> None:
         if is_main_process():
             print(f"[init] loading tokenizer weights: {args.init_tokenizer_path}", flush=True)
         init_payload = torch.load(args.init_tokenizer_path, map_location="cpu")
+        objective_source = require_tokenizer_v2_checkpoint(
+            init_payload, path=args.init_tokenizer_path
+        )
+        if is_main_process():
+            print(f"[init] tokenizer objective: {objective_source}", flush=True)
         state_dict = extract_scene_tokenizer_state_dict(init_payload, args.init_tokenizer_path)
         model.scene_tokenizer.load_state_dict(state_dict, strict=True)
 
@@ -2961,6 +3225,11 @@ def main() -> None:
         if is_main_process():
             print(f"[resume] loading training state: {args.resume_path}", flush=True)
         resume_payload = torch.load(args.resume_path, map_location="cpu")
+        objective_source = require_tokenizer_v2_checkpoint(
+            resume_payload, path=args.resume_path
+        )
+        if is_main_process():
+            print(f"[resume] tokenizer objective: {objective_source}", flush=True)
         required_keys = {"scene_tokenizer", "optimizer", "scheduler", "global_step"}
         if not isinstance(resume_payload, dict) or not required_keys.issubset(resume_payload.keys()):
             missing = sorted(required_keys.difference(resume_payload.keys() if isinstance(resume_payload, dict) else ()))
@@ -2980,6 +3249,7 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         accum_count = 0
         accum_log_sums: dict[str, float] = {}
+        accum_v2_diagnostic_totals: dict[str, float] = {}
         accum_num_frames = 0.0
         accum_local_batch = 0.0
         train_pbar = None
@@ -3113,7 +3383,10 @@ def main() -> None:
                 else:
                     del teacher, student, total_loss
 
+            _accumulate_v2_loss_diagnostics(accum_v2_diagnostic_totals, scalar_logs)
             for key, value in scalar_logs.items():
+                if key in _V2_LOSS_DIAGNOSTIC_LOG_KEYS:
+                    continue
                 accum_log_sums[key] = accum_log_sums.get(key, 0.0) + float(value)
             accum_num_frames += float(num_frames)
             accum_local_batch += float(local_batch_size)
@@ -3128,6 +3401,7 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             step_logs = {key: value / float(accum_count) for key, value in accum_log_sums.items()}
+            step_logs.update(_finalize_v2_loss_diagnostics(accum_v2_diagnostic_totals))
             step_num_frames = accum_num_frames / float(accum_count)
             step_local_batch = accum_local_batch
 
@@ -3267,6 +3541,7 @@ def main() -> None:
 
             accum_count = 0
             accum_log_sums = {}
+            accum_v2_diagnostic_totals = {}
             accum_num_frames = 0.0
             accum_local_batch = 0.0
             accum_source_counts = {}

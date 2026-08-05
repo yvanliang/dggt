@@ -11,12 +11,12 @@ Launch:
   torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
       --image_dir /data/waymo \
       --dggt_ckpt_path pretrained/dggt.pth \
-      --tokenizer_ckpt_path logs/tokenizer_t0_waymo_views1/ckpt/scene_tokenizer_latest.pt \
-      --feature_stats_path logs/scene_flow_pretrain_1024/feature_stats_pretrain_v4.pt \
+      --tokenizer_ckpt_path logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt \
+      --feature_stats_path logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt \
       --scene_gauge_path data/scene_gauge/training.json \
       --val_scene_gauge_path data/scene_gauge/validation.json \
-      --pullback_calibration_path data/scene_gauge/pullback_75e566ef.json \
-      --log_dir logs/scene_flow_pretrain
+      --pullback_calibration_path data/scene_gauge/pullback_d63b34f7.json \
+      --log_dir logs/scene_flow_pretrain_tokenizer_v2
 """
 from __future__ import annotations
 
@@ -719,10 +719,15 @@ def validate_scene_flow_checkpoint_config(
             f"missing={sorted(METRIC_GAUGE_PROVENANCE_FIELDS - provenance_fields)}, "
             f"unknown={sorted(provenance_fields - METRIC_GAUGE_PROVENANCE_FIELDS)}"
         )
+    runtime_contract_version = provenance.get("pullback_runtime_contract_version")
+    if runtime_contract_version != PULLBACK_RUNTIME_CONTRACT_VERSION:
+        raise ValueError(
+            f"{path} provenance pullback_runtime_contract_version is unsupported: "
+            f"{runtime_contract_version!r}"
+        )
     expected_static = {
         "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
         "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
-        "pullback_runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
         "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
         "camera_target_space": CAMERA_TARGET_SPACE,
         "camera_target_source": CAMERA_TARGET_SOURCE,
@@ -7692,6 +7697,22 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
+    gradient_checkpointing_group = parser.add_mutually_exclusive_group()
+    gradient_checkpointing_group.add_argument(
+        "--gradient_checkpointing",
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_true",
+        help="Enable SceneFlow activation checkpointing to reduce training memory.",
+    )
+    gradient_checkpointing_group.add_argument(
+        "--no_gradient_checkpointing",
+        "--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable SceneFlow activation checkpointing to avoid backward recomputation.",
+    )
+    parser.set_defaults(gradient_checkpointing=True)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument(
         "--pretrain_instance_cache_size",
@@ -8368,7 +8389,16 @@ def main() -> None:
         sky_atlas_hw=args.sky_atlas_hw,
         prediction_type=args.prediction_type,
     ).to(device)
-    scene_flow.enable_gradient_checkpointing()
+    if bool(args.gradient_checkpointing):
+        scene_flow.enable_gradient_checkpointing()
+    else:
+        scene_flow.disable_gradient_checkpointing()
+    if is_main_process():
+        print(
+            "[memory] SceneFlow gradient checkpointing "
+            f"{'enabled' if scene_flow.gradient_checkpointing else 'disabled'}",
+            flush=True,
+        )
     if args.tokenizer_ckpt_path is None:
         raise ValueError(
             "Metric-gauge pretraining requires an explicit --tokenizer_ckpt_path so the "
@@ -8431,7 +8461,9 @@ def main() -> None:
         "tokenizer_sha256": pullback_calibration.tokenizer_sha256,
         "dggt_checkpoint_sha256": pullback_calibration.dggt_sha256,
         "pullback_artifact_sha256": pullback_calibration.artifact_sha256,
-        "pullback_runtime_contract_version": PULLBACK_RUNTIME_CONTRACT_VERSION,
+        "pullback_runtime_contract_version": (
+            pullback_calibration.runtime_contract_version
+        ),
         "pullback_window_len": pullback_calibration.window_len,
         "pullback_patch_grid_hw": list(pullback_calibration.patch_grid_hw),
         "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,

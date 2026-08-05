@@ -24,7 +24,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from dggt.utils.factorized_asset_condition import build_placement_state
+from dggt.utils.feature_stats import (
+    DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
+    validate_production_stats_coverage,
+    validate_tokenizer_stats_provenance,
+)
 from dggt.utils.scene_gauge import metric_c2w_to_teacher_anchor_dggt
+
+
+TOKENIZER_V2_SHA256 = "d63b34f7b1193ed7da399f953db504cfadb4f98dce2519854227a0f44714c8e8"
 
 
 def verify_teacher_atlas_world(device: torch.device) -> dict[str, float]:
@@ -69,6 +77,8 @@ def verify_production_placement_stats(stats_path: Path) -> dict[str, float | int
     payload = torch.load(stats_path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
         raise TypeError(f"feature stats must be a dict, got {type(payload).__name__}")
+    validate_production_stats_coverage(payload)
+    validate_tokenizer_stats_provenance(payload, TOKENIZER_V2_SHA256)
     mean = torch.as_tensor(payload["placement_mean"]).float()
     std = torch.as_tensor(payload["placement_std"]).float()
     count = int(torch.as_tensor(payload["placement_count"]).item())
@@ -112,7 +122,7 @@ def main() -> None:
     parser.add_argument(
         "--stats_path",
         type=Path,
-        default=Path("logs/scene_flow_pretrain_1024/feature_stats_pretrain_v4.pt"),
+        default=DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output", type=Path, default=None)
