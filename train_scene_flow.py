@@ -1360,7 +1360,25 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_false",
         help="Disable SceneFlow activation checkpointing to avoid backward recomputation.",
     )
-    parser.set_defaults(gradient_checkpointing=True)
+    gradient_checkpointing_group.add_argument(
+        "--half_gradient_checkpointing",
+        "--half-gradient-checkpointing",
+        dest="half_gradient_checkpointing",
+        action="store_true",
+        help="Checkpoint alternating SceneFlow encoder and DDT blocks.",
+    )
+    gradient_checkpointing_group.add_argument(
+        "--three_quarter_gradient_checkpointing",
+        "--three-quarter-gradient-checkpointing",
+        dest="three_quarter_gradient_checkpointing",
+        action="store_true",
+        help="Checkpoint three of every four SceneFlow encoder blocks and no DDT blocks.",
+    )
+    parser.set_defaults(
+        gradient_checkpointing=True,
+        half_gradient_checkpointing=False,
+        three_quarter_gradient_checkpointing=False,
+    )
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--prefetch_factor", type=int, default=1,
                         help="DataLoader batches prefetched per worker. Keep low because each cache item is large.")
@@ -4573,14 +4591,20 @@ def main() -> None:
             f"checkpoint asset_position_mode={scene_flow.config.asset_position_mode!r} "
             f"!= --asset_position_mode={args.asset_position_mode!r}"
         )
-    if bool(args.gradient_checkpointing):
+    if bool(args.three_quarter_gradient_checkpointing):
+        scene_flow.enable_three_quarter_gradient_checkpointing()
+    elif bool(args.half_gradient_checkpointing):
+        scene_flow.enable_half_gradient_checkpointing()
+    elif bool(args.gradient_checkpointing):
         scene_flow.enable_gradient_checkpointing()
     else:
         scene_flow.disable_gradient_checkpointing()
     if is_main_process():
         print(
             "[memory] SceneFlow gradient checkpointing "
-            f"{'enabled' if scene_flow.gradient_checkpointing else 'disabled'}",
+            f"mode={scene_flow.gradient_checkpointing_mode} "
+            f"encoder_blocks={len(scene_flow.checkpointed_block_indices(len(scene_flow.blocks)))}/{len(scene_flow.blocks)} "
+            f"ddt_blocks={len(scene_flow.checkpointed_block_indices(len(scene_flow.ddt_head), block_group='ddt'))}/{len(scene_flow.ddt_head)}",
             flush=True,
         )
     text_encoder = setup_text_encoder(args, device)

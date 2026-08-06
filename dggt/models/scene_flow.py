@@ -1069,6 +1069,7 @@ class RAEVideoSceneFlow(nn.Module):
             t_eps=float(t_eps),
         )
         self.gradient_checkpointing = False
+        self.gradient_checkpointing_mode = "off"
 
         self.video_embed = nn.Linear(out_channels, hidden_size)
         self.decoder_video_embed = nn.Linear(out_channels, int(ddt_head_dim))
@@ -1427,9 +1428,53 @@ class RAEVideoSceneFlow(nn.Module):
 
     def enable_gradient_checkpointing(self) -> None:
         self.gradient_checkpointing = True
+        self.gradient_checkpointing_mode = "full"
+
+    def enable_half_gradient_checkpointing(self) -> None:
+        """Checkpoint alternating blocks in both the encoder and DDT head."""
+        self.gradient_checkpointing = True
+        self.gradient_checkpointing_mode = "half"
+
+    def enable_three_quarter_gradient_checkpointing(self) -> None:
+        """Checkpoint three of every four encoder blocks, but no DDT blocks."""
+        self.gradient_checkpointing = True
+        self.gradient_checkpointing_mode = "three_quarter"
 
     def disable_gradient_checkpointing(self) -> None:
         self.gradient_checkpointing = False
+        self.gradient_checkpointing_mode = "off"
+
+    def _should_checkpoint_block(self, block_index: int, *, block_group: str) -> bool:
+        if not self.gradient_checkpointing:
+            return False
+        mode = str(getattr(self, "gradient_checkpointing_mode", "full"))
+        if block_group not in {"encoder", "ddt"}:
+            raise ValueError(f"block_group must be 'encoder' or 'ddt', got {block_group!r}")
+        if mode == "full":
+            return True
+        if mode == "half":
+            return int(block_index) % 2 == 0
+        if mode == "three_quarter":
+            return block_group == "encoder" and int(block_index) % 4 != 3
+        if mode == "off":
+            return False
+        raise RuntimeError(f"Unsupported gradient checkpointing mode: {mode!r}")
+
+    def checkpointed_block_indices(
+        self,
+        block_count: int,
+        *,
+        block_group: str = "encoder",
+    ) -> tuple[int, ...]:
+        """Return the deterministic block selection used by the active mode."""
+        count = int(block_count)
+        if count < 0:
+            raise ValueError(f"block_count must be non-negative, got {block_count}")
+        return tuple(
+            index
+            for index in range(count)
+            if self._should_checkpoint_block(index, block_group=block_group)
+        )
 
     def set_latent_stats(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         if tuple(mu.shape) != tuple(self.mu_z.shape):
@@ -3435,7 +3480,9 @@ class RAEVideoSceneFlow(nn.Module):
         sky_hidden = None
         gauge_hidden = None
         for idx, block in enumerate(self.blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+            if torch.is_grad_enabled() and self._should_checkpoint_block(
+                idx, block_group="encoder"
+            ):
                 full_seq = torch.utils.checkpoint.checkpoint(
                     block,
                     full_seq,
@@ -3484,8 +3531,10 @@ class RAEVideoSceneFlow(nn.Module):
             position_ids=target_pos,
             mrope_section=self.config.ddt_mrope_section,
         )
-        for block in self.ddt_head:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
+        for idx, block in enumerate(self.ddt_head):
+            if torch.is_grad_enabled() and self._should_checkpoint_block(
+                idx, block_group="ddt"
+            ):
                 dec_x = torch.utils.checkpoint.checkpoint(block, dec_x, cond, dec_rope, None, use_reentrant=False)
             else:
                 dec_x = block(dec_x, cond, dec_rope, None)

@@ -128,11 +128,11 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 EXPECTED_GLOBAL_BATCH_SIZE="${EXPECTED_GLOBAL_BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
-# 0 avoids activation recomputation and is the temporary DLC default. Set to 1
-# when per-PPU peak memory is insufficient without checkpointing.
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"
-if [[ "${GRADIENT_CHECKPOINTING}" != "0" && "${GRADIENT_CHECKPOINTING}" != "1" ]]; then
-    echo "[错误] GRADIENT_CHECKPOINTING 必须是 0 或 1，当前值：${GRADIENT_CHECKPOINTING}" >&2
+# three_quarter checkpoints 21/28 encoder blocks and no DDT blocks. Use 1
+# for full activation checkpointing, half for 14/28 + 1/2, or 0 to disable.
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-three_quarter}"
+if [[ "${GRADIENT_CHECKPOINTING}" != "0" && "${GRADIENT_CHECKPOINTING}" != "1" && "${GRADIENT_CHECKPOINTING}" != "half" && "${GRADIENT_CHECKPOINTING}" != "three_quarter" ]]; then
+    echo "[错误] GRADIENT_CHECKPOINTING 必须是 0、half、three_quarter 或 1，当前值：${GRADIENT_CHECKPOINTING}" >&2
     exit 1
 fi
 
@@ -358,11 +358,12 @@ build_train_args() {
         --wandb_name "${WANDB_NAME}"
         --wandb_resume "${WANDB_RESUME}"
     )
-    if [[ "${GRADIENT_CHECKPOINTING}" == "1" ]]; then
-        TRAIN_ARGS+=(--gradient_checkpointing)
-    else
-        TRAIN_ARGS+=(--no_gradient_checkpointing)
-    fi
+    case "${GRADIENT_CHECKPOINTING}" in
+        1) TRAIN_ARGS+=(--gradient_checkpointing) ;;
+        three_quarter) TRAIN_ARGS+=(--three_quarter_gradient_checkpointing) ;;
+        half) TRAIN_ARGS+=(--half_gradient_checkpointing) ;;
+        0) TRAIN_ARGS+=(--no_gradient_checkpointing) ;;
+    esac
 }
 
 setup_common_env
@@ -391,7 +392,7 @@ echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
 echo "NCCL_IB_DISABLE: ${NCCL_IB_DISABLE}"
 echo "DGGT_DEVICE_BACKEND: ${DGGT_DEVICE_BACKEND}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${DLC_NNODES} nodes × ${DLC_NPROC_PER_NODE} ppu/node × ${BATCH_SIZE_PER_PPU} batch/ppu × ${GRAD_ACCUM_STEPS} accum"
-echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, 1=enabled)"
+echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+1/2, three_quarter=21/28+0/2, 1=full)"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG}"
 echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME}, new run (resume=${WANDB_RESUME})"

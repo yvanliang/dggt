@@ -87,19 +87,33 @@ def _parse_formal_args(*extra: str):
 def test_scene_flow_training_gradient_checkpointing_cli() -> None:
     assert _parse_pretrain_args().gradient_checkpointing is True
     assert _parse_formal_args().gradient_checkpointing is True
+    assert _parse_pretrain_args().half_gradient_checkpointing is False
+    assert _parse_formal_args().half_gradient_checkpointing is False
+    assert _parse_pretrain_args().three_quarter_gradient_checkpointing is False
+    assert _parse_formal_args().three_quarter_gradient_checkpointing is False
     assert _parse_pretrain_args("--no_gradient_checkpointing").gradient_checkpointing is False
     assert _parse_formal_args("--no-gradient-checkpointing").gradient_checkpointing is False
     assert _parse_pretrain_args("--gradient_checkpointing").gradient_checkpointing is True
     assert _parse_formal_args("--gradient-checkpointing").gradient_checkpointing is True
+    assert _parse_pretrain_args("--half_gradient_checkpointing").half_gradient_checkpointing is True
+    assert _parse_formal_args("--half-gradient-checkpointing").half_gradient_checkpointing is True
+    assert _parse_pretrain_args(
+        "--three_quarter_gradient_checkpointing"
+    ).three_quarter_gradient_checkpointing is True
+    assert _parse_formal_args(
+        "--three-quarter-gradient-checkpointing"
+    ).three_quarter_gradient_checkpointing is True
 
 
-def test_dlc_launchers_disable_gradient_checkpointing_by_default() -> None:
+def test_dlc_launchers_use_three_quarter_gradient_checkpointing_by_default() -> None:
     common = (REPO_ROOT / "pretrain_ppu_two_nodes_dlc.sh").read_text()
     four_node = (REPO_ROOT / "pretrain_ppu_four_nodes_dlc.sh").read_text()
-    assert 'GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"' in common
+    assert 'GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-three_quarter}"' in common
     assert "TRAIN_ARGS+=(--no_gradient_checkpointing)" in common
+    assert "TRAIN_ARGS+=(--half_gradient_checkpointing)" in common
+    assert "TRAIN_ARGS+=(--three_quarter_gradient_checkpointing)" in common
     assert "TRAIN_ARGS+=(--gradient_checkpointing)" in common
-    assert 'GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-0}"' in four_node
+    assert 'GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-three_quarter}"' in four_node
 
 
 class _Tokenizer(nn.Module):
