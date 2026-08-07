@@ -164,8 +164,10 @@ from train_scene_flow_pretrain import (
     decode_metric_camera_from_features,
     decode_sky_patch_tokens,
     discover_scene_names,
+    load_scene_flow_state_dict_strict_profile_aware,
     load_dggt_aggregator_and_tokenizer,
     render_validation_generated_rgb,
+    sampled_gauge_validation_metrics,
     seed_everything,
     setup_text_encoder,
     sky_generation_enabled,
@@ -576,6 +578,7 @@ def build_external_factorized_pretrain_bundle(
             intrinsics.to(device),
             image_size_hw.to(device),
             target_width=int(patch_grid[1]) * 14,
+            target_height=int(patch_grid[0]) * 14,
             patch_size=14,
         )
     )
@@ -594,6 +597,9 @@ def build_external_factorized_pretrain_bundle(
         image_size_hw=projection_image_hw,
         patch_grid=patch_grid,
         reference_frame_id=reference_frame_id,
+        # External manifests are user-authored metric inputs rather than
+        # offline teacher estimates, so their alignment trust is explicit.
+        gauge_alignment_valid=torch.ones((1,), device=device, dtype=torch.bool),
     )
     # Anchor coordinates are a valid metric world.  Use the same role-aware
     # normalized 9-D condition channels as raw pretraining and formal T1.
@@ -643,10 +649,6 @@ def build_external_factorized_pretrain_bundle(
         "fps": fps,
         "image_size_hw": image_size_hw.tolist(),
     }
-
-
-def _strip_module_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
 
 
 def _checkpoint_config(payload: Any) -> dict[str, Any] | None:
@@ -779,7 +781,12 @@ def build_scene_flow_from_checkpoint(
     if state is not None:
         if not isinstance(state, dict):
             raise ValueError(f"Checkpoint state {source} is not a state_dict.")
-        scene_flow.load_state_dict(_strip_module_prefix(state), strict=True)
+        load_scene_flow_state_dict_strict_profile_aware(
+            scene_flow,
+            state,
+            path=path,
+            source=source,
+        )
     scene_flow.to(device).eval()
     for parameter in scene_flow.parameters():
         parameter.requires_grad_(False)
@@ -2201,6 +2208,14 @@ def main() -> None:
                 return_gauge=True,
                 return_sky_mask=True,
             )
+            if generated.gauge is None:
+                raise RuntimeError("SceneFlow sampling did not return the required gauge.")
+            gauge_metrics = sampled_gauge_validation_metrics(
+                generated.gauge,
+                bundle.scene_gauge_clean,
+                bundle.scene_gauge_valid,
+                prior_log_scale=scene_flow.gauge_mean[0],
+            )
             suffix = f"cfg{cfg_tag(scale)}"
             (
                 rgb_images,
@@ -2249,6 +2264,7 @@ def main() -> None:
                     "generated_metric_camera": generated_metric_camera,
                     "camera_geometry_flow_consistency": flow_consistency,
                     "camera_gauge_attribution": attribution,
+                    "sample_gauge_metrics": gauge_metrics,
                 }
             )
             run_flow_diagnostics.append(

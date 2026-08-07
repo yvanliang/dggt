@@ -115,8 +115,10 @@ SCENE_CAPTION_ROOT="${SCENE_CAPTION_ROOT:-${DATASET_ROOT}/training_captions}"
 SCENE_CAPTION_VAL_ROOT="${SCENE_CAPTION_VAL_ROOT:-${DATASET_ROOT}/validation_captions}"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${MODEL_ROOT}/Qwen/Qwen3-0.6B}"
 
-LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_tokenizer_v2}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_v5}"
 LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_dlc_launch}"
+RESUME_PATH="${RESUME_PATH:-}"
+RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:--1}"
 
 # ============================================================
 # 训练配置
@@ -136,6 +138,29 @@ if [[ "${GRADIENT_CHECKPOINTING}" != "0" && "${GRADIENT_CHECKPOINTING}" != "1" &
     exit 1
 fi
 
+MAX_STEPS="${MAX_STEPS:-200000}"
+DECAY_END_STEPS="${DECAY_END_STEPS:-0}"
+SAVE_EVERY="${SAVE_EVERY:-2500}"
+VAL_EVERY="${VAL_EVERY:-1000}"
+VAL_BATCHES="${VAL_BATCHES:-1}"
+VAL_LOG_IMAGES="${VAL_LOG_IMAGES:-10}"
+VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-35}"
+for value_name in MAX_STEPS DECAY_END_STEPS SAVE_EVERY VAL_EVERY VAL_BATCHES VAL_LOG_IMAGES VAL_SAMPLE_STEPS; do
+    value="${!value_name}"
+    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+        echo "[错误] ${value_name} 必须是非负整数，当前值：${value}" >&2
+        exit 1
+    fi
+done
+if [[ ! "${RESUME_EXPECTED_STEP}" =~ ^-?[0-9]+$ ]]; then
+    echo "[错误] RESUME_EXPECTED_STEP 必须是整数，当前值：${RESUME_EXPECTED_STEP}" >&2
+    exit 1
+fi
+if (( MAX_STEPS <= 0 || SAVE_EVERY <= 0 )); then
+    echo "[错误] MAX_STEPS 和 SAVE_EVERY 必须大于 0。" >&2
+    exit 1
+fi
+
 TEXT_UNCOND_DROP_PROB="${TEXT_UNCOND_DROP_PROB:-0.1}"
 JOINT_GENERATION_PROB="${JOINT_GENERATION_PROB:-0.2}"
 CAMERA_CONTROLLED_PROB="${CAMERA_CONTROLLED_PROB:-0.2}"
@@ -149,7 +174,7 @@ VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
 # metric-gauge v5 使用独立的新 wandb run，不续接旧 run。
 WANDB_PROJECT="${WANDB_PROJECT:-dggt-flow}"
 WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v5}"
-WANDB_RESUME="never"
+WANDB_RESUME="${WANDB_RESUME:-never}"
 
 GLOBAL_BATCH_SIZE=$((DLC_NNODES * DLC_NPROC_PER_NODE * BATCH_SIZE_PER_PPU * GRAD_ACCUM_STEPS))
 
@@ -236,6 +261,9 @@ check_required_paths() {
     check_dir "SCENE_CAPTION_ROOT" "${SCENE_CAPTION_ROOT}"
     check_dir "SCENE_CAPTION_VAL_ROOT" "${SCENE_CAPTION_VAL_ROOT}"
     check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
+    if [[ -n "${RESUME_PATH}" ]]; then
+        check_file "RESUME_PATH" "${RESUME_PATH}"
+    fi
     if [[ ! -f "${ALEXNET_CKPT}" ]]; then
         echo "[错误] 缺少 LPIPS AlexNet 本地权重：" >&2
         echo "       ${ALEXNET_CKPT}" >&2
@@ -317,8 +345,9 @@ build_train_args() {
         --optimizer_type gmuon
         --ema_decay 0.9995
         --warmup_steps 4000
-        --max_steps 200000
-        --save_every 2000
+        --max_steps "${MAX_STEPS}"
+        --decay_end_steps "${DECAY_END_STEPS}"
+        --save_every "${SAVE_EVERY}"
         --shift 10.0
         --weighting_scheme waver
         --mode_scale 1.29
@@ -345,10 +374,10 @@ build_train_args() {
         --val_guidance_scales "${VAL_GUIDANCE_SCALES}"
         --val_scene_start 0
         --val_scene_end 100
-        --val_every 1000
-        --val_batches 1
-        --val_log_images 10
-        --val_sample_steps 35
+        --val_every "${VAL_EVERY}"
+        --val_batches "${VAL_BATCHES}"
+        --val_log_images "${VAL_LOG_IMAGES}"
+        --val_sample_steps "${VAL_SAMPLE_STEPS}"
         --grad_clip_norm 1.0
         --seed 0
         --precision bf16
@@ -358,6 +387,15 @@ build_train_args() {
         --wandb_name "${WANDB_NAME}"
         --wandb_resume "${WANDB_RESUME}"
     )
+    if [[ -n "${RESUME_PATH}" ]]; then
+        TRAIN_ARGS+=(--resume_path "${RESUME_PATH}")
+        if (( RESUME_EXPECTED_STEP >= 0 )); then
+            TRAIN_ARGS+=(--resume_expected_step "${RESUME_EXPECTED_STEP}")
+        fi
+    elif (( RESUME_EXPECTED_STEP >= 0 )); then
+        echo "[错误] RESUME_EXPECTED_STEP=${RESUME_EXPECTED_STEP} 但未设置 RESUME_PATH。" >&2
+        exit 1
+    fi
     case "${GRADIENT_CHECKPOINTING}" in
         1) TRAIN_ARGS+=(--gradient_checkpointing) ;;
         three_quarter) TRAIN_ARGS+=(--three_quarter_gradient_checkpointing) ;;
@@ -393,9 +431,12 @@ echo "NCCL_IB_DISABLE: ${NCCL_IB_DISABLE}"
 echo "DGGT_DEVICE_BACKEND: ${DGGT_DEVICE_BACKEND}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${DLC_NNODES} nodes × ${DLC_NPROC_PER_NODE} ppu/node × ${BATCH_SIZE_PER_PPU} batch/ppu × ${GRAD_ACCUM_STEPS} accum"
 echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+1/2, three_quarter=21/28+0/2, 1=full)"
+echo "resume checkpoint: ${RESUME_PATH:-<none>} (expected step=${RESUME_EXPECTED_STEP})"
+echo "training steps: max=${MAX_STEPS}, lr_decay_end=${DECAY_END_STEPS}, save_every=${SAVE_EVERY}"
+echo "validation: every=${VAL_EVERY}, batches=${VAL_BATCHES}, log_images=${VAL_LOG_IMAGES}, sample_steps=${VAL_SAMPLE_STEPS}"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG}"
-echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME}, new run (resume=${WANDB_RESUME})"
+echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME} (resume=${WANDB_RESUME})"
 echo "============================================================"
 
 "${PYTHON_BIN}" -m torch.distributed.run \

@@ -1898,6 +1898,200 @@ def gauge_to_pose_enc_fov(
     return fov_yx[:, None, :].expand(-1, int(seq_len), -1)
 
 
+def _require_actor_pullback_tensor(value: torch.Tensor, *, name: str) -> None:
+    """Validate static tensor properties without synchronizing tensor data."""
+
+    if not torch.is_tensor(value):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if not value.is_floating_point():
+        raise TypeError(f"{name} must have a floating-point dtype, got {value.dtype}")
+    if value.layout != torch.strided:
+        raise ValueError(f"{name} must use strided layout, got {value.layout}")
+
+
+def build_actor_gauge_pullback_matrix(
+    model_intrinsics_normalized: torch.Tensor,
+    clean_gauge_physical: torch.Tensor,
+) -> torch.Tensor:
+    """Build the full-intrinsic metric-to-DGGT camera pullback.
+
+    Args:
+        model_intrinsics_normalized: Full model-canvas Waymo intrinsics
+            ``K_W`` with shape ``[B,S,3,3]``, normalized by
+            ``diag(1/W, 1/H, 1)``.  The caller owns the pinhole contract,
+            including the standard ``[0,0,1]`` bottom row.
+        clean_gauge_physical: Scene-global physical gauge ``[ell, ax, ay]``
+            with shape ``[B,3]``, where ``ell`` is log metres per DGGT unit
+            and ``ax/ay`` are log tangent half-FOV values.
+
+    Returns:
+        A float32 tensor shaped ``[B,S,3,3]`` containing
+        ``exp(-ell) * K_D(ax, ay)^-1 * K_W``.  The computation is performed
+        with autocast disabled, even when called from a bf16/fp16 region.
+
+    This low-level mathematical helper deliberately performs only static
+    shape/device/dtype checks.  It does not synchronize to inspect tensor
+    values, clamp them, or replace invalid rows.  Callers must apply their
+    finite/support gates and finite placeholders before calling it; non-finite
+    values or exponential overflow otherwise propagate to the result.
+    """
+
+    _require_actor_pullback_tensor(
+        model_intrinsics_normalized, name="model_intrinsics_normalized"
+    )
+    _require_actor_pullback_tensor(
+        clean_gauge_physical, name="clean_gauge_physical"
+    )
+    if model_intrinsics_normalized.ndim != 4 or tuple(
+        model_intrinsics_normalized.shape[-2:]
+    ) != (3, 3):
+        raise ValueError(
+            "model_intrinsics_normalized must have shape [B,S,3,3], got "
+            f"{tuple(model_intrinsics_normalized.shape)}"
+        )
+    if clean_gauge_physical.ndim != 2 or int(clean_gauge_physical.shape[-1]) != 3:
+        raise ValueError(
+            "clean_gauge_physical must have shape [B,3], got "
+            f"{tuple(clean_gauge_physical.shape)}"
+        )
+    if int(model_intrinsics_normalized.shape[0]) != int(
+        clean_gauge_physical.shape[0]
+    ):
+        raise ValueError(
+            "model intrinsics and clean gauge batch sizes must match, got "
+            f"{int(model_intrinsics_normalized.shape[0])} and "
+            f"{int(clean_gauge_physical.shape[0])}"
+        )
+    if model_intrinsics_normalized.device != clean_gauge_physical.device:
+        raise ValueError(
+            "model_intrinsics_normalized and clean_gauge_physical must be on "
+            f"the same device, got {model_intrinsics_normalized.device} and "
+            f"{clean_gauge_physical.device}"
+        )
+
+    device_type = model_intrinsics_normalized.device.type
+    with torch.amp.autocast(device_type=device_type, enabled=False):
+        intrinsics = model_intrinsics_normalized.float()
+        gauge = clean_gauge_physical.float()
+        ell, ax, ay = gauge.unbind(dim=-1)
+
+        exp_ax = torch.exp(ax)
+        exp_ay = torch.exp(ay)
+        zeros = torch.zeros_like(exp_ax)
+        ones = torch.ones_like(exp_ax)
+        kd_inverse = torch.stack(
+            (
+                torch.stack((2.0 * exp_ax, zeros, -exp_ax), dim=-1),
+                torch.stack((zeros, 2.0 * exp_ay, -exp_ay), dim=-1),
+                torch.stack((zeros, zeros, ones), dim=-1),
+            ),
+            dim=-2,
+        )
+        intrinsic_pullback = torch.matmul(kd_inverse[:, None], intrinsics)
+        inv_metres_per_unit = torch.exp(-ell)
+        return intrinsic_pullback * inv_metres_per_unit[:, None, None, None]
+
+
+def apply_actor_gauge_pullback(
+    matrix: torch.Tensor,
+    corners_camera_metric: torch.Tensor,
+    velocity_camera_metric: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply a full-K actor pullback to camera-space corners and velocity.
+
+    Args:
+        matrix: Pullback matrices shaped ``[B,S,3,3]``, normally produced by
+            :func:`build_actor_gauge_pullback_matrix`.
+        corners_camera_metric: Ordered box corners in metric camera frames,
+            shaped ``[B,K,S,8,3]``.
+        velocity_camera_metric: Actor-only metric camera-frame velocities,
+            shaped ``[B,K,S,3]``.
+
+    Returns:
+        ``(corners_camera_dggt, velocity_camera_dggt)`` with the same
+        respective shapes as the two geometry inputs and float32 dtype.  The
+        entire transform runs with autocast disabled.
+
+    As in :func:`build_actor_gauge_pullback_matrix`, finite/support masking is
+    a caller responsibility.  This helper neither clamps nor sanitizes data;
+    invalid values propagate.  Inactive actors must be replaced with finite
+    placeholders before this function is called.
+    """
+
+    _require_actor_pullback_tensor(matrix, name="matrix")
+    _require_actor_pullback_tensor(
+        corners_camera_metric, name="corners_camera_metric"
+    )
+    _require_actor_pullback_tensor(
+        velocity_camera_metric, name="velocity_camera_metric"
+    )
+    if matrix.ndim != 4 or tuple(matrix.shape[-2:]) != (3, 3):
+        raise ValueError(
+            f"matrix must have shape [B,S,3,3], got {tuple(matrix.shape)}"
+        )
+    if corners_camera_metric.ndim != 5 or tuple(
+        corners_camera_metric.shape[-2:]
+    ) != (8, 3):
+        raise ValueError(
+            "corners_camera_metric must have shape [B,K,S,8,3], got "
+            f"{tuple(corners_camera_metric.shape)}"
+        )
+    if velocity_camera_metric.ndim != 4 or int(
+        velocity_camera_metric.shape[-1]
+    ) != 3:
+        raise ValueError(
+            "velocity_camera_metric must have shape [B,K,S,3], got "
+            f"{tuple(velocity_camera_metric.shape)}"
+        )
+
+    matrix_prefix = tuple(matrix.shape[:2])
+    corners_prefix = (
+        int(corners_camera_metric.shape[0]),
+        int(corners_camera_metric.shape[2]),
+    )
+    velocity_prefix = (
+        int(velocity_camera_metric.shape[0]),
+        int(velocity_camera_metric.shape[2]),
+    )
+    if corners_prefix != matrix_prefix or velocity_prefix != matrix_prefix:
+        raise ValueError(
+            "matrix, corners, and velocity batch/frame dimensions must match: "
+            f"matrix={matrix_prefix}, corners={corners_prefix}, "
+            f"velocity={velocity_prefix}"
+        )
+    if int(corners_camera_metric.shape[1]) != int(velocity_camera_metric.shape[1]):
+        raise ValueError(
+            "corners and velocity actor dimensions must match, got "
+            f"{int(corners_camera_metric.shape[1])} and "
+            f"{int(velocity_camera_metric.shape[1])}"
+        )
+    devices = {
+        matrix.device,
+        corners_camera_metric.device,
+        velocity_camera_metric.device,
+    }
+    if len(devices) != 1:
+        raise ValueError(
+            "matrix, corners_camera_metric, and velocity_camera_metric must be "
+            "on the same device, got "
+            f"{matrix.device}, {corners_camera_metric.device}, and "
+            f"{velocity_camera_metric.device}"
+        )
+
+    device_type = matrix.device.type
+    with torch.amp.autocast(device_type=device_type, enabled=False):
+        matrix_fp32 = matrix.float()
+        corners_fp32 = corners_camera_metric.float()
+        velocity_fp32 = velocity_camera_metric.float()
+        corners_dggt = torch.einsum(
+            "bsij,bksqj->bksqi", matrix_fp32, corners_fp32
+        )
+        velocity_dggt = torch.einsum(
+            "bsij,bksj->bksi", matrix_fp32, velocity_fp32
+        )
+    return corners_dggt, velocity_dggt
+
+
 def assemble_dggt_pose_encoding(
     camera_to_world_dggt: torch.Tensor,
     gauge: torch.Tensor,
@@ -2292,9 +2486,11 @@ __all__ = [
     "SCENE_GAUGE_DIM",
     "SCENE_GAUGE_REPRESENTATION",
     "SCENE_GAUGE_STATS_VERSION",
+    "apply_actor_gauge_pullback",
     "apply_depth_pullback_calibration",
     "apply_pullback_calibration",
     "assemble_dggt_pose_encoding",
+    "build_actor_gauge_pullback_matrix",
     "denormalize_scene_gauge",
     "dggt_c2w_to_metric",
     "effective_scene_gauge",

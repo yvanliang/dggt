@@ -30,9 +30,20 @@ def resize_crop_intrinsics_to_model_canvas(
     image_size_hw: torch.Tensor | Sequence[int],
     *,
     target_width: int = 518,
+    target_height: int | None = None,
+    require_exact_canvas: bool = False,
     patch_size: int = 14,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Map raw pinhole intrinsics into the resized/cropped model canvas."""
+    """Map raw pinhole intrinsics into the resized/cropped model canvas.
+
+    ``require_exact_canvas=True`` asserts that the width-based resize already
+    lands exactly on ``target_height``, i.e. that no additional vertical
+    crop/pad is needed. Callers whose images come from the shared preprocessing
+    must set it: that pipeline performs no such extra crop, so a silent
+    adjustment here would shift the intrinsics away from the actual pixels.
+    External-manifest callers, whose cameras legitimately differ in aspect
+    ratio from the fixed patch canvas, keep the permissive default.
+    """
     Ks = torch.as_tensor(intrinsics)
     if Ks.ndim < 2 or tuple(Ks.shape[-2:]) != (3, 3):
         raise ValueError(
@@ -84,6 +95,31 @@ def resize_crop_intrinsics_to_model_canvas(
     raw_to_model[..., 2, 2] = 1.0
     model_intrinsics = torch.matmul(raw_to_model, Ks)
     model_hw = torch.stack((model_h, model_w), dim=-1).to(dtype=torch.long)
+    if target_height is not None:
+        target_height = int(target_height)
+        if target_height <= 0 or target_height % patch_size != 0:
+            raise ValueError(
+                "target_height must be a positive multiple of patch_size"
+            )
+        # The shared image preprocessing first performs the width-based resize
+        # above. External cameras can have a different aspect ratio from the
+        # fixed SceneFlow patch canvas, so complete that mapping with a centered
+        # vertical crop (or symmetric pad when the resized image is shorter).
+        if bool(require_exact_canvas) and not bool(
+            (model_h == float(target_height)).all()
+        ):
+            observed = torch.unique(model_h.detach().reshape(-1)).cpu().tolist()
+            raise ValueError(
+                "resized image height does not match the model canvas: expected "
+                f"{target_height}, got {observed}. The shared preprocessing does "
+                "not apply a second vertical crop, so adjusting the intrinsics "
+                "here would desynchronize them from the actual pixels."
+            )
+        crop_top_to_target = (model_h - float(target_height)) / 2.0
+        model_intrinsics = model_intrinsics.clone()
+        model_intrinsics[..., 1, 2] -= crop_top_to_target
+        model_hw = model_hw.clone()
+        model_hw[..., 0] = target_height
     return model_intrinsics, model_hw
 
 
@@ -98,8 +134,16 @@ class FactorizedAssetCondition:
     target_bbox_patch: torch.Tensor
     track_valid: torch.Tensor
     reference_frame_id: torch.Tensor | None = None
+    box_corners_camera_metric: torch.Tensor | None = None
+    velocity_camera_metric: torch.Tensor | None = None
+    model_intrinsics_normalized: torch.Tensor | None = None
+    gauge_alignment_valid: torch.Tensor | None = None
 
-    def validate(self) -> "FactorizedAssetCondition":
+    def validate(
+        self,
+        *,
+        require_alignment_payload: bool = False,
+    ) -> "FactorizedAssetCondition":
         if self.appearance_tokens.ndim != 4:
             raise ValueError(
                 "appearance_tokens must be [B,K,Q,Ca], got "
@@ -146,6 +190,79 @@ class FactorizedAssetCondition:
             )
         if self.reference_frame_id is not None and self.reference_frame_id.dtype != torch.long:
             raise TypeError("reference_frame_id must have int64 dtype")
+        alignment_payload = {
+            "box_corners_camera_metric": self.box_corners_camera_metric,
+            "velocity_camera_metric": self.velocity_camera_metric,
+            "model_intrinsics_normalized": self.model_intrinsics_normalized,
+            "gauge_alignment_valid": self.gauge_alignment_valid,
+        }
+        present_alignment_fields = {
+            name for name, value in alignment_payload.items() if value is not None
+        }
+        if present_alignment_fields and len(present_alignment_fields) != len(alignment_payload):
+            missing = sorted(set(alignment_payload) - present_alignment_fields)
+            raise ValueError(
+                "actor-alignment sidecars must be all present or all absent; "
+                f"missing={missing}"
+            )
+        has_alignment_payload = len(present_alignment_fields) == len(alignment_payload)
+        if bool(require_alignment_payload) and not has_alignment_payload:
+            raise ValueError(
+                "actor-alignment payload is required but the four v3 sidecars are absent"
+            )
+        if has_alignment_payload:
+            assert self.box_corners_camera_metric is not None
+            assert self.velocity_camera_metric is not None
+            assert self.model_intrinsics_normalized is not None
+            assert self.gauge_alignment_valid is not None
+            if tuple(self.box_corners_camera_metric.shape) != (b, k, s, 8, 3):
+                raise ValueError(
+                    "box_corners_camera_metric shape "
+                    f"{tuple(self.box_corners_camera_metric.shape)} != {(b, k, s, 8, 3)}"
+                )
+            if tuple(self.velocity_camera_metric.shape) != (b, k, s, 3):
+                raise ValueError(
+                    "velocity_camera_metric shape "
+                    f"{tuple(self.velocity_camera_metric.shape)} != {(b, k, s, 3)}"
+                )
+            if tuple(self.model_intrinsics_normalized.shape) != (b, s, 3, 3):
+                raise ValueError(
+                    "model_intrinsics_normalized shape "
+                    f"{tuple(self.model_intrinsics_normalized.shape)} != {(b, s, 3, 3)}"
+                )
+            if tuple(self.gauge_alignment_valid.shape) != (b,):
+                raise ValueError(
+                    "gauge_alignment_valid shape "
+                    f"{tuple(self.gauge_alignment_valid.shape)} != {(b,)}"
+                )
+            for name, value in (
+                ("box_corners_camera_metric", self.box_corners_camera_metric),
+                ("velocity_camera_metric", self.velocity_camera_metric),
+                ("model_intrinsics_normalized", self.model_intrinsics_normalized),
+            ):
+                if value.dtype != torch.float32:
+                    raise TypeError(f"{name} must have float32 dtype")
+                if not bool(torch.isfinite(value).all()):
+                    raise ValueError(f"{name} contains NaN or Inf")
+            if self.gauge_alignment_valid.dtype != torch.bool:
+                raise TypeError("gauge_alignment_valid must have bool dtype")
+            normalized_k = self.model_intrinsics_normalized
+            if bool((normalized_k[..., 0, 0] <= 0.0).any()) or bool(
+                (normalized_k[..., 1, 1] <= 0.0).any()
+            ):
+                raise ValueError(
+                    "model_intrinsics_normalized must have positive focal lengths"
+                )
+            expected_bottom_row = normalized_k.new_tensor((0.0, 0.0, 1.0))
+            if not torch.allclose(
+                normalized_k[..., 2, :],
+                expected_bottom_row.expand_as(normalized_k[..., 2, :]),
+                atol=1.0e-6,
+                rtol=0.0,
+            ):
+                raise ValueError(
+                    "model_intrinsics_normalized must have bottom row [0,0,1]"
+                )
         for name, value in (
             ("appearance_tokens", self.appearance_tokens),
             ("canonical_uv", self.canonical_uv),
@@ -174,7 +291,27 @@ class FactorizedAssetCondition:
         def move(value: torch.Tensor | None) -> torch.Tensor | None:
             return None if value is None else value.to(*args, **kwargs)
 
+        def move_geometry(value: torch.Tensor | None) -> torch.Tensor | None:
+            if value is None:
+                return None
+            # Resolve the destination using the complete Tensor.to() overload,
+            # but never apply its requested dtype to metric geometry. Moving a
+            # sidecar through bf16 and casting it back would irreversibly lose
+            # the FP32 values that define the full-intrinsic projection.
+            probe = torch.empty(0, device=value.device, dtype=torch.float32).to(
+                *args, **kwargs
+            )
+            move_kwargs: dict[str, Any] = {
+                "device": probe.device,
+                "dtype": torch.float32,
+            }
+            for name in ("non_blocking", "copy", "memory_format"):
+                if name in kwargs:
+                    move_kwargs[name] = kwargs[name]
+            return value.to(**move_kwargs)
+
         moved_reference = move(self.reference_frame_id)
+        moved_alignment_valid = move(self.gauge_alignment_valid)
         return FactorizedAssetCondition(
             appearance_tokens=move(self.appearance_tokens),
             appearance_mask=move(self.appearance_mask).to(dtype=torch.bool),
@@ -184,6 +321,18 @@ class FactorizedAssetCondition:
             track_valid=move(self.track_valid).to(dtype=torch.bool),
             reference_frame_id=(
                 None if moved_reference is None else moved_reference.to(dtype=torch.long)
+            ),
+            box_corners_camera_metric=move_geometry(
+                self.box_corners_camera_metric
+            ),
+            velocity_camera_metric=move_geometry(self.velocity_camera_metric),
+            model_intrinsics_normalized=move_geometry(
+                self.model_intrinsics_normalized
+            ),
+            gauge_alignment_valid=(
+                None
+                if moved_alignment_valid is None
+                else moved_alignment_valid.to(dtype=torch.bool)
             ),
         ).validate()
 
@@ -196,6 +345,21 @@ class FactorizedAssetCondition:
             placement_state=self.placement_state[:, :, start:end],
             target_bbox_patch=self.target_bbox_patch[:, :, start:end],
             track_valid=self.track_valid[:, :, start:end],
+            box_corners_camera_metric=(
+                None
+                if self.box_corners_camera_metric is None
+                else self.box_corners_camera_metric[:, :, start:end]
+            ),
+            velocity_camera_metric=(
+                None
+                if self.velocity_camera_metric is None
+                else self.velocity_camera_metric[:, :, start:end]
+            ),
+            model_intrinsics_normalized=(
+                None
+                if self.model_intrinsics_normalized is None
+                else self.model_intrinsics_normalized[:, start:end]
+            ),
         ).validate()
 
     def drop_rows(self, rows: torch.Tensor) -> "FactorizedAssetCondition":
@@ -206,7 +370,16 @@ class FactorizedAssetCondition:
         track = self.track_valid.clone()
         mask[rows] = False
         track[rows] = False
-        return replace(self, appearance_mask=mask, track_valid=track).validate()
+        alignment_valid = self.gauge_alignment_valid
+        if alignment_valid is not None:
+            alignment_valid = alignment_valid.clone()
+            alignment_valid[rows.to(device=alignment_valid.device)] = False
+        return replace(
+            self,
+            appearance_mask=mask,
+            track_valid=track,
+            gauge_alignment_valid=alignment_valid,
+        ).validate()
 
 
 def canonicalize_asset_reference(
@@ -500,36 +673,99 @@ def object_to_anchor_from_center_yaw(
     return result
 
 
-def project_anchor_boxes_to_patch_bboxes(
+@dataclass(frozen=True)
+class _CameraSpaceBoxGeometry:
+    """One shared object/camera transform result for bbox and alignment paths."""
+
+    box_corners_camera_metric: torch.Tensor
+    anchor_to_camera: torch.Tensor
+
+
+def _camera_space_box_geometry(
     object_to_anchor: torch.Tensor,
     box_size_lwh: torch.Tensor,
-    track_valid: torch.Tensor,
     camera_to_anchor: torch.Tensor,
-    intrinsics: torch.Tensor,
-    image_size_hw: torch.Tensor | Sequence[int],
-    patch_grid: tuple[int, int] | Sequence[int],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Project boxes with geometry only; no silhouette or GT visibility input."""
+) -> _CameraSpaceBoxGeometry:
     if object_to_anchor.ndim != 5 or object_to_anchor.shape[-2:] != (4, 4):
-        raise ValueError(f"object_to_anchor must be [B,K,S,4,4], got {tuple(object_to_anchor.shape)}")
-    b, k, s = (int(v) for v in object_to_anchor.shape[:3])
-    if tuple(box_size_lwh.shape) != (b, k, s, 3):
-        raise ValueError(f"box_size_lwh shape {tuple(box_size_lwh.shape)} != {(b, k, s, 3)}")
-    if tuple(track_valid.shape) != (b, k, s):
-        raise ValueError(f"track_valid shape {tuple(track_valid.shape)} != {(b, k, s)}")
-    c2a = torch.as_tensor(camera_to_anchor, device=object_to_anchor.device, dtype=object_to_anchor.dtype)
+        raise ValueError(
+            "object_to_anchor must be [B,K,S,4,4], got "
+            f"{tuple(object_to_anchor.shape)}"
+        )
+    if not object_to_anchor.is_floating_point():
+        raise TypeError("object_to_anchor must have floating-point dtype")
+    b, k, s = (int(value) for value in object_to_anchor.shape[:3])
+    size = torch.as_tensor(
+        box_size_lwh,
+        device=object_to_anchor.device,
+        dtype=object_to_anchor.dtype,
+    )
+    if tuple(size.shape) != (b, k, s, 3):
+        raise ValueError(
+            f"box_size_lwh shape {tuple(size.shape)} != {(b, k, s, 3)}"
+        )
+    c2a = torch.as_tensor(
+        camera_to_anchor,
+        device=object_to_anchor.device,
+        dtype=object_to_anchor.dtype,
+    )
     if c2a.ndim == 3:
         c2a = c2a.unsqueeze(0)
     if tuple(c2a.shape) != (b, s, 4, 4):
-        raise ValueError(f"camera_to_anchor shape {tuple(c2a.shape)} != {(b, s, 4, 4)}")
-    Ks = torch.as_tensor(intrinsics, device=object_to_anchor.device, dtype=object_to_anchor.dtype)
+        raise ValueError(
+            f"camera_to_anchor shape {tuple(c2a.shape)} != {(b, s, 4, 4)}"
+        )
+
+    # Production inputs are FP32. Disabling the surrounding autocast is what
+    # keeps the shared corner result FP32 instead of silently lowering it to
+    # bf16. Float64 diagnostic callers retain their original precision.
+    with torch.autocast(device_type=object_to_anchor.device.type, enabled=False):
+        corners_obj = _box_corners_object(size)
+        corner_ones = torch.ones(
+            corners_obj.shape[:-1] + (1,),
+            device=corners_obj.device,
+            dtype=corners_obj.dtype,
+        )
+        corners_anchor = torch.matmul(
+            object_to_anchor.unsqueeze(-3),
+            torch.cat((corners_obj, corner_ones), dim=-1).unsqueeze(-1),
+        ).squeeze(-1)[..., :3]
+        anchor_to_camera = torch.linalg.inv(c2a)
+        corners_h = torch.cat((corners_anchor, corner_ones), dim=-1)
+        corners_camera = torch.matmul(
+            anchor_to_camera[:, None, :, None],
+            corners_h.unsqueeze(-1),
+        ).squeeze(-1)[..., :3]
+    return _CameraSpaceBoxGeometry(
+        box_corners_camera_metric=corners_camera,
+        anchor_to_camera=anchor_to_camera,
+    )
+
+
+def _expanded_projection_inputs(
+    intrinsics: torch.Tensor,
+    image_size_hw: torch.Tensor | Sequence[int],
+    *,
+    batch_size: int,
+    seq_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    b, s = int(batch_size), int(seq_len)
+    Ks = torch.as_tensor(intrinsics, device=device, dtype=dtype)
     if Ks.ndim == 3:
         Ks = Ks.unsqueeze(0)
+    if Ks.ndim != 4 or tuple(Ks.shape[-2:]) != (3, 3):
+        raise ValueError(
+            f"intrinsics must be [B,1/S,3,3], got {tuple(Ks.shape)}"
+        )
+    if int(Ks.shape[0]) == 1 and b > 1:
+        Ks = Ks.expand(b, -1, -1, -1)
     if int(Ks.shape[1]) == 1 and s > 1:
-        Ks = Ks.expand(b, s, -1, -1)
+        Ks = Ks.expand(-1, s, -1, -1)
     if tuple(Ks.shape) != (b, s, 3, 3):
         raise ValueError(f"intrinsics shape {tuple(Ks.shape)} != {(b, s, 3, 3)}")
-    hw = torch.as_tensor(image_size_hw, device=object_to_anchor.device, dtype=object_to_anchor.dtype)
+
+    hw = torch.as_tensor(image_size_hw, device=device, dtype=dtype)
     if tuple(hw.shape) == (2,):
         hw = hw.view(1, 1, 2).expand(b, s, 2)
     elif tuple(hw.shape) == (b, 2):
@@ -539,20 +775,83 @@ def project_anchor_boxes_to_patch_bboxes(
     elif tuple(hw.shape) == (b, 1, 2):
         hw = hw.expand(b, s, 2)
     if tuple(hw.shape) != (b, s, 2):
-        raise ValueError(f"image_size_hw shape {tuple(hw.shape)} cannot map to {(b, s, 2)}")
+        raise ValueError(
+            f"image_size_hw shape {tuple(hw.shape)} cannot map to {(b, s, 2)}"
+        )
+    if bool((hw <= 0.0).any()):
+        raise ValueError("image_size_hw entries must be positive")
+    return Ks, hw
 
-    corners_obj = _box_corners_object(box_size_lwh)
-    ones = torch.ones(corners_obj.shape[:-1] + (1,), device=corners_obj.device, dtype=corners_obj.dtype)
-    corners_anchor = torch.matmul(
-        object_to_anchor.unsqueeze(-3),
-        torch.cat((corners_obj, ones), dim=-1).unsqueeze(-1),
-    ).squeeze(-1)[..., :3]
-    anchor_to_camera = torch.linalg.inv(c2a)
-    corners_h = torch.cat((corners_anchor, ones), dim=-1)
-    corners_cam = torch.matmul(
-        anchor_to_camera[:, None, :, None],
-        corners_h.unsqueeze(-1),
-    ).squeeze(-1)[..., :3]
+
+def _normalized_model_intrinsics(
+    intrinsics: torch.Tensor,
+    image_size_hw: torch.Tensor,
+    patch_grid: tuple[int, int] | Sequence[int],
+) -> torch.Tensor:
+    """Return full-S normalized model-canvas K in immutable FP32 precision."""
+    if intrinsics.ndim != 4 or tuple(intrinsics.shape[-2:]) != (3, 3):
+        raise ValueError("expanded intrinsics must be [B,S,3,3]")
+    if tuple(image_size_hw.shape) != tuple(intrinsics.shape[:2]) + (2,):
+        raise ValueError("expanded image_size_hw must be [B,S,2]")
+    gh, gw = int(patch_grid[0]), int(patch_grid[1])
+    expected_hw = image_size_hw.new_tensor((gh * 14, gw * 14))
+    if not bool((image_size_hw == expected_hw).all()):
+        unique_hw = torch.unique(image_size_hw.detach().reshape(-1, 2), dim=0)
+        raise ValueError(
+            "actor-alignment intrinsics must already use the model canvas: "
+            f"expected {[gh * 14, gw * 14]}, got {unique_hw.cpu().tolist()}"
+        )
+    Ks = intrinsics.to(dtype=torch.float32)
+    hw = image_size_hw.to(device=Ks.device, dtype=torch.float32)
+    normalizer = torch.zeros_like(Ks)
+    normalizer[..., 0, 0] = hw[..., 1].reciprocal()
+    normalizer[..., 1, 1] = hw[..., 0].reciprocal()
+    normalizer[..., 2, 2] = 1.0
+    with torch.autocast(device_type=Ks.device.type, enabled=False):
+        return torch.matmul(normalizer, Ks)
+
+
+def project_anchor_boxes_to_patch_bboxes(
+    object_to_anchor: torch.Tensor,
+    box_size_lwh: torch.Tensor,
+    track_valid: torch.Tensor,
+    camera_to_anchor: torch.Tensor,
+    intrinsics: torch.Tensor,
+    image_size_hw: torch.Tensor | Sequence[int],
+    patch_grid: tuple[int, int] | Sequence[int],
+    *,
+    camera_geometry: _CameraSpaceBoxGeometry | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project boxes with geometry only; no silhouette or GT visibility input."""
+    if object_to_anchor.ndim != 5 or object_to_anchor.shape[-2:] != (4, 4):
+        raise ValueError(f"object_to_anchor must be [B,K,S,4,4], got {tuple(object_to_anchor.shape)}")
+    b, k, s = (int(v) for v in object_to_anchor.shape[:3])
+    if tuple(box_size_lwh.shape) != (b, k, s, 3):
+        raise ValueError(f"box_size_lwh shape {tuple(box_size_lwh.shape)} != {(b, k, s, 3)}")
+    if tuple(track_valid.shape) != (b, k, s):
+        raise ValueError(f"track_valid shape {tuple(track_valid.shape)} != {(b, k, s)}")
+    Ks, hw = _expanded_projection_inputs(
+        intrinsics,
+        image_size_hw,
+        batch_size=b,
+        seq_len=s,
+        device=object_to_anchor.device,
+        dtype=object_to_anchor.dtype,
+    )
+    if camera_geometry is None:
+        camera_geometry = _camera_space_box_geometry(
+            object_to_anchor,
+            box_size_lwh,
+            camera_to_anchor,
+        )
+    corners_cam = camera_geometry.box_corners_camera_metric
+    if tuple(corners_cam.shape) != (b, k, s, 8, 3):
+        raise ValueError(
+            "camera_geometry corners shape "
+            f"{tuple(corners_cam.shape)} != {(b, k, s, 8, 3)}"
+        )
+    if corners_cam.device != object_to_anchor.device:
+        raise ValueError("camera_geometry and object_to_anchor must share a device")
     depth = corners_cam[..., 2]
     near = float(BOX_PROJECTION_NEAR_PLANE)
     positive = depth >= near
@@ -677,6 +976,8 @@ def build_placement_state(
     velocity_anchor: torch.Tensor,
     in_frustum: torch.Tensor,
     camera_to_anchor: torch.Tensor,
+    *,
+    anchor_to_camera: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build the scale-aware v2 placement representation.
 
@@ -712,13 +1013,25 @@ def build_placement_state(
         raise ValueError(
             f"camera_to_anchor shape {tuple(c2a.shape)} != {(b, s, 4, 4)}"
         )
-    anchor_to_camera = torch.linalg.inv(c2a)
+    if anchor_to_camera is None:
+        anchor_to_camera_t = torch.linalg.inv(c2a)
+    else:
+        anchor_to_camera_t = torch.as_tensor(
+            anchor_to_camera,
+            device=center_anchor.device,
+            dtype=center_anchor.dtype,
+        )
+        if tuple(anchor_to_camera_t.shape) != (b, s, 4, 4):
+            raise ValueError(
+                "anchor_to_camera shape "
+                f"{tuple(anchor_to_camera_t.shape)} != {(b, s, 4, 4)}"
+            )
     center_h = torch.cat(
         (center_anchor, torch.ones_like(center_anchor[..., :1])),
         dim=-1,
     )
     center_camera = torch.matmul(
-        anchor_to_camera[:, None],
+        anchor_to_camera_t[:, None],
         center_h.unsqueeze(-1),
     ).squeeze(-1)[..., :3]
     z_depth = center_camera[..., 2]
@@ -790,8 +1103,15 @@ def build_factorized_asset_condition(
     image_size_hw: torch.Tensor | Sequence[int],
     patch_grid: tuple[int, int] | Sequence[int],
     reference_frame_id: torch.Tensor | None = None,
+    gauge_alignment_valid: torch.Tensor | None = None,
 ) -> FactorizedAssetCondition:
-    """Shared training/inference builder for destination geometry."""
+    """Shared training/inference builder for destination geometry.
+
+    ``gauge_alignment_valid=None`` is the explicit legacy call contract and
+    returns no actor-alignment sidecars. Passing a bool ``[B]`` opts into the
+    complete v3 alignment payload; there is deliberately no implicit all-true
+    fallback for raw training data.
+    """
     expected_center = object_to_anchor[..., :3, 3]
     if tuple(expected_center.shape) != tuple(center_anchor.shape):
         raise ValueError(
@@ -829,6 +1149,11 @@ def build_factorized_asset_condition(
             "object_to_anchor local-z height axis must be unit length and point "
             "approximately along anchor -y on a valid track"
         )
+    camera_geometry = _camera_space_box_geometry(
+        object_to_anchor,
+        box_size_lwh,
+        camera_to_anchor,
+    )
     # METRIC CAMERA CONTRACT: object/camera transforms and ``intrinsics`` are
     # all Waymo-metric quantities.  This 2D footprint and in-frustum result must
     # never be recomputed with the generated DGGT/gauge intrinsics.
@@ -840,6 +1165,7 @@ def build_factorized_asset_condition(
         intrinsics,
         image_size_hw,
         patch_grid,
+        camera_geometry=camera_geometry,
     )
     placement = build_placement_state(
         center_anchor,
@@ -848,7 +1174,56 @@ def build_factorized_asset_condition(
         velocity_anchor,
         in_frustum,
         camera_to_anchor,
+        anchor_to_camera=camera_geometry.anchor_to_camera,
     )
+    box_corners_camera_metric = None
+    velocity_camera_metric = None
+    model_intrinsics_normalized = None
+    alignment_valid = None
+    if gauge_alignment_valid is not None:
+        if not torch.is_tensor(gauge_alignment_valid):
+            raise TypeError("gauge_alignment_valid must be a bool tensor [B]")
+        b, _k, s = (int(value) for value in track_valid.shape)
+        if tuple(gauge_alignment_valid.shape) != (b,):
+            raise ValueError(
+                "gauge_alignment_valid shape "
+                f"{tuple(gauge_alignment_valid.shape)} != {(b,)}"
+            )
+        if gauge_alignment_valid.dtype != torch.bool:
+            raise TypeError("gauge_alignment_valid must have bool dtype")
+        projection_intrinsics, projection_hw = _expanded_projection_inputs(
+            intrinsics,
+            image_size_hw,
+            batch_size=b,
+            seq_len=s,
+            device=object_to_anchor.device,
+            dtype=torch.float32,
+        )
+        model_intrinsics_normalized = _normalized_model_intrinsics(
+            projection_intrinsics,
+            projection_hw,
+            patch_grid,
+        )
+        box_corners_camera_metric = (
+            camera_geometry.box_corners_camera_metric.to(dtype=torch.float32)
+        )
+        velocity_metric = torch.as_tensor(
+            velocity_anchor,
+            device=object_to_anchor.device,
+            dtype=torch.float32,
+        )
+        anchor_to_camera_rotation = camera_geometry.anchor_to_camera[
+            ..., :3, :3
+        ].to(dtype=torch.float32)
+        with torch.autocast(device_type=object_to_anchor.device.type, enabled=False):
+            velocity_camera_metric = torch.matmul(
+                anchor_to_camera_rotation[:, None],
+                velocity_metric.unsqueeze(-1),
+            ).squeeze(-1)
+        alignment_valid = gauge_alignment_valid.to(
+            device=object_to_anchor.device,
+            dtype=torch.bool,
+        )
     # A slot without a source reference is closed even when a target track is
     # present; there is intentionally no target-window fallback.
     source_valid = appearance_mask.any(dim=-1)
@@ -861,4 +1236,8 @@ def build_factorized_asset_condition(
         target_bbox_patch=bbox,
         track_valid=closed_track,
         reference_frame_id=reference_frame_id,
-    ).validate()
+        box_corners_camera_metric=box_corners_camera_metric,
+        velocity_camera_metric=velocity_camera_metric,
+        model_intrinsics_normalized=model_intrinsics_normalized,
+        gauge_alignment_valid=alignment_valid,
+    ).validate(require_alignment_payload=gauge_alignment_valid is not None)

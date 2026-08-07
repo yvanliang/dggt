@@ -477,7 +477,10 @@ def test_pretrain_bundle_uses_metric_waymo_target_and_matching_condition_delta(
         "masks": torch.zeros(batch_size, window_frames, 1, 2, 2),
         "camera_to_world_corrected": selected_c2w,
         "intrinsics": intrinsics,
-        "raw_image_size_hw": torch.tensor([[2, 2], [2, 2]]),
+        # The raw aspect ratio must match patch_grid=(1,2), i.e. the 14x28 model
+        # canvas: the width-based resize has to land on the canvas height with
+        # no extra vertical crop, exactly as the real preprocessing does.
+        "raw_image_size_hw": torch.tensor([[1, 2], [1, 2]]),
         "camera_trajectory_anchor_to_world_corrected": full_c2w[:, :1],
         "camera_previous_to_world_corrected": previous_c2w,
         "metric_lidar_depth_m": torch.full(
@@ -616,13 +619,10 @@ def test_pretrain_bundle_uses_metric_waymo_target_and_matching_condition_delta(
 def test_production_pretrain_launchers_enable_pinned_memory() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     launchers = (
-        "pretrain_four_nodes.sh",
         "pretrain_half_node_p6000.sh",
         "pretrain_ppu.sh",
         "pretrain_ppu_two_nodes_dlc.sh",
         "pretrain_single_node.sh",
-        "pretrain_single_node30.sh",
-        "pretrain_three_nodes.sh",
         "pretrain_two_nodes26.sh",
         "pretrain_two_nodes31.sh",
     )

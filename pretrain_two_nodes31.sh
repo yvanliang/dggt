@@ -381,7 +381,7 @@ build_train_args() {
         --ema_decay 0.9995
         --warmup_steps 4000
         --max_steps 200000
-        --save_every 2000
+        --save_every 2500
         --shift 10.0
         --weighting_scheme waver
         --mode_scale 1.29

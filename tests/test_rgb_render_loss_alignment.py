@@ -49,12 +49,12 @@ from train_scene_flow_pretrain import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRETRAIN_LAUNCH_SCRIPTS = (
-    "pretrain_four_nodes.sh",
     "pretrain_half_node_p6000.sh",
     "pretrain_ppu.sh",
+    "pretrain_ppu_four_nodes_dlc.sh",
+    "pretrain_ppu_four_nodes_hds_ablation_dlc.sh",
+    "pretrain_ppu_two_nodes_dlc.sh",
     "pretrain_single_node.sh",
-    "pretrain_single_node30.sh",
-    "pretrain_three_nodes.sh",
     "pretrain_two_nodes26.sh",
     "pretrain_two_nodes31.sh",
 )

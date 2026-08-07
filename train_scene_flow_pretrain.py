@@ -56,7 +56,11 @@ from dggt.losses.rgb_render_loss import (
     setup_lpips_for_rgb_loss,
     should_apply_rgb_render_loss,
 )
-from dggt.models.scene_flow import WanSceneFlow
+from dggt.models.scene_flow import (
+    ACTOR_GEOMETRY_ALIGNMENT_NONE,
+    ACTOR_GEOMETRY_ALIGNMENT_V1,
+    WanSceneFlow,
+)
 from dggt.models.canonical_asset_encoder import CanonicalAssetEncoder
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.vggt import VGGT
@@ -476,6 +480,15 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "gauge_gen_dim",
     "scene_gauge_representation",
     "scene_gauge_stats_version",
+    "actor_geometry_alignment_version",
+    "actor_geometry_velocity_ref",
+    "actor_geometry_sigma_power",
+    "actor_geometry_near_plane_m",
+    "actor_geometry_metric_speed_max_mps",
+    "actor_geometry_clean_gauge_norm_abs_max",
+    "actor_geometry_linear_condition_max",
+    "actor_geometry_ray_abs_max",
+    "actor_geometry_log_depth_abs_max",
     "camera_condition_representation",
     "mask_compositing_version",
     "asset_position_mode",
@@ -489,6 +502,127 @@ SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
     "sky_mask_refine_scale",
     "sky_mask_refine_channels",
 )
+
+
+# Profile-aware defaults apply only to fields that had an unambiguous historical
+# meaning. Numeric actor-alignment constants deliberately have no legacy default:
+# they are inactive for ``none`` and mandatory in every v1 checkpoint.
+SCENE_FLOW_CONFIG_LEGACY_DEFAULTS = {
+    "actor_geometry_alignment_version": ACTOR_GEOMETRY_ALIGNMENT_NONE,
+}
+
+
+ACTOR_GEOMETRY_ALIGNMENT_CONFIG_FIELDS = (
+    "actor_geometry_velocity_ref",
+    "actor_geometry_sigma_power",
+    "actor_geometry_near_plane_m",
+    "actor_geometry_metric_speed_max_mps",
+    "actor_geometry_clean_gauge_norm_abs_max",
+    "actor_geometry_linear_condition_max",
+    "actor_geometry_ray_abs_max",
+    "actor_geometry_log_depth_abs_max",
+)
+ACTOR_GEOMETRY_ADAPTER_STATE_PREFIX = "actor_gauge_adapter."
+
+
+def scene_flow_actor_alignment_config_active(scene_flow: nn.Module) -> bool:
+    """Return whether regular SceneFlow calls require a generated gauge state."""
+    config = getattr(unwrap_ddp(scene_flow), "config", None)
+    return (
+        str(getattr(config, "actor_geometry_alignment_version", ACTOR_GEOMETRY_ALIGNMENT_NONE))
+        == ACTOR_GEOMETRY_ALIGNMENT_V1
+    )
+
+
+def _checkpoint_actor_geometry_version(saved_cfg: dict[str, Any]) -> str:
+    value = saved_cfg.get(
+        "actor_geometry_alignment_version",
+        SCENE_FLOW_CONFIG_LEGACY_DEFAULTS["actor_geometry_alignment_version"],
+    )
+    if value not in (ACTOR_GEOMETRY_ALIGNMENT_NONE, ACTOR_GEOMETRY_ALIGNMENT_V1):
+        raise ValueError(
+            "scene_flow_config.actor_geometry_alignment_version must be "
+            f"{ACTOR_GEOMETRY_ALIGNMENT_NONE!r} or {ACTOR_GEOMETRY_ALIGNMENT_V1!r}, got {value!r}"
+        )
+    return str(value)
+
+
+def _actor_geometry_adapter_state_keys(scene_flow: nn.Module) -> set[str]:
+    return {
+        key
+        for key in unwrap_ddp(scene_flow).state_dict()
+        if key.startswith(ACTOR_GEOMETRY_ADAPTER_STATE_PREFIX)
+    }
+
+
+def validate_scene_flow_state_dict_exact(
+    scene_flow: nn.Module,
+    state_dict: Any,
+    *,
+    path: str | Path,
+    source: str,
+) -> dict[str, torch.Tensor]:
+    """Preflight an exact state before compatibility load hooks can alter it."""
+
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"{path} {source} is not a state_dict")
+    stripped = strip_module_prefix(state_dict)
+    expected = unwrap_ddp(scene_flow).state_dict()
+    actual_keys = set(stripped)
+    expected_keys = set(expected)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    if missing or unexpected:
+        raise ValueError(
+            f"{path} {source} state-key mismatch before compatibility hooks: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    invalid_values = sorted(
+        key for key, value in stripped.items() if not torch.is_tensor(value)
+    )
+    if invalid_values:
+        raise ValueError(f"{path} {source} contains non-tensor values at {invalid_values}")
+    shape_mismatches = sorted(
+        key
+        for key, value in stripped.items()
+        if tuple(value.shape) != tuple(expected[key].shape)
+    )
+    if shape_mismatches:
+        raise ValueError(
+            f"{path} {source} state-shape mismatch at {shape_mismatches}"
+        )
+    return stripped
+
+
+def load_scene_flow_state_dict_strict_profile_aware(
+    scene_flow: nn.Module,
+    state_dict: Any,
+    *,
+    path: str | Path,
+    source: str,
+) -> None:
+    """Strict-load a selected state, preflighting every v1 key and shape."""
+
+    model = unwrap_ddp(scene_flow)
+    version = str(
+        getattr(
+            getattr(model, "config", None),
+            "actor_geometry_alignment_version",
+            ACTOR_GEOMETRY_ALIGNMENT_NONE,
+        )
+    )
+    if version == ACTOR_GEOMETRY_ALIGNMENT_V1:
+        prepared = validate_scene_flow_state_dict_exact(
+            model,
+            state_dict,
+            path=path,
+            source=source,
+        )
+    else:
+        if not isinstance(state_dict, dict):
+            raise ValueError(f"{path} {source} is not a state_dict")
+        prepared = strip_module_prefix(state_dict)
+    model.load_state_dict(dict(prepared), strict=True)
 
 
 METRIC_GAUGE_PROVENANCE_FIELDS = frozenset(
@@ -656,6 +790,8 @@ def validate_scene_flow_checkpoint_config(
     expected_feature_stats_sha256: str | None = None,
     expected_stats_sequence_length: int | None = None,
     expected_stats_patch_grid: tuple[int, int] | list[int] | None = None,
+    *,
+    allow_actor_geometry_none_to_v1_migration: bool = False,
 ) -> None:
     validate_prediction_type_checkpoint(scene_flow, payload, path)
     if not isinstance(payload, dict):
@@ -667,6 +803,48 @@ def validate_scene_flow_checkpoint_config(
     saved_cfg = payload.get("scene_flow_config")
     if not isinstance(saved_cfg, dict):
         raise ValueError(f"{path} is missing scene_flow_config; old checkpoints are not loadable")
+    saved_actor_geometry_version = _checkpoint_actor_geometry_version(saved_cfg)
+    current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)
+    current_actor_geometry_version = str(
+        getattr(
+            current_cfg,
+            "actor_geometry_alignment_version",
+            ACTOR_GEOMETRY_ALIGNMENT_NONE,
+        )
+    )
+    actor_geometry_migration = (
+        bool(allow_actor_geometry_none_to_v1_migration)
+        and saved_actor_geometry_version == ACTOR_GEOMETRY_ALIGNMENT_NONE
+        and current_actor_geometry_version == ACTOR_GEOMETRY_ALIGNMENT_V1
+    )
+    if saved_actor_geometry_version == ACTOR_GEOMETRY_ALIGNMENT_V1:
+        missing_actor_config = sorted(
+            field
+            for field in ACTOR_GEOMETRY_ALIGNMENT_CONFIG_FIELDS
+            if field not in saved_cfg
+        )
+        if missing_actor_config:
+            raise ValueError(
+                f"{path} v1 actor-geometry checkpoint is missing frozen config fields "
+                f"{missing_actor_config}"
+            )
+        for field in ACTOR_GEOMETRY_ALIGNMENT_CONFIG_FIELDS:
+            value = saved_cfg[field]
+            if isinstance(value, bool):
+                raise ValueError(f"{path} scene_flow_config.{field} must be finite numeric")
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path} scene_flow_config.{field} must be finite numeric"
+                ) from exc
+            if not math.isfinite(numeric_value):
+                raise ValueError(f"{path} scene_flow_config.{field} must be finite numeric")
+            if field == "actor_geometry_sigma_power":
+                if numeric_value < 0.0:
+                    raise ValueError(f"{path} scene_flow_config.{field} must be non-negative")
+            elif numeric_value <= 0.0:
+                raise ValueError(f"{path} scene_flow_config.{field} must be positive")
     if saved_cfg.get("sky_representation_version") != SKY_REPRESENTATION_VERSION:
         raise ValueError(
             f"{path} is not a {SKY_REPRESENTATION_VERSION} sky checkpoint. Old RGB-atlas checkpoints "
@@ -823,9 +1001,40 @@ def validate_scene_flow_checkpoint_config(
         "gauge_gen_decoder.3.weight",
         "gauge_gen_modality_embed",
     }
+    adapter_state_keys = {
+        key for key in state if key.startswith(ACTOR_GEOMETRY_ADAPTER_STATE_PREFIX)
+    }
+    if saved_actor_geometry_version == ACTOR_GEOMETRY_ALIGNMENT_V1:
+        expected_adapter_state_keys = _actor_geometry_adapter_state_keys(scene_flow)
+        if not expected_adapter_state_keys:
+            raise ValueError(
+                f"{path} declares v1 actor geometry but the runtime model has no adapter"
+            )
+        required_state.update(expected_adapter_state_keys)
+        if adapter_state_keys != expected_adapter_state_keys:
+            raise ValueError(
+                f"{path} v1 actor adapter state mismatch: "
+                f"missing={sorted(expected_adapter_state_keys - adapter_state_keys)}, "
+                f"unexpected={sorted(adapter_state_keys - expected_adapter_state_keys)}"
+            )
+    elif adapter_state_keys:
+        raise ValueError(
+            f"{path} declares actor geometry 'none' but contains adapter keys "
+            f"{sorted(adapter_state_keys)}"
+        )
     missing_state = sorted(required_state.difference(state))
     if missing_state:
         raise ValueError(f"{path} metric-gauge checkpoint is missing {missing_state}")
+    if saved_actor_geometry_version == ACTOR_GEOMETRY_ALIGNMENT_V1:
+        # SceneFlow has intentional compatibility hooks for older non-v1
+        # checkpoints. Those hooks may synthesize missing keys or discard stale
+        # keys even under strict=True, so v1 must be checked before loading.
+        validate_scene_flow_state_dict_exact(
+            scene_flow,
+            state,
+            path=path,
+            source="raw scene_flow",
+        )
     if not bool(torch.as_tensor(state["camera_stats_valid"]).item()):
         raise ValueError(f"{path} camera statistics are not valid")
     if not bool(torch.as_tensor(state["gauge_stats_valid"]).item()):
@@ -837,13 +1046,22 @@ def validate_scene_flow_checkpoint_config(
             "(video/asset/camera shared video time, camera center, spherical sky coordinates near 15000); "
             "do not resume/warm-start across these incompatible position semantics."
         )
-    current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)
     mismatches: list[str] = []
     for field in SCENE_FLOW_CONFIG_COMPAT_FIELDS:
-        if field not in saved_cfg or not hasattr(current_cfg, field):
+        if not hasattr(current_cfg, field):
             continue
         current_value = getattr(current_cfg, field)
-        saved_value = saved_cfg[field]
+        if field in saved_cfg:
+            saved_value = saved_cfg[field]
+        elif field in SCENE_FLOW_CONFIG_LEGACY_DEFAULTS:
+            saved_value = SCENE_FLOW_CONFIG_LEGACY_DEFAULTS[field]
+        else:
+            continue
+        if actor_geometry_migration and (
+            field == "actor_geometry_alignment_version"
+            or field in ACTOR_GEOMETRY_ALIGNMENT_CONFIG_FIELDS
+        ):
+            continue
         if not _config_values_match(current_value, saved_value):
             mismatches.append(f"{field}: checkpoint={saved_value!r}, current={current_value!r}")
     if mismatches:
@@ -851,6 +1069,16 @@ def validate_scene_flow_checkpoint_config(
         raise ValueError(
             f"{path} SceneFlow config does not match the current model: {joined}. "
             "Do not resume/warm-start across incompatible RoPE/model geometry settings."
+        )
+    if (
+        current_actor_geometry_version != saved_actor_geometry_version
+        and not actor_geometry_migration
+    ):
+        raise ValueError(
+            f"{path} actor geometry profile mismatch: "
+            f"checkpoint={saved_actor_geometry_version!r}, "
+            f"current={current_actor_geometry_version!r}. Only an explicit none->v1 "
+            "architecture-migration warm start is supported."
         )
 
 
@@ -870,6 +1098,140 @@ def validate_prediction_type_checkpoint(scene_flow: nn.Module, payload: Any, pat
             f"{path} prediction_type={saved!r} does not match current model prediction_type={current!r}. "
             "Do not warm-start/resume across x-prediction and velocity-prediction checkpoints."
         )
+
+
+def _is_actor_geometry_none_to_v1_migration(
+    scene_flow: nn.Module,
+    payload: Any,
+) -> bool:
+    if not isinstance(payload, dict) or not isinstance(payload.get("scene_flow_config"), dict):
+        return False
+    return (
+        _checkpoint_actor_geometry_version(payload["scene_flow_config"])
+        == ACTOR_GEOMETRY_ALIGNMENT_NONE
+        and str(
+            getattr(
+                getattr(unwrap_ddp(scene_flow), "config", None),
+                "actor_geometry_alignment_version",
+                ACTOR_GEOMETRY_ALIGNMENT_NONE,
+            )
+        )
+        == ACTOR_GEOMETRY_ALIGNMENT_V1
+    )
+
+
+def load_actor_geometry_migration_state_dict(
+    scene_flow: nn.Module,
+    state_dict: Any,
+    *,
+    path: str | Path,
+) -> None:
+    """Load the one supported architecture migration with an exact missing set."""
+    if not isinstance(state_dict, dict):
+        raise ValueError(f"{path} selected migration weights are not a state_dict")
+    model = unwrap_ddp(scene_flow)
+    expected_missing = _actor_geometry_adapter_state_keys(model)
+    if not expected_missing:
+        raise RuntimeError("none->v1 migration requested but the runtime adapter is absent")
+    stripped = strip_module_prefix(state_dict)
+    expected_state = model.state_dict()
+    expected_input_keys = set(expected_state) - expected_missing
+    actual_input_keys = set(stripped)
+    missing_input = sorted(expected_input_keys - actual_input_keys)
+    unexpected_input = sorted(actual_input_keys - expected_input_keys)
+    if missing_input or unexpected_input:
+        raise ValueError(
+            f"{path} none->v1 migration state mismatch before compatibility hooks: "
+            f"missing={missing_input}, unexpected={unexpected_input}"
+        )
+    invalid_values = sorted(
+        key for key, value in stripped.items() if not torch.is_tensor(value)
+    )
+    if invalid_values:
+        raise ValueError(
+            f"{path} none->v1 migration contains non-tensor values at {invalid_values}"
+        )
+    shape_mismatches = sorted(
+        key
+        for key, value in stripped.items()
+        if tuple(value.shape) != tuple(expected_state[key].shape)
+    )
+    if shape_mismatches:
+        raise ValueError(
+            f"{path} none->v1 migration state-shape mismatch at {shape_mismatches}"
+        )
+    # Pass a fresh mapping because the model's compatibility hook mutates the
+    # state dictionary while resolving legacy fields.
+    incompatible = model.load_state_dict(dict(stripped), strict=False)
+    actual_missing = set(incompatible.missing_keys)
+    actual_unexpected = set(incompatible.unexpected_keys)
+    if actual_missing != expected_missing or actual_unexpected:
+        raise ValueError(
+            f"{path} none->v1 migration state mismatch: "
+            f"missing={sorted(actual_missing)} expected={sorted(expected_missing)}, "
+            f"unexpected={sorted(actual_unexpected)}"
+        )
+
+
+def validate_v1_exact_training_state(
+    scene_flow: nn.Module,
+    payload: dict[str, Any],
+    *,
+    path: str | Path,
+) -> None:
+    """Validate named EMA/optimizer coverage for an exact v1 training resume."""
+    saved_cfg = payload.get("scene_flow_config")
+    if not isinstance(saved_cfg, dict) or (
+        _checkpoint_actor_geometry_version(saved_cfg) != ACTOR_GEOMETRY_ALIGNMENT_V1
+    ):
+        return
+    model = unwrap_ddp(scene_flow)
+    expected_state = model.state_dict()
+    ema_named = payload.get("ema_scene_flow_state_dict")
+    if not isinstance(ema_named, dict):
+        raise ValueError(f"{path} v1 exact resume requires ema_scene_flow_state_dict")
+    ema_named = strip_module_prefix(ema_named)
+    if set(ema_named) != set(expected_state):
+        raise ValueError(
+            f"{path} v1 EMA state is incomplete: "
+            f"missing={sorted(set(expected_state) - set(ema_named))}, "
+            f"unexpected={sorted(set(ema_named) - set(expected_state))}"
+        )
+    shape_mismatches = [
+        key
+        for key, value in expected_state.items()
+        if tuple(ema_named[key].shape) != tuple(value.shape)
+    ]
+    if shape_mismatches:
+        raise ValueError(f"{path} v1 EMA state shape mismatch at {shape_mismatches}")
+
+    optimizer_state = payload.get("optimizer")
+    if not isinstance(optimizer_state, dict) or not isinstance(
+        optimizer_state.get("param_groups"), list
+    ):
+        raise ValueError(f"{path} v1 exact resume has no valid optimizer param_groups")
+    optimizer_params = [
+        parameter_id
+        for group in optimizer_state["param_groups"]
+        for parameter_id in group.get("params", [])
+    ]
+    if len(optimizer_params) != len(set(optimizer_params)) or len(optimizer_params) != len(
+        list(model.parameters())
+    ):
+        raise ValueError(
+            f"{path} v1 optimizer does not cover every model parameter exactly once"
+        )
+
+    ema_state = payload.get("ema_scene_flow")
+    shadow_params = ema_state.get("shadow_params") if isinstance(ema_state, dict) else None
+    model_params = list(model.parameters())
+    if not isinstance(shadow_params, list) or len(shadow_params) != len(model_params):
+        raise ValueError(f"{path} v1 EMA shadow parameter set is incomplete")
+    if any(
+        tuple(shadow.shape) != tuple(parameter.shape)
+        for shadow, parameter in zip(shadow_params, model_params)
+    ):
+        raise ValueError(f"{path} v1 EMA shadow parameter shapes do not match the model")
 
 
 def model_prediction_to_velocity(scene_flow: nn.Module, prediction: torch.Tensor, target) -> torch.Tensor:
@@ -1110,7 +1472,7 @@ def gauge_diagnostic_metrics(
     *,
     prior_log_scale: torch.Tensor | float,
 ) -> dict[str, float]:
-    """Return the four mandatory physical gauge diagnostics.
+    """Return physical gauge diagnostics, including the explicit constant prior.
 
     Keeping these formulas outside the trainer makes their channel masking and
     marginal-prior baseline directly testable without a full diffusion step.
@@ -1149,11 +1511,16 @@ def gauge_diagnostic_metrics(
         raise ValueError("prior_log_scale must be one finite scalar")
     prior_error = (prior.reshape(()) - target[..., 0]).abs()
     pred_error = absolute_error[..., 0]
+    prior_log_scale_error = (
+        (prior_error * scale_weights).sum().div(scale_denominator)
+    )
+    predicted_log_scale_error = (
+        (pred_error * scale_weights).sum().div(scale_denominator)
+    )
     return {
         "gauge_valid_frac": float(weights.mean().item()),
-        "gauge_log_scale_error": float(
-            (pred_error * scale_weights).sum().div(scale_denominator).item()
-        ),
+        "gauge_log_scale_error": float(predicted_log_scale_error.item()),
+        "gauge_prior_log_scale_error": float(prior_log_scale_error.item()),
         "gauge_fov_error_deg": float(
             (torch.rad2deg((fov_pred - fov_gt).abs()) * fov_weights)
             .sum()
@@ -1161,10 +1528,7 @@ def gauge_diagnostic_metrics(
             .item()
         ),
         "gauge_vs_prior_gain": float(
-            ((prior_error - pred_error) * scale_weights)
-            .sum()
-            .div(scale_denominator)
-            .item()
+            (prior_log_scale_error - predicted_log_scale_error).item()
         ),
     }
 
@@ -1193,27 +1557,41 @@ def sampled_gauge_validation_metrics(
         valid,
         prior_log_scale=prior_log_scale,
     )
+    # Keep the sampled-gauge API stable and intentionally compact. The
+    # training-only prior error is already encoded by ``vs_prior_gain`` plus
+    # ``log_scale_error`` and should not silently create a fifth W&B series.
+    sampled_names = (
+        "gauge_valid_frac",
+        "gauge_log_scale_error",
+        "gauge_fov_error_deg",
+        "gauge_vs_prior_gain",
+    )
     return {
-        f"{prefix}_{name.removeprefix('gauge_')}": value
-        for name, value in base.items()
+        f"{prefix}_{name.removeprefix('gauge_')}": base[name]
+        for name in sampled_names
     }
 
 
 def metric_depth_diagnostic_log_values(
     relative_error: torch.Tensor | float | None = None,
+    *,
+    prefix: str = "metric_depth_rel_err",
 ) -> dict[str, float]:
     """Encode metric-depth availability without treating a sentinel as data."""
 
+    if not prefix:
+        raise ValueError("metric depth diagnostic prefix must be non-empty")
+    available_key = f"{prefix}_available"
     if relative_error is None:
-        return {"metric_depth_rel_err": -1.0, "metric_depth_rel_err_available": 0.0}
+        return {prefix: -1.0, available_key: 0.0}
     value = torch.as_tensor(relative_error).detach().float()
     if value.numel() != 1:
         raise ValueError("metric depth relative error must be one scalar")
     if not bool(torch.isfinite(value).item()):
-        return {"metric_depth_rel_err": -1.0, "metric_depth_rel_err_available": 0.0}
+        return {prefix: -1.0, available_key: 0.0}
     return {
-        "metric_depth_rel_err": float(value.item()),
-        "metric_depth_rel_err_available": 1.0,
+        prefix: float(value.item()),
+        available_key: 1.0,
     }
 
 
@@ -1644,6 +2022,11 @@ def _kind_list(
         return [default] * int(batch_size)
     if isinstance(kinds, str):
         return [kinds] * int(batch_size)
+    if torch.is_tensor(kinds):
+        raise TypeError(
+            "Pretrain/CFG condition kinds must be strings or a per-row string list; "
+            "tensor kind masks are only supported by the low-level model API."
+        )
     values = list(kinds)
     if len(values) != int(batch_size):
         raise ValueError(f"condition kind length {len(values)} != batch size {batch_size}")
@@ -2225,6 +2608,7 @@ def load_resume_checkpoint(
     expected_feature_stats_sha256: str | None = None,
     expected_stats_sequence_length: int | None = None,
     expected_stats_patch_grid: tuple[int, int] | list[int] | None = None,
+    expected_step: int | None = None,
     args: argparse.Namespace | None = None,
 ) -> int:
     if not resume_path:
@@ -2259,11 +2643,26 @@ def load_resume_checkpoint(
             f"*_ema_weights_only.pt to --resume_path; those files are for warm-start "
             f"or inference, not exact training resume."
         )
-    unwrap_ddp(scene_flow).load_state_dict(payload["scene_flow"], strict=True)
+    validate_v1_exact_training_state(
+        scene_flow,
+        payload,
+        path=resume_path,
+    )
+    step = int(payload["step"])
+    if expected_step is not None and step != int(expected_step):
+        raise ValueError(
+            f"Resume checkpoint step mismatch: expected step={int(expected_step)}, "
+            f"checkpoint {resume_path} stores step={step}."
+        )
+    load_scene_flow_state_dict_strict_profile_aware(
+        scene_flow,
+        payload["scene_flow"],
+        path=resume_path,
+        source="raw scene_flow",
+    )
     ema.load_state_dict(payload["ema_scene_flow"])
     optimizer.load_state_dict(payload["optimizer"])
     lr_scheduler.load_state_dict(payload["lr_scheduler"])
-    step = int(payload.get("step", 0))
     if is_main_process():
         print(f"[resume] loaded {resume_path} at step={step}", flush=True)
     return step
@@ -2305,6 +2704,14 @@ def require_pretrain_feature_stats_match_after_checkpoint_load(
 def init_wandb(args: argparse.Namespace, log_dir: Path):
     if not args.wandb or not is_main_process():
         return None
+    # W&B distinguishes an absent run id from an exported empty string and
+    # rejects the latter before ``wandb.init`` can use the explicit ``id``.
+    # Sanitize both launcher residue and a manually supplied empty CLI value.
+    if not os.environ.get("WANDB_RUN_ID", "").strip():
+        os.environ.pop("WANDB_RUN_ID", None)
+    wandb_run_id = getattr(args, "wandb_run_id", None)
+    if wandb_run_id is not None and not str(wandb_run_id).strip():
+        wandb_run_id = None
     try:
         import wandb
     except ImportError as exc:
@@ -2315,7 +2722,7 @@ def init_wandb(args: argparse.Namespace, log_dir: Path):
         name=args.wandb_name,
         dir=str(log_dir),
         config=vars(args),
-        id=args.wandb_run_id,
+        id=wandb_run_id,
         resume=args.wandb_resume,
     )
     return run
@@ -2325,6 +2732,131 @@ def log_wandb(run, metrics: dict[str, float], step: int, prefix: str) -> None:
     if run is None:
         return
     run.log({f"{prefix}/{key}": value for key, value in metrics.items()}, step=step)
+
+
+_METRIC_DEPTH_WANDB_AVAILABILITY = {
+    "metric_depth_rel_err": "metric_depth_rel_err_available",
+    "metric_depth_rel_err_pred_gauge": "metric_depth_rel_err_pred_gauge_available",
+    "metric_depth_rel_err_teacher_gauge": "metric_depth_rel_err_teacher_gauge_available",
+}
+_METRIC_DEPTH_WANDB_HIDDEN_KEYS = {
+    # This legacy alias is identical to the explicit predicted-gauge metric.
+    "metric_depth_rel_err",
+    "metric_depth_diagnostic_due",
+    *_METRIC_DEPTH_WANDB_AVAILABILITY.values(),
+}
+_ACTOR_ALIGNMENT_WANDB_PREFIX = "actor_alignment/"
+_ACTOR_ALIGNMENT_WANDB_STAT_KEYS = (
+    "actor_alignment/real_actor_frames",
+    "actor_alignment/gauge_target_valid_actor_frames",
+    "actor_alignment/final_aligned_actor_frames",
+    "actor_alignment/effective_adapter_squared_sum",
+    "actor_alignment/effective_adapter_elements",
+)
+
+
+def accumulate_wandb_metrics(
+    sums: dict[str, float],
+    observation_counts: dict[str, int],
+    metrics: dict[str, float],
+) -> None:
+    """Accumulate one W&B observation without averaging missing diagnostics."""
+
+    for key, raw_value in metrics.items():
+        availability_key = _METRIC_DEPTH_WANDB_AVAILABILITY.get(key)
+        if (
+            availability_key is not None
+            and float(metrics.get(availability_key, 0.0)) <= 0.0
+        ):
+            continue
+        value = float(raw_value)
+        sums[key] = sums.get(key, 0.0) + value
+        observation_counts[key] = observation_counts.get(key, 0) + 1
+
+
+def accumulate_actor_alignment_wandb_statistics(
+    sums: dict[str, float],
+    metrics: dict[str, float],
+) -> None:
+    """Accumulate ratio/RMS sufficient statistics over every microbatch."""
+
+    for key in _ACTOR_ALIGNMENT_WANDB_STAT_KEYS:
+        sums[key] = sums.get(key, 0.0) + float(metrics.get(key, 0.0))
+
+
+def distributed_sum_actor_alignment_wandb_statistics(
+    sums: dict[str, float],
+    device: torch.device,
+) -> dict[str, float]:
+    """Sum five actor statistics across ranks once per W&B window."""
+
+    values = torch.tensor(
+        [float(sums.get(key, 0.0)) for key in _ACTOR_ALIGNMENT_WANDB_STAT_KEYS],
+        device=device,
+        dtype=torch.float64,
+    )
+    if is_distributed():
+        dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    host_values = values.cpu().tolist()
+    return dict(zip(_ACTOR_ALIGNMENT_WANDB_STAT_KEYS, host_values))
+
+
+def finalize_wandb_metrics(
+    sums: dict[str, float],
+    observation_counts: dict[str, int],
+    *,
+    actor_statistics: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Build the compact W&B view from a completed aggregation window."""
+
+    result: dict[str, float] = {}
+    for key, value_sum in sums.items():
+        if key.startswith(_ACTOR_ALIGNMENT_WANDB_PREFIX):
+            continue
+        if key in _METRIC_DEPTH_WANDB_HIDDEN_KEYS:
+            continue
+        count = int(observation_counts.get(key, 0))
+        if count > 0:
+            result[key] = float(value_sum) / float(count)
+
+    if actor_statistics is None:
+        return result
+
+    real_count = float(
+        actor_statistics.get("actor_alignment/real_actor_frames", 0.0)
+    )
+    gauge_valid_count = float(
+        actor_statistics.get(
+            "actor_alignment/gauge_target_valid_actor_frames", 0.0
+        )
+    )
+    final_count = float(
+        actor_statistics.get("actor_alignment/final_aligned_actor_frames", 0.0)
+    )
+    if real_count > 0.0:
+        result["actor_alignment/gauge_valid_fraction"] = (
+            gauge_valid_count / real_count
+        )
+    if gauge_valid_count > 0.0:
+        result["actor_alignment/final_aligned_fraction"] = (
+            final_count / gauge_valid_count
+        )
+
+    adapter_elements = float(
+        actor_statistics.get("actor_alignment/effective_adapter_elements", 0.0)
+    )
+    if adapter_elements > 0.0:
+        adapter_mean_square = float(
+            actor_statistics.get(
+                "actor_alignment/effective_adapter_squared_sum", 0.0
+            )
+        ) / adapter_elements
+        result["actor_alignment/effective_adapter_rms"] = (
+            math.sqrt(adapter_mean_square)
+            if adapter_mean_square >= 0.0
+            else float("nan")
+        )
+    return result
 
 
 def setup_text_encoder(args: argparse.Namespace, device: torch.device) -> nn.Module | None:
@@ -4384,7 +4916,10 @@ def _cfg_sample_pretrain_latents_sliding(
         scene_flow,
         bundle,
         generator,
-        return_gauge=return_gauge,
+        return_gauge=(
+            bool(return_gauge)
+            or scene_flow_actor_alignment_config_active(scene_flow)
+        ),
     )
     sky_z = None
     if return_sky:
@@ -4678,6 +5213,10 @@ def _cfg_sample_pretrain_latents_sliding(
                     gauge_gen_tokens=gauge_z,
                     asset_condition_kind=asset_kind, control_drop_mask=control_drop,
                     frame_ids=frame_ids_full[:, start:end], fps=getattr(bundle, "fps", None),
+                    # This endpoint only reads sky-mask logits, which the sky
+                    # branch derives without `cond`. Skip the full-K reread the
+                    # same way train_step does for its sigma=0 endpoint.
+                    apply_actor_alignment=False,
                 )
                 if not isinstance(result, dict):
                     raise RuntimeError("SceneFlow sliding endpoint mask forward must return a dict")
@@ -4840,7 +5379,10 @@ def cfg_sample_pretrain_latents(
         scene_flow,
         bundle,
         generator,
-        return_gauge=return_gauge,
+        return_gauge=(
+            bool(return_gauge)
+            or scene_flow_actor_alignment_config_active(scene_flow)
+        ),
     )
     sky_z = None
     if return_sky:
@@ -4906,6 +5448,7 @@ def cfg_sample_pretrain_latents(
             camera_kind: Any,
             control_drop_mask: torch.Tensor | None = None,
             request_sky_mask: bool = False,
+            apply_actor_alignment: bool = True,
         ) -> dict[str, torch.Tensor]:
             out = sf(
                 z,
@@ -4936,6 +5479,7 @@ def cfg_sample_pretrain_latents(
                 control_drop_mask=control_drop_mask,
                 frame_ids=frame_ids,
                 fps=getattr(bundle, "fps", None),
+                apply_actor_alignment=apply_actor_alignment,
             )
             if not isinstance(out, dict):
                 raise RuntimeError("SceneFlow return_dict=True must return dicts in pretrain sampling.")
@@ -5040,6 +5584,7 @@ def cfg_sample_pretrain_latents(
             branch_text_mask=text_mask,
             camera_kind=full_camera_kind,
             request_sky_mask=True,
+            apply_actor_alignment=False,
         )
         endpoint_no_text = endpoint_text_base = endpoint_text_camera = None
         if do_cfg and (abs(scale - 1.0) > 1e-6 or abs(camera_text_scale - 1.0) > 1e-6):
@@ -5051,6 +5596,7 @@ def cfg_sample_pretrain_latents(
                 branch_text_mask=text_null_mask,
                 camera_kind=full_camera_kind,
                 request_sky_mask=True,
+                apply_actor_alignment=False,
             )
         if do_cfg and abs(camera_scale - 1.0) > 1e-6:
             endpoint_text_base = _run_branch(
@@ -5061,6 +5607,7 @@ def cfg_sample_pretrain_latents(
                 branch_text_mask=text_mask,
                 camera_kind=camera_null_kind,
                 request_sky_mask=True,
+                apply_actor_alignment=False,
             )
         if do_cfg and (
             abs(asset_control_scale - 1.0) > 1e-6
@@ -5074,6 +5621,7 @@ def cfg_sample_pretrain_latents(
                 branch_text_mask=text_mask,
                 camera_kind=full_camera_kind,
                 request_sky_mask=True,
+                apply_actor_alignment=False,
             )
 
         def combine_endpoint(key: str) -> torch.Tensor:
@@ -5494,6 +6042,34 @@ def train_step(
             identity_batch=False,
             preserve_floor=args.preserve_floor,
         )
+        actor_alignment_diagnostics = out.get("actor_alignment_diagnostics")
+        if isinstance(actor_alignment_diagnostics, dict):
+            diagnostic_names: list[str] = []
+            diagnostic_values: list[torch.Tensor] = []
+            for name, value in actor_alignment_diagnostics.items():
+                if not torch.is_tensor(value):
+                    continue
+                flat_value = value.detach().to(dtype=torch.float32).reshape(-1)
+                if int(flat_value.numel()) == 1:
+                    diagnostic_names.append(f"actor_alignment/{name}")
+                    diagnostic_values.append(flat_value)
+                else:
+                    diagnostic_names.extend(
+                        f"actor_alignment/{name}_{index}"
+                        for index in range(int(flat_value.numel()))
+                    )
+                    diagnostic_values.append(flat_value)
+            if diagnostic_values:
+                # Logging is the intentional host boundary. Transfer every
+                # small coverage scalar together to avoid one device
+                # synchronization per metric.
+                host_values = torch.cat(diagnostic_values).cpu().tolist()
+                logs.update(
+                    {
+                        name: float(value)
+                        for name, value in zip(diagnostic_names, host_values)
+                    }
+                )
         if loss_terms_out is not None:
             loss_terms_out["video_core"] = loss
         z_camera_pred = None
@@ -5738,6 +6314,7 @@ def train_step(
                 control_drop_mask=None,
                 frame_ids=getattr(bundle, "frame_ids", None),
                 fps=getattr(bundle, "fps", None),
+                apply_actor_alignment=False,
             )
             if not isinstance(endpoint_out, dict):
                 raise RuntimeError("sigma=0 sky-mask endpoint forward must return a dict")
@@ -5812,6 +6389,16 @@ def train_step(
             logs.update({f"endpoint_{key}": value for key, value in endpoint_refined_logs.items()})
 
         logs.update(metric_depth_diagnostic_log_values())
+        logs.update(
+            metric_depth_diagnostic_log_values(
+                prefix="metric_depth_rel_err_pred_gauge"
+            )
+        )
+        logs.update(
+            metric_depth_diagnostic_log_values(
+                prefix="metric_depth_rel_err_teacher_gauge"
+            )
+        )
         logs["metric_depth_diagnostic_due"] = float(metric_depth_diagnostic_due)
         if rgb_render_active:
             if not torch.is_tensor(getattr(bundle, "rgb_render_images", None)):
@@ -6054,28 +6641,56 @@ def train_step(
                     metric_lidar_valid = getattr(
                         bundle, "metric_lidar_depth_valid", None
                     )
+                    selected_metric_lidar = select_rows(
+                        metric_lidar, "metric_lidar_depth_m"
+                    )
+                    selected_scale_valid = select_rows(
+                        bundle.scene_gauge_valid[..., 0],
+                        "scene_gauge_scale_valid",
+                    )
+                    selected_lidar_valid = (
+                        select_rows(
+                            metric_lidar_valid, "metric_lidar_depth_valid"
+                        )
+                        if torch.is_tensor(metric_lidar_valid)
+                        else None
+                    )
                     metric_rel_err = metric_depth_relative_error(
                         rgb_result.generated_depth,
-                        select_rows(
-                            metric_lidar, "metric_lidar_depth_m"
-                        ),
+                        selected_metric_lidar,
                         selected_gauge[..., 0],
                         calibration=getattr(
                             unwrap_ddp(scene_flow), "_pullback_calibration", None
                         ),
-                        scale_valid=select_rows(
-                            bundle.scene_gauge_valid[..., 0],
-                            "scene_gauge_scale_valid",
-                        ),
-                        lidar_valid=(
-                            select_rows(
-                                metric_lidar_valid, "metric_lidar_depth_valid"
-                            )
-                            if torch.is_tensor(metric_lidar_valid)
-                            else None
-                        ),
+                        scale_valid=selected_scale_valid,
+                        lidar_valid=selected_lidar_valid,
                     )
                     logs.update(metric_depth_diagnostic_log_values(metric_rel_err))
+                    logs.update(
+                        metric_depth_diagnostic_log_values(
+                            metric_rel_err,
+                            prefix="metric_depth_rel_err_pred_gauge",
+                        )
+                    )
+                    teacher_gauge = select_rows(
+                        bundle.scene_gauge_clean, "scene_gauge_clean"
+                    )
+                    teacher_metric_rel_err = metric_depth_relative_error(
+                        rgb_result.generated_depth,
+                        selected_metric_lidar,
+                        teacher_gauge[..., 0],
+                        calibration=getattr(
+                            unwrap_ddp(scene_flow), "_pullback_calibration", None
+                        ),
+                        scale_valid=selected_scale_valid,
+                        lidar_valid=selected_lidar_valid,
+                    )
+                    logs.update(
+                        metric_depth_diagnostic_log_values(
+                            teacher_metric_rel_err,
+                            prefix="metric_depth_rel_err_teacher_gauge",
+                        )
+                    )
         else:
             logs["rgb_render_active"] = 0.0
             logs["loss_level_consistency"] = 0.0
@@ -6124,7 +6739,33 @@ def train_step(
                             else None
                         ),
                     )
+                    teacher_metric_rel_err = metric_depth_relative_error(
+                        metric_geometry.depth,
+                        metric_lidar[:row_count],
+                        bundle.scene_gauge_clean[:row_count, ..., 0],
+                        calibration=getattr(
+                            unwrap_ddp(scene_flow), "_pullback_calibration", None
+                        ),
+                        scale_valid=bundle.scene_gauge_valid[:row_count, ..., 0],
+                        lidar_valid=(
+                            bundle.metric_lidar_depth_valid[:row_count]
+                            if torch.is_tensor(getattr(bundle, "metric_lidar_depth_valid", None))
+                            else None
+                        ),
+                    )
                 logs.update(metric_depth_diagnostic_log_values(metric_rel_err))
+                logs.update(
+                    metric_depth_diagnostic_log_values(
+                        metric_rel_err,
+                        prefix="metric_depth_rel_err_pred_gauge",
+                    )
+                )
+                logs.update(
+                    metric_depth_diagnostic_log_values(
+                        teacher_metric_rel_err,
+                        prefix="metric_depth_rel_err_teacher_gauge",
+                    )
+                )
 
     logs["kv_tokens_mean"] = float(bundle.F_asset_lengths.float().mean().item())
     asset_source_kinds = getattr(bundle, "asset_condition_source_kind", None)
@@ -6266,6 +6907,52 @@ def _canonical_asset_cache_keys(
     return keys
 
 
+def _canonical_raw_image_size_hw(
+    image_size_hw: torch.Tensor | tuple[int, int],
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Accept only frozen raw-size layouts; never discard per-frame values."""
+    value = torch.as_tensor(image_size_hw, device=device)
+    if value.ndim == 1 and tuple(value.shape) == (2,):
+        result = value
+    elif value.ndim == 2 and tuple(value.shape) == (int(batch_size), 2):
+        result = value
+    elif value.ndim == 3 and tuple(value.shape) == (int(batch_size), 1, 2):
+        result = value[:, 0]
+    else:
+        raise ValueError(
+            "raw_image_size_hw must be [2], [B,2], or singleton [B,1,2]; "
+            f"time-varying [B,S,2] is unsupported, got {tuple(value.shape)} for B={batch_size}"
+        )
+    if bool((result <= 0).any()):
+        raise ValueError("raw_image_size_hw must contain positive height/width")
+    return result
+
+
+def _raw_gauge_alignment_valid(
+    batch: dict[str, Any],
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    raw = batch.get("scene_gauge_valid")
+    if not torch.is_tensor(raw):
+        raise RuntimeError(
+            "v1 actor alignment requires scene_gauge_valid from the offline gauge table"
+        )
+    valid = raw.to(device=device, dtype=torch.bool, non_blocking=True)
+    if valid.ndim == 3 and tuple(valid.shape) == (int(batch_size), 1, SCENE_GAUGE_DIM):
+        valid = valid[:, 0]
+    if tuple(valid.shape) != (int(batch_size), SCENE_GAUGE_DIM):
+        raise ValueError(
+            "scene_gauge_valid must be [B,3] or [B,1,3], got "
+            f"{tuple(valid.shape)}"
+        )
+    return valid.all(dim=-1)
+
+
 def build_factorized_asset_condition_from_batch(
     batch: dict[str, Any],
     vggt_model: VGGT,
@@ -6287,6 +6974,22 @@ def build_factorized_asset_condition_from_batch(
     if frame_ids.ndim == 1:
         frame_ids = frame_ids.unsqueeze(0)
     batch_size = int(frame_ids.shape[0])
+    actor_geometry_version = str(
+        getattr(
+            getattr(sf_root, "config", None),
+            "actor_geometry_alignment_version",
+            ACTOR_GEOMETRY_ALIGNMENT_NONE,
+        )
+    )
+    gauge_alignment_valid = (
+        _raw_gauge_alignment_valid(
+            batch,
+            batch_size=batch_size,
+            device=device,
+        )
+        if actor_geometry_version == ACTOR_GEOMETRY_ALIGNMENT_V1
+        else None
+    )
     protocol = batch.get("pretrain_asset_condition_version")
     protocol_values = (
         [str(protocol)] * batch_size
@@ -6388,6 +7091,11 @@ def build_factorized_asset_condition_from_batch(
             f"target window {target_ids}"
         )
 
+    raw_image_size_hw = _canonical_raw_image_size_hw(
+        image_size_hw,
+        batch_size=batch_size,
+        device=device,
+    )
     projection_intrinsics, projection_image_hw = (
         resize_crop_intrinsics_to_model_canvas(
             torch.as_tensor(
@@ -6395,8 +7103,14 @@ def build_factorized_asset_condition_from_batch(
                 device=device,
                 dtype=torch.float32,
             ),
-            torch.as_tensor(image_size_hw, device=device),
+            raw_image_size_hw,
             target_width=int(patch_grid[1]) * 14,
+            target_height=int(patch_grid[0]) * 14,
+            # These intrinsics must describe the very pixels the tokenizer saw,
+            # and those come from the shared width-based resize with no second
+            # vertical crop. Fail loudly instead of silently shifting the
+            # principal point when a camera's aspect ratio disagrees.
+            require_exact_canvas=True,
             patch_size=14,
         )
     )
@@ -6429,6 +7143,7 @@ def build_factorized_asset_condition_from_batch(
         image_size_hw=projection_image_hw,
         patch_grid=patch_grid,
         reference_frame_id=reference_frame_id,
+        gauge_alignment_valid=gauge_alignment_valid,
     )
     lengths = condition.appearance_mask.any(dim=-1).sum(dim=-1).long()
     kinds = [
@@ -6477,6 +7192,16 @@ def _align_sliding_asset_payload_slots(
     scores: dict[str, float] = {}
     for payload in payloads:
         ids = [str(value) for value in payload["pretrain_object_ids"]]
+        nonempty_ids = [object_id for object_id in ids if object_id]
+        if len(nonempty_ids) != len(set(nonempty_ids)):
+            duplicates = sorted(
+                object_id
+                for object_id in set(nonempty_ids)
+                if nonempty_ids.count(object_id) > 1
+            )
+            raise ValueError(
+                f"sliding asset payload contains duplicate non-empty object ids: {duplicates}"
+            )
         values = torch.as_tensor(payload["pretrain_object_scores"]).reshape(-1)
         if len(ids) != max_assets or int(values.numel()) != max_assets:
             raise ValueError("sliding asset payload slot counts disagree")
@@ -6581,9 +7306,11 @@ def attach_training_equivalent_sliding_asset_conditions(
         raise RuntimeError(
             "raw sliding asset extraction requires raw_image_size_hw"
         )
-    raw_hw = torch.as_tensor(raw_hw_value, device=device)
-    if raw_hw.ndim >= 3 and int(raw_hw.shape[-1]) == 2:
-        raw_hw = raw_hw[:, 0]
+    raw_hw = _canonical_raw_image_size_hw(
+        raw_hw_value,
+        batch_size=int(bundle.z_clean_n.shape[0]),
+        device=device,
+    )
     frame_ids = torch.as_tensor(bundle.frame_ids, device=device, dtype=torch.long)
     if frame_ids.ndim == 1:
         frame_ids = frame_ids.unsqueeze(0)
@@ -6607,6 +7334,9 @@ def attach_training_equivalent_sliding_asset_conditions(
             payload_batch[key] = (
                 value.unsqueeze(0) if torch.is_tensor(value) else value
             )
+        # Window-local asset payloads are rebuilt from dataset metadata, but
+        # gauge trust is a trunk-row property and must follow the parent batch.
+        payload_batch["scene_gauge_valid"] = batch.get("scene_gauge_valid")
         built = build_factorized_asset_condition_from_batch(
             payload_batch,
             vggt_model,
@@ -6669,6 +7399,35 @@ def attach_training_equivalent_sliding_asset_conditions(
             right_slice = right.slice_time(
                 overlap_start - right_start, overlap_end - right_start
             )
+            left_k = left_slice.model_intrinsics_normalized
+            right_k = right_slice.model_intrinsics_normalized
+            if (left_k is None) != (right_k is None):
+                raise RuntimeError(
+                    "overlapping sliding windows disagree on actor-alignment K availability"
+                )
+            if left_k is not None and right_k is not None:
+                # K is frame-level, so compare every overlap frame without an
+                # actor-valid mask.
+                k_error = (left_k - right_k).abs().amax(dim=(-2, -1))
+                if bool((k_error > 1.0e-6).any()):
+                    raise RuntimeError(
+                        "overlapping sliding windows disagree on normalized intrinsics "
+                        f"for frames [{overlap_start},{overlap_end})"
+                    )
+            left_gauge_valid = left_slice.gauge_alignment_valid
+            right_gauge_valid = right_slice.gauge_alignment_valid
+            gauge_valid_disagrees = (left_gauge_valid is None) != (
+                right_gauge_valid is None
+            )
+            if left_gauge_valid is not None and right_gauge_valid is not None:
+                gauge_valid_disagrees = not torch.equal(
+                    left_gauge_valid,
+                    right_gauge_valid,
+                )
+            if gauge_valid_disagrees:
+                raise RuntimeError(
+                    "overlapping sliding windows disagree on gauge-alignment validity"
+                )
             shared = left_slice.track_valid & right_slice.track_valid
             if bool(shared.any()):
                 placement_error = (
@@ -6677,12 +7436,31 @@ def attach_training_equivalent_sliding_asset_conditions(
                 bbox_error = (
                     left_slice.target_bbox_patch - right_slice.target_bbox_patch
                 ).abs().amax(dim=-1)
-                if bool((placement_error[shared] > 1.0e-4).any()) or bool(
-                    (bbox_error[shared] > 1.0e-4).any()
+                left_corners = left_slice.box_corners_camera_metric
+                right_corners = right_slice.box_corners_camera_metric
+                left_velocity = left_slice.velocity_camera_metric
+                right_velocity = right_slice.velocity_camera_metric
+                if (left_corners is None) != (right_corners is None) or (
+                    (left_velocity is None) != (right_velocity is None)
                 ):
                     raise RuntimeError(
+                        "overlapping sliding windows disagree on actor geometry availability"
+                    )
+                geometry_disagrees = False
+                if left_corners is not None and right_corners is not None:
+                    corner_error = (left_corners - right_corners).abs().amax(
+                        dim=(-2, -1)
+                    )
+                    velocity_error = (left_velocity - right_velocity).abs().amax(dim=-1)
+                    geometry_disagrees = bool(
+                        (corner_error[shared] > 1.0e-4).any()
+                    ) or bool((velocity_error[shared] > 1.0e-4).any())
+                if bool((placement_error[shared] > 1.0e-4).any()) or bool(
+                    (bbox_error[shared] > 1.0e-4).any()
+                ) or geometry_disagrees:
+                    raise RuntimeError(
                         "overlapping sliding windows disagree on shared-object "
-                        f"placement/bbox for frames [{overlap_start},{overlap_end})"
+                        f"placement/bbox/corners/velocity for frames [{overlap_start},{overlap_end})"
                     )
     bundle.factorized_asset_conditions_by_window = conditions
     bundle.F_asset_lengths = max_lengths
@@ -6813,9 +7591,11 @@ def build_pretrain_bundle_from_batch(
         if c2w_all.ndim not in (4, 5):
             raise ValueError(f"camera_to_world_corrected must be [B,S,V,4,4] or [B,S,4,4], got {tuple(c2w_all.shape)}")
         intrinsics_all = intrinsics_gt.to(device=device, dtype=torch.float32, non_blocking=True)
-        raw_hw_front = torch.as_tensor(raw_hw, device=device)
-        if raw_hw_front.ndim >= 3 and raw_hw_front.shape[-1] == 2:
-            raw_hw_front = raw_hw_front[:, 0]
+        raw_hw_front = _canonical_raw_image_size_hw(
+            raw_hw,
+            batch_size=int(batch_size_raw),
+            device=device,
+        )
         trajectory_anchor_raw = batch.get("camera_trajectory_anchor_to_world_corrected")
         previous_camera_raw = batch.get("camera_previous_to_world_corrected")
         if not torch.is_tensor(trajectory_anchor_raw) or not torch.is_tensor(previous_camera_raw):
@@ -7114,6 +7894,7 @@ def _run_validation_impl(
         ema.copy_to(ema_params)
 
     sums: dict[str, float] = {}
+    observation_counts: dict[str, int] = {}
     count = 0
     first_batch: dict[str, Any] | None = None
     validation_generator = make_validation_generator(device, int(args.seed))
@@ -7157,11 +7938,13 @@ def _run_validation_impl(
         )
         logs = dict(logs)
         logs["loss"] = float(loss.detach().item())
-        for key, value in logs.items():
-            sums[key] = sums.get(key, 0.0) + float(value)
+        accumulate_wandb_metrics(sums, observation_counts, logs)
         count += 1
 
-    metrics = {key: value / max(1, count) for key, value in sums.items()}
+    # Validation uses the same sparse-diagnostic semantics as training. Raw
+    # actor gate counts stay available in train_step/terminal diagnostics but
+    # do not become a noisy one-batch W&B panel.
+    metrics = finalize_wandb_metrics(sums, observation_counts)
     metrics["batches"] = float(count)
 
     # EMA shadows are maintained independently on each rank.  Before assigning
@@ -7665,6 +8448,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--text_max_length", type=int, default=256)
     parser.add_argument("--no_text_condition", action="store_true")
     parser.add_argument("--resume_path", type=str, default=None)
+    parser.add_argument(
+        "--resume_expected_step",
+        type=int,
+        default=-1,
+        help=(
+            "Optional exact step assertion for --resume_path. A non-negative value "
+            "fails before loading optimizer/model state when the checkpoint step differs."
+        ),
+    )
     parser.add_argument("--warm_start_path", type=str, default=None,
                         help="加载模型权重以从头开始训练，不恢复优化器和step")
     parser.add_argument("--patch_grid_h", type=int, default=25)
@@ -7895,6 +8687,23 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--lambda_gauge_flow", type=float, default=0.1)
     parser.add_argument("--lambda_gauge_direct", type=float, default=1.0)
+    parser.add_argument(
+        "--actor_geometry_alignment_version",
+        choices=(ACTOR_GEOMETRY_ALIGNMENT_NONE, ACTOR_GEOMETRY_ALIGNMENT_V1),
+        default=ACTOR_GEOMETRY_ALIGNMENT_V1,
+        help=(
+            "Late actor/gauge geometry profile. The v1 pretrain profile performs a "
+            "full-intrinsic 8-corner camera pullback; 'none' preserves the legacy architecture."
+        ),
+    )
+    parser.add_argument("--actor_geometry_velocity_ref", type=float, default=1.0)
+    parser.add_argument("--actor_geometry_sigma_power", type=float, default=0.0)
+    parser.add_argument("--actor_geometry_near_plane_m", type=float, default=0.5)
+    parser.add_argument("--actor_geometry_metric_speed_max_mps", type=float, default=100.0)
+    parser.add_argument("--actor_geometry_clean_gauge_norm_abs_max", type=float, default=6.0)
+    parser.add_argument("--actor_geometry_linear_condition_max", type=float, default=1.0e4)
+    parser.add_argument("--actor_geometry_ray_abs_max", type=float, default=16.0)
+    parser.add_argument("--actor_geometry_log_depth_abs_max", type=float, default=20.0)
     parser.add_argument("--camera_absolute_weight", type=float, default=1.0)
     parser.add_argument("--camera_relative_weight", type=float, default=1.0)
     parser.add_argument("--camera_smoothness_weight", type=float, default=0.25)
@@ -8341,6 +9150,18 @@ def main() -> None:
         raise ValueError("--rgb_render_sky_weight must be in [0,1].")
     if float(args.rgb_render_sky_mask_grad_scale) < 0.0:
         raise ValueError("--rgb_render_sky_mask_grad_scale must be non-negative.")
+    actor_geometry_values = {
+        field: float(getattr(args, field))
+        for field in ACTOR_GEOMETRY_ALIGNMENT_CONFIG_FIELDS
+    }
+    for field, value in actor_geometry_values.items():
+        if not math.isfinite(value):
+            raise ValueError(f"--{field} must be finite.")
+        if field == "actor_geometry_sigma_power":
+            if value < 0.0:
+                raise ValueError(f"--{field} must be non-negative.")
+        elif value <= 0.0:
+            raise ValueError(f"--{field} must be positive.")
     if args.val_image_dir is None:
         args.val_image_dir = args.image_dir
     if args.val_scene_start is None:
@@ -8390,11 +9211,18 @@ def main() -> None:
             "Use --resume_path for exact training resume, or --warm_start_path "
             "to initialize weights and start a fresh optimizer/scheduler run."
         )
+    if int(args.resume_expected_step) >= 0 and not args.resume_path:
+        raise ValueError("--resume_expected_step requires --resume_path.")
 
     device, local_rank, world_size = setup_distributed(args)
     if int(args.num_workers) > 0:
         torch.multiprocessing.set_sharing_strategy(str(args.mp_sharing_strategy))
     seed_everything(args.seed + get_rank())
+    if is_main_process():
+        print(
+            f"[actor-geometry] alignment={args.actor_geometry_alignment_version}",
+            flush=True,
+        )
 
     log_dir = Path(args.log_dir)
     if is_main_process():
@@ -8426,6 +9254,17 @@ def main() -> None:
         gauge_gen_dim=SCENE_GAUGE_DIM,
         scene_gauge_representation=SCENE_GAUGE_REPRESENTATION,
         scene_gauge_stats_version=SCENE_GAUGE_STATS_VERSION,
+        actor_geometry_alignment_version=str(args.actor_geometry_alignment_version),
+        actor_geometry_velocity_ref=float(args.actor_geometry_velocity_ref),
+        actor_geometry_sigma_power=float(args.actor_geometry_sigma_power),
+        actor_geometry_near_plane_m=float(args.actor_geometry_near_plane_m),
+        actor_geometry_metric_speed_max_mps=float(args.actor_geometry_metric_speed_max_mps),
+        actor_geometry_clean_gauge_norm_abs_max=float(
+            args.actor_geometry_clean_gauge_norm_abs_max
+        ),
+        actor_geometry_linear_condition_max=float(args.actor_geometry_linear_condition_max),
+        actor_geometry_ray_abs_max=float(args.actor_geometry_ray_abs_max),
+        actor_geometry_log_depth_abs_max=float(args.actor_geometry_log_depth_abs_max),
         asset_position_mode=str(args.asset_position_mode),
         asset_condition_protocol="factorized_v1",
         sky_token_dim=SKY_TOKEN_DIM,
@@ -8656,6 +9495,11 @@ def main() -> None:
         expected_feature_stats_sha256=args.feature_stats_sha256,
         expected_stats_sequence_length=int(args.sequence_length),
         expected_stats_patch_grid=args.patch_grid,
+        expected_step=(
+            int(args.resume_expected_step)
+            if int(args.resume_expected_step) >= 0
+            else None
+        ),
         args=args,
     )
     # DDP broadcasts rank-0 module parameters in its constructor.  When training
@@ -8667,6 +9511,10 @@ def main() -> None:
     # no legacy partial migration path.
     if args.warm_start_path:
         payload = torch.load(args.warm_start_path, map_location=device)
+        actor_geometry_migration = _is_actor_geometry_none_to_v1_migration(
+            scene_flow,
+            payload,
+        )
         validate_scene_flow_checkpoint_config(
             scene_flow,
             payload,
@@ -8675,6 +9523,7 @@ def main() -> None:
             expected_feature_stats_sha256=args.feature_stats_sha256,
             expected_stats_sequence_length=int(args.sequence_length),
             expected_stats_patch_grid=args.patch_grid,
+            allow_actor_geometry_none_to_v1_migration=True,
         )
         validate_checkpoint_flow_schedule(
             payload,
@@ -8684,21 +9533,60 @@ def main() -> None:
             t_eps=scene_flow_t_eps(scene_flow),
         )
 
-        if isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
-            unwrap_ddp(scene_flow).load_state_dict(payload["ema_scene_flow_state_dict"], strict=True)
+        if actor_geometry_migration:
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"{args.warm_start_path} none->v1 migration requires a versioned checkpoint"
+                )
+            if "ema_scene_flow_state_dict" in payload:
+                migration_state = payload["ema_scene_flow_state_dict"]
+                warm_source = "ema_scene_flow_state_dict (none->v1 migration)"
+            elif "scene_flow" in payload:
+                migration_state = payload["scene_flow"]
+                warm_source = "scene_flow (none->v1 migration)"
+            else:
+                raise ValueError(
+                    f"{args.warm_start_path} has no named model state for none->v1 migration"
+                )
+            load_actor_geometry_migration_state_dict(
+                scene_flow,
+                migration_state,
+                path=args.warm_start_path,
+            )
+            # Architecture migration is a fresh training run. The old EMA has
+            # no adapter slots, so rebuild it from the migrated model rather
+            # than attempting a partial shadow-parameter load.
+            sync_ema_shadow_from_model(scene_flow, ema)
+        elif isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
+            load_scene_flow_state_dict_strict_profile_aware(
+                scene_flow,
+                payload["ema_scene_flow_state_dict"],
+                path=args.warm_start_path,
+                source="ema_scene_flow_state_dict",
+            )
             if "ema_scene_flow" in payload:
                 load_warm_start_ema_or_sync(scene_flow, ema, payload["ema_scene_flow"])
             else:
                 sync_ema_shadow_from_model(scene_flow, ema)
             warm_source = "ema_scene_flow_state_dict"
         elif isinstance(payload, dict) and payload.get("is_ema_weights") and "scene_flow" in payload:
-            unwrap_ddp(scene_flow).load_state_dict(payload["scene_flow"], strict=True)
+            load_scene_flow_state_dict_strict_profile_aware(
+                scene_flow,
+                payload["scene_flow"],
+                path=args.warm_start_path,
+                source="EMA-only scene_flow",
+            )
             sync_ema_shadow_from_model(scene_flow, ema)
             warm_source = "ema_weights_only"
         elif isinstance(payload, dict) and "ema_scene_flow" in payload:
             if "scene_flow" not in payload:
                 raise ValueError(f"{args.warm_start_path} has ema_scene_flow but no scene_flow weights.")
-            unwrap_ddp(scene_flow).load_state_dict(payload["scene_flow"], strict=True)
+            load_scene_flow_state_dict_strict_profile_aware(
+                scene_flow,
+                payload["scene_flow"],
+                path=args.warm_start_path,
+                source="raw scene_flow",
+            )
             if load_warm_start_ema_or_sync(scene_flow, ema, payload["ema_scene_flow"]):
                 ema.copy_to(unwrap_ddp(scene_flow).parameters())
                 warm_source = "ema_scene_flow"
@@ -8706,7 +9594,12 @@ def main() -> None:
                 warm_source = "scene_flow"
         else:
             state_dict = payload.get("scene_flow", payload) if isinstance(payload, dict) else payload
-            unwrap_ddp(scene_flow).load_state_dict(state_dict, strict=True)
+            load_scene_flow_state_dict_strict_profile_aware(
+                scene_flow,
+                state_dict,
+                path=args.warm_start_path,
+                source="scene_flow",
+            )
             sync_ema_shadow_from_model(scene_flow, ema)
             warm_source = "scene_flow"
         ema.optimization_step = 0
@@ -8742,7 +9635,16 @@ def main() -> None:
     # Rolling sums for wandb so we report the mean over the last
     # `--wandb_log_every` optimizer steps instead of every individual step.
     wandb_sums: dict[str, float] = {}
+    wandb_observation_counts: dict[str, int] = {}
+    wandb_actor_statistics: dict[str, float] = {}
     wandb_count = 0
+    actor_alignment_wandb_enabled = bool(args.wandb) and str(
+        getattr(
+            args,
+            "actor_geometry_alignment_version",
+            ACTOR_GEOMETRY_ALIGNMENT_NONE,
+        )
+    ) == ACTOR_GEOMETRY_ALIGNMENT_V1
     progress = None
     if is_main_process() and not args.no_tqdm:
         progress = tqdm(
@@ -8792,6 +9694,13 @@ def main() -> None:
                         accum_step = 0
                         continue
                     (loss / max(1, args.grad_accum_steps)).backward()
+                if actor_alignment_wandb_enabled:
+                    # Unlike the ordinary training scalars, actor coverage is
+                    # count-based, so include every microbatch in the window.
+                    accumulate_actor_alignment_wandb_statistics(
+                        wandb_actor_statistics,
+                        logs,
+                    )
                 accum_step += 1
 
                 if not sync_grad:
@@ -8820,14 +9729,34 @@ def main() -> None:
                         metrics_str = " | ".join(f"{key}={value:.4f}" for key, value in logs.items())
                         print(f"[step {global_step:06d}] lr={lr_now:.2e} | {metrics_str}", flush=True)
 
-                    # Accumulate for averaged wandb reporting.
-                    for key, value in train_metrics.items():
-                        wandb_sums[key] = wandb_sums.get(key, 0.0) + float(value)
+                    if wandb_run is not None:
+                        accumulate_wandb_metrics(
+                            wandb_sums,
+                            wandb_observation_counts,
+                            train_metrics,
+                        )
+
+                if bool(args.wandb):
                     wandb_count += 1
-                    if wandb_run is not None and wandb_count >= max(1, int(args.wandb_log_every)):
-                        averaged = {key: value / wandb_count for key, value in wandb_sums.items()}
-                        log_wandb(wandb_run, averaged, global_step, "train")
-                        wandb_sums = {}
+                    if wandb_count >= max(1, int(args.wandb_log_every)):
+                        actor_statistics = (
+                            distributed_sum_actor_alignment_wandb_statistics(
+                                wandb_actor_statistics,
+                                device,
+                            )
+                            if actor_alignment_wandb_enabled
+                            else None
+                        )
+                        if is_main_process() and wandb_run is not None:
+                            averaged = finalize_wandb_metrics(
+                                wandb_sums,
+                                wandb_observation_counts,
+                                actor_statistics=actor_statistics,
+                            )
+                            log_wandb(wandb_run, averaged, global_step, "train")
+                            wandb_sums = {}
+                            wandb_observation_counts = {}
+                        wandb_actor_statistics = {}
                         wandb_count = 0
 
                 if (
