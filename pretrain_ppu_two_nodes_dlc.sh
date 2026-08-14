@@ -99,6 +99,8 @@ ALEXNET_CKPT="${TORCH_HOME}/hub/checkpoints/alexnet-owt-7be5be79.pth"
 # ============================================================
 WAYMO_DGGT_ROOT="${WAYMO_DGGT_ROOT:-${DATASET_ROOT}/training}"
 WAYMO_DGGT_VAL_ROOT="${WAYMO_DGGT_VAL_ROOT:-${DATASET_ROOT}/validation}"
+HDMAP_ROOT="${HDMAP_ROOT:-${DATASET_ROOT}/training_hdmap}"
+VAL_HDMAP_ROOT="${VAL_HDMAP_ROOT:-${DATASET_ROOT}/validation_hdmap}"
 DEFAULT_DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
 if [[ ! -f "${DEFAULT_DGGT_CKPT}" && -f /data/lyy_dataset/model/dggt/model_latest_waymo.pt ]]; then
   DEFAULT_DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
@@ -115,10 +117,8 @@ SCENE_CAPTION_ROOT="${SCENE_CAPTION_ROOT:-${DATASET_ROOT}/training_captions}"
 SCENE_CAPTION_VAL_ROOT="${SCENE_CAPTION_VAL_ROOT:-${DATASET_ROOT}/validation_captions}"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${MODEL_ROOT}/Qwen/Qwen3-0.6B}"
 
-LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_v5}"
-LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_dlc_launch}"
-RESUME_PATH="${RESUME_PATH:-}"
-RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:--1}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_v6}"
+LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_dlc_v6_launch}"
 
 # ============================================================
 # 训练配置
@@ -130,6 +130,9 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 EXPECTED_GLOBAL_BATCH_SIZE="${EXPECTED_GLOBAL_BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+VAL_NUM_WORKERS="${VAL_NUM_WORKERS:-0}"
+DATALOADER_WORKER_THREADS="${DATALOADER_WORKER_THREADS:-1}"
+DATALOADER_OUT_OF_ORDER="${DATALOADER_OUT_OF_ORDER:-0}"
 # three_quarter checkpoints 21/28 encoder blocks and no DDT blocks. Use 1
 # for full activation checkpointing, half for 14/28 + 1/2, or 0 to disable.
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-three_quarter}"
@@ -141,39 +144,48 @@ fi
 MAX_STEPS="${MAX_STEPS:-200000}"
 DECAY_END_STEPS="${DECAY_END_STEPS:-0}"
 SAVE_EVERY="${SAVE_EVERY:-2500}"
-VAL_EVERY="${VAL_EVERY:-1000}"
+VAL_EVERY="${VAL_EVERY:-2000}"
 VAL_BATCHES="${VAL_BATCHES:-1}"
 VAL_LOG_IMAGES="${VAL_LOG_IMAGES:-10}"
-VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-35}"
-for value_name in MAX_STEPS DECAY_END_STEPS SAVE_EVERY VAL_EVERY VAL_BATCHES VAL_LOG_IMAGES VAL_SAMPLE_STEPS; do
+VAL_INFERENCE_SCENES="${VAL_INFERENCE_SCENES:-5}"
+VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-50}"
+# Keep a one-step fallback cadence if a caller explicitly switches back to
+# --no_tqdm. The default PPU path below forces tqdm through the Web log pipe so
+# its elapsed time, throughput and ETA remain visible.
+LOG_EVERY="${LOG_EVERY:-1}"
+for value_name in \
+    NUM_WORKERS PREFETCH_FACTOR VAL_NUM_WORKERS DATALOADER_WORKER_THREADS \
+    MAX_STEPS DECAY_END_STEPS SAVE_EVERY VAL_EVERY VAL_BATCHES \
+    VAL_LOG_IMAGES VAL_INFERENCE_SCENES VAL_SAMPLE_STEPS LOG_EVERY; do
     value="${!value_name}"
     if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
         echo "[错误] ${value_name} 必须是非负整数，当前值：${value}" >&2
         exit 1
     fi
 done
-if [[ ! "${RESUME_EXPECTED_STEP}" =~ ^-?[0-9]+$ ]]; then
-    echo "[错误] RESUME_EXPECTED_STEP 必须是整数，当前值：${RESUME_EXPECTED_STEP}" >&2
+if (( MAX_STEPS <= 0 || SAVE_EVERY <= 0 || VAL_INFERENCE_SCENES <= 0 || LOG_EVERY <= 0 )); then
+    echo "[错误] MAX_STEPS、SAVE_EVERY 和 LOG_EVERY 必须大于 0。" >&2
     exit 1
 fi
-if (( MAX_STEPS <= 0 || SAVE_EVERY <= 0 )); then
-    echo "[错误] MAX_STEPS 和 SAVE_EVERY 必须大于 0。" >&2
+if (( PREFETCH_FACTOR <= 0 || DATALOADER_WORKER_THREADS <= 0 )); then
+    echo "[错误] PREFETCH_FACTOR 和 DATALOADER_WORKER_THREADS 必须大于 0。" >&2
+    exit 1
+fi
+if [[ "${DATALOADER_OUT_OF_ORDER}" != "0" && "${DATALOADER_OUT_OF_ORDER}" != "1" ]]; then
+    echo "[错误] DATALOADER_OUT_OF_ORDER 必须是 0 或 1。" >&2
     exit 1
 fi
 
-TEXT_UNCOND_DROP_PROB="${TEXT_UNCOND_DROP_PROB:-0.1}"
-JOINT_GENERATION_PROB="${JOINT_GENERATION_PROB:-0.2}"
-CAMERA_CONTROLLED_PROB="${CAMERA_CONTROLLED_PROB:-0.2}"
-ASSET_CAMERA_CONTROLLED_PROB="${ASSET_CAMERA_CONTROLLED_PROB:-0.6}"
-
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
+CFG_SCALE="${CFG_SCALE:-1.0}"
+LAYOUT_GUIDANCE_SCALE="${LAYOUT_GUIDANCE_SCALE:-1.0}"
 ASSET_CONTROL_GUIDANCE_SCALE="${ASSET_CONTROL_GUIDANCE_SCALE:-1.0}"
-CAMERA_GUIDANCE_SCALE="${CAMERA_GUIDANCE_SCALE:-1.0}"
 VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
+LAYOUT_MAX_ACTORS="${LAYOUT_MAX_ACTORS:-96}"
+STATIC_FAR_PLANE_M="${STATIC_FAR_PLANE_M:-120}"
 
-# metric-gauge v5 使用独立的新 wandb run，不续接旧 run。
+# layout-v2 v6 使用独立的新 wandb run，不续接旧 run。
 WANDB_PROJECT="${WANDB_PROJECT:-dggt-flow}"
-WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v5}"
+WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v6}"
 WANDB_RESUME="${WANDB_RESUME:-never}"
 
 GLOBAL_BATCH_SIZE=$((DLC_NNODES * DLC_NPROC_PER_NODE * BATCH_SIZE_PER_PPU * GRAD_ACCUM_STEPS))
@@ -252,6 +264,8 @@ check_required_paths() {
     check_file "train_scene_flow_pretrain.py" "${PROJECT_ROOT}/train_scene_flow_pretrain.py"
     check_dir "WAYMO_DGGT_ROOT" "${WAYMO_DGGT_ROOT}"
     check_dir "WAYMO_DGGT_VAL_ROOT" "${WAYMO_DGGT_VAL_ROOT}"
+    check_dir "HDMAP_ROOT" "${HDMAP_ROOT}"
+    check_dir "VAL_HDMAP_ROOT" "${VAL_HDMAP_ROOT}"
     check_file "DGGT_CKPT" "${DGGT_CKPT}"
     check_file "TOKENIZER_CKPT" "${TOKENIZER_CKPT}"
     check_file "FEATURE_STATS" "${FEATURE_STATS}"
@@ -261,9 +275,6 @@ check_required_paths() {
     check_dir "SCENE_CAPTION_ROOT" "${SCENE_CAPTION_ROOT}"
     check_dir "SCENE_CAPTION_VAL_ROOT" "${SCENE_CAPTION_VAL_ROOT}"
     check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
-    if [[ -n "${RESUME_PATH}" ]]; then
-        check_file "RESUME_PATH" "${RESUME_PATH}"
-    fi
     if [[ ! -f "${ALEXNET_CKPT}" ]]; then
         echo "[错误] 缺少 LPIPS AlexNet 本地权重：" >&2
         echo "       ${ALEXNET_CKPT}" >&2
@@ -315,6 +326,8 @@ build_train_args() {
         train_scene_flow_pretrain.py
         --image_dir "${WAYMO_DGGT_ROOT}"
         --val_image_dir "${WAYMO_DGGT_VAL_ROOT}"
+        --hdmap_root "${HDMAP_ROOT}"
+        --val_hdmap_root "${VAL_HDMAP_ROOT}"
         --dggt_ckpt_path "${DGGT_CKPT}"
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
@@ -330,7 +343,6 @@ build_train_args() {
         --sequence_length 10
         --val_sliding_window 10
         --val_sliding_stride 7
-        --camera_anchor_context_dropout 0.25
         --patch_grid_h 25
         --patch_grid_w 37
         --latent_dim 1024
@@ -338,6 +350,8 @@ build_train_args() {
         --grad_accum_steps "${GRAD_ACCUM_STEPS}"
         --num_workers "${NUM_WORKERS}"
         --prefetch_factor "${PREFETCH_FACTOR}"
+        --val_num_workers "${VAL_NUM_WORKERS}"
+        --dataloader_worker_threads "${DATALOADER_WORKER_THREADS}"
         --pin_memory
         --lr 1e-4
         --final_lr 1e-5
@@ -356,45 +370,34 @@ build_train_args() {
         --lambda_repa 0.5
         --base_model_coeff 0.25
         --lambda_boundary 0.25
-        --lambda_camera_flow 0.1
-        --lambda_camera_pose 0.25
-        --camera_pose_start_step 0
-        --camera_pose_warmup_steps 10000
-        --camera_absolute_translation_scale_m 10.0
-        --camera_relative_translation_scale_m 1.0
-        --camera_acceleration_translation_scale_m 1.0
         --lambda_sky_flow 0.1
-        --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
-        --joint_generation_prob "${JOINT_GENERATION_PROB}"
-        --camera_controlled_prob "${CAMERA_CONTROLLED_PROB}"
-        --asset_camera_controlled_prob "${ASSET_CAMERA_CONTROLLED_PROB}"
-        --guidance_scale "${GUIDANCE_SCALE}"
+        --lambda_rgb_render 0.005
+        --cfg "${CFG_SCALE}"
+        --layout_guidance_scale "${LAYOUT_GUIDANCE_SCALE}"
         --asset_control_guidance_scale "${ASSET_CONTROL_GUIDANCE_SCALE}"
-        --camera_guidance_scale "${CAMERA_GUIDANCE_SCALE}"
+        --layout_max_actors "${LAYOUT_MAX_ACTORS}"
+        --static_far_plane_m "${STATIC_FAR_PLANE_M}"
         --val_guidance_scales "${VAL_GUIDANCE_SCALES}"
         --val_scene_start 0
         --val_scene_end 100
         --val_every "${VAL_EVERY}"
         --val_batches "${VAL_BATCHES}"
         --val_log_images "${VAL_LOG_IMAGES}"
+        --val_inference_scenes "${VAL_INFERENCE_SCENES}"
         --val_sample_steps "${VAL_SAMPLE_STEPS}"
         --grad_clip_norm 1.0
         --seed 0
         --precision bf16
         --ddp_timeout_minutes 60
+        --force_tqdm
+        --log_every "${LOG_EVERY}"
         --wandb
         --wandb_project "${WANDB_PROJECT}"
         --wandb_name "${WANDB_NAME}"
         --wandb_resume "${WANDB_RESUME}"
     )
-    if [[ -n "${RESUME_PATH}" ]]; then
-        TRAIN_ARGS+=(--resume_path "${RESUME_PATH}")
-        if (( RESUME_EXPECTED_STEP >= 0 )); then
-            TRAIN_ARGS+=(--resume_expected_step "${RESUME_EXPECTED_STEP}")
-        fi
-    elif (( RESUME_EXPECTED_STEP >= 0 )); then
-        echo "[错误] RESUME_EXPECTED_STEP=${RESUME_EXPECTED_STEP} 但未设置 RESUME_PATH。" >&2
-        exit 1
+    if [[ "${DATALOADER_OUT_OF_ORDER}" == "1" ]]; then
+        TRAIN_ARGS+=(--dataloader_out_of_order)
     fi
     case "${GRADIENT_CHECKPOINTING}" in
         1) TRAIN_ARGS+=(--gradient_checkpointing) ;;
@@ -430,10 +433,12 @@ echo "NCCL_IB_HCA: ${NCCL_IB_HCA}"
 echo "NCCL_IB_DISABLE: ${NCCL_IB_DISABLE}"
 echo "DGGT_DEVICE_BACKEND: ${DGGT_DEVICE_BACKEND}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${DLC_NNODES} nodes × ${DLC_NPROC_PER_NODE} ppu/node × ${BATCH_SIZE_PER_PPU} batch/ppu × ${GRAD_ACCUM_STEPS} accum"
+echo "dataloader: train_workers/rank=${NUM_WORKERS}, prefetch/worker=${PREFETCH_FACTOR}, validation_workers/active_rank=${VAL_NUM_WORKERS}, worker_threads=${DATALOADER_WORKER_THREADS}, out_of_order=${DATALOADER_OUT_OF_ORDER}"
 echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+1/2, three_quarter=21/28+0/2, 1=full)"
-echo "resume checkpoint: ${RESUME_PATH:-<none>} (expected step=${RESUME_EXPECTED_STEP})"
+echo "training start: step 0 (layout-v2 v6; no legacy checkpoint)"
 echo "training steps: max=${MAX_STEPS}, lr_decay_end=${DECAY_END_STEPS}, save_every=${SAVE_EVERY}"
-echo "validation: every=${VAL_EVERY}, batches=${VAL_BATCHES}, log_images=${VAL_LOG_IMAGES}, sample_steps=${VAL_SAMPLE_STEPS}"
+echo "training logs: tqdm Web-console mode (ETA/rate enabled; one update per optimizer step)"
+echo "validation: every=${VAL_EVERY}, batches=${VAL_BATCHES}, inference_scenes=${VAL_INFERENCE_SCENES} (5 scenes x 3 CFG on >=15 ranks; otherwise 1 scene), log_images=${VAL_LOG_IMAGES}, sample_steps=${VAL_SAMPLE_STEPS}"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG}"
 echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME} (resume=${WANDB_RESUME})"

@@ -18,7 +18,7 @@ import time
 from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -28,7 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
-from datasets.waymo_flow_cache_dataset import SUPPORTED_CACHE_SCHEMA_VERSIONS, WaymoFlowCacheDataset
+from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
 from dggt.losses.flow_losses import (
     boundary_mask_from_edit_mask,
     build_hard_edit_domain,
@@ -48,36 +48,16 @@ from dggt.losses.rgb_render_loss import (
     should_apply_rgb_render_loss,
 )
 from dggt.models.flow_feature_assembler import FlowFeatureAssembler
-from dggt.models.asset_pass import (
-    build_asset_condition_slots,
-    require_asset_patch_valid_mask,
-)
 from dggt.models.joint_scene_tokenizer import JointSceneTokenizer
 from dggt.models.embedders.text_encoder import TextEncoder
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_quant import QuantizedTokens, dequantize_tokens
 from dggt.utils.feature_stats import (
     DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
-    FEATURE_STATS_SCHEMA,
-    FEATURE_STATS_SCHEMA_VERSION,
-    checkpoint_sha256,
-    load_all_stats_into_buffers,
-    validate_production_stats_coverage,
+    load_feature_stats,
 )
 from dggt.utils.camera_condition import (
-    camera_condition_from_waymo_metric_target,
-    normalize_front_image_hw,
-)
-from dggt.utils.camera_generation import (
-    CAMERA_GENERATION_DIM,
-    CAMERA_GENERATION_REPRESENTATION,
-    CAMERA_STATS_VERSION,
-    CAMERA_TARGET_SOURCE,
-    CAMERA_TARGET_SPACE,
-)
-from dggt.utils.factorized_asset_condition import (
-    FACTORIZED_ASSET_CONDITION_VERSION,
-    PLACEMENT_STATE_DIM,
+    camera_condition_from_waymo_request,
 )
 from dggt.utils.flow_cache_io import (
     is_chunked_flow_cache,
@@ -91,16 +71,6 @@ from dggt.utils.flow_schedule import (
     validate_checkpoint_flow_schedule,
 )
 from dggt.utils.rae_optim import build_rae_optimizer, build_rae_scheduler
-from dggt.utils.scene_gauge import (
-    PULLBACK_RENDER_BOUNDARY,
-    PULLBACK_RUNTIME_CONTRACT_VERSION,
-    PullbackCalibration,
-    SCENE_GAUGE_DIM,
-    SCENE_GAUGE_REPRESENTATION,
-    SCENE_GAUGE_STATS_VERSION,
-    apply_pullback_calibration,
-    load_pullback_calibration,
-)
 from dggt.utils.sliding_window import cosine_window, default_window_stride, window_slices
 from dggt.utils.tokens import reattach_special_tokens, replace_selected_levels, select_patch_pyramid
 from dggt.utils.tokenizer_checkpoint import load_scene_tokenizer_checkpoint_strict
@@ -108,14 +78,10 @@ from dggt.utils.tokenizer_window import (
     decode_tokenizer_windowed,
     encode_tokenizer_windowed,
 )
-from dggt.utils.validation_cache_naming import validation_asset_condition_kind
 from dggt.utils.validation_rng import make_validation_generator, preserve_validation_rng_state
 from diffusers.training_utils import EMAModel
 from train_scene_flow_pretrain import (
-    PRETRAIN_FEATURE_STATS_CONTRACT_KEY,
     TOKENIZER_LEVELS,
-    DEFAULT_SKY_GRID,
-    SKY_TOKEN_DIM,
     _image_grid,
     _latent_pca_grid,
     _mask_grid,
@@ -123,395 +89,26 @@ from train_scene_flow_pretrain import (
     _render_gs_map_rgb,
     _semantic_logits_to_sky_mask,
     _sky_mask_image_grid,
-    build_sky_tokens_from_images,
     load_dggt_aggregator_and_tokenizer,
-    sky_grid_shape,
     split_image_tokens_for_heads,
-    validate_pretrain_feature_stats_contract,
 )
 
 
 FORMAL_FLOW_DOMAIN_VERSION = "hard_binary_edit_domain_v1"
 # All formal caches currently come from the 10 Hz Waymo camera stream. Keep
-# mRoPE time coordinates identical to the factorized pretraining stage.
+# mRoPE time coordinates identical to pretraining.
 FORMAL_SCENE_FPS = 10.0
 FORMAL_DGGT_CONTEXT_LENGTH = 29
 FORMAL_TOKENIZER_WINDOW_LEN = 10
-DEFAULT_FORMAL_PULLBACK_CALIBRATION = "data/scene_gauge/pullback_d63b34f7.json"
-FORMAL_METRIC_GAUGE_CONTRACT_SCHEMA = "formal_scene_flow_metric_gauge_contract"
-FORMAL_METRIC_GAUGE_CONTRACT_VERSION = "1.0.0"
-
-METRIC_GAUGE_PROVENANCE_FIELDS = frozenset(
-    {
-        "scene_gauge_representation",
-        "scene_gauge_stats_version",
-        "gauge_table_sha256",
-        "tokenizer_sha256",
-        "dggt_checkpoint_sha256",
-        "pullback_artifact_sha256",
-        "pullback_runtime_contract_version",
-        "pullback_window_len",
-        "pullback_patch_grid_hw",
-        "camera_generation_representation",
-        "camera_target_space",
-        "camera_target_source",
-    }
-)
-
-FORMAL_METRIC_GAUGE_CONTRACT_FIELDS = frozenset(
-    {
-        "schema",
-        "version",
-        "feature_stats_sha256",
-        "dggt_context_length",
-        "camera_gen_dim",
-        "gauge_gen_dim",
-        "placement_state_dim",
-        "factorized_asset_condition_version",
-        "dggt_checkpoint_sha256",
-        "tokenizer_sha256",
-        "gauge_table_sha256",
-        "pullback_artifact_sha256",
-        "pullback_window_len",
-        "pullback_patch_grid_hw",
-    }
-)
-
-
-def _require_sha256(value: Any, *, name: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(
-            f"{name} must be a lowercase 64-character SHA-256, got {value!r}"
-        )
-    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-        raise ValueError(
-            f"{name} must be a lowercase 64-character SHA-256, got {value!r}"
-        )
-    return value
-
-
-def _config_value(config: Any, field: str) -> Any:
-    if isinstance(config, Mapping):
-        return config.get(field)
-    return getattr(config, field, None)
-
-
-def _require_positive_int(value: Any, *, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    return int(value)
-
-
-def _require_patch_grid(value: Any, *, name: str) -> tuple[int, int]:
-    if (
-        not isinstance(value, (list, tuple))
-        or len(value) != 2
-        or any(isinstance(item, bool) or not isinstance(item, int) or item <= 0 for item in value)
-    ):
-        raise ValueError(f"{name} must contain two positive integers, got {value!r}")
-    return int(value[0]), int(value[1])
-
-
-def validate_metric_gauge_provenance(
-    provenance: Any,
-    *,
-    config: Any,
-    expected_dggt_sha256: str | None = None,
-    expected_tokenizer_sha256: str | None = None,
-    expected_pullback_runtime_contract_version: str | None = None,
-    expected_window_len: int = FORMAL_TOKENIZER_WINDOW_LEN,
-    expected_patch_grid: Sequence[int] | None = None,
-) -> dict[str, Any]:
-    """Validate the unchanged 12-field pretrain metric/gauge provenance."""
-
-    if not isinstance(provenance, Mapping):
-        raise ValueError(
-            "checkpoint is missing metric_gauge_provenance; legacy "
-            "camera_dggt_provenance checkpoints are deliberately rejected"
-        )
-    actual_fields = set(provenance)
-    if actual_fields != METRIC_GAUGE_PROVENANCE_FIELDS:
-        raise ValueError(
-            "metric_gauge_provenance does not match the strict 12-field schema: "
-            f"missing={sorted(METRIC_GAUGE_PROVENANCE_FIELDS - actual_fields)}, "
-            f"unknown={sorted(actual_fields - METRIC_GAUGE_PROVENANCE_FIELDS)}"
-        )
-    window_len = _require_positive_int(
-        provenance["pullback_window_len"],
-        name="metric_gauge_provenance.pullback_window_len",
-    )
-    expected_window = _require_positive_int(
-        int(expected_window_len), name="expected_window_len"
-    )
-    artifact_grid = _require_patch_grid(
-        provenance["pullback_patch_grid_hw"],
-        name="metric_gauge_provenance.pullback_patch_grid_hw",
-    )
-    config_grid = _require_patch_grid(
-        _config_value(config, "patch_grid"), name="SceneFlow config patch_grid"
-    )
-    runtime_grid = (
-        config_grid
-        if expected_patch_grid is None
-        else _require_patch_grid(tuple(int(item) for item in expected_patch_grid), name="expected_patch_grid")
-    )
-    if config_grid != runtime_grid:
-        raise ValueError(
-            f"SceneFlow config patch_grid={config_grid} != runtime patch_grid={runtime_grid}"
-        )
-    runtime_contract_version = provenance["pullback_runtime_contract_version"]
-    if runtime_contract_version != PULLBACK_RUNTIME_CONTRACT_VERSION:
-        raise ValueError(
-            "metric_gauge_provenance.pullback_runtime_contract_version is unsupported: "
-            f"{runtime_contract_version!r}"
-        )
-    if (
-        expected_pullback_runtime_contract_version is not None
-        and expected_pullback_runtime_contract_version
-        != PULLBACK_RUNTIME_CONTRACT_VERSION
-    ):
-        raise ValueError(
-            "expected_pullback_runtime_contract_version is unsupported: "
-            f"{expected_pullback_runtime_contract_version!r}"
-        )
-
-    expected_values = {
-        "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
-        "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
-        "pullback_window_len": expected_window,
-        "pullback_patch_grid_hw": list(runtime_grid),
-        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
-        "camera_target_space": CAMERA_TARGET_SPACE,
-        "camera_target_source": CAMERA_TARGET_SOURCE,
-    }
-    if expected_pullback_runtime_contract_version is not None:
-        expected_values["pullback_runtime_contract_version"] = (
-            expected_pullback_runtime_contract_version
-        )
-    if expected_dggt_sha256 is not None:
-        expected_values["dggt_checkpoint_sha256"] = _require_sha256(
-            expected_dggt_sha256, name="runtime DGGT checkpoint SHA-256"
-        )
-    if expected_tokenizer_sha256 is not None:
-        expected_values["tokenizer_sha256"] = _require_sha256(
-            expected_tokenizer_sha256, name="runtime tokenizer checkpoint SHA-256"
-        )
-    for field, expected in expected_values.items():
-        if provenance[field] != expected:
-            raise ValueError(
-                f"metric_gauge_provenance.{field} mismatch: "
-                f"checkpoint={provenance[field]!r}, expected={expected!r}"
-            )
-    if window_len != expected_window or artifact_grid != runtime_grid:
-        raise AssertionError("unreachable pullback window/grid mismatch")
-    for field in (
-        "gauge_table_sha256",
-        "tokenizer_sha256",
-        "dggt_checkpoint_sha256",
-        "pullback_artifact_sha256",
-    ):
-        _require_sha256(
-            provenance[field], name=f"metric_gauge_provenance.{field}"
-        )
-
-    config_expectations = {
-        "camera_gen_dim": CAMERA_GENERATION_DIM,
-        "camera_generation_representation": CAMERA_GENERATION_REPRESENTATION,
-        "camera_stats_version": CAMERA_STATS_VERSION,
-        "gauge_gen_dim": SCENE_GAUGE_DIM,
-        "scene_gauge_representation": SCENE_GAUGE_REPRESENTATION,
-        "scene_gauge_stats_version": SCENE_GAUGE_STATS_VERSION,
-        "asset_condition_protocol": "factorized_v1",
-        "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
-    }
-    for field, expected in config_expectations.items():
-        actual = _config_value(config, field)
-        if actual != expected:
-            raise ValueError(
-                f"SceneFlow config {field}={actual!r} does not satisfy the v4 "
-                f"metric/gauge contract {expected!r}"
-            )
-    for field in ("placement_mean", "placement_std"):
-        value = _config_value(config, field)
-        if not isinstance(value, (list, tuple)) or len(value) != PLACEMENT_STATE_DIM:
-            raise ValueError(
-                f"SceneFlow config {field} must contain {PLACEMENT_STATE_DIM} values"
-            )
-    return dict(provenance)
-
-
-def build_formal_metric_gauge_contract(
-    provenance: Mapping[str, Any],
-    *,
-    feature_stats_sha256: str,
-) -> dict[str, Any]:
-    """Cross-bind formal-only metadata without changing base provenance."""
-
-    return {
-        "schema": FORMAL_METRIC_GAUGE_CONTRACT_SCHEMA,
-        "version": FORMAL_METRIC_GAUGE_CONTRACT_VERSION,
-        "feature_stats_sha256": _require_sha256(
-            feature_stats_sha256, name="feature-stats SHA-256"
-        ),
-        "dggt_context_length": FORMAL_DGGT_CONTEXT_LENGTH,
-        "camera_gen_dim": CAMERA_GENERATION_DIM,
-        "gauge_gen_dim": SCENE_GAUGE_DIM,
-        "placement_state_dim": PLACEMENT_STATE_DIM,
-        "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
-        "dggt_checkpoint_sha256": provenance["dggt_checkpoint_sha256"],
-        "tokenizer_sha256": provenance["tokenizer_sha256"],
-        "gauge_table_sha256": provenance["gauge_table_sha256"],
-        "pullback_artifact_sha256": provenance["pullback_artifact_sha256"],
-        "pullback_window_len": provenance["pullback_window_len"],
-        "pullback_patch_grid_hw": list(provenance["pullback_patch_grid_hw"]),
-    }
-
-
-def validate_formal_metric_gauge_contract(
-    contract: Any,
-    *,
-    provenance: Mapping[str, Any],
-    expected_feature_stats_sha256: str | None = None,
-) -> dict[str, Any]:
-    """Validate the formal-only cross-binding block with an exact schema."""
-
-    if not isinstance(contract, Mapping):
-        raise ValueError(
-            "formal checkpoint is missing formal_metric_gauge_contract; old formal "
-            "checkpoints are deliberately rejected"
-        )
-    actual_fields = set(contract)
-    if actual_fields != FORMAL_METRIC_GAUGE_CONTRACT_FIELDS:
-        raise ValueError(
-            "formal_metric_gauge_contract does not match the strict schema: "
-            f"missing={sorted(FORMAL_METRIC_GAUGE_CONTRACT_FIELDS - actual_fields)}, "
-            f"unknown={sorted(actual_fields - FORMAL_METRIC_GAUGE_CONTRACT_FIELDS)}"
-        )
-    expected = build_formal_metric_gauge_contract(
-        provenance,
-        feature_stats_sha256=(
-            contract["feature_stats_sha256"]
-            if expected_feature_stats_sha256 is None
-            else expected_feature_stats_sha256
-        ),
-    )
-    for field, expected_value in expected.items():
-        if contract[field] != expected_value:
-            raise ValueError(
-                f"formal_metric_gauge_contract.{field} mismatch: "
-                f"checkpoint={contract[field]!r}, expected={expected_value!r}"
-            )
-    _require_sha256(
-        contract["feature_stats_sha256"],
-        name="formal_metric_gauge_contract.feature_stats_sha256",
-    )
-    return dict(contract)
-
-
-def validate_formal_feature_stats_artifact(
-    path: str | Path,
-    *,
-    provenance: Mapping[str, Any],
-    expected_window_len: int,
-    expected_patch_grid: Sequence[int],
-) -> str:
-    """Validate and hash the exact production feature-stats artifact."""
-
-    stats_path = Path(path)
-    payload = torch.load(stats_path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise TypeError(f"Feature stats at {stats_path} must be a dict")
-    validate_production_stats_coverage(payload)
-    source = payload.get("source")
-    if not isinstance(source, Mapping):
-        raise ValueError("Feature stats are missing source provenance")
-    expected_source = {
-        "sequence_length": int(expected_window_len),
-        "dggt_context_length": FORMAL_DGGT_CONTEXT_LENGTH,
-        "patch_grid": list(_require_patch_grid(tuple(int(v) for v in expected_patch_grid), name="expected_patch_grid")),
-        "tokenizer_checkpoint_sha256": provenance["tokenizer_sha256"],
-        "scene_gauge_table_sha256": provenance["gauge_table_sha256"],
-    }
-    for field, expected in expected_source.items():
-        if source.get(field) != expected:
-            raise ValueError(
-                f"Feature stats source.{field} mismatch: "
-                f"stats={source.get(field)!r}, expected={expected!r}"
-            )
-    top_level_expected = {
-        "stats_schema": FEATURE_STATS_SCHEMA,
-        "stats_schema_version": FEATURE_STATS_SCHEMA_VERSION,
-        "dggt_checkpoint_sha256": provenance["dggt_checkpoint_sha256"],
-        "tokenizer_checkpoint_sha256": provenance["tokenizer_sha256"],
-        "gauge_table_sha256": provenance["gauge_table_sha256"],
-        "factorized_asset_condition_version": FACTORIZED_ASSET_CONDITION_VERSION,
-        "placement_dim": PLACEMENT_STATE_DIM,
-    }
-    for field, expected in top_level_expected.items():
-        if payload.get(field) != expected:
-            raise ValueError(
-                f"Feature stats {field} mismatch: "
-                f"stats={payload.get(field)!r}, expected={expected!r}"
-            )
-    return checkpoint_sha256(stats_path)
-
-
-def validate_metric_gauge_checkpoint_payload(
-    payload: Any,
-    *,
-    path: str | Path,
-    config: Any,
-    require_formal_contract: bool,
-    expected_dggt_sha256: str | None = None,
-    expected_tokenizer_sha256: str | None = None,
-    expected_pullback_runtime_contract_version: str | None = None,
-    expected_feature_stats_sha256: str | None = None,
-    expected_window_len: int = FORMAL_TOKENIZER_WINDOW_LEN,
-    expected_patch_grid: Sequence[int] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Validate base provenance and, for formal checkpoints, its cross-binding."""
-
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"{path} is not a versioned metric/gauge checkpoint")
-    if "camera_dggt_provenance" in payload:
-        raise ValueError(
-            f"{path} contains legacy camera_dggt_provenance; old checkpoints are deliberately rejected"
-        )
-    provenance = validate_metric_gauge_provenance(
-        payload.get("metric_gauge_provenance"),
-        config=config,
-        expected_dggt_sha256=expected_dggt_sha256,
-        expected_tokenizer_sha256=expected_tokenizer_sha256,
-        expected_pullback_runtime_contract_version=(
-            expected_pullback_runtime_contract_version
-        ),
-        expected_window_len=expected_window_len,
-        expected_patch_grid=expected_patch_grid,
-    )
-    raw_contract = payload.get("formal_metric_gauge_contract")
-    if raw_contract is None:
-        if require_formal_contract:
-            raise ValueError(
-                f"{path} is missing formal_metric_gauge_contract; old formal checkpoints are rejected"
-            )
-        return provenance, None
-    contract = validate_formal_metric_gauge_contract(
-        raw_contract,
-        provenance=provenance,
-        expected_feature_stats_sha256=expected_feature_stats_sha256,
-    )
-    return provenance, contract
-
-
-def _asset_condition_kind_from_item(item: dict[str, Any], mode_kind: str) -> str:
-    variant = item.get("validation_variant")
-    if variant not in (None, ""):
-        return validation_asset_condition_kind(str(variant))
-    return (
-        "mode_b_empty"
-        if str(mode_kind) in ("mode_b", "mode_b_empty", "empty")
-        else "mode_a"
-    )
+FORMAL_LAYOUT_CONDITION_VERSION = "none"
+FORMAL_LAYOUT_DISABLED_CONFIG = {
+    "layout_map_injection": False,
+    "layout_actor_injection": False,
+    "layout_map_metric_injection": False,
+    "layout_actor_metric_injection": False,
+    "appearance_context_injection": False,
+    "layout_to_gauge_grad_scale": 0.0,
+}
 
 
 def formal_flow_domain_config(args) -> dict[str, Any]:
@@ -658,7 +255,7 @@ def encode_text_condition(
     return tokens, attention_mask
 
 
-def build_camera_condition_from_waymo_gt(
+def build_camera_condition_from_waymo_request(
     camera_to_world: torch.Tensor | None,
     intrinsics: torch.Tensor | None,
     *,
@@ -666,8 +263,6 @@ def build_camera_condition_from_waymo_gt(
     image_hw: tuple[int, int] | None = None,
     trajectory_anchor_to_world: torch.Tensor | None = None,
     previous_camera_to_world: torch.Tensor | None = None,
-    anchor_mask: torch.Tensor,
-    scene_flow: nn.Module,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     if not torch.is_tensor(camera_to_world) or not torch.is_tensor(intrinsics):
         return None, None
@@ -689,49 +284,20 @@ def build_camera_condition_from_waymo_gt(
     ):
         camera_metric = camera_metric[:, 0].unsqueeze(0)
         intrinsics_metric = intrinsics_metric[:, 0].unsqueeze(0)
-    condition, valid, _, returned_anchor_mask = (
-        camera_condition_from_waymo_metric_target(
-            camera_metric,
-            intrinsics_metric,
-            image_hw=image_hw,
-            trajectory_anchor_to_world=trajectory_anchor_to_world.to(
-                device=device, dtype=torch.float32
-            ),
-            previous_camera_to_world=(
-                None
-                if not torch.is_tensor(previous_camera_to_world)
-                else previous_camera_to_world.to(device=device, dtype=torch.float32)
-            ),
-            anchor_mask=anchor_mask.to(device=device, dtype=torch.bool),
-            normalize_camera=unwrap_ddp(scene_flow).normalize_camera,
-        )
-    )
-    expected_anchor_mask = anchor_mask.to(
-        device=returned_anchor_mask.device, dtype=torch.bool
-    )
-    if not torch.equal(returned_anchor_mask, expected_anchor_mask):
-        raise RuntimeError("formal metric camera condition changed global anchor roles")
-    return condition, valid
-
-
-def build_camera_condition_from_sample(
-    sample: dict[str, Any],
-    *,
-    device: torch.device,
-    anchor_mask: torch.Tensor,
-    scene_flow: nn.Module,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    image_hw = normalize_front_image_hw(sample.get("raw_image_size_hw"))
-    return build_camera_condition_from_waymo_gt(
-        sample.get("camera_to_world_corrected"),
-        sample.get("intrinsics"),
-        device=device,
+    condition, valid = camera_condition_from_waymo_request(
+        camera_metric,
+        intrinsics_metric,
         image_hw=image_hw,
-        trajectory_anchor_to_world=sample.get("camera_trajectory_anchor_to_world_corrected"),
-        previous_camera_to_world=sample.get("camera_previous_to_world_corrected"),
-        anchor_mask=anchor_mask,
-        scene_flow=scene_flow,
+        trajectory_anchor_to_world=trajectory_anchor_to_world.to(
+            device=device, dtype=torch.float32
+        ),
+        previous_camera_to_world=(
+            None
+            if not torch.is_tensor(previous_camera_to_world)
+            else previous_camera_to_world.to(device=device, dtype=torch.float32)
+        ),
     )
+    return condition, valid
 
 
 TRAIN_PROGRESS_KEYS = (
@@ -798,12 +364,6 @@ def sample_uncond_drop_mask(
     return torch.rand(int(batch_size), device=device) < float(prob)
 
 
-def formal_sky_generation_enabled(args) -> bool:
-    """T1 editing keeps sky from GT render context, so do not train sky gen tokens."""
-    del args
-    return False
-
-
 @torch.no_grad()
 def materialize_ema_state_dict(scene_flow: nn.Module, ema: EMAModel) -> dict[str, torch.Tensor]:
     sf = unwrap_ddp(scene_flow)
@@ -857,76 +417,31 @@ def build_training_scheduler(optimizer: torch.optim.Optimizer, args: argparse.Na
     )
 
 
-def _strip_module_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
-
-
-def _load_state_dict_checked(
-    module: nn.Module,
-    state: dict[str, torch.Tensor],
-    *,
-    path: str,
-    label: str,
-) -> tuple[int, int]:
-    missing, unexpected = module.load_state_dict(_strip_module_prefix(state), strict=False)
-    if missing or unexpected:
-        raise RuntimeError(
-            f"{label} from {path} is incompatible: "
-            f"missing={len(missing)} unexpected={len(unexpected)}"
-        )
-    return len(missing), len(unexpected)
-
-
 def _scene_flow_prediction_type_from_module(scene_flow: nn.Module) -> str:
     cfg = getattr(unwrap_ddp(scene_flow), "config", None)
     return str(getattr(cfg, "prediction_type", "x"))
 
 
-def _checkpoint_prediction_type(payload: Any) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    cfg = payload.get("scene_flow_config")
-    if isinstance(cfg, dict) and "prediction_type" in cfg:
-        return str(cfg["prediction_type"])
-    args = payload.get("args")
-    if isinstance(args, dict) and "prediction_type" in args:
-        return str(args["prediction_type"])
-    return None
-
-
-SCENE_FLOW_CONFIG_COMPAT_FIELDS = (
-    "rope_layout_version",
-    "rope_theta",
-    "encoder_rope_theta",
-    "ddt_rope_theta",
-    "encoder_mrope_section",
-    "ddt_mrope_section",
-    "patch_grid",
-    "out_channels",
-    "sky_grid",
-    "sky_representation_version",
-    "sky_atlas_hw",
-    "sky_token_dim",
-    "rope_max_position",
-    "camera_gen_dim",
-    "camera_generation_representation",
-    "camera_stats_version",
-    "gauge_gen_dim",
-    "scene_gauge_representation",
-    "scene_gauge_stats_version",
-    "camera_condition_representation",
-    "mask_compositing_version",
-    "asset_position_mode",
-    "asset_condition_protocol",
-    "factorized_asset_condition_version",
-    "placement_mean",
-    "placement_std",
-    "sky_rope_temporal_offset",
-    "camera_rope_spatial_mode",
-    "sky_mask_head_version",
-    "sky_mask_refine_scale",
-    "sky_mask_refine_channels",
-)
+def load_formal_latent_stats(
+    scene_flow: nn.Module,
+    path: str | Path,
+    *,
+    token_dim: int,
+    require_existing_match: bool,
+) -> None:
+    """Load the only feature statistics consumed by the layout-free editor."""
+    mean, std = load_feature_stats(path, token_dim=int(token_dim))
+    root = unwrap_ddp(scene_flow)
+    if require_existing_match:
+        current_mean = mean.to(device=root.mu_z.device, dtype=root.mu_z.dtype)
+        current_std = std.to(
+            device=root.sigma_z.device, dtype=root.sigma_z.dtype
+        ).clamp_min(1.0e-4)
+        if not torch.equal(root.mu_z, current_mean) or not torch.equal(root.sigma_z, current_std):
+            raise ValueError(
+                f"{path} latent statistics do not match the exact-resume checkpoint buffers"
+            )
+    root.set_latent_stats(mean, std)
 
 
 def build_scene_flow_from_checkpoint_config(
@@ -939,235 +454,68 @@ def build_scene_flow_from_checkpoint_config(
     payload = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(payload, dict) or not isinstance(payload.get("scene_flow_config"), dict):
         raise ValueError(
-            f"{checkpoint_path} has no scene_flow_config. Formal training must construct the exact "
-            "pretrained architecture from a versioned checkpoint."
+            f"{checkpoint_path} has no scene_flow_config; only current formal checkpoints are accepted."
         )
     config = dict(payload["scene_flow_config"])
-    is_formal_checkpoint = bool(
-        payload.get("formal_flow_domain_version") is not None
-        or payload.get("formal_metric_gauge_contract") is not None
-    )
-    validate_metric_gauge_checkpoint_payload(
-        payload,
-        path=checkpoint_path,
-        config=config,
-        require_formal_contract=is_formal_checkpoint,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=patch_grid,
-    )
-    if not is_formal_checkpoint:
-        validate_pretrain_feature_stats_contract(
-            payload.get(PRETRAIN_FEATURE_STATS_CONTRACT_KEY),
-            path=checkpoint_path,
-            expected_sequence_length=FORMAL_TOKENIZER_WINDOW_LEN,
-            expected_patch_grid=patch_grid,
+    if config.get("layout_condition_version") != FORMAL_LAYOUT_CONDITION_VERSION:
+        raise ValueError(
+            f"{checkpoint_path} layout_condition_version={config.get('layout_condition_version')!r}; "
+            "the first formal editor requires its independent from-scratch 'none' model and "
+            "must not silently ignore a layout_v2 checkpoint."
         )
+    for field, expected in FORMAL_LAYOUT_DISABLED_CONFIG.items():
+        if config.get(field) != expected:
+            raise ValueError(
+                f"{checkpoint_path} {field}={config.get(field)!r}; "
+                f"layout-free formal checkpoints require {expected!r}"
+            )
     if tuple(config.get("patch_grid", ())) != tuple(patch_grid):
         raise ValueError(f"checkpoint patch_grid={config.get('patch_grid')} != cache patch_grid={patch_grid}")
     if int(config.get("out_channels", -1)) != int(latent_dim):
         raise ValueError(f"checkpoint out_channels={config.get('out_channels')} != --latent_dim={latent_dim}")
+    for derived in (
+        "hidden_size",
+        "rope_layout_version",
+        "sky_rope_temporal_offset",
+        "camera_rope_spatial_mode",
+    ):
+        config.pop(derived, None)
     return WanSceneFlow(**config).to(device)
 
 
-def _normalize_config_value(value: Any) -> Any:
-    if isinstance(value, list):
-        return tuple(_normalize_config_value(v) for v in value)
-    if isinstance(value, tuple):
-        return tuple(_normalize_config_value(v) for v in value)
-    return value
-
-
-def _config_values_match(current: Any, saved: Any) -> bool:
-    current = _normalize_config_value(current)
-    saved = _normalize_config_value(saved)
-    if isinstance(current, tuple) and isinstance(saved, tuple):
-        return len(current) == len(saved) and all(_config_values_match(c, s) for c, s in zip(current, saved))
-    if isinstance(current, float) or isinstance(saved, float):
-        try:
-            return abs(float(current) - float(saved)) <= 1e-6
-        except (TypeError, ValueError):
-            return False
-    return current == saved
-
-
 def _validate_scene_flow_checkpoint_config(scene_flow: nn.Module, payload: Any, path: str | Path) -> None:
-    _validate_scene_flow_prediction_type(scene_flow, payload, path)
     if not isinstance(payload, dict):
-        raise ValueError(f"{path} is not a versioned metric/gauge SceneFlow checkpoint")
+        raise ValueError(f"{path} is not a current formal SceneFlow checkpoint")
     saved_cfg = payload.get("scene_flow_config")
     if not isinstance(saved_cfg, dict):
-        raise ValueError(f"{path} is missing scene_flow_config; old checkpoints are rejected")
-    require_formal_contract = bool(
-        payload.get("formal_flow_domain_version") is not None
-        or payload.get("formal_metric_gauge_contract") is not None
-    )
-    provenance, formal_contract = validate_metric_gauge_checkpoint_payload(
-        payload,
-        path=path,
-        config=saved_cfg,
-        require_formal_contract=require_formal_contract,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=saved_cfg.get("patch_grid"),
-    )
-    current_provenance = getattr(unwrap_ddp(scene_flow), "_metric_gauge_provenance", None)
-    if current_provenance is not None and dict(current_provenance) != provenance:
+        raise ValueError(f"{path} is missing scene_flow_config")
+    if saved_cfg.get("layout_condition_version") != FORMAL_LAYOUT_CONDITION_VERSION:
         raise ValueError(
-            f"{path} metric_gauge_provenance does not match the active formal coordinate contract"
-        )
-    current_formal_contract = getattr(
-        unwrap_ddp(scene_flow), "_formal_metric_gauge_contract", None
-    )
-    if current_formal_contract is not None and require_formal_contract:
-        if formal_contract is None or dict(current_formal_contract) != formal_contract:
-            raise ValueError(
-                f"{path} formal_metric_gauge_contract does not match the active formal coordinate contract"
-            )
-    if saved_cfg.get("sky_representation_version") != "rgb_patch_teacher_anchor_v3":
-        raise ValueError(
-            f"{path} is not an rgb_patch_teacher_anchor_v3 sky checkpoint and cannot be resumed directly."
-        )
-    if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
-        raise ValueError(
-            f"{path} was saved with the legacy global mrope_temporal_margin RoPE layout. "
-            "The current SceneFlow model uses the fixed A3 layout "
-            "(video/asset/camera shared video time, camera center, spherical sky coordinates near 15000); "
-            "do not resume/warm-start across these incompatible position semantics."
+            f"{path} is not a layout-free formal-editor checkpoint; refusing cross-task loading"
         )
     current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)
-    mismatches: list[str] = []
-    for field in SCENE_FLOW_CONFIG_COMPAT_FIELDS:
-        if field not in saved_cfg or not hasattr(current_cfg, field):
-            continue
-        current_value = getattr(current_cfg, field)
-        saved_value = saved_cfg[field]
-        if not _config_values_match(current_value, saved_value):
-            mismatches.append(f"{field}: checkpoint={saved_value!r}, current={current_value!r}")
-    if mismatches:
-        joined = "; ".join(mismatches)
-        raise ValueError(
-            f"{path} SceneFlow config does not match the current model: {joined}. "
-            "Do not resume/warm-start across incompatible RoPE/model geometry settings."
+    for field in (
+        "layout_condition_version",
+        *FORMAL_LAYOUT_DISABLED_CONFIG,
+        "patch_grid",
+        "out_channels",
+        "prediction_type",
+    ):
+        current_value = getattr(current_cfg, field, None)
+        saved_value = saved_cfg.get(field)
+        same = (
+            tuple(current_value) == tuple(saved_value)
+            if field == "patch_grid"
+            else current_value == saved_value
         )
-
-
-def _validate_scene_flow_prediction_type(scene_flow: nn.Module, payload: Any, path: str | Path) -> None:
-    current = _scene_flow_prediction_type_from_module(scene_flow)
-    saved = _checkpoint_prediction_type(payload)
-    if saved is None:
-        if current == "v":
+        if not same:
             raise ValueError(
-                f"{path} does not record SceneFlow prediction_type. Refusing to load it into "
-                "a velocity-prediction model because legacy checkpoints were x-prediction by default. "
-                "Use --prediction_type x for that checkpoint or warm-start from a checkpoint saved with scene_flow_config."
+                f"{path} config {field}={saved_value!r} != active model {current_value!r}"
             )
-        return
-    if saved != current:
+    if payload.get("formal_flow_domain_version") != FORMAL_FLOW_DOMAIN_VERSION:
         raise ValueError(
-            f"{path} prediction_type={saved!r} does not match current model prediction_type={current!r}. "
-            "Do not warm-start/resume across x-prediction and velocity-prediction checkpoints."
+            f"{path} formal_flow_domain_version is not {FORMAL_FLOW_DOMAIN_VERSION!r}"
         )
-
-
-def load_scene_flow_warm_start(
-    scene_flow: nn.Module,
-    pretrain_path: str | None,
-    *,
-    use_ema: bool = True,
-    args: argparse.Namespace | None = None,
-) -> dict[str, Any] | None:
-    if not pretrain_path:
-        return None
-
-    sf = unwrap_ddp(scene_flow)
-    payload = torch.load(pretrain_path, map_location="cpu")
-    _validate_scene_flow_checkpoint_config(scene_flow, payload, pretrain_path)
-    if args is None:
-        raise ValueError("SceneFlow warm-start requires runtime args for flow-schedule validation")
-    stats_contract = validate_pretrain_feature_stats_contract(
-        payload.get(PRETRAIN_FEATURE_STATS_CONTRACT_KEY),
-        path=pretrain_path,
-        expected_feature_stats_sha256=getattr(args, "feature_stats_sha256", None),
-        expected_sequence_length=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=getattr(unwrap_ddp(scene_flow).config, "patch_grid", None),
-    )
-    # The pretrain checkpoint owns the frozen metric/gauge coordinate system.
-    # Keep the exact validated 12-field block on the formal model so every
-    # later save inherits it verbatim rather than reconstructing provenance
-    # from runtime arguments.
-    sf._metric_gauge_provenance = copy.deepcopy(
-        payload["metric_gauge_provenance"]
-    )
-    sf._pretrain_feature_stats_contract = copy.deepcopy(stats_contract)
-    validate_checkpoint_flow_schedule(
-        payload,
-        args,
-        pretrain_path,
-        prediction_type=_scene_flow_prediction_type_from_module(scene_flow),
-        t_eps=scene_flow_t_eps(scene_flow),
-    )
-    info: dict[str, Any] = {
-        "path": pretrain_path,
-        "step": int(payload.get("step", -1)) if isinstance(payload, dict) else -1,
-        "ema_used": False,
-    }
-
-    if use_ema:
-        if isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
-            _load_state_dict_checked(
-                sf,
-                payload["ema_scene_flow_state_dict"],
-                path=pretrain_path,
-                label="EMA SceneFlow state_dict",
-            )
-            info["ema_used"] = True
-            info["source"] = "ema_scene_flow_state_dict"
-            return info
-
-        if isinstance(payload, dict) and payload.get("is_ema_weights") and "scene_flow" in payload:
-            _load_state_dict_checked(
-                sf,
-                payload["scene_flow"],
-                path=pretrain_path,
-                label="EMA SceneFlow weights-only state_dict",
-            )
-            info["ema_used"] = True
-            info["source"] = "ema_weights_only"
-            return info
-
-        if isinstance(payload, dict) and "ema_scene_flow" in payload:
-            if "scene_flow" not in payload:
-                raise ValueError(f"{pretrain_path} has ema_scene_flow but no scene_flow buffers to initialize.")
-            _load_state_dict_checked(
-                sf,
-                payload["scene_flow"],
-                path=pretrain_path,
-                label="raw SceneFlow state_dict",
-            )
-            ema = EMAModel(sf.parameters())
-            ema.load_state_dict(payload["ema_scene_flow"])
-            ema.copy_to(sf.parameters())
-            info["ema_used"] = True
-            info["source"] = "ema_scene_flow"
-            return info
-
-        raise ValueError(
-            f"{pretrain_path} does not contain EMA SceneFlow weights. "
-            "Use the full pretrain_step{N}.pt checkpoint, a new "
-            "pretrain_step{N}_ema_weights_only.pt export, or pass "
-            "--no_scene_flow_pretrain_ema to explicitly load raw weights."
-        )
-
-    if isinstance(payload, dict) and "scene_flow" in payload:
-        state = payload["scene_flow"]
-        info["source"] = "scene_flow"
-    elif isinstance(payload, dict) and "state_dict" in payload:
-        state = payload["state_dict"]
-        info["source"] = "state_dict"
-    else:
-        state = payload
-        info["source"] = "raw_state_dict"
-    _load_state_dict_checked(sf, state, path=pretrain_path, label="SceneFlow state_dict")
-    return info
 
 
 def _infer_cache_patch_grid(dataset: WaymoFlowCacheDataset) -> tuple[int, int]:
@@ -1233,20 +581,6 @@ def split_train_val_entries(
     return val_dataset
 
 
-def _validate_item_patch_grid(
-    asset_pass_result,
-    assembler: FlowFeatureAssembler,
-    cache_path: str | None = None,
-) -> None:
-    item_grid = tuple(int(v) for v in asset_pass_result.patch_grid)
-    if item_grid != assembler.patch_grid:
-        where = f" for {cache_path}" if cache_path else ""
-        raise ValueError(
-            f"Cache patch_grid{where} is {item_grid}, but assembler was initialized "
-            f"with {assembler.patch_grid}. Use one training run per image geometry."
-        )
-
-
 # ---------------------------------------------------------------------- #
 # CLI                                                                     #
 # ---------------------------------------------------------------------- #
@@ -1264,40 +598,17 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--feature_stats_path", type=str, default=str(DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH),
                         help=(
-                            "Metric-gauge v4 latent/camera/gauge/placement stats contract; "
-                            "defaults to the full-pass tokenizer-v2 v5 stats artifact. "
-                            "The file must exactly match the "
-                            "buffers stored in the warm-start/resume checkpoint; mismatches fail fast."
+                            "Tokenizer latent mean/std. Exact resume requires these values "
+                            "to match the checkpoint buffers."
                         ))
-    parser.add_argument(
-        "--pullback_calibration_path",
-        type=str,
-        default=DEFAULT_FORMAL_PULLBACK_CALIBRATION,
-        help=(
-            "Strict checkpoint-bound tokenizer pullback artifact. Formal render/decode "
-            "always executes its explicit identity boundary and rejects a hash, tokenizer, "
-            "DGGT, window, or patch-grid mismatch."
-        ),
-    )
     parser.add_argument(
         "--latent_dim",
         type=int,
         default=1024,
         help=(
-            "Tokenizer latent channels; must match pretrain warm-start and feature stats. "
-            "SceneFlow DDT visual embedders consume z_t directly; legacy in_channels "
-            "still records 3 * latent_dim + 3 packed control channels."
+            "Tokenizer latent channels. SceneFlow consumes z_t directly."
         ),
     )
-    parser.add_argument("--scene_flow_pretrain_path", type=str, default=None,
-                        help="Optional SceneFlow pretrain checkpoint for warm-start.")
-    parser.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
-    parser.add_argument("--scene_flow_pretrain_ema", dest="scene_flow_pretrain_ema",
-                        action="store_true", default=True,
-                        help="Load EMA weights from --scene_flow_pretrain_path. Enabled by default.")
-    parser.add_argument("--no_scene_flow_pretrain_ema", dest="scene_flow_pretrain_ema",
-                        action="store_false",
-                        help="Load raw scene_flow weights from --scene_flow_pretrain_path.")
     parser.add_argument("--cache_root", type=str, default=None,
                         help="Offline feature cache root (Phase 4.5 output). Mutually exclusive with --manifest_path.")
     parser.add_argument("--manifest_path", type=str, default=None,
@@ -1316,16 +627,6 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Optional independent validation cache root. Enables --val_caption_root.")
     parser.add_argument("--val_caption_root", type=str, default=None,
                         help="Caption root for an independent validation manifest/cache.")
-    parser.add_argument(
-        "--val_scene_gauge_sha256",
-        type=str,
-        default=None,
-        help=(
-            "Trusted scene-gauge table SHA-256 for an independent validation cache. "
-            "Required with --val_manifest_path/--val_cache_root; internal holdout uses "
-            "the training checkpoint provenance."
-        ),
-    )
     parser.add_argument("--val_split", type=str, default="validation")
     parser.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B")
     parser.add_argument("--text_max_length", type=int, default=256)
@@ -1393,15 +694,6 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Disable mmap=True when reading uncompressed torch cache files.")
     parser.add_argument("--no_batch_scene_flow", action="store_true",
                         help="Process cache items in a micro-batch serially instead of batching WanSceneFlow.")
-    parser.add_argument(
-        "--full_asset_lut_cache",
-        action="store_true",
-        help=(
-            "Compatibility flag. RAE-style SceneFlow always loads all cached "
-            "asset LUT levels because asset conditioning is encoded before "
-            "frame-level compression."
-        ),
-    )
     parser.add_argument("--max_steps", type=int, default=40000)
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--vis_every", type=int, default=1000)
@@ -1520,25 +812,7 @@ def build_argparser() -> argparse.ArgumentParser:
         default=1,
         help="Patch-grid dilation radius for the binary formal-edit flow domain.",
     )
-    parser.add_argument(
-        "--no_sky_generation",
-        action="store_true",
-        help=(
-            "Deprecated compatibility flag. Formal T1 training no longer packs "
-            "generated-sky tokens or computes sky flow loss; RGB rendering preserves "
-            "the original input RGB exactly inside the GT sky mask."
-        ),
-    )
-    parser.add_argument("--sky_grid_h", type=int, default=DEFAULT_SKY_GRID[0])
-    parser.add_argument("--sky_grid_w", type=int, default=DEFAULT_SKY_GRID[1])
-    parser.add_argument(
-        "--lambda_sky_flow",
-        type=float,
-        default=0.1,
-        help="Deprecated no-op in formal T1 training; sky flow loss is pretrain-only.",
-    )
     parser.add_argument("--guidance_scale", type=float, default=1.0)
-    parser.add_argument("--asset_control_guidance_scale", type=float, default=1.0)
     parser.add_argument("--uncond_drop_prob", type=float, default=0.1)
     parser.add_argument("--val_guidance_scales", type=str, default="")
     parser.add_argument("--weighting_scheme", type=str, default="waver")
@@ -1662,43 +936,6 @@ def build_formal_edit_domains(
     )
 
 
-def normalize_asset_latents(scene_flow_root: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
-    cfg = getattr(scene_flow_root, "config", None)
-    latent_dim = int(getattr(cfg, "out_channels", tokens.shape[-1]))
-    if torch.is_tensor(tokens) and tokens.ndim >= 3 and int(tokens.shape[-1]) == latent_dim:
-        return scene_flow_root.normalize(tokens.float()).to(dtype=tokens.dtype)
-    return tokens
-
-
-def estimate_sparse_asset_token_count(
-    scene_flow_root: nn.Module,
-    tokens: torch.Tensor,
-    mask: torch.Tensor | None,
-) -> float:
-    if not torch.is_tensor(tokens):
-        return 0.0
-    cfg = getattr(scene_flow_root, "config", None)
-    max_patch = int(getattr(cfg, "max_asset_patch_tokens_per_asset_frame", 32))
-    max_total = int(getattr(cfg, "max_asset_tokens", 4096))
-    if tokens.ndim == 5:
-        if mask is None:
-            valid = torch.ones(tokens.shape[:-1], device=tokens.device, dtype=torch.bool)
-        else:
-            valid = mask.to(device=tokens.device, dtype=torch.bool)
-        counts = valid.sum(dim=-1)
-        per_asset_frame = torch.where(
-            counts > 0,
-            counts.clamp_max(max_patch) + 1,
-            torch.zeros_like(counts),
-        )
-        return float(per_asset_frame.sum(dim=(1, 2)).clamp_max(max_total).float().mean().item())
-    if tokens.ndim == 3:
-        if mask is None:
-            return float(tokens.shape[1])
-        return float(mask.to(device=tokens.device, dtype=torch.bool).sum(dim=1).float().mean().item())
-    return 0.0
-
-
 def estimate_control_token_count(
     scene_flow_root: nn.Module,
     M_source: torch.Tensor,
@@ -1715,122 +952,6 @@ def estimate_control_token_count(
     support = torch.nn.functional.max_pool2d(grid, kernel_size=5, stride=1, padding=2).gt(0.0)
     counts = support.reshape(b, s, p).sum(dim=-1)
     return float(counts.clamp_max(max_per_frame).sum(dim=1).clamp_max(max_total).float().mean().item())
-
-
-def _move_v6_fast_path_inputs(
-    item: dict[str, Any],
-    mode_kind: str,
-    device: torch.device,
-) -> tuple[dict[str, Any] | None, list[torch.Tensor]]:
-    schema_version = int(item.get("cache_schema_version", 0))
-    if schema_version not in SUPPORTED_CACHE_SCHEMA_VERSIONS:
-        raise RuntimeError(
-            f"Training item {item.get('cache_path', '<unknown>')} has "
-            f"cache_schema_version={schema_version}; supported versions are "
-            f"{SUPPORTED_CACHE_SCHEMA_VERSIONS}."
-        )
-
-    if mode_kind not in ("mode_a", "mode_b"):
-        raise RuntimeError(
-            f"Training item {item.get('cache_path', '<unknown>')} has "
-            f"invalid mode_kind={mode_kind!r}."
-        )
-
-    phase1_localized_lite = item.get("phase1_localized")
-    if mode_kind == "mode_a":
-        if phase1_localized_lite is None:
-            raise RuntimeError(
-                f"Mode-A cache item {item.get('cache_path', '<unknown>')} missing phase1_localized."
-            )
-        phase1_localized_lite = {
-            k: v.to(device) if torch.is_tensor(v) else v
-            for k, v in phase1_localized_lite.items()
-        }
-    else:
-        if phase1_localized_lite is not None:
-            raise RuntimeError(
-                f"Mode-B v6 item {item.get('cache_path', '<unknown>')} unexpectedly has phase1_localized."
-            )
-        phase1_localized_lite = None
-
-    splatted_tok_low_cached = item.get("splatted_tok_low_cached")
-    if splatted_tok_low_cached is None:
-        raise RuntimeError(
-            f"v6 item {item.get('cache_path', '<unknown>')} missing splatted_tok_low_cached."
-        )
-    return phase1_localized_lite, [t.to(device) for t in splatted_tok_low_cached]
-
-
-def _flatten_fast_asset_kv(asset_pass_result, flow_inputs: dict[str, Any], device: torch.device) -> torch.Tensor:
-    chunks: list[torch.Tensor] = []
-    coverage = flow_inputs.get("phase1_coverage")
-    if torch.is_tensor(coverage):
-        coverage = coverage.to(device=device, dtype=torch.bool)
-    phase4_slots = {int(v) for v in flow_inputs.get("phase4_slots", [])}
-    for obj_key in sorted(int(k) for k in asset_pass_result.F_g_lut_asset.keys()):
-        levels = asset_pass_result.F_g_lut_asset[obj_key]
-        if not levels:
-            continue
-        lvl = levels[-1].to(device)
-        patch_valid = require_asset_patch_valid_mask(
-            asset_pass_result,
-            obj_key,
-            expected_shape=(int(lvl.shape[0]), int(lvl.shape[1]), int(lvl.shape[2])),
-            device=device,
-        )
-        if torch.is_tensor(coverage) and obj_key < int(coverage.shape[0]):
-            cov = coverage[obj_key].to(device=device, dtype=lvl.dtype)
-            if cov.ndim != 1 or int(cov.numel()) != int(lvl.shape[1]):
-                raise ValueError(
-                    f"Asset {obj_key} coverage must be [S]={int(lvl.shape[1])}, "
-                    f"got {tuple(cov.shape)} for LUT {tuple(lvl.shape)}."
-                )
-            patch_valid = patch_valid & cov.to(dtype=torch.bool).reshape(1, -1, 1)
-        if phase4_slots and obj_key not in phase4_slots:
-            patch_valid = torch.zeros_like(patch_valid)
-        lvl = lvl * patch_valid.unsqueeze(-1).to(dtype=lvl.dtype)
-        B, S, P, C = lvl.shape
-        chunks.append(lvl.reshape(B, S * P, C))
-    if not chunks:
-        return torch.zeros((1, 0, 3072), dtype=torch.float32, device=device)
-    return torch.cat(chunks, dim=1)
-
-
-def _encode_fast_asset_conditions(
-    asset_pass_result,
-    flow_inputs: dict[str, Any],
-    *,
-    scene_tokenizer: nn.Module,
-    patch_grid: tuple[int, int],
-    reference: torch.Tensor,
-    device: torch.device,
-    mode_kind: str = "mode_a",
-    tokenizer_window_len: int = FORMAL_TOKENIZER_WINDOW_LEN,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Encode each asset's 4-level LUT through the tokenizer.
-
-    Returns `[B,K,S,P,C_latent]` plus a `[B,K,S,P]` valid mask. K is capped at 5.
-    """
-    B, S, P, C = reference.shape
-    out = reference.new_zeros((B, 5, S, P, C))
-    mask = torch.zeros((B, 5, S, P), device=device, dtype=torch.bool)
-    if str(mode_kind) == "mode_b":
-        return out, mask
-
-    coverage = flow_inputs.get("phase1_coverage")
-    phase4_slots = flow_inputs.get("phase4_slots")
-    out, mask = build_asset_condition_slots(
-        asset_pass_result,
-        phase1_coverage=coverage if torch.is_tensor(coverage) else None,
-        phase4_slots=phase4_slots,
-        scene_tokenizer=scene_tokenizer,
-        patch_grid=patch_grid,
-        reference=reference,
-        max_assets=5,
-        expected_num_levels=4,
-        tokenizer_window_len=int(tokenizer_window_len),
-    )
-    return out, mask
 
 
 def _split_nplc_levels_for_train(x: torch.Tensor) -> list[torch.Tensor]:
@@ -1867,58 +988,6 @@ def _dequantize_stacked_nplc_levels_on_device(
     )
     x = dequantize_tokens(q, dtype=dtype).reshape(b, s, p_count, levels, channels)
     return [x[:, :, :, level, :].contiguous() for level in range(int(levels))]
-
-
-def _build_sky_tokens_from_training_source(
-    source: dict[str, Any] | None,
-    args,
-    device: torch.device,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    if args is None or not formal_sky_generation_enabled(args) or source is None:
-        return None, None
-    images = source.get("images", source.get("images_clean"))
-    masks = source.get("masks", source.get("sky_mask"))
-    if not torch.is_tensor(images) or not torch.is_tensor(masks):
-        return None, None
-    images = images.to(device=device, dtype=torch.float32, non_blocking=True)
-    masks = masks.to(device=device, dtype=torch.float32, non_blocking=True)
-    if images.ndim == 4:
-        images = images.unsqueeze(0)
-    if masks.ndim == 4:
-        masks = masks.unsqueeze(0)
-    sky_h, sky_w = sky_grid_shape(args)
-    return build_sky_tokens_from_images(
-        images,
-        masks,
-        grid_h=sky_h,
-        grid_w=sky_w,
-    )
-
-
-def _build_sky_tokens_from_item(
-    item: dict[str, Any],
-    args,
-    device: torch.device,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    source = item.get("sky_training")
-    if source is None:
-        source = item.get("sample")
-    return _build_sky_tokens_from_training_source(source, args, device)
-
-
-def _attach_sky_tokens_to_bundle(
-    bundle: Any,
-    item: dict[str, Any],
-    args,
-    device: torch.device,
-) -> Any:
-    del item, args, device
-    # Formal T1 sampling and offline inference do not provide generated-sky
-    # state to SceneFlow. Keep training on the same conditioning surface; pretrain
-    # owns the generated-sky branch.
-    bundle.sky_gen_clean = None
-    bundle.sky_gen_attention_mask = None
-    return bundle
 
 
 def _frame_ids_from_sources(
@@ -2056,9 +1125,7 @@ def build_cached_flow_bundle(
     item: dict[str, Any],
     assembler: FlowFeatureAssembler,
     device: torch.device,
-    args=None,
     *,
-    scene_flow: nn.Module,
     include_rgb_render_context: bool = False,
 ) -> Any:
     flow_inputs = {
@@ -2115,18 +1182,6 @@ def build_cached_flow_bundle(
     # packer installs and executes its gradient-reduction hooks.
     scaffold_tok = assembler.scaffold_packer(scaffold_pooled, already_pooled=True)
 
-    asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
-    mode_kind = str(item.get("mode_kind", flow_inputs.get("mode_kind", "mode_a")))
-    F_asset_tokens, asset_mask = _encode_fast_asset_conditions(
-        asset_pass_result,
-        flow_inputs,
-        scene_tokenizer=assembler.scene_tokenizer,
-        patch_grid=assembler.patch_grid,
-        reference=z_clean,
-        device=device,
-        mode_kind=mode_kind,
-        tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-    )
     frame_ids = _frame_ids_from_item(
         item,
         seq_len=int(z_clean.shape[1]),
@@ -2134,15 +1189,13 @@ def build_cached_flow_bundle(
         flow_inputs=flow_inputs,
     )
     camera_gt = item.get("camera_gt") or {}
-    camera_condition_tokens, camera_attention_mask = build_camera_condition_from_waymo_gt(
+    camera_condition_tokens, camera_attention_mask = build_camera_condition_from_waymo_request(
         camera_gt.get("camera_to_world_corrected"),
         camera_gt.get("intrinsics"),
         device=device,
         image_hw=camera_gt.get("raw_image_size_hw"),
         trajectory_anchor_to_world=camera_gt.get("trajectory_anchor_to_world"),
         previous_camera_to_world=camera_gt.get("previous_camera_to_world"),
-        anchor_mask=frame_ids.eq(0),
-        scene_flow=scene_flow,
     )
     if camera_condition_tokens is None:
         raise RuntimeError(
@@ -2156,12 +1209,8 @@ def build_cached_flow_bundle(
         M_preserve=M_preserve,
         M_source=M_source,
         M_dest=M_dest,
-        F_asset_tokens=F_asset_tokens,
-        encoder_attention_mask=asset_mask,
         camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
-        asset_condition_kind=_asset_condition_kind_from_item(item, mode_kind),
-        phase4_slots=list(flow_inputs.get("phase4_slots", [])),
         captions=[str(item.get("caption", ""))],
         patch_grid=assembler.patch_grid,
         patch_start_idx=assembler.patch_start_idx,
@@ -2169,7 +1218,6 @@ def build_cached_flow_bundle(
         F_g_lut_scene=F_g_lut_scene,
         frame_ids=frame_ids,
     )
-    bundle = _attach_sky_tokens_to_bundle(bundle, item, args, device)
     if include_rgb_render_context:
         bundle = _attach_rgb_context(bundle, _formal_rgb_context(item, device=device, strict=True))
     return bundle
@@ -2179,11 +1227,9 @@ def build_cached_flow_batch_bundle(
     items: list[dict[str, Any]],
     assembler: FlowFeatureAssembler,
     device: torch.device,
-    args=None,
     *,
-    scene_flow: nn.Module,
     include_rgb_render_context: bool = False,
-) -> tuple[Any, list[int], float]:
+) -> Any:
     if len(items) == 0:
         raise ValueError("Cannot build an empty cached flow batch.")
     if not all(item.get("flow_inputs_cached") is not None for item in items):
@@ -2235,35 +1281,6 @@ def build_cached_flow_batch_bundle(
         already_pooled=True,
     )
 
-    asset_bundles: list[Any] = []
-    num_objects = 0.0
-    for item in items:
-        mode_kind = str(item.get("mode_kind", "mode_a"))
-        item_flow_inputs = {
-            k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
-            for k, v in item["flow_inputs_cached"].items()
-        }
-        asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
-        F_asset_tokens_i, asset_mask_i = _encode_fast_asset_conditions(
-            asset_pass_result,
-            item_flow_inputs,
-            scene_tokenizer=assembler.scene_tokenizer,
-            patch_grid=assembler.patch_grid,
-            reference=z_clean[len(asset_bundles) : len(asset_bundles) + 1],
-            device=device,
-            mode_kind=mode_kind,
-            tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        )
-        asset_bundles.append(
-            SimpleNamespace(
-                F_asset_tokens=F_asset_tokens_i,
-                encoder_attention_mask=asset_mask_i,
-                asset_condition_kind=_asset_condition_kind_from_item(item, mode_kind),
-            )
-        )
-        num_objects += float(len(item_flow_inputs.get("phase4_slots", [])))
-    F_asset_tokens, asset_mask = _pad_asset_tokens_for_batch(asset_bundles)
-    asset_lengths = [int(bundle.F_asset_tokens.shape[1]) for bundle in asset_bundles]
     frame_id_rows = [
         _frame_ids_from_item(
             item,
@@ -2275,39 +1292,29 @@ def build_cached_flow_batch_bundle(
     ]
     camera_token_rows: list[torch.Tensor] = []
     camera_mask_rows: list[torch.Tensor] = []
-    for item, item_frame_ids in zip(items, frame_id_rows):
+    for item in items:
         camera_gt = item.get("camera_gt") or {}
-        camera_tokens_i, camera_mask_i = build_camera_condition_from_waymo_gt(
+        camera_tokens_i, camera_mask_i = build_camera_condition_from_waymo_request(
             camera_gt.get("camera_to_world_corrected"),
             camera_gt.get("intrinsics"),
             device=device,
             image_hw=camera_gt.get("raw_image_size_hw"),
             trajectory_anchor_to_world=camera_gt.get("trajectory_anchor_to_world"),
             previous_camera_to_world=camera_gt.get("previous_camera_to_world"),
-            anchor_mask=item_frame_ids.eq(0),
-            scene_flow=scene_flow,
         )
         if camera_tokens_i is None:
             raise RuntimeError(
                 f"Formal SceneFlow cache item {item.get('cache_path', '<unknown>')} "
                 "is missing Waymo camera_gt; camera conditioning must use Waymo camera parameters."
             )
-        if camera_tokens_i is not None:
-            camera_token_rows.append(camera_tokens_i)
-            camera_mask_rows.append(
-                camera_mask_i
-                if camera_mask_i is not None
-                else torch.ones(camera_tokens_i.shape[:2], device=device, dtype=torch.bool)
-            )
-    if len(camera_token_rows) == len(items):
-        camera_condition_tokens = torch.cat(camera_token_rows, dim=0)
-        camera_attention_mask = torch.cat(camera_mask_rows, dim=0)
-    else:
-        camera_condition_tokens, camera_attention_mask = None, None
-    # Keep formal T1 train conditioning identical to validation/offline sampling:
-    # no generated-sky tokens are packed into the SceneFlow sequence.
-    sky_gen_clean = None
-    sky_gen_attention_mask = None
+        camera_token_rows.append(camera_tokens_i)
+        camera_mask_rows.append(
+            camera_mask_i
+            if camera_mask_i is not None
+            else torch.ones(camera_tokens_i.shape[:2], device=device, dtype=torch.bool)
+        )
+    camera_condition_tokens = torch.cat(camera_token_rows, dim=0)
+    camera_attention_mask = torch.cat(camera_mask_rows, dim=0)
     frame_ids = torch.cat(frame_id_rows, dim=0)
 
     merged = SimpleNamespace(
@@ -2317,20 +1324,8 @@ def build_cached_flow_batch_bundle(
         M_preserve=M_preserve,
         M_source=M_source,
         M_dest=M_dest,
-        F_asset_tokens=F_asset_tokens,
-        encoder_attention_mask=asset_mask,
         camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
-        sky_gen_clean=sky_gen_clean,
-        sky_gen_attention_mask=sky_gen_attention_mask,
-        asset_condition_kind=[
-            _asset_condition_kind_from_item(
-                item,
-                str(item.get("mode_kind", "mode_a")),
-            )
-            for item in items
-        ],
-        phase4_slots=[],
         captions=[str(item.get("caption", "")) for item in items],
         patch_grid=assembler.patch_grid,
         patch_start_idx=assembler.patch_start_idx,
@@ -2345,7 +1340,7 @@ def build_cached_flow_batch_bundle(
             _attach_rgb_context(holder, _formal_rgb_context(item, device=device, strict=True))
             contexts.append(holder)
         merged = _attach_rgb_context(merged, _merge_rgb_contexts(contexts))
-    return merged, asset_lengths, num_objects / float(len(items))
+    return merged
 
 
 # ---------------------------------------------------------------------- #
@@ -2355,9 +1350,7 @@ def build_flow_bundle(
     item: dict[str, Any],
     assembler: FlowFeatureAssembler,
     device: torch.device,
-    args=None,
     *,
-    scene_flow: nn.Module,
     include_rgb_render_context: bool = False,
 ) -> Any:
     if item.get("flow_inputs_cached") is not None:
@@ -2365,222 +1358,25 @@ def build_flow_bundle(
             item,
             assembler,
             device,
-            args=args,
-            scene_flow=scene_flow,
             include_rgb_render_context=include_rgb_render_context,
         )
-
-    sample = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item["sample"].items()}
-    predictions = _move_predictions(item["predictions"], device)
-    asset_pass_result = _move_asset_pass(item["asset_pass_result"], device)
-    _validate_item_patch_grid(asset_pass_result, assembler, item.get("cache_path"))
-    cameras_dggt = {k: v.to(device) for k, v in item["cameras_dggt"].items()}
-    mode_kind = str(item.get("mode_kind", sample.get("mode_kind", "mode_a")))
-    mode_b_payload = item.get("mode_b")
-    if mode_b_payload is not None:
-        mode_b_payload = _move_mode_b(mode_b_payload, device)
-
-    phase1_localized_lite, splatted_tok_low_cached = _move_v6_fast_path_inputs(
-        item, mode_kind, device
+    raise RuntimeError(
+        "The clean-cut formal editor requires flow_inputs_cached; rebuild this cache item "
+        "with the current offline feature pipeline."
     )
 
-    bundle = assembler(
-        sample=sample,
-        predictions=predictions,
-        asset_pass_result=asset_pass_result,
-        cameras_dggt=cameras_dggt,
-        object_slots_spec="all",
-        device=device,
-        mode_kind=mode_kind,
-        mode_b=mode_b_payload,
-        phase1_localized_lite=phase1_localized_lite,
-        splatted_tok_low_cached=splatted_tok_low_cached,
-    )
-    frame_ids = _frame_ids_from_item(
-        item,
-        seq_len=int(bundle.z_clean.shape[1]),
-        device=device,
-        sample=sample,
-    )
-    camera_condition_tokens, camera_attention_mask = build_camera_condition_from_sample(
-        sample,
-        device=device,
-        anchor_mask=frame_ids.eq(0),
-        scene_flow=scene_flow,
-    )
-    if camera_condition_tokens is None:
-        raise RuntimeError(
-            f"Formal SceneFlow item {item.get('cache_path', '<unknown>')} "
-            "sample is missing camera_to_world_corrected/intrinsics; camera conditioning must use Waymo camera parameters."
-        )
-    bundle.camera_condition_tokens = camera_condition_tokens
-    bundle.camera_attention_mask = camera_attention_mask
-    bundle.captions = [str(item.get("caption", ""))]
-    bundle.frame_ids = frame_ids
-    kind = str(getattr(bundle, "extras", {}).get("asset_condition_kind", mode_kind))
-    bundle.asset_condition_kind = _asset_condition_kind_from_item(item, kind)
-    bundle = _attach_sky_tokens_to_bundle(bundle, item, args, device)
-    if include_rgb_render_context:
-        bundle = _attach_rgb_context(bundle, _formal_rgb_context(item, device=device, strict=True))
-    return bundle
 
-
-def _asset_condition_kinds(bundle, batch_size: int) -> list[str]:
-    kind = getattr(bundle, "asset_condition_kind", None)
-    if kind is None:
-        extras = getattr(bundle, "extras", {})
-        if isinstance(extras, dict):
-            kind = extras.get("asset_condition_kind") or extras.get("mode_kind")
-    if kind is None:
-        return ["mode_a"] * int(batch_size)
-    if isinstance(kind, str):
-        normalized = "mode_b_empty" if kind in ("mode_b", "mode_b_empty", "empty") else str(kind)
-        return [normalized] * int(batch_size)
-    values = list(kind)
-    if len(values) != int(batch_size):
-        raise ValueError(f"asset_condition_kind length {len(values)} != batch size {batch_size}")
-    return [
-        "mode_b_empty" if str(v) in ("mode_b", "mode_b_empty", "empty") else str(v)
-        for v in values
-    ]
-
-
-def _asset_condition_kind_for_model(bundle, batch_size: int) -> list[str]:
-    return _asset_condition_kinds(bundle, batch_size)
-
-
-def _maybe_drop_asset_kv(
-    bundle,
-    drop_prob: float,
-    drop_mask: torch.Tensor | None = None,
-) -> None:
-    """Mask asset conditions for CFG-unconditional training rows.
-
-    This intentionally does not insert the learned empty-asset token. That token
-    is a conditional Mode-B signal: a target hole exists, but no target asset is
-    provided. CFG uncond uses the learned asset-null token, which is distinct
-    from the user-facing formal-edit path where asset input is required.
-    """
-    if drop_mask is None and float(drop_prob) <= 0.0:
-        return
-    if not torch.is_tensor(bundle.F_asset_tokens):
-        return
-    if bundle.F_asset_tokens.shape[1] == 0:
-        return
-    B = int(bundle.F_asset_tokens.shape[0])
-    if drop_mask is None:
-        drop = torch.rand(B, device=bundle.F_asset_tokens.device) < float(drop_prob)
-    else:
-        drop = drop_mask.to(device=bundle.F_asset_tokens.device, dtype=torch.bool).view(-1)
-        if int(drop.numel()) != B:
-            raise ValueError(f"drop_mask has {int(drop.numel())} rows, asset batch has {B}")
-    if not bool(drop.any().item()):
-        return
-    mask = getattr(bundle, "encoder_attention_mask", None)
-    if bundle.F_asset_tokens.ndim == 5:
-        if mask is None:
-            mask = torch.ones(
-                bundle.F_asset_tokens.shape[:-1],
-                device=bundle.F_asset_tokens.device,
-                dtype=torch.bool,
-            )
-        else:
-            mask = mask.clone().to(device=bundle.F_asset_tokens.device, dtype=torch.bool)
-        mask[drop] = False
-        bundle.encoder_attention_mask = mask
-    else:
-        if mask is None:
-            mask = torch.ones(
-                bundle.F_asset_tokens.shape[:2],
-                device=bundle.F_asset_tokens.device,
-                dtype=torch.bool,
-            )
-        else:
-            mask = mask.clone().to(device=bundle.F_asset_tokens.device, dtype=torch.bool)
-        mask[drop] = False
-        bundle.encoder_attention_mask = mask
-
-    kinds = _asset_condition_kinds(bundle, B)
-    for idx, should_drop in enumerate(drop.detach().cpu().tolist()):
-        if should_drop:
-            kinds[idx] = "asset_uncond"
-    bundle.asset_condition_kind = kinds
-
-
-def _pad_asset_tokens_for_batch(bundles: list[Any]) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if len(bundles) == 0:
-        raise ValueError("Cannot pad an empty bundle list.")
-    token_lists = [bundle.F_asset_tokens for bundle in bundles]
-    device = token_lists[0].device
-    dtype = token_lists[0].dtype
-    if token_lists[0].ndim == 5:
-        _, _, S, P, C = token_lists[0].shape
-        lengths = [int(tokens.shape[1]) for tokens in token_lists]
-        max_len = max(lengths)
-        batch = len(token_lists)
-        if max_len == 0:
-            return token_lists[0].new_zeros((batch, 0, S, P, C)), None
-        out = torch.zeros((batch, max_len, S, P, C), device=device, dtype=dtype)
-        mask = torch.zeros((batch, max_len, S, P), device=device, dtype=torch.bool)
-        for row, bundle in enumerate(bundles):
-            tokens = bundle.F_asset_tokens
-            n = int(tokens.shape[1])
-            if n == 0:
-                continue
-            out[row : row + 1, :n] = tokens
-            row_mask = getattr(bundle, "encoder_attention_mask", None)
-            if row_mask is None:
-                mask[row : row + 1, :n] = True
-            else:
-                mask[row : row + 1, :n] = row_mask.to(device=device, dtype=torch.bool)
-        return out, mask
-
-    dim = int(token_lists[0].shape[-1])
-    lengths = [int(tokens.shape[1]) for tokens in token_lists]
-    max_len = max(lengths)
-    batch = len(token_lists)
-    if max_len == 0:
-        return token_lists[0].new_zeros((batch, 0, dim)), None
-    out = torch.zeros((batch, max_len, dim), device=device, dtype=dtype)
-    mask = torch.zeros((batch, max_len), device=device, dtype=torch.bool)
-    for row, tokens in enumerate(token_lists):
-        n = int(tokens.shape[1])
-        if n == 0:
-            continue
-        out[row, :n] = tokens.squeeze(0)
-        mask[row, :n] = True
-    if all(n == max_len for n in lengths):
-        return out, None
-    return out, mask
-
-
-def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor | None, list[int]]:
-    asset_tokens, asset_mask = _pad_asset_tokens_for_batch(bundles)
-    lengths = [int(bundle.F_asset_tokens.shape[1]) for bundle in bundles]
+def _merge_bundles_for_scene_flow(bundles: list[Any]) -> Any:
+    if not bundles:
+        raise ValueError("Cannot merge an empty formal-editor batch")
     camera_tokens_list = [getattr(bundle, "camera_condition_tokens", None) for bundle in bundles]
-    if all(torch.is_tensor(tokens) for tokens in camera_tokens_list):
-        camera_condition_tokens = torch.cat(camera_tokens_list, dim=0)
-        camera_masks = [getattr(bundle, "camera_attention_mask", None) for bundle in bundles]
-        camera_attention_mask = (
-            torch.cat(camera_masks, dim=0)
-            if all(torch.is_tensor(mask) for mask in camera_masks)
-            else None
-        )
-    else:
-        camera_condition_tokens = None
-        camera_attention_mask = None
-    sky_tokens_list = [getattr(bundle, "sky_gen_clean", None) for bundle in bundles]
-    if all(torch.is_tensor(tokens) for tokens in sky_tokens_list):
-        sky_gen_clean = torch.cat(sky_tokens_list, dim=0)
-        sky_masks = [getattr(bundle, "sky_gen_attention_mask", None) for bundle in bundles]
-        sky_gen_attention_mask = (
-            torch.cat(sky_masks, dim=0)
-            if all(torch.is_tensor(mask) for mask in sky_masks)
-            else None
-        )
-    else:
-        sky_gen_clean = None
-        sky_gen_attention_mask = None
+    camera_masks = [getattr(bundle, "camera_attention_mask", None) for bundle in bundles]
+    if not all(torch.is_tensor(tokens) for tokens in camera_tokens_list):
+        raise ValueError("Every formal-editor item must carry requested camera tokens")
+    if not all(torch.is_tensor(mask) for mask in camera_masks):
+        raise ValueError("Every formal-editor item must carry a requested camera mask")
+    camera_condition_tokens = torch.cat(camera_tokens_list, dim=0)
+    camera_attention_mask = torch.cat(camera_masks, dim=0)
     frame_ids_list = [getattr(bundle, "frame_ids", None) for bundle in bundles]
     if all(torch.is_tensor(ids) for ids in frame_ids_list):
         frame_ids = torch.cat(frame_ids_list, dim=0)
@@ -2593,37 +1389,15 @@ def _merge_bundles_for_scene_flow(bundles: list[Any]) -> tuple[Any, torch.Tensor
         M_preserve=torch.cat([bundle.M_preserve for bundle in bundles], dim=0),
         M_source=torch.cat([bundle.M_source for bundle in bundles], dim=0),
         M_dest=torch.cat([bundle.M_dest for bundle in bundles], dim=0),
-        F_asset_tokens=asset_tokens,
-        encoder_attention_mask=asset_mask,
         camera_condition_tokens=camera_condition_tokens,
         camera_attention_mask=camera_attention_mask,
-        sky_gen_clean=sky_gen_clean,
-        sky_gen_attention_mask=sky_gen_attention_mask,
         frame_ids=frame_ids,
-        asset_condition_kind=[kind for bundle in bundles for kind in _asset_condition_kinds(bundle, 1)],
-        phase4_slots=[],
         captions=[caption for bundle in bundles for caption in getattr(bundle, "captions", [""])],
+        patch_grid=bundles[0].patch_grid,
+        patch_start_idx=bundles[0].patch_start_idx,
     )
     merged = _attach_rgb_context(merged, _merge_rgb_contexts(bundles))
-    return merged, asset_mask, lengths
-
-
-def require_formal_pullback_calibration(scene_flow: nn.Module) -> PullbackCalibration:
-    """Return the validated formal pullback contract or fail closed.
-
-    Formal editing uses the v2 render boundary, which is numerically identity.
-    Requiring the artifact prevents a tokenizer or calibration swap from
-    silently bypassing the checkpoint-bound contract merely because the
-    accepted Scheme-A coefficients happen to be one.
-    """
-
-    calibration = getattr(unwrap_ddp(scene_flow), "_pullback_calibration", None)
-    if not isinstance(calibration, PullbackCalibration):
-        raise RuntimeError(
-            "Formal SceneFlow decode/render requires a validated "
-            "PullbackCalibration attached at startup"
-        )
-    return calibration
+    return merged
 
 
 def _add_formal_rgb_render_loss(
@@ -2669,7 +1443,6 @@ def _add_formal_rgb_render_loss(
         sigma,
         float(getattr(args, "rgb_render_sigma_power", 2.0)),
     )
-    pullback_calibration = require_formal_pullback_calibration(scene_flow_root)
     result = compute_rgb_render_loss(
         vggt_model=unwrap_ddp(render_vggt_model),
         scene_flow_root=scene_flow_root,
@@ -2688,12 +1461,8 @@ def _add_formal_rgb_render_loss(
         max_frames=int(args.rgb_render_max_frames),
         render_stride=int(args.rgb_render_stride),
         background_mode="gt_sky",
-        sky_tokens=None,
-        sky_grid=tuple(getattr(args, "sky_grid", DEFAULT_SKY_GRID)),
+        sky_grid=(16, 32),
         patch_weight_mask=target.M_edit,
-        sky_weight=0.0,
-        camera_grad_scale=0.0,
-        sky_mask_grad_scale=0.0,
         lpips_model=lpips_model,
         lpips_weight=float(args.rgb_render_lpips_weight),
         loss_sample_weight=sigma_weights,
@@ -2703,7 +1472,6 @@ def _add_formal_rgb_render_loss(
         conf_weight_floor=float(
             getattr(args, "feedback_conf_weight_floor", 0.05)
         ),
-        pullback_calibration=pullback_calibration,
     )
     ramp = rgb_render_loss_ramp(args, global_step)
     weighted = float(args.lambda_rgb_render) * float(ramp) * result.loss
@@ -2751,212 +1519,61 @@ def train_step(
         training=unwrap_ddp(scene_flow).training,
     )
     if isinstance(item, list):
-        if len(item) == 0:
+        if not item:
             raise ValueError("Received an empty training micro-batch.")
         if len(item) > 1 and not bool(getattr(args, "no_batch_scene_flow", False)):
             if all(single.get("flow_inputs_cached") is not None for single in item):
-                bundle, asset_lengths, mean_num_objects = build_cached_flow_batch_bundle(
+                bundle = build_cached_flow_batch_bundle(
                     item,
                     assembler,
                     device,
-                    args=args,
-                    scene_flow=scene_flow,
                     include_rgb_render_context=rgb_render_active,
                 )
-                asset_mask = getattr(bundle, "encoder_attention_mask", None)
             else:
-                bundles = [
+                bundle = _merge_bundles_for_scene_flow([
                     build_flow_bundle(
                         single,
                         assembler,
                         device,
-                        args=args,
-                        scene_flow=scene_flow,
                         include_rgb_render_context=rgb_render_active,
                     )
                     for single in item
-                ]
-                bundle, asset_mask, asset_lengths = _merge_bundles_for_scene_flow(bundles)
-                mean_num_objects = sum(float(len(b.phase4_slots)) for b in bundles) / float(len(bundles))
-            text_drop_mask = sample_uncond_drop_mask(
-                int(bundle.z_clean.shape[0]),
-                args.uncond_drop_prob,
-                device=bundle.z_clean.device,
-                training=unwrap_ddp(scene_flow).training,
-            )
-            asset_control_drop_mask = sample_uncond_drop_mask(
-                int(bundle.z_clean.shape[0]),
-                args.uncond_drop_prob,
-                device=bundle.z_clean.device,
-                training=unwrap_ddp(scene_flow).training,
-            )
-            if asset_control_drop_mask is not None:
-                _maybe_drop_asset_kv(bundle, args.uncond_drop_prob, drop_mask=asset_control_drop_mask)
-                asset_mask = getattr(bundle, "encoder_attention_mask", None)
-            sf = unwrap_ddp(scene_flow)
-            z_clean_n = sf.normalize(bundle.z_clean)
-            z_splat_n = sf.normalize(bundle.z_splat)
-            bundle.F_asset_tokens = normalize_asset_latents(sf, bundle.F_asset_tokens)
-            bundle.z_clean_n = z_clean_n
+                ])
+        else:
+            losses: list[torch.Tensor] = []
+            metric_sums: dict[str, float] = {}
+            for single in item:
+                loss_i, metrics_i = train_step(
+                    single,
+                    assembler,
+                    scene_flow,
+                    scheduler,
+                    device,
+                    args,
+                    text_encoder,
+                    global_step=global_step,
+                    render_vggt_model=render_vggt_model,
+                    lpips_model=lpips_model,
+                    generator=generator,
+                )
+                losses.append(loss_i)
+                for key, value in metrics_i.items():
+                    metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
+            scale = 1.0 / float(len(item))
+            metrics = {key: value * scale for key, value in metric_sums.items()}
+            metrics["micro_batch_size"] = float(len(item))
+            return torch.stack(losses).mean(), metrics
+    else:
+        bundle = build_flow_bundle(
+            item,
+            assembler,
+            device,
+            include_rgb_render_context=rgb_render_active,
+        )
 
-            M_edit_soft, M_edit, M_keep, boundary = build_formal_edit_domains(
-                bundle,
-                args,
-                device=z_clean_n.device,
-                dtype=z_clean_n.dtype,
-            )
-            bundle.M_edit = M_edit
-            target = build_masked_rectified_flow_target(
-                scheduler,
-                z_clean_n,
-                z_splat_n,
-                M_edit,
-                weighting_scheme=args.weighting_scheme,
-                logit_mean=args.logit_mean,
-                logit_std=args.logit_std,
-                mode_scale=args.mode_scale,
-                loss_weighting_scheme=args.loss_weighting_scheme,
-                time_shift=float(args.shift),
-                t_eps=scene_flow_t_eps(scene_flow),
-                generator=generator,
-            )
-            use_repa = float(args.lambda_repa) != 0.0
-            text_tokens, text_mask = encode_text_condition(
-                text_encoder,
-                getattr(bundle, "captions", None),
-                drop_mask=text_drop_mask,
-            )
-            out = scene_flow(
-                target.z_t,
-                target.sigmas,
-                z_splat_n,
-                bundle.scaffold_tok,
-                bundle.M_preserve,
-                bundle.M_source,
-                bundle.M_dest,
-                bundle.F_asset_tokens,
-                encoder_attention_mask=asset_mask,
-                text_tokens=text_tokens,
-                text_attention_mask=text_mask,
-                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
-                camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
-                return_mid=use_repa,
-                return_base=float(args.base_model_coeff) != 0.0,
-                asset_condition_kind=_asset_condition_kind_for_model(bundle, int(z_clean_n.shape[0])),
-                control_drop_mask=asset_control_drop_mask,
-                frame_ids=getattr(bundle, "frame_ids", None),
-                fps=FORMAL_SCENE_FPS,
-                flow_edit_mask=M_edit,
-            )
-            if use_repa:
-                model_out, mid_repa = out
-                if isinstance(model_out, tuple):
-                    pred_clean, pred_base = model_out
-                else:
-                    pred_clean, pred_base = model_out, None
-            else:
-                model_out, mid_repa = out, None
-                if isinstance(model_out, tuple):
-                    pred_clean, pred_base = model_out
-                else:
-                    pred_clean, pred_base = model_out, None
-            v_pred = model_prediction_to_velocity(scene_flow, pred_clean, target)
-            z_pred = model_prediction_to_clean(scene_flow, pred_clean, target)
-            v_base_pred = (
-                model_prediction_to_velocity(scene_flow, pred_base, target)
-                if pred_base is not None
-                else None
-            )
-            loss, metrics = compute_total_loss(
-                v_pred=v_pred,
-                v_gt=target.v_gt,
-                eps=target.eps,
-                bundle=bundle,
-                sd3_weights=target.weights,
-                mid_repa=mid_repa,
-                repa_target=target.z_clean_target,
-                z_pred=z_pred,
-                z_preserve_target=target.z_cond,
-                M_edit=target.M_edit,
-                M_preserve_loss=M_keep,
-                boundary_mask=boundary,
-                v_base_pred=v_base_pred,
-                base_model_coeff=args.base_model_coeff,
-                lambda_flow=args.lambda_flow,
-                lambda_preserve=args.lambda_preserve,
-                lambda_boundary=args.lambda_boundary,
-                lambda_repa=args.lambda_repa,
-                lambda_identity=args.lambda_identity,
-                identity_batch=~M_edit.detach().to(torch.bool).flatten(1).any(dim=1),
-                preserve_floor=args.preserve_floor,
-            )
-            metrics.update({
-                "edit_weight_mean": float(M_edit_soft.mean().item()),
-                "edit_frac": float(M_edit.mean().item()),
-                "num_objects": float(mean_num_objects),
-                "kv_tokens": sum(float(n) for n in asset_lengths) / float(len(asset_lengths)),
-                "asset_token_count": estimate_sparse_asset_token_count(sf, bundle.F_asset_tokens, asset_mask),
-                "control_token_count": estimate_control_token_count(
-                    sf,
-                    bundle.M_source,
-                    bundle.M_dest,
-                    getattr(bundle, "patch_grid", getattr(args, "patch_grid", (25, 37))),
-                ),
-                "sigma_mean": float(target.sigmas.float().mean().item()),
-                "micro_batch_size": float(len(item)),
-            })
-            loss = _add_formal_rgb_render_loss(
-                loss,
-                metrics,
-                args=args,
-                global_step=global_step,
-                active=rgb_render_active,
-                render_vggt_model=render_vggt_model,
-                scene_flow_root=sf,
-                z_pred=z_pred,
-                bundle=bundle,
-                target=target,
-                lpips_model=lpips_model,
-            )
-            metrics["loss"] = float(loss.detach().item())
-            return loss, metrics
-
-        losses: list[torch.Tensor] = []
-        metric_sums: dict[str, float] = {}
-        for single in item:
-            loss_i, metrics_i = train_step(
-                single,
-                assembler,
-                scene_flow,
-                scheduler,
-                device,
-                args,
-                text_encoder,
-                global_step=global_step,
-                render_vggt_model=render_vggt_model,
-                lpips_model=lpips_model,
-                generator=generator,
-            )
-            losses.append(loss_i)
-            for key, value in metrics_i.items():
-                metric_sums[key] = metric_sums.get(key, 0.0) + float(value)
-        scale = 1.0 / float(len(item))
-        metrics = {key: value * scale for key, value in metric_sums.items()}
-        metrics["micro_batch_size"] = float(len(item))
-        return torch.stack(losses).mean(), metrics
-
-    bundle = build_flow_bundle(
-        item,
-        assembler,
-        device,
-        args=args,
-        scene_flow=scene_flow,
-        include_rgb_render_context=rgb_render_active,
-    )
     sf = unwrap_ddp(scene_flow)
     z_clean_n = sf.normalize(bundle.z_clean)
     z_splat_n = sf.normalize(bundle.z_splat)
-    bundle.F_asset_tokens = normalize_asset_latents(sf, bundle.F_asset_tokens)
     bundle.z_clean_n = z_clean_n
     text_drop_mask = sample_uncond_drop_mask(
         int(bundle.z_clean.shape[0]),
@@ -2964,14 +1581,6 @@ def train_step(
         device=bundle.z_clean.device,
         training=unwrap_ddp(scene_flow).training,
     )
-    asset_control_drop_mask = sample_uncond_drop_mask(
-        int(bundle.z_clean.shape[0]),
-        args.uncond_drop_prob,
-        device=bundle.z_clean.device,
-        training=unwrap_ddp(scene_flow).training,
-    )
-    if asset_control_drop_mask is not None:
-        _maybe_drop_asset_kv(bundle, args.uncond_drop_prob, drop_mask=asset_control_drop_mask)
 
     M_edit_soft, M_edit, M_keep, boundary = build_formal_edit_domains(
         bundle,
@@ -3008,32 +1617,20 @@ def train_step(
         bundle.M_preserve,
         bundle.M_source,
         bundle.M_dest,
-        bundle.F_asset_tokens,
-        encoder_attention_mask=getattr(bundle, "encoder_attention_mask", None),
         text_tokens=text_tokens,
         text_attention_mask=text_mask,
         camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
         camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
         return_mid=use_repa,
         return_base=float(args.base_model_coeff) != 0.0,
-        asset_condition_kind=_asset_condition_kind_for_model(bundle, int(z_clean_n.shape[0])),
-        control_drop_mask=asset_control_drop_mask,
+        return_dict=True,
         frame_ids=getattr(bundle, "frame_ids", None),
         fps=FORMAL_SCENE_FPS,
         flow_edit_mask=M_edit,
     )
-    if use_repa:
-        model_out, mid_repa = out
-        if isinstance(model_out, tuple):
-            pred_clean, pred_base = model_out
-        else:
-            pred_clean, pred_base = model_out, None
-    else:
-        model_out, mid_repa = out, None
-        if isinstance(model_out, tuple):
-            pred_clean, pred_base = model_out
-        else:
-            pred_clean, pred_base = model_out, None
+    pred_clean = out["video"]
+    pred_base = out.get("video_base")
+    mid_repa = out.get("mid_repa") if use_repa else None
     v_pred = model_prediction_to_velocity(scene_flow, pred_clean, target)
     z_pred = model_prediction_to_clean(scene_flow, pred_clean, target)
     v_base_pred = (
@@ -3067,13 +1664,6 @@ def train_step(
     metrics.update({
         "edit_weight_mean": float(M_edit_soft.mean().item()),
         "edit_frac": float(M_edit.mean().item()),
-        "num_objects": float(len(bundle.phase4_slots)),
-        "kv_tokens": float(bundle.F_asset_tokens.shape[1]),
-        "asset_token_count": estimate_sparse_asset_token_count(
-            sf,
-            bundle.F_asset_tokens,
-            getattr(bundle, "encoder_attention_mask", None),
-        ),
         "control_token_count": estimate_control_token_count(
             sf,
             bundle.M_source,
@@ -3082,6 +1672,8 @@ def train_step(
         ),
         "sigma_mean": float(target.sigmas.float().mean().item()),
     })
+    if isinstance(item, list):
+        metrics["micro_batch_size"] = float(len(item))
     loss = _add_formal_rgb_render_loss(
         loss,
         metrics,
@@ -3113,46 +1705,6 @@ def _move_predictions(predictions: dict, device: torch.device) -> dict:
     return out
 
 
-def _move_mode_b(mode_b: dict, device: torch.device) -> dict:
-    out = dict(mode_b)
-    for k in ("delete_mask", "delete_mask_per_frame_subset", "subset_frames",
-              "delete_core_indices", "delete_shell_indices"):
-        v = out.get(k)
-        if torch.is_tensor(v):
-            out[k] = v.to(device)
-    return out
-
-
-def _move_asset_pass(apr, device: torch.device):
-    from dggt.models.asset_pass import AssetPassResult
-
-    return AssetPassResult(
-        patch_grid=apr.patch_grid,
-        patch_start_idx=apr.patch_start_idx,
-        object_keys=list(apr.object_keys),
-        cameras_waymo={k: v.to(device) for k, v in apr.cameras_waymo.items()} if apr.cameras_waymo else {},
-        F_g_lut_asset={k: [lv.to(device) for lv in v] for k, v in apr.F_g_lut_asset.items()},
-        ptr_asset={k: [p.to(device) for p in v] for k, v in apr.ptr_asset.items()},
-        G_asset_waymo={
-            k: [{kk: vv.to(device) for kk, vv in g.items()} for g in v]
-            for k, v in apr.G_asset_waymo.items()
-        },
-        G_asset_dggt=None
-        if apr.G_asset_dggt is None
-        else {
-            k: [{kk: vv.to(device) for kk, vv in g.items()} for g in v]
-            for k, v in apr.G_asset_dggt.items()
-        },
-        I_asset={k: v.to(device) for k, v in apr.I_asset.items()},
-        A_asset={k: v.to(device) for k, v in apr.A_asset.items()},
-        asset_patch_valid_mask={
-            k: v.to(device) for k, v in apr.asset_patch_valid_mask.items()
-        },
-        asset_pass_space=apr.asset_pass_space,
-        fit_metrics=apr.fit_metrics,
-    )
-
-
 def _bundle_frame_ids(
     bundle: Any,
     *,
@@ -3178,18 +1730,6 @@ def _slice_time(tensor: torch.Tensor | None, start: int, end: int, seq_len: int)
     if tensor is None or not torch.is_tensor(tensor):
         return tensor
     if tensor.ndim >= 2 and int(tensor.shape[1]) == int(seq_len):
-        return tensor[:, start:end]
-    return tensor
-
-
-def _slice_asset_time(tensor: torch.Tensor | None, start: int, end: int, seq_len: int) -> torch.Tensor | None:
-    if tensor is None or not torch.is_tensor(tensor):
-        return tensor
-    if tensor.ndim == 5 and int(tensor.shape[2]) == int(seq_len):
-        return tensor[:, :, start:end]
-    if tensor.ndim == 4 and int(tensor.shape[2]) == int(seq_len):
-        return tensor[:, :, start:end]
-    if tensor.ndim == 4 and int(tensor.shape[1]) == int(seq_len):
         return tensor[:, start:end]
     return tensor
 
@@ -3243,23 +1783,9 @@ def _cfg_sample_edit_latents_sliding(
     frame_ids = _bundle_frame_ids(bundle, batch_size=batch_size, seq_len=seq_len, device=device)
     windows = window_slices(seq_len, window, stride)
 
-    F_asset = normalize_asset_latents(sf, bundle.F_asset_tokens)
-    if F_asset.ndim in (4, 5):
-        F_uncond = torch.zeros_like(F_asset)
-        uncond_asset_mask = torch.zeros(F_asset.shape[:-1], device=F_asset.device, dtype=torch.bool)
-    else:
-        F_uncond = F_asset.new_zeros((batch_size, 0, F_asset.shape[-1]))
-        uncond_asset_mask = None
-    encoder_attention_mask = getattr(bundle, "encoder_attention_mask", None)
     text_tokens, text_mask = encode_text_condition(text_encoder, getattr(bundle, "captions", None))
     text_null, text_null_mask = encode_text_condition(text_encoder, [""] * batch_size if text_tokens is not None else None)
-    asset_kinds = _asset_condition_kind_for_model(bundle, batch_size)
-    asset_control_scale = float(getattr(args, "asset_control_guidance_scale", 1.0))
-    do_cfg = (
-        abs(float(guidance_scale) - 1.0) > 1e-6
-        or abs(asset_control_scale - 1.0) > 1e-6
-    )
-    drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
+    do_cfg = abs(float(guidance_scale) - 1.0) > 1e-6
     camera_condition_tokens = getattr(bundle, "camera_condition_tokens", None)
     camera_attention_mask = getattr(bundle, "camera_attention_mask", None)
 
@@ -3282,12 +1808,7 @@ def _cfg_sample_edit_latents_sliding(
             frame_ids_w = frame_ids[:, start:end]
             camera_tokens_w = _slice_time(camera_condition_tokens, start, end, seq_len)
             camera_mask_w = _slice_time(camera_attention_mask, start, end, seq_len)
-            F_asset_w = _slice_asset_time(F_asset, start, end, seq_len)
-            asset_mask_w = _slice_asset_time(encoder_attention_mask, start, end, seq_len)
-            F_uncond_w = _slice_asset_time(F_uncond, start, end, seq_len)
-            uncond_mask_w = _slice_asset_time(uncond_asset_mask, start, end, seq_len)
-
-            v_full = sf(
+            out_full = sf(
                 z_w,
                 sigma,
                 z_splat_w,
@@ -3295,20 +1816,19 @@ def _cfg_sample_edit_latents_sliding(
                 M_preserve_w,
                 M_source_w,
                 M_dest_w,
-                F_asset_w,
-                encoder_attention_mask=asset_mask_w,
                 text_tokens=text_tokens,
                 text_attention_mask=text_mask,
                 camera_condition_tokens=camera_tokens_w,
                 camera_attention_mask=camera_mask_w,
-                asset_condition_kind=asset_kinds,
                 return_mid=False,
+                return_dict=True,
                 frame_ids=frame_ids_w,
                 fps=FORMAL_SCENE_FPS,
                 flow_edit_mask=M_edit_w,
             )
+            pred = out_full["video"]
             if do_cfg:
-                v_text = sf(
+                out_null = sf(
                     z_w,
                     sigma,
                     z_splat_w,
@@ -3316,48 +1836,19 @@ def _cfg_sample_edit_latents_sliding(
                     M_preserve_w,
                     M_source_w,
                     M_dest_w,
-                    F_uncond_w,
-                    encoder_attention_mask=uncond_mask_w,
-                    text_tokens=text_tokens,
-                    text_attention_mask=text_mask,
-                    camera_condition_tokens=camera_tokens_w,
-                    camera_attention_mask=camera_mask_w,
-                    asset_condition_kind=["asset_uncond"] * batch_size,
-                    return_mid=False,
-                    control_drop_mask=drop_all_control,
-                    frame_ids=frame_ids_w,
-                    fps=FORMAL_SCENE_FPS,
-                    flow_edit_mask=M_edit_w,
-                )
-                v_uncond = sf(
-                    z_w,
-                    sigma,
-                    z_splat_w,
-                    scaffold_w,
-                    M_preserve_w,
-                    M_source_w,
-                    M_dest_w,
-                    F_uncond_w,
-                    encoder_attention_mask=uncond_mask_w,
                     text_tokens=text_null,
                     text_attention_mask=text_null_mask,
                     camera_condition_tokens=camera_tokens_w,
                     camera_attention_mask=camera_mask_w,
-                    asset_condition_kind=["asset_uncond"] * batch_size,
                     return_mid=False,
-                    control_drop_mask=drop_all_control,
+                    return_dict=True,
                     frame_ids=frame_ids_w,
                     fps=FORMAL_SCENE_FPS,
                     flow_edit_mask=M_edit_w,
                 )
-                v_pred = (
-                    v_uncond
-                    + float(guidance_scale) * (v_text - v_uncond)
-                    + asset_control_scale * (v_full - v_text)
-                )
-            else:
-                v_pred = v_full
-            v = sampler_prediction_to_velocity(sf, v_pred, z_w, sigma)
+                pred_null = out_null["video"]
+                pred = pred_null + float(guidance_scale) * (pred - pred_null)
+            v = sampler_prediction_to_velocity(sf, pred, z_w, sigma)
             v_acc[:, start:end] += v * w
             v_weight[:, start:end] += w
 
@@ -3413,28 +1904,14 @@ def cfg_sample_edit_latents(
     z = project_masked_flow_state(z, z_splat_n, M_edit)
     batch_size = int(z.shape[0])
     frame_ids = _bundle_frame_ids(bundle, batch_size=batch_size, seq_len=int(z.shape[1]), device=device)
-    F_asset = normalize_asset_latents(sf, bundle.F_asset_tokens)
-    if F_asset.ndim in (4, 5):
-        F_uncond = torch.zeros_like(F_asset)
-        uncond_asset_mask = torch.zeros(F_asset.shape[:-1], device=F_asset.device, dtype=torch.bool)
-    else:
-        F_uncond = F_asset.new_zeros((batch_size, 0, F_asset.shape[-1]))
-        uncond_asset_mask = None
-    encoder_attention_mask = getattr(bundle, "encoder_attention_mask", None)
     text_tokens, text_mask = encode_text_condition(text_encoder, getattr(bundle, "captions", None))
     text_null, text_null_mask = encode_text_condition(text_encoder, [""] * batch_size if text_tokens is not None else None)
-    asset_kinds = _asset_condition_kind_for_model(bundle, batch_size)
-    asset_control_scale = float(getattr(args, "asset_control_guidance_scale", 1.0))
-    do_cfg = (
-        abs(float(guidance_scale) - 1.0) > 1e-6
-        or abs(asset_control_scale - 1.0) > 1e-6
-    )
-    drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
+    do_cfg = abs(float(guidance_scale) - 1.0) > 1e-6
 
     for i in range(int(args.val_sample_steps)):
         step_h = t_steps[i] - t_steps[i + 1]
         sigma = torch.full((batch_size,), float(t_steps[i].item()), device=device)
-        v_full = sf(
+        out_full = sf(
             z,
             sigma,
             z_splat_n,
@@ -3442,20 +1919,19 @@ def cfg_sample_edit_latents(
             bundle.M_preserve,
             bundle.M_source,
             bundle.M_dest,
-            F_asset,
-            encoder_attention_mask=encoder_attention_mask,
             text_tokens=text_tokens,
             text_attention_mask=text_mask,
             camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
             camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
-            asset_condition_kind=asset_kinds,
             return_mid=False,
+            return_dict=True,
             frame_ids=frame_ids,
             fps=FORMAL_SCENE_FPS,
             flow_edit_mask=M_edit,
         )
+        pred = out_full["video"]
         if do_cfg:
-            v_text = sf(
+            out_null = sf(
                 z,
                 sigma,
                 z_splat_n,
@@ -3463,48 +1939,19 @@ def cfg_sample_edit_latents(
                 bundle.M_preserve,
                 bundle.M_source,
                 bundle.M_dest,
-                F_uncond,
-                encoder_attention_mask=uncond_asset_mask,
-                text_tokens=text_tokens,
-                text_attention_mask=text_mask,
-                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
-                camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
-                asset_condition_kind=["asset_uncond"] * batch_size,
-                return_mid=False,
-                control_drop_mask=drop_all_control,
-                frame_ids=frame_ids,
-                fps=FORMAL_SCENE_FPS,
-                flow_edit_mask=M_edit,
-            )
-            v_uncond = sf(
-                z,
-                sigma,
-                z_splat_n,
-                bundle.scaffold_tok,
-                bundle.M_preserve,
-                bundle.M_source,
-                bundle.M_dest,
-                F_uncond,
-                encoder_attention_mask=uncond_asset_mask,
                 text_tokens=text_null,
                 text_attention_mask=text_null_mask,
                 camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
                 camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
-                asset_condition_kind=["asset_uncond"] * batch_size,
                 return_mid=False,
-                control_drop_mask=drop_all_control,
+                return_dict=True,
                 frame_ids=frame_ids,
                 fps=FORMAL_SCENE_FPS,
                 flow_edit_mask=M_edit,
             )
-            v = (
-                v_uncond
-                + float(guidance_scale) * (v_text - v_uncond)
-                + asset_control_scale * (v_full - v_text)
-            )
-        else:
-            v = v_full
-        v = sampler_prediction_to_velocity(sf, v, z, sigma)
+            pred_null = out_null["video"]
+            pred = pred_null + float(guidance_scale) * (pred - pred_null)
+        v = sampler_prediction_to_velocity(sf, pred, z, sigma)
         z = masked_flow_euler_step(z, v, step_h, z_splat_n, M_edit)
 
     return project_masked_flow_state(z, z_splat_n, M_edit)
@@ -3745,7 +2192,6 @@ def render_validation_rgb_gt_sky(
     render_pose_enc_dggt = _cached_render_pose_from_batch(batch, images, device)
     frames = min(int(args.val_log_images), int(images.shape[1]))
     sf = unwrap_ddp(scene_flow)
-    pullback_calibration = require_formal_pullback_calibration(sf)
     timestamps_raw = batch["timestamps"]
     timestamps = timestamps_raw[0] if torch.is_tensor(timestamps_raw) else torch.as_tensor(timestamps_raw[0])
 
@@ -3823,7 +2269,6 @@ def render_validation_rgb_gt_sky(
             patch_start_idx=patch_start_idx,
             image_hw=(int(images.shape[-2]), int(images.shape[-1])),
             tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-            pullback_calibration=pullback_calibration,
         )
         with torch.amp.autocast(device_type=device.type, enabled=False):
             generated_semantic_logits, _ = vggt_model.semantic_head(
@@ -3871,18 +2316,6 @@ def render_validation_rgb_gt_sky(
             recon_dynamic_conf, _ = vggt_model.instance_head(recon_dino, images, patch_start_idx)
             recon_gs_map, recon_gs_conf = vggt_model.gs_head(recon_image_tokens, images, patch_start_idx)
 
-    recon_pullback = apply_pullback_calibration(
-        recon_depth,
-        recon_gs_map,
-        log_metric_scale=0.0,
-        calibration=pullback_calibration,
-        boundary=PULLBACK_RENDER_BOUNDARY,
-    )
-    if recon_pullback.depth_dggt is not recon_depth or recon_pullback.gs_map_dggt is not recon_gs_map:
-        raise AssertionError("formal tokenizer-recon render pullback must be an exact identity")
-    recon_depth = recon_pullback.depth_dggt
-    recon_gs_map = recon_pullback.gs_map_dggt
-
     del recon_image_tokens, recon_agg, recon_dino
 
     result["tokenizer_recon_3dgs_rgb"] = _render_gs_map_rgb(
@@ -3922,7 +2355,6 @@ def render_validation_generated_rgb_gt_sky(
     render_pose_enc_dggt = _cached_render_pose_from_batch(batch, images, device)
     frames = min(int(args.val_log_images), int(images.shape[1]))
     sf = unwrap_ddp(scene_flow)
-    pullback_calibration = require_formal_pullback_calibration(sf)
     timestamps_raw = batch["timestamps"]
     timestamps = timestamps_raw[0] if torch.is_tensor(timestamps_raw) else torch.as_tensor(timestamps_raw[0])
 
@@ -3938,7 +2370,6 @@ def render_validation_generated_rgb_gt_sky(
             patch_start_idx=patch_start_idx,
             image_hw=(int(images.shape[-2]), int(images.shape[-1])),
             tokenizer_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-            pullback_calibration=pullback_calibration,
         )
         with torch.amp.autocast(device_type=device.type, enabled=False):
             generated_semantic_logits, _ = vggt_model.semantic_head(
@@ -4197,8 +2628,6 @@ def _run_validation_impl(
                 first_item,
                 assembler,
                 device,
-                args=args,
-                scene_flow=scene_flow,
             )
             image_paths = save_validation_images(
                 first_bundle,
@@ -4251,7 +2680,7 @@ def load_resume_checkpoint(
     if saved_flow_domain != FORMAL_FLOW_DOMAIN_VERSION:
         raise ValueError(
             f"{resume_path} formal_flow_domain_version={saved_flow_domain!r}, expected "
-            f"{FORMAL_FLOW_DOMAIN_VERSION!r}. Legacy formal checkpoints used an inconsistent "
+            f"{FORMAL_FLOW_DOMAIN_VERSION!r}. Earlier formal checkpoints used an inconsistent "
             "soft-mask flow path and cannot be resumed as mathematically equivalent training."
         )
     validate_formal_flow_domain_config(payload, args, resume_path)
@@ -4269,8 +2698,8 @@ def load_resume_checkpoint(
         raise ValueError(
             f"`--resume_path` requires a full training checkpoint, but {resume_path} "
             f"is missing keys: {missing_keys}. Do not pass *_weights_only.pt or "
-            f"*_ema_weights_only.pt to --resume_path; those files are for warm-start "
-            f"or inference, not exact training resume."
+            f"*_ema_weights_only.pt to --resume_path; those files are for inference, "
+            "not exact training resume."
         )
     unwrap_ddp(scene_flow).load_state_dict(payload["scene_flow"], strict=True)
     unwrap_ddp(assembler.scaffold_packer).load_state_dict(payload["scaffold_packer"], strict=True)
@@ -4288,20 +2717,12 @@ def load_resume_checkpoint(
 # ---------------------------------------------------------------------- #
 def main() -> None:
     args = build_argparser().parse_args()
-    args.sky_grid = sky_grid_shape(args)
     if not args.tokenizer_ckpt_path:
         raise ValueError(
-            "Formal metric/gauge training requires an explicit --tokenizer_ckpt_path "
-            "for content-hash verification"
+            "Formal editor training requires an explicit --tokenizer_ckpt_path"
         )
     if not args.feature_stats_path:
-        raise ValueError(
-            "Formal metric/gauge training requires --feature_stats_path"
-        )
-    if not args.pullback_calibration_path:
-        raise ValueError(
-            "Formal metric/gauge training requires --pullback_calibration_path"
-        )
+        raise ValueError("Formal editor training requires --feature_stats_path")
     if int(args.sequence_length) != FORMAL_TOKENIZER_WINDOW_LEN:
         raise ValueError(
             "Formal metric/gauge training must use the checkpoint-bound tokenizer "
@@ -4366,13 +2787,11 @@ def main() -> None:
         max_frames=args.sequence_length,
         seed=args.seed,
         mmap_plain_cache=not bool(args.no_mmap_plain_cache),
-        asset_lut_level_indices=None,
         caption_root=args.caption_root,
         include_sky_training_data=False,
         include_rgb_training_data=enable_rgb_render_loss,
         require_edit_window=True,
         edit_domain_threshold=args.edit_domain_threshold,
-        require_metric_gauge_provenance=True,
     )
     independent_val = args.val_manifest_path is not None or args.val_cache_root is not None
     val_caption_root = args.val_caption_root
@@ -4387,14 +2806,12 @@ def main() -> None:
             max_frames=args.sequence_length,
             seed=args.seed + 1,
             mmap_plain_cache=not bool(args.no_mmap_plain_cache),
-            asset_lut_level_indices=None,
             caption_root=val_caption_root,
             include_sky_training_data=False,
             include_rgb_training_data=False,
             require_edit_window=True,
             edit_domain_threshold=args.edit_domain_threshold,
             deterministic_windows=True,
-            require_metric_gauge_provenance=True,
         )
     else:
         if args.val_caption_root is not None:
@@ -4416,8 +2833,7 @@ def main() -> None:
             f"[data] train_entries={len(train_ds.entries)} "
             f"val_entries={0 if val_ds is None else len(val_ds.entries)} "
             f"val_source={'independent' if independent_val else 'holdout'} "
-            f"val_fraction={0.0 if independent_val else float(args.val_fraction):.3f} "
-            "asset_lut_levels=all",
+            f"val_fraction={0.0 if independent_val else float(args.val_fraction):.3f}",
             flush=True,
         )
     val_loader = None
@@ -4489,108 +2905,21 @@ def main() -> None:
     freeze_module(assembler.soft_mask)  # no params but safe.
     freeze_module(assembler.feature_splatter)
 
-    architecture_checkpoint = args.resume_path or args.scene_flow_pretrain_path
-    if not architecture_checkpoint:
-        raise ValueError(
-            "Formal SceneFlow training requires --scene_flow_pretrain_path (new pretrain checkpoint) "
-            "or --resume_path; constructing a default camera architecture is not supported."
+    if args.resume_path:
+        scene_flow = build_scene_flow_from_checkpoint_config(
+            args.resume_path,
+            patch_grid=patch_grid,
+            latent_dim=int(args.latent_dim),
+            device=device,
         )
-    scene_flow = build_scene_flow_from_checkpoint_config(
-        architecture_checkpoint,
-        patch_grid=patch_grid,
-        latent_dim=int(args.latent_dim),
-        device=device,
-    )
-    args.dggt_checkpoint_sha256 = checkpoint_sha256(args.ckpt_path)
-    args.tokenizer_checkpoint_sha256 = checkpoint_sha256(args.tokenizer_ckpt_path)
-    architecture_payload = torch.load(architecture_checkpoint, map_location="cpu")
-    base_provenance = validate_metric_gauge_provenance(
-        architecture_payload.get("metric_gauge_provenance")
-        if isinstance(architecture_payload, Mapping)
-        else None,
-        config=scene_flow.config,
-        expected_dggt_sha256=args.dggt_checkpoint_sha256,
-        expected_tokenizer_sha256=args.tokenizer_checkpoint_sha256,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=patch_grid,
-    )
-    args.feature_stats_sha256 = validate_formal_feature_stats_artifact(
-        args.feature_stats_path,
-        provenance=base_provenance,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=patch_grid,
-    )
-    base_provenance, existing_formal_contract = validate_metric_gauge_checkpoint_payload(
-        architecture_payload,
-        path=architecture_checkpoint,
-        config=scene_flow.config,
-        require_formal_contract=bool(args.resume_path),
-        expected_dggt_sha256=args.dggt_checkpoint_sha256,
-        expected_tokenizer_sha256=args.tokenizer_checkpoint_sha256,
-        expected_feature_stats_sha256=args.feature_stats_sha256,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=patch_grid,
-    )
-    train_ds.bind_metric_gauge_provenance(
-        expected_scene_gauge_sha256=base_provenance["gauge_table_sha256"],
-        expected_dggt_sha256=args.dggt_checkpoint_sha256,
-    )
-    if val_ds is not None:
-        if independent_val:
-            if args.val_scene_gauge_sha256 is None:
-                raise ValueError(
-                    "Independent formal validation requires --val_scene_gauge_sha256 "
-                    "so its cache provenance is checked against a trusted table."
-                )
-            val_gauge_sha256 = args.val_scene_gauge_sha256
-        else:
-            val_gauge_sha256 = base_provenance["gauge_table_sha256"]
-        val_ds.bind_metric_gauge_provenance(
-            expected_scene_gauge_sha256=val_gauge_sha256,
-            expected_dggt_sha256=args.dggt_checkpoint_sha256,
-        )
-    formal_metric_gauge_contract = (
-        existing_formal_contract
-        if existing_formal_contract is not None
-        else build_formal_metric_gauge_contract(
-            base_provenance,
-            feature_stats_sha256=args.feature_stats_sha256,
-        )
-    )
-    pullback_calibration = load_pullback_calibration(
-        args.pullback_calibration_path,
-        tokenizer_checkpoint_path=args.tokenizer_ckpt_path,
-        dggt_checkpoint_path=args.ckpt_path,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=patch_grid,
-        expected_artifact_sha256=base_provenance["pullback_artifact_sha256"],
-    )
-    if (
-        base_provenance["pullback_runtime_contract_version"]
-        != pullback_calibration.runtime_contract_version
-    ):
-        raise ValueError(
-            "checkpoint pullback runtime contract does not match the loaded artifact: "
-            f"checkpoint={base_provenance['pullback_runtime_contract_version']!r}, "
-            f"artifact={pullback_calibration.runtime_contract_version!r}"
-        )
-    scene_flow._metric_gauge_provenance = copy.deepcopy(base_provenance)
-    scene_flow._formal_metric_gauge_contract = copy.deepcopy(
-        formal_metric_gauge_contract
-    )
-    scene_flow._pullback_calibration = pullback_calibration
-    if is_main_process():
-        print(
-            "[pullback] verified formal render identity contract "
-            f"{pullback_calibration.path} "
-            f"(sha256={pullback_calibration.artifact_sha256})",
-            flush=True,
-        )
-    if str(scene_flow.config.asset_position_mode) != str(args.asset_position_mode):
-        raise ValueError(
-            f"checkpoint asset_position_mode={scene_flow.config.asset_position_mode!r} "
-            f"!= --asset_position_mode={args.asset_position_mode!r}"
-        )
+    else:
+        scene_flow = WanSceneFlow.from_scene_config(
+            patch_grid=patch_grid,
+            out_channels=int(args.latent_dim),
+            prediction_type=str(args.prediction_type),
+            layout_condition_version=FORMAL_LAYOUT_CONDITION_VERSION,
+            **FORMAL_LAYOUT_DISABLED_CONFIG,
+        ).to(device)
     if bool(args.three_quarter_gradient_checkpointing):
         scene_flow.enable_three_quarter_gradient_checkpointing()
     elif bool(args.half_gradient_checkpointing):
@@ -4608,14 +2937,6 @@ def main() -> None:
             flush=True,
         )
     text_encoder = setup_text_encoder(args, device)
-    warm_start_info = load_scene_flow_warm_start(
-        scene_flow,
-        args.scene_flow_pretrain_path,
-        use_ema=bool(args.scene_flow_pretrain_ema),
-        args=args,
-    )
-    if is_main_process() and warm_start_info is not None:
-        print(f"[warm-start] {warm_start_info}", flush=True)
 
     ema = EMAModel(scene_flow.parameters(), decay=args.ema_decay)
     ema.to(device)
@@ -4681,22 +3002,15 @@ def main() -> None:
         device,
         args,
     )
-    load_all_stats_into_buffers(
-        unwrap_ddp(scene_flow),
+    load_formal_latent_stats(
+        scene_flow,
         args.feature_stats_path,
         token_dim=int(args.latent_dim),
-        expected_dggt_sha256=args.dggt_checkpoint_sha256,
-        expected_tokenizer_sha256=args.tokenizer_checkpoint_sha256,
-        expected_scene_gauge_sha256=base_provenance["gauge_table_sha256"],
-        expected_sequence_length=FORMAL_TOKENIZER_WINDOW_LEN,
-        require_existing_match=True,
+        require_existing_match=bool(args.resume_path),
     )
     if is_main_process():
-        checkpoint_kind = "resume" if args.resume_path else "warm-start"
         print(
-            f"[stats] verified latent+camera+gauge+placement stats against the effective "
-            f"{checkpoint_kind} checkpoint and loaded {args.feature_stats_path} "
-            f"(sha256={args.feature_stats_sha256})",
+            f"[stats] loaded tokenizer latent statistics from {args.feature_stats_path}",
             flush=True,
         )
 
@@ -4812,7 +3126,7 @@ def main() -> None:
                         wandb_count = 0
 
                 if is_main_process() and args.vis_every > 0 and (global_step % args.vis_every == 0):
-                    _dump_vis(_first_item(item), assembler, log_dir, global_step, device, args)
+                    _dump_vis(_first_item(item), assembler, log_dir, global_step, device)
 
                 if (
                     val_loader is not None
@@ -4866,47 +3180,20 @@ def _dump_vis(
     log_dir: Path,
     step: int,
     device: torch.device,
-    args,
 ) -> None:
-    from dggt.utils.flow_viz import dump_flow_features
-
-    if item.get("flow_inputs_cached") is not None:
-        if is_main_process():
-            print(
-                f"[vis] skipping full flow feature dump for fast cache item at step={step}; "
-                "fast items do not load raw heads or asset Gaussians.",
-                flush=True,
-            )
-        return
-
     vis_dir = log_dir / "vis" / f"step_{step:06d}"
     vis_dir.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
-        sample = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in item["sample"].items()}
-        predictions = _move_predictions(item["predictions"], device)
-        apr = _move_asset_pass(item["asset_pass_result"], device)
-        _validate_item_patch_grid(apr, assembler, item.get("cache_path"))
-        cams = {k: v.to(device) for k, v in item["cameras_dggt"].items()}
-        mode_kind = str(item.get("mode_kind", sample.get("mode_kind", "mode_a")))
-        mode_b_payload = item.get("mode_b")
-        if mode_b_payload is not None:
-            mode_b_payload = _move_mode_b(mode_b_payload, device)
-        phase1_localized_lite, splatted_tok_low_cached = _move_v6_fast_path_inputs(
-            item, mode_kind, device
-        )
-        bundle = assembler(
-            sample=sample,
-            predictions=predictions,
-            asset_pass_result=apr,
-            cameras_dggt=cams,
-            object_slots_spec="all",
-            device=device,
-            mode_kind=mode_kind,
-            mode_b=mode_b_payload,
-            phase1_localized_lite=phase1_localized_lite,
-            splatted_tok_low_cached=splatted_tok_low_cached,
-        )
-    dump_flow_features(bundle, vis_dir, save_splat_pca=False)
+        bundle = build_flow_bundle(item, assembler, device)
+        frames = min(10, int(bundle.z_clean.shape[1]))
+        grids = {
+            "target_latent_pca": _latent_pca_grid(bundle.z_clean.float(), bundle.patch_grid, frames),
+            "M_preserve": _mask_grid(bundle.M_preserve, bundle.patch_grid, frames),
+            "M_source": _mask_grid(bundle.M_source, bundle.patch_grid, frames),
+            "M_dest": _mask_grid(bundle.M_dest, bundle.patch_grid, frames),
+        }
+        for name, image in grids.items():
+            save_image_grid(image, vis_dir / f"{name}.jpg", nrow=frames)
 
 
 def _save_checkpoint(
@@ -4938,31 +3225,6 @@ def _save_checkpoint(
         t_eps=scene_flow_t_eps(sf),
     )
     flow_domain_config = formal_flow_domain_config(args)
-    provenance = copy.deepcopy(getattr(sf, "_metric_gauge_provenance", None))
-    pullback_calibration = require_formal_pullback_calibration(sf)
-    formal_metric_gauge_contract = copy.deepcopy(
-        getattr(sf, "_formal_metric_gauge_contract", None)
-    )
-    provenance = validate_metric_gauge_provenance(
-        provenance,
-        config=scene_flow_config,
-        expected_dggt_sha256=getattr(args, "dggt_checkpoint_sha256", None),
-        expected_tokenizer_sha256=getattr(
-            args, "tokenizer_checkpoint_sha256", None
-        ),
-        expected_pullback_runtime_contract_version=(
-            pullback_calibration.runtime_contract_version
-        ),
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=scene_flow_config.get("patch_grid"),
-    )
-    formal_metric_gauge_contract = validate_formal_metric_gauge_contract(
-        formal_metric_gauge_contract,
-        provenance=provenance,
-        expected_feature_stats_sha256=getattr(
-            args, "feature_stats_sha256", None
-        ),
-    )
     state = {
         "step": int(step),
         "scene_flow": scene_flow_state,
@@ -4974,8 +3236,6 @@ def _save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
         "args": vars(args),
-        "metric_gauge_provenance": provenance,
-        "formal_metric_gauge_contract": formal_metric_gauge_contract,
         "formal_flow_domain_version": FORMAL_FLOW_DOMAIN_VERSION,
         "formal_flow_domain_config": flow_domain_config,
     }
@@ -4986,8 +3246,6 @@ def _save_checkpoint(
             "scaffold_packer": scaffold_packer_state,
             "scene_flow_config": scene_flow_config,
             "flow_schedule_config": flow_schedule_config,
-            "metric_gauge_provenance": provenance,
-            "formal_metric_gauge_contract": formal_metric_gauge_contract,
             "formal_flow_domain_version": FORMAL_FLOW_DOMAIN_VERSION,
             "formal_flow_domain_config": flow_domain_config,
         },
@@ -5001,8 +3259,6 @@ def _save_checkpoint(
             "flow_schedule_config": flow_schedule_config,
             "step": int(step),
             "is_ema_weights": True,
-            "metric_gauge_provenance": provenance,
-            "formal_metric_gauge_contract": formal_metric_gauge_contract,
             "formal_flow_domain_version": FORMAL_FLOW_DOMAIN_VERSION,
             "formal_flow_domain_config": flow_domain_config,
         },

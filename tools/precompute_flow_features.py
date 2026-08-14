@@ -74,7 +74,10 @@ from dggt.utils.flow_cache_io import (
 )
 from dggt.utils.gaussian_edit import _transform_sample_track_box, parse_object_slots
 from dggt.utils.gaussian_time import GAUSSIAN_TIME_REPRESENTATION
-from dggt.utils.scene_gauge import resolve_scene_gauge_checkpoint_sha256
+from dggt.utils.scene_gauge import (
+    SCENE_GAUGE_TABLE_SCHEMA,
+    SCENE_GAUGE_TABLE_SCHEMA_VERSION,
+)
 from dggt.utils.tokens import select_patch_pyramid
 
 
@@ -82,6 +85,17 @@ DEFAULT_LEVELS = (4, 11, 17, 23)
 CACHE_SCHEMA_VERSION = CURRENT_FLOW_CACHE_SCHEMA_VERSION
 GS_CONF_REPAIR_VALUE = 1_000_000.0
 CLIP_LENGTH = 29
+
+
+def _scene_gauge_keys(scene_name: Any, frame_indices: torch.Tensor) -> list[str]:
+    scene = str(scene_name)
+    scene = scene.zfill(3) if scene.isdigit() else scene
+    if not scene:
+        raise ValueError("scene_name must be non-empty for metric-gauge cache generation")
+    indices = torch.as_tensor(frame_indices, dtype=torch.long).reshape(-1)
+    if indices.numel() == 0 or bool((indices < 0).any()):
+        raise ValueError("frame_indices_scene must contain non-negative frames")
+    return sorted({f"{scene}/{int(frame) // CLIP_LENGTH}" for frame in indices.tolist()})
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -103,7 +117,6 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--scene_gauge_path", default=None,
                    help="Complete split-specific gauge table; required by metric_gauge_v4.")
-    p.add_argument("--expected_scene_gauge_dggt_sha256", default=None)
     p.add_argument("--asset_root", default=None)
     p.add_argument("--split", default="training")
     p.add_argument("--out_root", required=True)
@@ -262,8 +275,21 @@ def _should_skip_existing_cache(path: Path, args: argparse.Namespace) -> tuple[b
 
     expected = {
         "metric_box_mapping_mode": str(args.metric_box_mapping_mode),
-        "scene_gauge_table_sha256": getattr(args, "scene_gauge_table_sha256", None),
-        "dggt_checkpoint_sha256": str(args.scene_gauge_dggt_sha256),
+        "scene_gauge_schema": (
+            SCENE_GAUGE_TABLE_SCHEMA
+            if str(args.metric_box_mapping_mode) == "metric_gauge_v4"
+            else None
+        ),
+        "scene_gauge_schema_version": (
+            SCENE_GAUGE_TABLE_SCHEMA_VERSION
+            if str(args.metric_box_mapping_mode) == "metric_gauge_v4"
+            else None
+        ),
+        "scene_gauge_split": (
+            str(args.split)
+            if str(args.metric_box_mapping_mode) == "metric_gauge_v4"
+            else None
+        ),
     }
     for field, expected_value in expected.items():
         actual_value = provenance.get(field)
@@ -1556,10 +1582,26 @@ def precompute_one_clip(
             "timestamps": sample["timestamps"].cpu().to(torch.float32),
             "gaussian_time_representation": GAUSSIAN_TIME_REPRESENTATION,
             "metric_box_mapping_mode": str(args.metric_box_mapping_mode),
-            "scene_gauge_table_sha256": getattr(
-                args, "scene_gauge_table_sha256", None
+            "scene_gauge_schema": (
+                SCENE_GAUGE_TABLE_SCHEMA
+                if str(args.metric_box_mapping_mode) == "metric_gauge_v4"
+                else None
             ),
-            "dggt_checkpoint_sha256": str(args.scene_gauge_dggt_sha256),
+            "scene_gauge_schema_version": (
+                SCENE_GAUGE_TABLE_SCHEMA_VERSION
+                if str(args.metric_box_mapping_mode) == "metric_gauge_v4"
+                else None
+            ),
+            "scene_gauge_split": (
+                str(args.split)
+                if str(args.metric_box_mapping_mode) == "metric_gauge_v4"
+                else None
+            ),
+            "scene_gauge_keys": (
+                _scene_gauge_keys(sample.get("scene_name", ""), sample["frame_indices"])
+                if str(args.metric_box_mapping_mode) == "metric_gauge_v4"
+                else []
+            ),
             "metric_box_scene_gauge": sample.get("metric_box_scene_gauge"),
             "metric_box_scene_gauge_raw": sample.get("metric_box_scene_gauge_raw"),
             "metric_box_scene_gauge_valid": sample.get("metric_box_scene_gauge_valid"),
@@ -1626,10 +1668,6 @@ def precompute_one_clip(
 
 def main() -> None:
     args = build_argparser().parse_args()
-    scene_gauge_dggt_sha256 = resolve_scene_gauge_checkpoint_sha256(
-        args.ckpt_path,
-        args.expected_scene_gauge_dggt_sha256,
-    )
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -1665,21 +1703,10 @@ def main() -> None:
         sample_window=CLIP_LENGTH,
         metric_box_mapping_mode=args.metric_box_mapping_mode,
         scene_gauge_path=args.scene_gauge_path,
-        expected_scene_gauge_dggt_sha256=scene_gauge_dggt_sha256,
     )
     if args.asset_root is not None:
         dataset_kwargs["asset_root"] = args.asset_root
     dataset = WaymoEditDataset(**dataset_kwargs)
-    args.scene_gauge_dggt_sha256 = scene_gauge_dggt_sha256
-    args.scene_gauge_table_sha256 = dataset.scene_gauge_sha256
-    if (
-        str(args.metric_box_mapping_mode) == "metric_gauge_v4"
-        and args.scene_gauge_table_sha256 is None
-    ):
-        raise RuntimeError(
-            "Formal metric_gauge_v4 cache generation requires a measured "
-            "scene-gauge table SHA-256."
-        )
     total = len(dataset)
     start_idx = int(args.start) if args.start is not None else int(args.start_clip_idx)
     end_idx = int(args.end) if args.end is not None else (total if args.end_clip_idx < 0 else int(args.end_clip_idx))

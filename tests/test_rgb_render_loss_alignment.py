@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import inspect
-import os
 from pathlib import Path
-import tempfile
 from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel
 
 import dggt.losses.reconstruction_feedback_loss as feedback_loss_module
 import dggt.losses.rgb_render_loss as rgb_render_module
@@ -32,7 +28,11 @@ from dggt.losses.rgb_render_loss import (
     torch_unproject_depth,
 )
 from dggt.utils.gaussian_render import composite_gsplat_rgb
-from dggt.utils.scene_gauge import PullbackCalibration
+from dggt.utils.scene_gauge import (
+    PullbackCalibration,
+    assemble_dggt_pose_encoding,
+    metric_c2w_to_teacher_anchor_dggt,
+)
 from datasets.waymo_flow_cache_dataset import WaymoFlowCacheDataset
 import train_scene_flow as formal_train
 from train_scene_flow import (
@@ -41,10 +41,6 @@ from train_scene_flow import (
     _prepare_visualization_batch,
     cached_render_pose_from_item,
 )
-from train_scene_flow_pretrain import (
-    auxiliary_scene_flow_forward,
-    should_apply_sky_mask_endpoint_supervision,
-)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -52,7 +48,6 @@ PRETRAIN_LAUNCH_SCRIPTS = (
     "pretrain_half_node_p6000.sh",
     "pretrain_ppu.sh",
     "pretrain_ppu_four_nodes_dlc.sh",
-    "pretrain_ppu_four_nodes_hds_ablation_dlc.sh",
     "pretrain_ppu_two_nodes_dlc.sh",
     "pretrain_single_node.sh",
     "pretrain_two_nodes26.sh",
@@ -65,6 +60,8 @@ def _parse_pretrain_args(*extra: str):
         [
             "--image_dir",
             "/tmp/training",
+            "--hdmap_root",
+            "/tmp/training_hdmap",
             "--dggt_ckpt_path",
             "/tmp/dggt.pt",
             "--scene_gauge_path",
@@ -212,9 +209,6 @@ class _SceneFlow(nn.Module):
         super().__init__()
         self._pullback_calibration = PullbackCalibration(
             path=Path("/tmp/pullback.json"),
-            artifact_sha256="a" * 64,
-            tokenizer_sha256="b" * 64,
-            dggt_sha256="c" * 64,
             tokenizer_generation="t0_v2",
             window_len=10,
             patch_grid_hw=(25, 37),
@@ -244,19 +238,6 @@ class _ValidationVGGT(nn.Module):
 class _SpatialLPIPS(nn.Module):
     def forward(self, prediction, target):
         return (prediction - target).abs().mean(dim=1, keepdim=True)
-
-
-class _AuxiliaryDDPModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.trunk = nn.Linear(2, 2, bias=False)
-        self.repa_proj = nn.Linear(2, 2, bias=False)
-
-    def forward(self, inputs: torch.Tensor, *, return_mid: bool) -> torch.Tensor:
-        outputs = self.trunk(inputs)
-        if return_mid:
-            outputs = outputs + self.repa_proj(inputs)
-        return outputs
 
 
 def test_primary_rgb_api_has_no_teacher_depth_argument():
@@ -513,22 +494,6 @@ def test_rgb_render_sigma_weight_rejects_invalid_power(power):
         rgb_render_sigma_weight(torch.tensor([0.5]), power=power)
 
 
-def test_sky_mask_endpoint_supervision_has_independent_delay_and_period():
-    args = SimpleNamespace(
-        sky_mask_endpoint_start_step=5000,
-        sky_mask_endpoint_every=4,
-    )
-    assert not should_apply_sky_mask_endpoint_supervision(args, None, training=True)
-    assert not should_apply_sky_mask_endpoint_supervision(args, 4999, training=True)
-    assert should_apply_sky_mask_endpoint_supervision(args, 5000, training=True)
-    assert not should_apply_sky_mask_endpoint_supervision(args, 5002, training=True)
-    assert should_apply_sky_mask_endpoint_supervision(args, 5004, training=True)
-    assert not should_apply_sky_mask_endpoint_supervision(args, 5004, training=False)
-
-    args.sky_mask_endpoint_every = 0
-    assert not should_apply_sky_mask_endpoint_supervision(args, 5000, training=True)
-
-
 def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
     from train_scene_flow_pretrain import build_argparser
 
@@ -536,6 +501,8 @@ def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
         [
             "--image_dir",
             "/tmp/images",
+            "--hdmap_root",
+            "/tmp/hdmap",
             "--dggt_ckpt_path",
             "/tmp/dggt.pt",
             "--feature_stats_path",
@@ -553,11 +520,99 @@ def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
     assert args.rgb_render_max_frames == 0  # 0 means every frame in the clip.
     assert args.rgb_render_stride == 1
     assert args.rgb_render_sigma_power == 2.0
-    assert args.lambda_rgb_render == pytest.approx(0.1)
+    assert args.lambda_rgb_render == pytest.approx(0.005)
     assert args.lambda_level_consistency == pytest.approx(0.1)
     assert args.lambda_head_consistency == pytest.approx(0.1)
     assert args.feedback_conf_weight_power == pytest.approx(1.0)
     assert args.feedback_conf_weight_floor == pytest.approx(0.05)
+    assert args.val_sample_steps == 50
+    assert not hasattr(args, "render_use_" + "predicted_gauge")
+
+
+def test_training_render_pose_uses_requested_c_and_predicted_gauge_rows() -> None:
+    requested = torch.eye(4).reshape(1, 1, 4, 4).repeat(3, 2, 1, 1)
+    requested[:, :, 0, 3] = torch.tensor(
+        [[1.0, 2.0], [10.0, 11.0], [20.0, 22.0]]
+    )
+    anchor = torch.eye(4).reshape(1, 4, 4).repeat(3, 1, 1)
+    gauge = torch.tensor(
+        [[[2.0, -0.7, -0.8]], [[3.0, -0.6, -0.9]], [[4.0, -0.5, -1.0]]],
+        requires_grad=True,
+    )
+    rows = torch.tensor([2, 0])
+    bundle = SimpleNamespace(
+        camera_to_world_requested_metric=requested,
+        camera_trajectory_anchor_to_world_metric=anchor,
+        unrelated_pose=torch.full((3, 2, 9), 777.0),
+    )
+    actual = pretrain_train.requested_render_pose_for_rows(bundle, gauge, rows)
+    selected_c = requested.index_select(0, rows)
+    selected_anchor = anchor.index_select(0, rows)
+    selected_gauge = gauge.index_select(0, rows)
+    expected = assemble_dggt_pose_encoding(
+        metric_c2w_to_teacher_anchor_dggt(
+            selected_c,
+            selected_anchor,
+            selected_gauge[..., 0],
+        ),
+        selected_gauge,
+    )
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+    assert not bool((actual == 777.0).any())
+    actual.sum().backward()
+    assert gauge.grad is not None
+    assert bool((gauge.grad.index_select(0, rows).abs() > 0).any())
+
+    train_source = inspect.getsource(pretrain_train.train_step)
+    assert "requested_render_pose_for_rows(" in train_source
+    assert "render_pose_enc_dggt=render_pose_requested" in train_source
+    assert "render_pose_enc_dggt=render_pose_requested" in train_source
+    assert "render_pose_enc_" + "teacher_gauge" not in train_source
+    assert "render_use_" + "predicted_gauge" not in train_source
+
+
+def test_pretrain_bundle_camera_condition_uses_canvas_k_and_canvas_hw() -> None:
+    raw = torch.eye(3).reshape(1, 1, 1, 3, 3).repeat(2, 3, 2, 1, 1)
+    raw[:, :, :, 0, 0] = 1000.0
+    raw[:, :, :, 1, 1] = 1000.0
+    selected = pretrain_train._requested_front_intrinsics(
+        raw,
+        batch_size=2,
+        seq_len=3,
+        device=torch.device("cpu"),
+        name="camera_intrinsics_canvas",
+    )
+    torch.testing.assert_close(selected, raw[:, :, 0])
+
+    # Raw Waymo K is a scene-level calibration and is intentionally stored
+    # with a singleton time axis.  Collation must expand only that axis; this
+    # is not permission to broadcast malformed batch/camera dimensions.
+    scene_static = raw[:, :1, 0].clone()
+    expanded = pretrain_train._requested_front_intrinsics(
+        scene_static,
+        batch_size=2,
+        seq_len=3,
+        device=torch.device("cpu"),
+        name="intrinsics",
+    )
+    assert expanded.shape == (2, 3, 3, 3)
+    torch.testing.assert_close(expanded, scene_static.expand(-1, 3, -1, -1))
+
+    with pytest.raises(ValueError, match=r"shape .* != \(2, 3, 3, 3\)"):
+        pretrain_train._requested_front_intrinsics(
+            raw[:, :2, 0],
+            batch_size=2,
+            seq_len=3,
+            device=torch.device("cpu"),
+            name="intrinsics",
+        )
+
+    source = inspect.getsource(pretrain_train.build_pretrain_bundle_from_batch)
+    assert 'batch.get("camera_intrinsics_canvas")' in source
+    assert "requested_intrinsics_canvas," in source
+    assert "image_hw=(int(images.shape[-2]), int(images.shape[-1]))" in source
+    assert "camera_intrinsics_requested_canvas_metric" in source
+    assert "camera_intrinsics_requested_raw_metric" in source
 
 
 def test_formal_rgb_defaults_match_pretrain_feedback_schedule():
@@ -596,32 +651,66 @@ def test_pretrain_launch_scripts_do_not_override_rgb_coverage_defaults():
             assert flag not in script, f"{script_name} must inherit the pretrain default for {flag}"
 
 
-def test_auxiliary_scene_flow_forward_does_not_prepare_ddp_reducer_twice():
-    if not dist.is_available():
-        pytest.skip("torch.distributed is unavailable")
-    if dist.is_initialized():
-        pytest.skip("test requires ownership of a temporary process group")
-
-    with tempfile.NamedTemporaryFile() as rendezvous:
-        dist.init_process_group(
-            backend="gloo",
-            init_method=f"file://{os.path.abspath(rendezvous.name)}",
-            rank=0,
-            world_size=1,
-        )
-        try:
-            model = DistributedDataParallel(
-                _AuxiliaryDDPModel(),
-                find_unused_parameters=True,
+def test_pretrain_launch_scripts_freeze_t59_validation_to_50_steps() -> None:
+    for script_name in PRETRAIN_LAUNCH_SCRIPTS:
+        script = (REPO_ROOT / script_name).read_text()
+        assert "v6" in script, f"{script_name} must keep v6 log/wandb naming"
+        if script_name != "pretrain_ppu_four_nodes_dlc.sh":
+            assert "WANDB_API_KEY" in script, (
+                f"{script_name} must preserve its existing WANDB_API_KEY handoff"
             )
-            inputs = torch.randn(3, 2)
-            primary = model(inputs, return_mid=True)
-            endpoint = auxiliary_scene_flow_forward(model, inputs, return_mid=False)
-            (primary + endpoint).square().mean().backward()
-            assert model.module.trunk.weight.grad is not None
-            assert model.module.repa_proj.weight.grad is not None
-        finally:
-            dist.destroy_process_group()
+        assert "VAL_SAMPLE_STEPS:-35" not in script
+        assert "--val_sample_steps 35" not in script
+        assert (
+            "VAL_SAMPLE_STEPS:-50" in script
+            or "--val_sample_steps 50" in script
+        ), f"{script_name} must explicitly select the accepted T59 50-step regime"
+
+
+def test_pretrain_resume_contract_fails_closed_on_tasks_rgb_and_args() -> None:
+    args = _parse_pretrain_args()
+    payload = {
+        "pretrain_resume_contract_version": (
+            pretrain_train.PRETRAIN_RESUME_CONTRACT_VERSION
+        ),
+        "pretrain_resume_reproducibility": (
+            pretrain_train.PRETRAIN_RESUME_REPRODUCIBILITY
+        ),
+        "layout_task_probabilities": list(
+            pretrain_train.LAYOUT_TASK_PROBABILITIES
+        ),
+        "rgb_render": pretrain_train.rgb_render_run_summary(args),
+        "pretrain_resume_critical_args": (
+            pretrain_train.pretrain_resume_critical_args(args)
+        ),
+        "args": vars(args).copy(),
+    }
+    pretrain_train.validate_pretrain_resume_contract(
+        payload, args, "checkpoint.pt"
+    )
+
+    changed_tasks = dict(payload)
+    changed_tasks["layout_task_probabilities"] = [0.2, 0.4, 0.4]
+    with pytest.raises(ValueError, match="task probabilities"):
+        pretrain_train.validate_pretrain_resume_contract(
+            changed_tasks, args, "checkpoint.pt"
+        )
+
+    changed_rgb = dict(payload)
+    changed_rgb["rgb_render"] = dict(payload["rgb_render"])
+    changed_rgb["rgb_render"]["lambda_rgb_render"] = 0.00025
+    with pytest.raises(ValueError, match="RGB/HDS"):
+        pretrain_train.validate_pretrain_resume_contract(
+            changed_rgb, args, "checkpoint.pt"
+        )
+
+    changed_args = dict(payload)
+    changed_args["args"] = dict(payload["args"])
+    changed_args["args"]["layout_max_actors"] = 7
+    with pytest.raises(ValueError, match="argparse values"):
+        pretrain_train.validate_pretrain_resume_contract(
+            changed_args, args, "checkpoint.pt"
+        )
 
 
 def test_directional_sky_projection_matches_validation_path():

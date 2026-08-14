@@ -1,19 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 
-from dggt.utils.camera_generation import camera_state_from_waymo_c2w
-
 CAMERA_POSE_SUMMARY_DIM = 20
-CAMERA_CONDITION_REPRESENTATION = "waymo_metric_rel_delta_rot6d_fov20d_stats_v3"
+CAMERA_CONDITION_REPRESENTATION = "requested_camera_rel_delta_rot6d_logtan_fov20d_v1"
 
 
 def fov_from_intrinsics(intrinsics: torch.Tensor, image_size_hw) -> torch.Tensor:
-    """Waymo-only principal-point-aware ``[FOVx,FOVy]`` in radians."""
+    """Principal-point-aware canvas ``[FOVx,FOVy]`` in radians."""
     if image_size_hw is None:
-        raise ValueError("raw image size is required for Waymo camera FOV")
+        raise ValueError("canvas image size is required for Waymo camera FOV")
     Ks = intrinsics.float()
     squeezed = Ks.ndim == 3
     if squeezed:
@@ -39,7 +35,7 @@ def fov_from_intrinsics(intrinsics: torch.Tensor, image_size_hw) -> torch.Tensor
     if not bool(torch.isfinite(values).all()) or bool((fx <= 0).any()) or bool((fy <= 0).any()):
         raise ValueError("Waymo intrinsics/image size must be finite with positive focal lengths")
     if bool(((cx < 0) | (cx > width) | (cy < 0) | (cy > height)).any()):
-        raise ValueError("Waymo principal point must lie inside the raw image bounds")
+        raise ValueError("Waymo principal point must lie inside the canvas bounds")
     result = torch.stack(
         (torch.atan2(cx, fx) + torch.atan2(width - cx, fx),
          torch.atan2(cy, fy) + torch.atan2(height - cy, fy)),
@@ -124,7 +120,7 @@ def _to_batched_pose(
 
 def _camera_summary_from_c2w(
     camera_to_world: torch.Tensor,
-    fov: torch.Tensor,
+    fov_log_tan: torch.Tensor,
     *,
     trajectory_anchor_to_world: torch.Tensor | None = None,
     previous_camera_to_world: torch.Tensor | None = None,
@@ -133,9 +129,14 @@ def _camera_summary_from_c2w(
     if c2w.shape[-2:] != (4, 4):
         raise ValueError(f"camera_to_world must end in [4,4], got {tuple(c2w.shape)}")
     b, s = int(c2w.shape[0]), int(c2w.shape[1])
-    fov = _to_batched_sequence(fov.float(), last_dims=2, name="fov")
-    if fov.shape != (b, s, 2):
-        raise ValueError(f"fov must be [B,S,2], got {tuple(fov.shape)} for B={b}, S={s}")
+    fov_log_tan = _to_batched_sequence(
+        fov_log_tan.float(), last_dims=2, name="fov_log_tan"
+    )
+    if fov_log_tan.shape != (b, s, 2):
+        raise ValueError(
+            "fov_log_tan must be [B,S,2], got "
+            f"{tuple(fov_log_tan.shape)} for B={b}, S={s}"
+        )
 
     if trajectory_anchor_to_world is None:
         anchor = c2w[:, :1]
@@ -172,7 +173,7 @@ def _camera_summary_from_c2w(
             _rotation_6d(rel[..., :3, :3]),
             delta_t,
             _rotation_6d(delta[..., :3, :3]),
-            fov,
+            fov_log_tan,
         ],
         dim=-1,
     )
@@ -238,7 +239,7 @@ def camera_summary_from_waymo_gt(
     trajectory_anchor_to_world: torch.Tensor | None = None,
     previous_camera_to_world: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build camera summary tokens from dataset GT camera trajectory.
+    """Build the pure requested-camera condition from a Waymo trajectory.
 
     Waymo edit/precompute caches store cameras with an explicit view dimension;
     SceneFlow currently trains on the front camera, so this helper selects view 0
@@ -247,41 +248,41 @@ def camera_summary_from_waymo_gt(
     c2w = _select_front_camera_to_world(camera_to_world, intrinsics)
     b, s = int(c2w.shape[0]), int(c2w.shape[1])
     Ks = _select_front_intrinsics(intrinsics, batch_size=b, seq_len=s)
-    image_hw = normalize_front_image_hw(image_hw)
+    # Preserve per-row/per-frame canvas sizes.  Collapsing a batched HW tensor
+    # to its first row silently gives the wrong FOV when crop/canvas geometry
+    # differs within a request.
     fov_xy = fov_from_intrinsics(Ks, image_hw)
-    fov = torch.stack((fov_xy[..., 1], fov_xy[..., 0]), dim=-1)
+    # Channels 18:20 summarize the requested sensor after its explicit
+    # raw-to-canvas transform.  They are not the generated DGGT gauge/FOV.
+    fov_log_tan = torch.log(torch.tan(0.5 * fov_xy).clamp_min(1.0e-8))
     return _camera_summary_from_c2w(
         c2w,
-        fov,
+        fov_log_tan,
         trajectory_anchor_to_world=trajectory_anchor_to_world,
         previous_camera_to_world=previous_camera_to_world,
     )
 
 
-def camera_condition_from_waymo_metric_target(
+def camera_condition_from_waymo_request(
     camera_to_world: torch.Tensor,
     intrinsics: torch.Tensor,
     *,
     image_hw: tuple[int, int] | None,
     trajectory_anchor_to_world: torch.Tensor,
     previous_camera_to_world: torch.Tensor | None,
-    anchor_mask: torch.Tensor,
-    normalize_camera: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build the v3 condition and its matching v4 metric generation target.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the clean-cut 20-D condition for the requested camera ``C``.
 
-    The 20-D condition keeps its raw anchor-relative pose and Waymo FOV, but
-    channels ``9:18`` are the *same* role-aware normalized 9-D state used by
-    camera generation.  Keeping this assembly in one helper prevents raw
-    pretraining, formal T1, and offline/external inference from silently using
-    different camera-condition coordinates.
+    The result is condition-only: channels 0:9 are anchor-relative pose,
+    9:18 are frame-to-frame delta pose, and 18:20 summarize the *sensor*
+    intrinsics as ``log(tan(FOV/2))``.  No target, noisy state, anchor role,
+    or predicted-camera representation is constructed here.
 
-    ``anchor_mask`` is global: a sliced window that does not contain trunk
-    frame zero must be delta-only and must receive the preceding camera pose.
+    A sliced window must pass its immediately preceding pose so the first
+    delta remains clip-global.  ``trajectory_anchor_to_world`` remains the
+    shared scene anchor for every window.
     """
 
-    if not callable(normalize_camera):
-        raise TypeError("normalize_camera must be callable")
     c2w = _select_front_camera_to_world(camera_to_world, intrinsics)
     batch_size, seq_len = int(c2w.shape[0]), int(c2w.shape[1])
     previous_front = None
@@ -308,20 +309,6 @@ def camera_condition_from_waymo_metric_target(
                 "previous_camera_to_world must provide one preceding pose or one pose per frame: "
                 f"got {tuple(previous_front.shape)} for B={batch_size}, S={seq_len}"
             )
-    target_state, returned_anchor_mask = camera_state_from_waymo_c2w(
-        c2w,
-        trajectory_anchor_to_world,
-        previous_camera_to_world=previous_front,
-        anchor_mask=anchor_mask,
-    )
-    normalized_target = normalize_camera(target_state, returned_anchor_mask)
-    if normalized_target.shape != target_state.shape:
-        raise ValueError(
-            "normalize_camera must preserve the metric target shape: "
-            f"got {tuple(normalized_target.shape)} for {tuple(target_state.shape)}"
-        )
-    if not bool(torch.isfinite(normalized_target).all()):
-        raise ValueError("normalized camera target contains non-finite values")
     summary_previous = previous_front
     if summary_previous is not None and int(summary_previous.shape[1]) == 1 and seq_len > 1:
         summary_previous = torch.cat((summary_previous, c2w[:, :-1]), dim=1)
@@ -332,14 +319,19 @@ def camera_condition_from_waymo_metric_target(
         trajectory_anchor_to_world=trajectory_anchor_to_world,
         previous_camera_to_world=summary_previous,
     )
-    if condition.shape[:-1] != normalized_target.shape[:-1]:
-        raise ValueError(
-            "camera summary and generation target disagree on batch/time shape: "
-            f"{tuple(condition.shape)} vs {tuple(normalized_target.shape)}"
+    if tuple(condition.shape) != (batch_size, seq_len, CAMERA_POSE_SUMMARY_DIM):
+        raise RuntimeError(
+            "requested-camera condition has an unexpected shape: "
+            f"{tuple(condition.shape)}"
         )
-    condition = condition.clone()
-    condition[..., 9:18] = normalized_target.to(
-        device=condition.device,
-        dtype=condition.dtype,
-    )
-    return condition, valid, target_state, returned_anchor_mask
+    return condition, valid
+
+
+__all__ = [
+    "CAMERA_CONDITION_REPRESENTATION",
+    "CAMERA_POSE_SUMMARY_DIM",
+    "camera_condition_from_waymo_request",
+    "camera_summary_from_waymo_gt",
+    "fov_from_intrinsics",
+    "normalize_front_image_hw",
+]

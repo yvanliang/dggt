@@ -1,3 +1,10 @@
+"""Legacy scene-editor entry point.
+
+Layout-v2 (HD map plus full actor geometry) is intentionally connected only to
+``inference_scene_flow_pretrain.py`` in the first production release.  This
+editor does not accept or silently ignore layout-v2 conditions.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -26,7 +33,6 @@ from dggt.utils.gaussian_ply import write_gaussian_ply, write_point_ply
 from dggt.utils.geometry import unproject_depth_map_to_point_map
 from dggt.utils.gs import concat_list, get_split_gs
 from dggt.utils.pose_enc import pose_encoding_to_extri_intri
-from dggt.utils.scene_gauge import resolve_scene_gauge_checkpoint_sha256
 
 PRED_VEHICLE_SEMANTIC_CLASS_ID = 4
 CUSTOM_MASK_VEHICLE_VALUE = 40
@@ -87,7 +93,6 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Complete split-specific 29-frame gauge table; required by metric_gauge_v4.",
     )
-    parser.add_argument("--expected_scene_gauge_dggt_sha256", type=str, default=None)
     parser.add_argument("--object_slots", type=str, default="all", help="Comma-separated slot ids or 'all'.")
     parser.add_argument("--min_match_score", type=float, default=0.1, help="Skip low-confidence slot-to-scene matches.")
     parser.add_argument("--dynamic_thresh", type=float, default=0.5)
@@ -1254,11 +1259,6 @@ def main() -> None:
         )
     torch.manual_seed(args.seed)
 
-    scene_gauge_dggt_sha256 = resolve_scene_gauge_checkpoint_sha256(
-        args.ckpt_path,
-        args.expected_scene_gauge_dggt_sha256,
-    )
-
     root_output_dir = Path(args.output_dir)
     root_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1275,7 +1275,6 @@ def main() -> None:
         sequence_length=args.sequence_length,
         metric_box_mapping_mode=args.metric_box_mapping_mode,
         scene_gauge_path=args.scene_gauge_path,
-        expected_scene_gauge_dggt_sha256=scene_gauge_dggt_sha256,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

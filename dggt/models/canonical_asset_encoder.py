@@ -1,4 +1,4 @@
-"""Frozen single-reference appearance encoder for factorized asset control."""
+"""Frozen single-reference encoder for non-positional appearance bindings."""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -8,10 +8,10 @@ from typing import Callable, Hashable, Sequence
 import torch
 import torch.nn as nn
 
-from dggt.utils.factorized_asset_condition import (
-    MAX_CANONICAL_APPEARANCE_TOKENS,
-    alpha_to_patch_mask,
-    sample_canonical_tokens,
+from dggt.utils.appearance_binding_condition import (
+    MAX_APPEARANCE_TOKENS,
+    appearance_alpha_to_patch_mask,
+    sample_appearance_tokens,
 )
 from dggt.utils.tokens import select_patch_pyramid
 
@@ -41,7 +41,7 @@ class CanonicalAssetEncoder(nn.Module):
         *,
         patch_grid: tuple[int, int],
         levels: Sequence[int] = CANONICAL_ASSET_ENCODER_LEVELS,
-        max_tokens: int = MAX_CANONICAL_APPEARANCE_TOKENS,
+        max_tokens: int = MAX_APPEARANCE_TOKENS,
         cache_size: int = 1024,
     ) -> None:
         super().__init__()
@@ -116,7 +116,7 @@ class CanonicalAssetEncoder(nn.Module):
             raise ValueError(
                 f"cache_keys length {len(cache_keys)} != canonical references {n}"
             )
-        patch_mask = alpha_to_patch_mask(
+        patch_mask = appearance_alpha_to_patch_mask(
             canonical_alpha[:, 0],
             self.patch_grid,
         )
@@ -174,7 +174,7 @@ class CanonicalAssetEncoder(nn.Module):
                 0,
                 selected.to(device=patch_mask.device),
             ).to(device=normalized.device)
-            tokens, mask, uv = sample_canonical_tokens(
+            tokens, mask, uv = sample_appearance_tokens(
                 normalized,
                 selected_patch_mask,
                 self.patch_grid,

@@ -1681,8 +1681,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         _atomic_write_json(validation_path, artifact)
         loaded = load_pullback_calibration(
             validation_path,
-            tokenizer_checkpoint_path=tokenizer_path,
-            dggt_checkpoint_path=dggt_path,
             expected_window_len=10,
             expected_patch_grid=artifact["runtime_contract"]["patch_grid_hw"],
         )
@@ -1691,9 +1689,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "artifact": str(output_path),
-                "artifact_sha256": loaded.artifact_sha256,
-                "tokenizer_sha256": loaded.tokenizer_sha256,
-                "dggt_sha256": loaded.dggt_sha256,
                 "eligible_for_training": True,
                 "metric_depth_form": loaded.depth_form,
                 "render_form": "identity",

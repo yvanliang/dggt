@@ -1,3 +1,10 @@
+"""Legacy Mode-B entry point.
+
+Layout-v2 (HD map plus full actor geometry) is intentionally connected only to
+``inference_scene_flow_pretrain.py`` in the first production release.  Mode-B
+does not accept or silently ignore layout-v2 conditions.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -21,7 +28,6 @@ from dggt.models.gaussian_scene_editor import GaussianSceneEditor
 from dggt.utils.gaussian_edit import _transform_sample_track_box
 from dggt.utils.gs import concat_list
 from dggt.utils.mode_b_planner import ModeBPlanner, apply_mode_b
-from dggt.utils.scene_gauge import resolve_scene_gauge_checkpoint_sha256
 from inference_scene_editor import (
     _as_homogeneous_viewmats,
     _load_model,
@@ -70,7 +76,6 @@ def build_argparser() -> argparse.ArgumentParser:
         default="metric_gauge_v4",
     )
     parser.add_argument("--scene_gauge_path", type=str, default=None)
-    parser.add_argument("--expected_scene_gauge_dggt_sha256", type=str, default=None)
     parser.add_argument("--render_max_points", type=int, default=250000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -946,11 +951,6 @@ def main() -> None:
     args = build_argparser().parse_args()
     torch.manual_seed(args.seed)
 
-    scene_gauge_dggt_sha256 = resolve_scene_gauge_checkpoint_sha256(
-        args.ckpt_path,
-        args.expected_scene_gauge_dggt_sha256,
-    )
-
     root_output_dir = Path(args.output_dir)
     root_output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -979,7 +979,6 @@ def main() -> None:
         sample_window=args.sequence_length,
         metric_box_mapping_mode=args.metric_box_mapping_mode,
         scene_gauge_path=args.scene_gauge_path,
-        expected_scene_gauge_dggt_sha256=scene_gauge_dggt_sha256,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

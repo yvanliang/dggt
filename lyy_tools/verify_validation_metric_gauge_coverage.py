@@ -42,7 +42,7 @@ def verify_validation_metric_gauge_coverage(
     rows = json.loads(Path(final_info_path).read_text(encoding="utf-8"))
     if not isinstance(rows, list) or not rows:
         raise ValueError("final_info_validation must be a non-empty JSON list")
-    _, table_sha256, dggt_sha256, lookup = load_scene_gauge_lookup(
+    _, lookup = load_scene_gauge_lookup(
         scene_gauge_path,
         expected_split="validation",
     )
@@ -97,8 +97,6 @@ def verify_validation_metric_gauge_coverage(
         "fallback_channel_count": total_fallback_channels,
         "invalid_raw_clips": invalid_clips,
         "valid_channel_mean": list(valid_mean),
-        "scene_gauge_table_sha256": table_sha256,
-        "dggt_checkpoint_sha256": dggt_sha256,
         "clips": clip_records,
     }
 

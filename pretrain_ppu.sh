@@ -52,6 +52,8 @@ ALEXNET_CKPT="${TORCH_HOME}/hub/checkpoints/alexnet-owt-7be5be79.pth"
 # ============================================================
 WAYMO_DGGT_ROOT="${WAYMO_DGGT_ROOT:-${DATASET_ROOT}/training}"
 WAYMO_DGGT_VAL_ROOT="${WAYMO_DGGT_VAL_ROOT:-${DATASET_ROOT}/validation}"
+HDMAP_ROOT="${HDMAP_ROOT:-${DATASET_ROOT}/training_hdmap}"
+VAL_HDMAP_ROOT="${VAL_HDMAP_ROOT:-${DATASET_ROOT}/validation_hdmap}"
 DEFAULT_DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
 if [[ ! -f "${DEFAULT_DGGT_CKPT}" && -f /data/lyy_dataset/model/dggt/model_latest_waymo.pt ]]; then
   DEFAULT_DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
@@ -68,8 +70,8 @@ SCENE_CAPTION_ROOT="${SCENE_CAPTION_ROOT:-${DATASET_ROOT}/training_captions}"
 SCENE_CAPTION_VAL_ROOT="${SCENE_CAPTION_VAL_ROOT:-${DATASET_ROOT}/validation_captions}"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${MODEL_ROOT}/Qwen/Qwen3-0.6B}"
 
-LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_tokenizer_v2}"
-LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_launch}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_v6}"
+LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_v6_launch}"
 
 # ============================================================
 # 训练配置
@@ -82,14 +84,13 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 
 TEXT_UNCOND_DROP_PROB="${TEXT_UNCOND_DROP_PROB:-0.1}"
-JOINT_GENERATION_PROB="${JOINT_GENERATION_PROB:-0.2}"
-CAMERA_CONTROLLED_PROB="${CAMERA_CONTROLLED_PROB:-0.2}"
-ASSET_CAMERA_CONTROLLED_PROB="${ASSET_CAMERA_CONTROLLED_PROB:-0.6}"
 
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
+CFG_SCALE="${CFG_SCALE:-1.0}"
+LAYOUT_GUIDANCE_SCALE="${LAYOUT_GUIDANCE_SCALE:-1.0}"
 ASSET_CONTROL_GUIDANCE_SCALE="${ASSET_CONTROL_GUIDANCE_SCALE:-1.0}"
-CAMERA_GUIDANCE_SCALE="${CAMERA_GUIDANCE_SCALE:-1.0}"
 VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
+LAYOUT_MAX_ACTORS="${LAYOUT_MAX_ACTORS:-96}"
+STATIC_FAR_PLANE_M="${STATIC_FAR_PLANE_M:-120}"
 
 # Keep production defaults unchanged while allowing the real-training PPU
 # smoke launcher to shorten the run without maintaining a second copy of the
@@ -97,12 +98,17 @@ VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
 MAX_STEPS="${MAX_STEPS:-200000}"
 WARMUP_STEPS="${WARMUP_STEPS:-4000}"
 SAVE_EVERY="${SAVE_EVERY:-2000}"
-VAL_EVERY="${VAL_EVERY:-1000}"
+VAL_EVERY="${VAL_EVERY:-2000}"
 VAL_BATCHES="${VAL_BATCHES:-1}"
 VAL_LOG_IMAGES="${VAL_LOG_IMAGES:-10}"
-VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-35}"
-RESUME_PATH="${RESUME_PATH:-}"
-WARM_START_PATH="${WARM_START_PATH:-}"
+VAL_INFERENCE_SCENES="${VAL_INFERENCE_SCENES:-5}"
+VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-50}"
+LOG_EVERY="${LOG_EVERY:-1}"
+
+if [[ ! "${LOG_EVERY}" =~ ^[1-9][0-9]*$ || ! "${VAL_INFERENCE_SCENES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[错误] LOG_EVERY 和 VAL_INFERENCE_SCENES 必须是正整数。" >&2
+    exit 1
+fi
 
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_PPU * GRAD_ACCUM_STEPS))
 
@@ -193,22 +199,14 @@ check_required_paths() {
     check_file "train_scene_flow_pretrain.py" "${PROJECT_ROOT}/train_scene_flow_pretrain.py"
     check_dir "WAYMO_DGGT_ROOT" "${WAYMO_DGGT_ROOT}"
     check_dir "WAYMO_DGGT_VAL_ROOT" "${WAYMO_DGGT_VAL_ROOT}"
+    check_dir "HDMAP_ROOT" "${HDMAP_ROOT}"
+    check_dir "VAL_HDMAP_ROOT" "${VAL_HDMAP_ROOT}"
     check_file "DGGT_CKPT" "${DGGT_CKPT}"
     check_file "TOKENIZER_CKPT" "${TOKENIZER_CKPT}"
     check_file "FEATURE_STATS" "${FEATURE_STATS}"
     check_file "SCENE_GAUGE_PATH" "${SCENE_GAUGE_PATH}"
     check_file "VAL_SCENE_GAUGE_PATH" "${VAL_SCENE_GAUGE_PATH}"
     check_file "PULLBACK_CALIBRATION_PATH" "${PULLBACK_CALIBRATION_PATH}"
-    if [[ -n "${RESUME_PATH}" ]]; then
-        check_file "RESUME_PATH" "${RESUME_PATH}"
-    fi
-    if [[ -n "${WARM_START_PATH}" ]]; then
-        check_file "WARM_START_PATH" "${WARM_START_PATH}"
-    fi
-    if [[ -n "${RESUME_PATH}" && -n "${WARM_START_PATH}" ]]; then
-        echo "[错误] RESUME_PATH 和 WARM_START_PATH 不能同时设置。" >&2
-        exit 1
-    fi
     check_dir "SCENE_CAPTION_ROOT" "${SCENE_CAPTION_ROOT}"
     check_dir "SCENE_CAPTION_VAL_ROOT" "${SCENE_CAPTION_VAL_ROOT}"
     check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
@@ -230,6 +228,8 @@ build_train_args() {
         train_scene_flow_pretrain.py
         --image_dir "${WAYMO_DGGT_ROOT}"
         --val_image_dir "${WAYMO_DGGT_VAL_ROOT}"
+        --hdmap_root "${HDMAP_ROOT}"
+        --val_hdmap_root "${VAL_HDMAP_ROOT}"
         --dggt_ckpt_path "${DGGT_CKPT}"
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
@@ -245,7 +245,6 @@ build_train_args() {
         --sequence_length 10
         --val_sliding_window 10
         --val_sliding_stride 7
-        --camera_anchor_context_dropout 0.25
         --patch_grid_h 25
         --patch_grid_w 37
         --latent_dim 1024
@@ -270,38 +269,29 @@ build_train_args() {
         --lambda_repa 0.5
         --base_model_coeff 0.25
         --lambda_boundary 0.25
-        --lambda_camera_flow 0.1
-        --lambda_camera_pose 0.25
-        --camera_pose_start_step 0
-        --camera_pose_warmup_steps 10000
-        --camera_absolute_translation_scale_m 10.0
-        --camera_relative_translation_scale_m 1.0
-        --camera_acceleration_translation_scale_m 1.0
         --lambda_sky_flow 0.1
+        --lambda_rgb_render 0.005
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
-        --joint_generation_prob "${JOINT_GENERATION_PROB}"
-        --camera_controlled_prob "${CAMERA_CONTROLLED_PROB}"
-        --asset_camera_controlled_prob "${ASSET_CAMERA_CONTROLLED_PROB}"
-        --guidance_scale "${GUIDANCE_SCALE}"
+        --cfg "${CFG_SCALE}"
+        --layout_guidance_scale "${LAYOUT_GUIDANCE_SCALE}"
         --asset_control_guidance_scale "${ASSET_CONTROL_GUIDANCE_SCALE}"
-        --camera_guidance_scale "${CAMERA_GUIDANCE_SCALE}"
+        --layout_max_actors "${LAYOUT_MAX_ACTORS}"
+        --static_far_plane_m "${STATIC_FAR_PLANE_M}"
         --val_guidance_scales "${VAL_GUIDANCE_SCALES}"
         --val_scene_start 0
         --val_scene_end 100
         --val_every "${VAL_EVERY}"
         --val_batches "${VAL_BATCHES}"
         --val_log_images "${VAL_LOG_IMAGES}"
+        --val_inference_scenes "${VAL_INFERENCE_SCENES}"
         --val_sample_steps "${VAL_SAMPLE_STEPS}"
         --grad_clip_norm 1.0
         --seed 0
         --precision bf16
         --ddp_timeout_minutes 60
+        --force_tqdm
+        --log_every "${LOG_EVERY}"
     )
-    if [[ -n "${RESUME_PATH}" ]]; then
-        TRAIN_ARGS+=(--resume_path "${RESUME_PATH}")
-    elif [[ -n "${WARM_START_PATH}" ]]; then
-        TRAIN_ARGS+=(--warm_start_path "${WARM_START_PATH}")
-    fi
 }
 
 setup_common_env
@@ -319,6 +309,8 @@ echo "NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME}"
 echo "DGGT_DEVICE_BACKEND=${DGGT_DEVICE_BACKEND}"
 echo "DGGT_PPU_MHA_BATCH_CHUNK_SIZE=${DGGT_PPU_MHA_BATCH_CHUNK_SIZE}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${NNODES} node x ${NPROC_PER_NODE} ppu/node x ${BATCH_SIZE_PER_PPU} batch/ppu x ${GRAD_ACCUM_STEPS} accum"
+echo "training logs: tqdm Web-console mode (ETA/rate enabled; one update per optimizer step)"
+echo "validation: every=${VAL_EVERY}, inference_scenes=${VAL_INFERENCE_SCENES} (5 scenes x 3 CFG on >=15 ranks; otherwise 1 scene)"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG_DIR}/ppu_2card.log"
 

@@ -643,7 +643,6 @@ class WaymoEditDataset(Dataset):
         clean_train_ratio=0.9,
         metric_box_mapping_mode=None,
         scene_gauge_path=None,
-        expected_scene_gauge_dggt_sha256=None,
     ):
         super().__init__()
         del transfer_root, transfer_camera, alignment_hw, alignment_num_anchors
@@ -682,8 +681,6 @@ class WaymoEditDataset(Dataset):
             )
         self.metric_box_mapping_mode = str(metric_box_mapping_mode)
         self.scene_gauge_path = None
-        self.scene_gauge_sha256 = None
-        self.scene_gauge_dggt_sha256 = None
         self.scene_gauge_valid_channel_mean = None
         self._scene_gauge_table = None
         if self.metric_box_mapping_mode == METRIC_BOX_MAPPING_MODE:
@@ -697,12 +694,9 @@ class WaymoEditDataset(Dataset):
             if scene_gauge_path is not None:
                 (
                     self.scene_gauge_path,
-                    self.scene_gauge_sha256,
-                    self.scene_gauge_dggt_sha256,
                     self._scene_gauge_table,
                 ) = load_scene_gauge_lookup(
                     scene_gauge_path,
-                    expected_checkpoint_sha256=expected_scene_gauge_dggt_sha256,
                     expected_split=str(self.split),
                 )
                 self.scene_gauge_valid_channel_mean = scene_gauge_valid_channel_mean(
@@ -944,8 +938,6 @@ class WaymoEditDataset(Dataset):
             "metric_box_scene_gauge_fallback_policy": "production_valid_channel_mean_v1",
             "metric_box_world_to_anchor": torch.from_numpy(np.stack(world_to_anchor)),
             "metric_box_camera_to_anchor": torch.from_numpy(np.stack(camera_to_anchor)),
-            "metric_box_gauge_table_sha256": str(self.scene_gauge_sha256),
-            "metric_box_gauge_dggt_sha256": str(self.scene_gauge_dggt_sha256),
         }
 
     def _pick_candidate(self, candidates):

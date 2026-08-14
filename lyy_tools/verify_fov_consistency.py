@@ -1268,9 +1268,7 @@ def _camera_candidates(
     raw_image_hw: torch.Tensor,
     image_hw: tuple[int, int],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    from dggt.utils.factorized_asset_condition import (
-        resize_crop_intrinsics_to_model_canvas,
-    )
+    from dggt.utils.actor_geometry_condition import raw_to_model_canvas_homography
     from dggt.utils.pose_enc import pose_encoding_to_extri_intri
 
     height, width = image_hw
@@ -1292,22 +1290,16 @@ def _camera_candidates(
         (extrinsics3, bottom.expand(1, TRUNK_FRAMES, -1, -1)),
         dim=-2,
     )[0]
-    waymo_k, model_hw = resize_crop_intrinsics_to_model_canvas(
-        torch.as_tensor(raw_intrinsics).float(),
+    raw_k = torch.as_tensor(raw_intrinsics).float()
+    raw_to_model, model_hw_tuple = raw_to_model_canvas_homography(
         torch.as_tensor(raw_image_hw),
         target_width=int(width),
         patch_size=14,
     )
-    if model_hw.reshape(-1, 2).shape[0] != 1:
-        unique_hw = torch.unique(model_hw.reshape(-1, 2), dim=0)
-    else:
-        unique_hw = model_hw.reshape(-1, 2)
-    if unique_hw.shape != (1, 2) or tuple(int(v) for v in unique_hw[0].tolist()) != (
-        height,
-        width,
-    ):
+    waymo_k = raw_to_model.to(dtype=raw_k.dtype) @ raw_k
+    if model_hw_tuple != (height, width):
         raise RuntimeError(
-            f"Waymo model canvas {model_hw.tolist()} does not match DGGT {(height, width)}"
+            f"Waymo model canvas {model_hw_tuple} does not match DGGT {(height, width)}"
         )
     waymo_k = waymo_k.reshape(-1, 3, 3)
     if int(waymo_k.shape[0]) == 1:
@@ -1347,7 +1339,6 @@ def _make_dataset(image_dir: str, scene: str, trunk: int):
         pretrain_max_objects=0,
         pretrain_instance_cache_size=0,
         trunk_frames=TRUNK_FRAMES,
-        camera_anchor_window_probability=1.0,
         return_full_dggt_context=True,
         load_dynamic_masks=True,
         binary_mask_channels=1,

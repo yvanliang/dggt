@@ -60,6 +60,8 @@ SCRIPT_PATH="${SCRIPT_PATH:-${PROJECT_ROOT}/pretrain_two_nodes26.sh}"
 # ============================================================
 WAYMO_DGGT_ROOT="${WAYMO_DGGT_ROOT:-${DATASET_ROOT}/training}"
 WAYMO_DGGT_VAL_ROOT="${WAYMO_DGGT_VAL_ROOT:-${DATASET_ROOT}/validation}"
+HDMAP_ROOT="${HDMAP_ROOT:-${DATASET_ROOT}/training_hdmap}"
+VAL_HDMAP_ROOT="${VAL_HDMAP_ROOT:-${DATASET_ROOT}/validation_hdmap}"
 DEFAULT_DGGT_CKPT="${PROJECT_ROOT}/pretrained/model_latest_waymo.pt"
 if [[ ! -f "${DEFAULT_DGGT_CKPT}" && -f /data/lyy_dataset/model/dggt/model_latest_waymo.pt ]]; then
   DEFAULT_DGGT_CKPT=/data/lyy_dataset/model/dggt/model_latest_waymo.pt
@@ -77,10 +79,8 @@ SCENE_CAPTION_VAL_ROOT="${SCENE_CAPTION_VAL_ROOT:-${DATASET_ROOT}/validation_cap
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${LIANGYY_ROOT}/model/Qwen/Qwen3-0.6B}"
 
 # 双机训练使用独立目录，避免覆盖单机训练的 checkpoint、验证结果和状态文件。
-LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_waymo_gb64_lr1e4_v5}"
-LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/distributed_launch}"
-RESUME_PATH="${RESUME_PATH:-}"
-RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:--1}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_waymo_gb64_lr1e4_v6}"
+LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/distributed_v6_launch}"
 
 # ============================================================
 # 训练配置
@@ -93,22 +93,21 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 
 TEXT_UNCOND_DROP_PROB="${TEXT_UNCOND_DROP_PROB:-0.1}"
-JOINT_GENERATION_PROB="${JOINT_GENERATION_PROB:-0.2}"
-CAMERA_CONTROLLED_PROB="${CAMERA_CONTROLLED_PROB:-0.2}"
-ASSET_CAMERA_CONTROLLED_PROB="${ASSET_CAMERA_CONTROLLED_PROB:-0.6}"
 
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
+CFG_SCALE="${CFG_SCALE:-1.0}"
+LAYOUT_GUIDANCE_SCALE="${LAYOUT_GUIDANCE_SCALE:-1.0}"
 ASSET_CONTROL_GUIDANCE_SCALE="${ASSET_CONTROL_GUIDANCE_SCALE:-1.0}"
-CAMERA_GUIDANCE_SCALE="${CAMERA_GUIDANCE_SCALE:-1.0}"
 VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
+LAYOUT_MAX_ACTORS="${LAYOUT_MAX_ACTORS:-96}"
+STATIC_FAR_PLANE_M="${STATIC_FAR_PLANE_M:-120}"
 
 MAX_STEPS="${MAX_STEPS:-200000}"
 DECAY_END_STEPS="${DECAY_END_STEPS:-0}"
 SAVE_EVERY="${SAVE_EVERY:-2500}"
-VAL_EVERY="${VAL_EVERY:-1000}"
+VAL_EVERY="${VAL_EVERY:-2000}"
 VAL_BATCHES="${VAL_BATCHES:-1}"
 VAL_LOG_IMAGES="${VAL_LOG_IMAGES:-10}"
-VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-35}"
+VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-50}"
 for value_name in \
     BATCH_SIZE_PER_GPU GRAD_ACCUM_STEPS NUM_WORKERS PREFETCH_FACTOR \
     MAX_STEPS DECAY_END_STEPS SAVE_EVERY VAL_EVERY VAL_BATCHES \
@@ -119,24 +118,14 @@ for value_name in \
         exit 1
     fi
 done
-if [[ ! "${RESUME_EXPECTED_STEP}" =~ ^-?[0-9]+$ ]]; then
-    echo "[错误] RESUME_EXPECTED_STEP 必须是整数，当前值：${RESUME_EXPECTED_STEP}" >&2
-    exit 1
-fi
 if (( BATCH_SIZE_PER_GPU <= 0 || GRAD_ACCUM_STEPS <= 0 || MAX_STEPS <= 0 || SAVE_EVERY <= 0 )); then
     echo "[错误] batch、梯度累积、MAX_STEPS 和 SAVE_EVERY 必须大于 0。" >&2
     exit 1
 fi
 
 WANDB_PROJECT="${WANDB_PROJECT:-dggt-flow}"
-WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v5}"
+WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v6}"
 WANDB_RESUME="${WANDB_RESUME:-never}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-}"
-if [[ -z "${WANDB_RUN_ID}" ]]; then
-    # Keep the shell-side empty sentinel for CLI construction, but do not let
-    # W&B see an exported empty WANDB_RUN_ID.
-    export -n WANDB_RUN_ID 2>/dev/null || true
-fi
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
 
 # ============================================================
@@ -178,14 +167,14 @@ remote_train_env() {
     local quoted
     local names=(
         LIANGYY_ROOT PROJECT_ROOT DATASET_ROOT CONDA_ROOT CONDA_ENV PYTHON_BIN SCRIPT_PATH
-        WAYMO_DGGT_ROOT WAYMO_DGGT_VAL_ROOT DGGT_CKPT TOKENIZER_CKPT FEATURE_STATS
+        WAYMO_DGGT_ROOT WAYMO_DGGT_VAL_ROOT HDMAP_ROOT VAL_HDMAP_ROOT
+        DGGT_CKPT TOKENIZER_CKPT FEATURE_STATS
         SCENE_GAUGE_PATH VAL_SCENE_GAUGE_PATH PULLBACK_CALIBRATION_PATH
         SCENE_CAPTION_ROOT SCENE_CAPTION_VAL_ROOT QWEN_TEXT_ENCODER
-        LOG_DIR LAUNCH_LOG_DIR RESUME_PATH RESUME_EXPECTED_STEP
+        LOG_DIR LAUNCH_LOG_DIR
         BATCH_SIZE_PER_GPU GRAD_ACCUM_STEPS NUM_WORKERS PREFETCH_FACTOR
-        TEXT_UNCOND_DROP_PROB JOINT_GENERATION_PROB CAMERA_CONTROLLED_PROB
-        ASSET_CAMERA_CONTROLLED_PROB GUIDANCE_SCALE ASSET_CONTROL_GUIDANCE_SCALE
-        CAMERA_GUIDANCE_SCALE VAL_GUIDANCE_SCALES
+        TEXT_UNCOND_DROP_PROB CFG_SCALE LAYOUT_GUIDANCE_SCALE
+        ASSET_CONTROL_GUIDANCE_SCALE VAL_GUIDANCE_SCALES LAYOUT_MAX_ACTORS
         MAX_STEPS DECAY_END_STEPS SAVE_EVERY
         VAL_EVERY VAL_BATCHES VAL_LOG_IMAGES VAL_SAMPLE_STEPS
         WANDB_PROJECT WANDB_NAME WANDB_RESUME SOCKET_IFNAME NETWORK_MODE
@@ -194,10 +183,6 @@ remote_train_env() {
         printf -v quoted '%q' "${!name}"
         printf '%s=%s ' "${name}" "${quoted}"
     done
-    if [[ -n "${WANDB_RUN_ID:-}" ]]; then
-        printf -v quoted '%q' "${WANDB_RUN_ID}"
-        printf 'WANDB_RUN_ID=%s ' "${quoted}"
-    fi
 }
 
 run_remote_script() {
@@ -504,6 +489,8 @@ check_required_paths() {
 
     check_dir "WAYMO_DGGT_ROOT" "${WAYMO_DGGT_ROOT}"
     check_dir "WAYMO_DGGT_VAL_ROOT" "${WAYMO_DGGT_VAL_ROOT}"
+    check_dir "HDMAP_ROOT" "${HDMAP_ROOT}"
+    check_dir "VAL_HDMAP_ROOT" "${VAL_HDMAP_ROOT}"
     check_file "DGGT_CKPT" "${DGGT_CKPT}"
     check_file "TOKENIZER_CKPT" "${TOKENIZER_CKPT}"
     check_file "FEATURE_STATS" "${FEATURE_STATS}"
@@ -513,10 +500,6 @@ check_required_paths() {
     check_dir "SCENE_CAPTION_ROOT" "${SCENE_CAPTION_ROOT}"
     check_dir "SCENE_CAPTION_VAL_ROOT" "${SCENE_CAPTION_VAL_ROOT}"
     check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
-    if [[ -n "${RESUME_PATH}" ]]; then
-        check_file "RESUME_PATH" "${RESUME_PATH}"
-    fi
-
     echo "[OK] RUNTIME_SOCKET_IFNAME: ${RUNTIME_SOCKET_IFNAME:-未设置}"
     echo "[OK] RUNTIME_NETWORK_MODE: ${RUNTIME_NETWORK_MODE:-未设置}"
     echo "[OK] NCCL_IB_DISABLE: ${NCCL_IB_DISABLE:-未设置}"
@@ -584,6 +567,8 @@ build_train_args() {
         train_scene_flow_pretrain.py
         --image_dir "${WAYMO_DGGT_ROOT}"
         --val_image_dir "${WAYMO_DGGT_VAL_ROOT}"
+        --hdmap_root "${HDMAP_ROOT}"
+        --val_hdmap_root "${VAL_HDMAP_ROOT}"
         --dggt_ckpt_path "${DGGT_CKPT}"
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
@@ -599,7 +584,6 @@ build_train_args() {
         --sequence_length 10
         --val_sliding_window 10
         --val_sliding_stride 7
-        --camera_anchor_context_dropout 0.25
         --patch_grid_h 25
         --patch_grid_w 37
         --latent_dim 1024
@@ -625,22 +609,14 @@ build_train_args() {
         --lambda_repa 0.5
         --base_model_coeff 0.25
         --lambda_boundary 0.25
-        --lambda_camera_flow 0.1
-        --lambda_camera_pose 0.25
-        --camera_pose_start_step 0
-        --camera_pose_warmup_steps 10000
-        --camera_absolute_translation_scale_m 10.0
-        --camera_relative_translation_scale_m 1.0
-        --camera_acceleration_translation_scale_m 1.0
         --lambda_sky_flow 0.1
-        --actor_geometry_alignment_version camera_pullback_8corner_v1
+        --lambda_rgb_render 0.005
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
-        --joint_generation_prob "${JOINT_GENERATION_PROB}"
-        --camera_controlled_prob "${CAMERA_CONTROLLED_PROB}"
-        --asset_camera_controlled_prob "${ASSET_CAMERA_CONTROLLED_PROB}"
-        --guidance_scale "${GUIDANCE_SCALE}"
+        --cfg "${CFG_SCALE}"
+        --layout_guidance_scale "${LAYOUT_GUIDANCE_SCALE}"
         --asset_control_guidance_scale "${ASSET_CONTROL_GUIDANCE_SCALE}"
-        --camera_guidance_scale "${CAMERA_GUIDANCE_SCALE}"
+        --layout_max_actors "${LAYOUT_MAX_ACTORS}"
+        --static_far_plane_m "${STATIC_FAR_PLANE_M}"
         --val_guidance_scales "${VAL_GUIDANCE_SCALES}"
         --val_scene_start 0
         --val_scene_end 100
@@ -657,18 +633,6 @@ build_train_args() {
         --wandb_name "${WANDB_NAME}"
         --wandb_resume "${WANDB_RESUME}"
     )
-    if [[ -n "${WANDB_RUN_ID}" ]]; then
-        TRAIN_ARGS+=(--wandb_run_id "${WANDB_RUN_ID}")
-    fi
-    if [[ -n "${RESUME_PATH}" ]]; then
-        TRAIN_ARGS+=(--resume_path "${RESUME_PATH}")
-        if (( RESUME_EXPECTED_STEP >= 0 )); then
-            TRAIN_ARGS+=(--resume_expected_step "${RESUME_EXPECTED_STEP}")
-        fi
-    elif (( RESUME_EXPECTED_STEP >= 0 )); then
-        echo "[错误] RESUME_EXPECTED_STEP=${RESUME_EXPECTED_STEP} 但未设置 RESUME_PATH。" >&2
-        exit 1
-    fi
 }
 
 # ============================================================
@@ -702,7 +666,7 @@ launch_node() {
     echo "[${node_name}] steps: max=${MAX_STEPS}, decay_end=${DECAY_END_STEPS}, save_every=${SAVE_EVERY}"
     echo "[${node_name}] validation: every=${VAL_EVERY}, batches=${VAL_BATCHES}, log_images=${VAL_LOG_IMAGES}, sample_steps=${VAL_SAMPLE_STEPS}, cfg=${VAL_GUIDANCE_SCALES}"
     echo "[${node_name}] output: ${LOG_DIR}"
-    echo "[${node_name}] wandb: ${WANDB_PROJECT}/${WANDB_NAME} (resume=${WANDB_RESUME}, id=${WANDB_RUN_ID:-<none>})"
+    echo "[${node_name}] wandb: ${WANDB_PROJECT}/${WANDB_NAME} (resume=${WANDB_RESUME})"
 
     nohup "${PYTHON_BIN}" -m torch.distributed.run \
         --nnodes="${NNODES}" \

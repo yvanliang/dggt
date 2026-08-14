@@ -485,9 +485,9 @@ sky_mask_refine_boundary_loss_weight = 0.25
 
 `pos_weight` 按当前 batch 的 sky/non-sky 比例动态计算并 clamp，避免天空正类比例低时被 BCE 淹没。Dice 约束区域重叠，boundary BCE 专门提高地平线、树冠、电线杆等边界附近的监督强度。
 
-sky mask head 首先在和 video clean prediction 相同的随机 `sigma` denoising forward 上接受辅助监督。为了让最终渲染所用的 mask 与生成完成后的 clean scene 对齐，训练从 `sky_mask_endpoint_start_step` 开始，按 `sky_mask_endpoint_every` 周期把当前预测的 clean video、camera、sky 和 gauge state `detach` 后再做一次 `sigma=0` mask-only endpoint forward，并对 endpoint mask 施加同一份 GT mask 监督。RGB render 若在非 endpoint-supervision step 激活，也会按依赖关系执行这个 clean endpoint，但不会额外改变 `sky_mask_endpoint_every` 所定义的 BCE/Dice endpoint 监督频率。
+sky mask 的 patch head 与 refined head 都在和 video clean prediction 相同的随机 `sigma` denoising forward 上接受辅助监督。它们与生成器的 clean-state prediction 共用主干，但保持两个独立输出头：patch head 预测面积池化后的概率，refined head 提供 RGB render 使用的稠密边界。训练只运行这一次主 SceneFlow forward；RGB render 直接读取该 forward 的 refined 概率，高噪声行继续由 $(1-\sigma)^2$ 连续降权，不再有额外的 `sigma=0` 辅助 forward 或 endpoint 监督。
 
-采样时完成全部 ODE 更新后，对最终 clean video/camera/sky/gauge state 做一次 `sigma=0` mask-only endpoint forward；普通采样和滑动窗采样都只从该 endpoint 读取 `sky_mask_logits` 和 `sky_mask_refined_logits`。启用 factored CFG 时，endpoint 复用与生成完全相同的 text/asset/camera 分支及 scale，再对组合后的 logits 做 sigmoid。不能从最后一个非零去噪步读取最终 mask：在默认 `shift=10` 下，最后一个非零 `sigma` 仍可能较大，并不代表最终 clean scene。RGB render 优先使用 refined mask；如果只有 patch mask，则回退到 patch mask 上采样。render 在 `_render_gs_map_rgb` 内把 sky mask hard-threshold 成 non-sky Gaussian 选择，这与 DGGT 用 GT sky mask 排除 sky Gaussian、再由 rasterizer transmittance 合成背景的定义一致；mask target 不应替换成 renderer alpha。
+采样时，x-prediction 的最后一次非零 $\sigma$ 模型调用已经给出最终 clean latent：Euler 最后一步的步长等于 $\sigma_{\mathrm{last}}$，因此更新后的 $z_0$ 恰好等于该次调用的 $\hat z_0$。请求 sky mask 时，采样器在 ODE 主循环的每个步骤都让现有分支返回两级 mask，但只保存最后一次调用的 `sky_mask_logits` 和 `sky_mask_refined_logits`，不再在 ODE 循环外执行 `sigma=0` mask-only pass。单窗直接使用最后一步已组合的 CFG mask；滑动窗则用与 latent 一致的 `cosine_window` 权重融合各窗最后一步的 mask。RGB render 优先使用 refined mask；如果只有 patch mask，则回退到 patch mask 上采样。render 在 `_render_gs_map_rgb` 内把 sky mask hard-threshold 成 non-sky Gaussian 选择，这与 DGGT 用 GT sky mask 排除 sky Gaussian、再由 rasterizer transmittance 合成背景的定义一致；mask target 不应替换成 renderer alpha。
 
 ## 12. DDT Head 与输出头
 

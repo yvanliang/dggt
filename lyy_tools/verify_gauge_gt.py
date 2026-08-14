@@ -73,10 +73,10 @@ from datasets.dataset import (  # noqa: E402
     load_and_preprocess_flow,
 )
 from dggt.models.vggt import VGGT  # noqa: E402
-from dggt.utils.camera_generation import camera_to_world_from_dggt_pose_enc  # noqa: E402
-from dggt.utils.factorized_asset_condition import (  # noqa: E402
-    resize_crop_intrinsics_to_model_canvas,
+from dggt.utils.actor_geometry_condition import (  # noqa: E402
+    raw_to_model_canvas_homography,
 )
+from dggt.utils.scene_gauge import dggt_pose_encoding_to_camera_to_world  # noqa: E402
 
 
 DEFAULT_IMAGE_DIR = "/data/lyy_dataset/waymo_processed_dggt/training"
@@ -988,7 +988,7 @@ def _predict_full_trunk(
                 images=images,
                 patch_start_idx=int(output["patch_start_idx"]),
             )
-    c2w = camera_to_world_from_dggt_pose_enc(pose_encoding)[0].detach().cpu().numpy()
+    c2w = dggt_pose_encoding_to_camera_to_world(pose_encoding)[0].detach().cpu().numpy()
     depth_array = depth[0].detach().float().cpu().numpy()
     if depth_array.ndim == 4 and depth_array.shape[-1] == 1:
         depth_array = depth_array[..., 0]
@@ -1184,13 +1184,12 @@ def evaluate_trunk(
         depth_result["missing_files"] = []
 
     K_raw = torch.as_tensor(camera_metadata["intrinsics"], dtype=torch.float32)
-    K_model, model_hw = resize_crop_intrinsics_to_model_canvas(
-        K_raw,
+    raw_to_model, model_hw_tuple = raw_to_model_canvas_homography(
         camera_metadata["raw_hw"],
         target_width=518,
         patch_size=14,
     )
-    model_hw_tuple = tuple(int(round(float(v))) for v in model_hw.reshape(-1).tolist())
+    K_model = raw_to_model.to(dtype=K_raw.dtype) @ K_raw
     if model_hw_tuple != image_hw:
         raise RuntimeError(
             f"Waymo/model canvas mismatch: intrinsics helper gives {model_hw_tuple}, depth is {image_hw}"
@@ -1694,7 +1693,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             pretrain_max_objects=0,
             pretrain_instance_cache_size=2,
             trunk_frames=TRUNK_FRAMES,
-            camera_anchor_window_probability=1.0,
             return_full_dggt_context=True,
             load_dynamic_masks=False,
             binary_mask_channels=1,

@@ -1,129 +1,16 @@
-"""SceneFlow validation inference — run the trained editor on the offline
-validation flow-cache and dump the same visualization set the training code
-produces.
+"""Run the layout-free formal SceneFlow editor on an offline validation cache.
 
-This script combines two documented formal-editing pipelines:
-
-* The **formal-training data path** of ``train_scene_flow.py`` (see
-  ``docs/scene_flow_cmd.md`` §3): read the current schema-v10 flow cache through
-  ``WaymoFlowCacheDataset`` and drive ``FlowFeatureAssembler`` per clip to
-  build the exact ``FlowFeatureBundle`` the trainer consumes. Its training-time
-  visualization op (``train_scene_flow.py:_dump_vis`` ->
-  ``dggt.utils.flow_viz.dump_flow_features``) is reproduced verbatim.
-
-* The **validation flow cache** of ``tools/precompute_flow_features_validation.py``
-  (see ``docs/flow_cache_validation_cmd.md``): Mode-A schema-v10 chunked-zstd
-  SQLite ``.pt`` files,
-  canonical layout
-  ``{cache_root}/validation/{entry_index:06d}_{edit_name}.pt``,
-  consumed unchanged via the validation manifest.
-
-On top of the bundle it runs the trained ``WanSceneFlow`` with classifier-free
-guidance (mirroring ``train_scene_flow.py:cfg_sample_edit_latents``: factored
-text CFG plus asset/control CFG, with non-edit tokens pinned to ``z_splat`` at
-every ODE step), then decodes the edited latent and renders 3DGS with
-``train_scene_flow.py:render_validation_rgb_gt_sky`` so formal offline
-validation matches training-time T1 validation: generated outputs preserve
-the original input RGB exactly inside the GT sky mask.
-
-================================ COMMANDS ================================
-
-Environment (see docs/scene_flow_cmd.md §0 and docs/flow_cache_validation_cmd.md):
-
-    conda activate dggt
-    export DGGT_CKPT=/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt
-    export TOKENIZER_CKPT=/home/dancer/code/dm/dggt/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt
-    export FEATURE_STATS=logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt
-    export VAL_MANIFEST=/data/disk2/lyy_dataset/waymo_processed_dggt/waymo_edit_cache/manifests/validation/validation_manifest.jsonl
-    export VAL_SCENE_GAUGE_SHA256=<sha256-of-production-validation-gauge-table>
-    export SCENE_CAPTION_VAL_ROOT=/data/disk2/lyy_dataset/waymo_processed_dggt/validation_captions
-
-Sliding window: the validation clips are 29 frames but WanSceneFlow is trained
-on 10-frame windows in both stages. Requests longer than 10 frames are
-automatically tiled into at most 10-frame windows with ``--window_stride``;
-``--window <= 0`` selects this automatic policy and values above 10 are capped.
-Every full window has exactly the resolved effective-window number of frames
-(the last start is clamped so the clip tail is
-covered). Sampling keeps one full-clip latent state; at each denoising step the
-model is run on window slices, window velocities are blended in overlap regions,
-and the full latent is updated once. Per-window bundles are still dumped for
-diagnostics. The final 3DGS render uses the full-clip latent but exports at most
-``--val_log_images`` frames (default 10; pass 29 to export a full Waymo clip).
-
-A) Validation manifest, formal-training (T1) checkpoint, all entries:
-
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
-        --ckpt_path $DGGT_CKPT \
-        --tokenizer_ckpt_path $TOKENIZER_CKPT \
-        --scene_flow_ckpt_path logs/scene_flow_t1_v2/ckpt/flow_step040000.pt \
-        --feature_stats_path $FEATURE_STATS \
-        --manifest_path $VAL_MANIFEST \
-        --split validation \
-        --cache_scene_gauge_sha256 $VAL_SCENE_GAUGE_SHA256 \
-        --output_dir runs/scene_flow_val_t1 \
-        --window 0 --window_stride 7 \
-        --sample_steps 50 --shift 10.0 \
-        --guidance_scales 1.0,2.0,4.0 \
-        --asset_control_guidance_scale 1.0 \
-        --val_log_images 10 \
-        --seed 0 --precision bf16
-
-Single-entry smoke (entry 0 -> manifest index 0, combined variant):
-
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python -u inference_scene_flow.py \
-        --ckpt_path $DGGT_CKPT --tokenizer_ckpt_path $TOKENIZER_CKPT \
-        --scene_flow_ckpt_path logs/scene_flow_t1_v2/ckpt/flow_step040000_ema_weights_only.pt \
-        --feature_stats_path $FEATURE_STATS \
-        --manifest_path $VAL_MANIFEST --split validation \
-        --cache_scene_gauge_sha256 $VAL_SCENE_GAUGE_SHA256 \
-        --output_dir /tmp/scene_flow_val_smoke \
-        --index 0 --sample_steps 15 --guidance_scales 2.0 \
-        --window 0 --no_render_rgb --splat_pca
-
-Notes:
-  * ``--scene_flow_ckpt_path`` accepts only a formal-training full / raw-only /
-    EMA-only checkpoint carrying ``formal_flow_domain_version`` and the trained
-    ``scaffold_packer``. Pretrain checkpoints use
-    ``inference_scene_flow_pretrain.py``.
-  * EMA weights are used BY DEFAULT (pass ``--no_ema`` to use raw weights).
-    Raw mid-training weights generally produce worse samples; prefer a formal
-    ``flow_step{N}_ema_weights_only.pt`` export or the EMA in a formal full
-    checkpoint.
-  * The flow schedule is loaded from the SceneFlow checkpoint. ``--shift`` is
-    only an optional assertion; a conflicting value is rejected.
-  * ``--prediction_type`` defaults to ``x`` to match RAEv2-style SceneFlow
-    training. Checkpoints that record a different prediction type are rejected
-    before weights are loaded; pass ``--prediction_type v`` only for explicit
-    velocity-prediction checkpoints.
-  * ``--feature_stats_path`` defaults to the tokenizer-v2 v5 production stats.
-    It is an exact consistency check against the checkpoint buffers and cannot
-    override or change the checkpoint coordinate system.
-  * Memory: the default single 29-frame render does one VGGT-L pass on the
-    full clip (~25GB free, same as the validation-cache precompute). Use
-    ``--render_per_window`` (per-window 10-frame geometry passes that slice the
-    same cached full-context DGGT pose trajectory) or ``--no_render_rgb`` if tight.
-
-Output (per entry, under ``{output_dir}/{tag}/``):
-
-    windows/win{a:03d}_{b:03d}/flow_features/...   # per-window, == _dump_vis
-    target_latent_pca.jpg                   # stitched 29-frame clean latent PCA
-    M_preserve.jpg / M_source.jpg / M_dest.jpg     # stitched
-    generated_raw_latent_pca__cfg{S}.jpg    # stitched edited latent PCA
-    abs_error__cfg{S}.jpg                   # stitched |z_edited - z_clean|
-    dggt_clean_3dgs_rgb.jpg                 # DGGT recon of input (sky bg)
-    tokenizer_recon_3dgs_rgb.jpg            # tokenizer round-trip of input
-    input_rgb_gt.jpg                        # cached input frames
-    generated_raw_3dgs_rgb__cfg{S}.jpg      # EDITED render per guidance scale
-    generated_pred_sky_mask__cfg{S}.jpg     # DGGT semantic-head diagnostic only; render uses GT sky
-    summary.json
+The editor is a separate from-scratch ``layout_condition_version='none'``
+model. Requested Waymo camera parameters are conditioning only. Text CFG keeps
+camera and edit controls fixed in both branches. The DGGT semantic head is used
+only for a sky-mask diagnostic; production RGB rendering composites GT sky.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -140,8 +27,6 @@ from dggt.models.flow_feature_assembler import FlowFeatureAssembler
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.utils.feature_stats import (
     DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
-    checkpoint_sha256,
-    load_all_stats_into_buffers,
 )
 from dggt.utils.flow_cache_io import (
     is_chunked_flow_cache,
@@ -149,9 +34,8 @@ from dggt.utils.flow_cache_io import (
     load_chunked_flow_cache_subset,
     load_flow_cache,
 )
-from dggt.utils.flow_viz import dump_flow_features, save_image_grid
+from dggt.utils.flow_viz import save_image_grid
 from dggt.utils.flow_schedule import resolve_inference_flow_schedule
-from dggt.utils.scene_gauge import load_pullback_calibration
 from dggt.utils.sliding_window import (
     OFFLINE_MAX_SINGLE_WINDOW,
     cosine_window,
@@ -162,24 +46,20 @@ from dggt.utils.sliding_window import (
 # Reuse the formal-training (train_scene_flow.py) cache->bundle helpers verbatim
 # so the bundle is byte-for-byte what the trainer feeds the model.
 from train_scene_flow import (
-    DEFAULT_FORMAL_PULLBACK_CALIBRATION,
     FORMAL_FLOW_DOMAIN_VERSION,
+    FORMAL_LAYOUT_DISABLED_CONFIG,
+    FORMAL_LAYOUT_CONDITION_VERSION,
     FORMAL_TOKENIZER_WINDOW_LEN,
     FORMAL_SCENE_FPS,
-    SCENE_FLOW_CONFIG_COMPAT_FIELDS as TRAIN_SCENE_FLOW_CONFIG_COMPAT_FIELDS,
-    _asset_condition_kind_for_model,
     _bundle_frame_ids,
     _infer_cache_patch_grid,
-    _slice_asset_time,
     _slice_time,
     build_formal_edit_domains,
-    validate_formal_feature_stats_artifact,
-    validate_metric_gauge_checkpoint_payload,
     build_flow_bundle as build_train_flow_bundle,
     cached_render_pose_from_item,
     encode_text_condition,
     freeze_module,
-    normalize_asset_latents,
+    load_formal_latent_stats,
     render_validation_rgb_gt_sky,
     sampler_prediction_to_velocity,
     scene_flow_t_eps,
@@ -189,8 +69,6 @@ from train_scene_flow import (
 
 # Reuse pretrain latent-grid helpers; RGB rendering uses formal T1 GT-sky helper.
 from train_scene_flow_pretrain import (
-    DEFAULT_SKY_GRID,
-    SKY_TOKEN_DIM,
     _image_grid,
     _latent_pca_grid,
     _mask_grid,
@@ -203,49 +81,6 @@ from train_scene_flow_pretrain import (
 # ---------------------------------------------------------------------- #
 # CLI                                                                     #
 # ---------------------------------------------------------------------- #
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-
-
-def resolve_inference_cache_scene_gauge_sha256(
-    *,
-    split: str,
-    checkpoint_scene_gauge_sha256: str,
-    explicit_cache_scene_gauge_sha256: str | None,
-) -> str:
-    """Resolve a trusted cache-table hash without trusting cache metadata.
-
-    The SceneFlow checkpoint is authoritative only for its training table.
-    Validation (or any other independent split) must provide its own expected
-    production-table digest; the cache loader then compares every cache against
-    that caller-trusted value.
-    """
-
-    checkpoint_sha = str(checkpoint_scene_gauge_sha256).lower()
-    if _SHA256_RE.fullmatch(checkpoint_sha) is None:
-        raise ValueError("checkpoint scene-gauge SHA-256 must be 64 lowercase hex characters")
-    explicit_sha = None
-    if explicit_cache_scene_gauge_sha256 is not None:
-        explicit_sha = str(explicit_cache_scene_gauge_sha256).lower()
-        if _SHA256_RE.fullmatch(explicit_sha) is None:
-            raise ValueError("--cache_scene_gauge_sha256 must be 64 hexadecimal characters")
-
-    normalized_split = str(split).strip().lower()
-    if normalized_split in ("training", "train"):
-        if explicit_sha is not None and explicit_sha != checkpoint_sha:
-            raise ValueError(
-                "Training cache gauge SHA-256 is fixed by the SceneFlow checkpoint; "
-                f"explicit={explicit_sha}, checkpoint={checkpoint_sha}."
-            )
-        return checkpoint_sha
-    if explicit_sha is None:
-        raise ValueError(
-            f"Formal {normalized_split or '<empty>'} cache inference requires "
-            "--cache_scene_gauge_sha256 from its independent production gauge table. "
-            "The checkpoint training-table SHA must not be reused implicitly."
-        )
-    return explicit_sha
-
-
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
@@ -269,42 +104,15 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Formal T1 WanSceneFlow checkpoint with trained scaffold_packer.")
     p.add_argument("--feature_stats_path", type=str, default=str(DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH),
                    help=(
-                       "Tokenizer-v2 v5 latent+camera stats contract. It must exactly match the buffers "
+                       "Tokenizer latent statistics. They must exactly match the buffers "
                        "stored inside --scene_flow_ckpt_path; the checkpoint remains authoritative."
                    ))
-    p.add_argument(
-        "--pullback_calibration_path",
-        type=str,
-        default=DEFAULT_FORMAL_PULLBACK_CALIBRATION,
-        help=(
-            "Strict checkpoint-bound tokenizer pullback artifact used by every "
-            "formal render/decode boundary."
-        ),
-    )
     p.add_argument("--no_ema", action="store_true",
                    help="Use raw weights. By DEFAULT the EMA shadow weights are "
                         "used when the checkpoint carries them (mandatory for "
                         "meaningful diffusion samples; see docs §1.5 / 6e2c039f). "
                         "weights_only checkpoints have no EMA -> raw is used "
                         "with a warning.")
-    p.add_argument("--bring_up", action="store_true",
-                   help="Build the small bring-up WanSceneFlow config instead of T1.")
-    p.add_argument("--latent_dim", type=int, default=1024,
-                   help="Tokenizer latent channels (WanSceneFlow out_channels; "
-                        "in_channels = 3*latent_dim + 3). Must match training.")
-    p.add_argument("--sky_grid_h", type=int, default=DEFAULT_SKY_GRID[0])
-    p.add_argument("--sky_grid_w", type=int, default=DEFAULT_SKY_GRID[1])
-    p.add_argument(
-        "--prediction_type",
-        type=str,
-        choices=("v", "x"),
-        default="x",
-        help=(
-            "SceneFlow output parameterization. Default 'x' matches RAEv2-style training; "
-            "use 'v' only for explicit velocity-prediction checkpoints."
-        ),
-    )
-    p.add_argument("--asset_position_mode", choices=("localized", "canonical"), default="localized")
     p.add_argument("--text_encoder_path", type=str, default="/home/dancer/model/Qwen/Qwen3-0.6B",
                    help="Qwen text encoder path used by RAE-style SceneFlow training.")
     p.add_argument("--text_max_length", type=int, default=256)
@@ -322,16 +130,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--mode_filter", type=str, default=None,
                    help="Restrict manifest to comma-sep modes (validation is mode_a).")
     p.add_argument("--split", type=str, default="validation")
-    p.add_argument(
-        "--cache_scene_gauge_sha256",
-        type=str,
-        default=None,
-        help=(
-            "Trusted production scene-gauge table SHA-256 for the selected cache split. "
-            "Required for validation/other independent splits; training is bound to the "
-            "SceneFlow checkpoint's training-table SHA."
-        ),
-    )
     p.add_argument("--output_dir", type=str, required=True,
                    help="Root directory for per-entry validation inference outputs.")
 
@@ -366,13 +164,6 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Patch-grid dilation radius for the binary flow domain.")
     p.add_argument("--guidance_scales", type=str, default="1.0,2.0",
                    help="Comma-sep text CFG scales; one edited render per scale.")
-    p.add_argument("--asset_control_guidance_scale", type=float, default=1.0,
-                   help="Factored CFG scale for asset + edit-control conditions.")
-    p.add_argument("--cond_norm", type=str, default="zsplat",
-                   choices=("zsplat", "all", "none"),
-                   help="Deprecated no-op; inference now matches training: z_splat is normalized and scaffold_tok is raw.")
-    p.add_argument("--no_preserve_blend", action="store_true",
-                   help="Deprecated compatibility flag; non-edit tokens are pinned to z_splat each ODE step.")
 
     # Visualization (consumed by reused pretrain render helpers)
     p.add_argument(
@@ -384,10 +175,6 @@ def build_argparser() -> argparse.ArgumentParser:
             "(for example 29) to export all frames."
         ),
     )
-    p.add_argument("--splat_pca", action="store_true",
-                   help="Also dump splat_pca grids in flow_features/.")
-    p.add_argument("--no_flow_tensors", action="store_true",
-                   help="Skip flow_features.pt (keep only the JPG grids).")
     p.add_argument("--no_render_rgb", action="store_true",
                    help="Skip the (heavy) 3DGS RGB renders; latent/mask viz only.")
     p.add_argument("--render_per_window", action="store_true",
@@ -406,15 +193,9 @@ def build_argparser() -> argparse.ArgumentParser:
 def build_bundle(
     item: dict[str, Any],
     assembler: FlowFeatureAssembler,
-    scene_flow: nn.Module,
     device: torch.device,
 ):
-    bundle = build_train_flow_bundle(
-        item,
-        assembler,
-        device,
-        scene_flow=scene_flow,
-    )
+    bundle = build_train_flow_bundle(item, assembler, device)
     return bundle, item["sample"]
 
 
@@ -465,26 +246,12 @@ def _cfg_sample_edit_latents_sliding(
     z.normal_(generator=generator)
     z = project_masked_flow_state(z, z_splat_n, M_edit)
 
-    F_asset = normalize_asset_latents(sf, bundle.F_asset_tokens)
-    if F_asset.ndim in (4, 5):
-        F_uncond = torch.zeros_like(F_asset)
-        uncond_asset_mask = torch.zeros(F_asset.shape[:-1], device=F_asset.device, dtype=torch.bool)
-    else:
-        F_uncond = F_asset.new_zeros((batch_size, 0, F_asset.shape[-1]))
-        uncond_asset_mask = None
-    encoder_attention_mask = getattr(bundle, "encoder_attention_mask", None)
     text_tokens, text_mask = encode_text_condition(text_encoder, getattr(bundle, "captions", None))
     text_null, text_null_mask = encode_text_condition(
         text_encoder,
         [""] * batch_size if text_tokens is not None else None,
     )
-    asset_kinds = _asset_condition_kind_for_model(bundle, batch_size)
-    asset_control_scale = float(getattr(args, "asset_control_guidance_scale", 1.0))
-    do_cfg = (
-        abs(float(guidance_scale) - 1.0) > 1e-6
-        or abs(asset_control_scale - 1.0) > 1e-6
-    )
-    drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
+    do_cfg = abs(float(guidance_scale) - 1.0) > 1e-6
     camera_condition_tokens = getattr(bundle, "camera_condition_tokens", None)
     camera_attention_mask = getattr(bundle, "camera_attention_mask", None)
 
@@ -506,65 +273,39 @@ def _cfg_sample_edit_latents_sliding(
             frame_ids_w = frame_ids[:, start:end]
             camera_tokens_w = _slice_time(camera_condition_tokens, start, end, seq_len)
             camera_mask_w = _slice_time(camera_attention_mask, start, end, seq_len)
-            F_asset_w = _slice_asset_time(F_asset, start, end, seq_len)
-            asset_mask_w = _slice_asset_time(encoder_attention_mask, start, end, seq_len)
-            F_uncond_w = _slice_asset_time(F_uncond, start, end, seq_len)
-            uncond_mask_w = _slice_asset_time(uncond_asset_mask, start, end, seq_len)
             scaffold_w = bundle.scaffold_tok[:, start:end]
 
-            v_full = sf(
+            out_full = sf(
                 z_w, sigma, z_splat_w, scaffold_w,
-                M_preserve_w, M_source_w, M_dest_w, F_asset_w,
-                encoder_attention_mask=asset_mask_w,
+                M_preserve_w, M_source_w, M_dest_w,
                 text_tokens=text_tokens,
                 text_attention_mask=text_mask,
                 camera_condition_tokens=camera_tokens_w,
                 camera_attention_mask=camera_mask_w,
-                asset_condition_kind=asset_kinds,
                 return_mid=False,
+                return_dict=True,
                 frame_ids=frame_ids_w,
                 fps=FORMAL_SCENE_FPS,
                 flow_edit_mask=M_edit_w,
             )
+            pred = out_full["video"]
             if do_cfg:
-                v_text = sf(
+                out_null = sf(
                     z_w, sigma, z_splat_w, scaffold_w,
-                    M_preserve_w, M_source_w, M_dest_w, F_uncond_w,
-                    encoder_attention_mask=uncond_mask_w,
-                    text_tokens=text_tokens,
-                    text_attention_mask=text_mask,
-                    camera_condition_tokens=camera_tokens_w,
-                    camera_attention_mask=camera_mask_w,
-                    asset_condition_kind=["asset_uncond"] * batch_size,
-                    return_mid=False,
-                    control_drop_mask=drop_all_control,
-                    frame_ids=frame_ids_w,
-                    fps=FORMAL_SCENE_FPS,
-                    flow_edit_mask=M_edit_w,
-                )
-                v_uncond = sf(
-                    z_w, sigma, z_splat_w, scaffold_w,
-                    M_preserve_w, M_source_w, M_dest_w, F_uncond_w,
-                    encoder_attention_mask=uncond_mask_w,
+                    M_preserve_w, M_source_w, M_dest_w,
                     text_tokens=text_null,
                     text_attention_mask=text_null_mask,
                     camera_condition_tokens=camera_tokens_w,
                     camera_attention_mask=camera_mask_w,
-                    asset_condition_kind=["asset_uncond"] * batch_size,
                     return_mid=False,
-                    control_drop_mask=drop_all_control,
+                    return_dict=True,
                     frame_ids=frame_ids_w,
                     fps=FORMAL_SCENE_FPS,
                     flow_edit_mask=M_edit_w,
                 )
-                v_pred = (
-                    v_uncond
-                    + float(guidance_scale) * (v_text - v_uncond)
-                    + asset_control_scale * (v_full - v_text)
-                )
-            else:
-                v_pred = v_full
-            v = sampler_prediction_to_velocity(sf, v_pred, z_w, sigma)
+                pred_null = out_null["video"]
+                pred = pred_null + float(guidance_scale) * (pred - pred_null)
+            v = sampler_prediction_to_velocity(sf, pred, z_w, sigma)
             v_acc[:, start:end] += v * w
             v_weight[:, start:end] += w
 
@@ -633,83 +374,47 @@ def cfg_sample_edit_latents(
     z = project_masked_flow_state(z, z_splat_n, M_edit)
     frame_ids = _bundle_frame_ids(bundle, batch_size=int(batch_size), seq_len=int(z.shape[1]), device=device)
 
-    F_asset = normalize_asset_latents(sf, bundle.F_asset_tokens)
-    if F_asset.ndim in (4, 5):
-        F_uncond = torch.zeros_like(F_asset)
-        uncond_asset_mask = torch.zeros(F_asset.shape[:-1], device=F_asset.device, dtype=torch.bool)
-    else:
-        F_uncond = F_asset.new_zeros((batch_size, 0, F_asset.shape[-1]))
-        uncond_asset_mask = None
-    encoder_attention_mask = getattr(bundle, "encoder_attention_mask", None)
     text_tokens, text_mask = encode_text_condition(text_encoder, getattr(bundle, "captions", None))
     text_null, text_null_mask = encode_text_condition(
         text_encoder,
         [""] * batch_size if text_tokens is not None else None,
     )
-    asset_kinds = _asset_condition_kind_for_model(bundle, batch_size)
-    asset_control_scale = float(getattr(args, "asset_control_guidance_scale", 1.0))
-    do_cfg = (
-        abs(float(guidance_scale) - 1.0) > 1e-6
-        or abs(asset_control_scale - 1.0) > 1e-6
-    )
-    drop_all_control = torch.ones((batch_size,), device=device, dtype=torch.bool)
+    do_cfg = abs(float(guidance_scale) - 1.0) > 1e-6
 
     for i in range(int(args.sample_steps)):
         step_h = t_steps[i] - t_steps[i + 1]
         sigma = torch.full((batch_size,), float(t_steps[i].item()), device=device)
-        v_full = sf(
+        out_full = sf(
             z, sigma, z_splat_n, bundle.scaffold_tok,
-            M_preserve, M_source, M_dest, F_asset,
-            encoder_attention_mask=encoder_attention_mask,
+            M_preserve, M_source, M_dest,
             text_tokens=text_tokens,
             text_attention_mask=text_mask,
             camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
             camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
-            asset_condition_kind=asset_kinds,
             return_mid=False,
+            return_dict=True,
             frame_ids=frame_ids,
             fps=FORMAL_SCENE_FPS,
             flow_edit_mask=M_edit,
         )
+        pred = out_full["video"]
         if do_cfg:
-            v_text = sf(
+            out_null = sf(
                 z, sigma, z_splat_n, bundle.scaffold_tok,
-                M_preserve, M_source, M_dest, F_uncond,
-                encoder_attention_mask=uncond_asset_mask,
-                text_tokens=text_tokens,
-                text_attention_mask=text_mask,
-                camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
-                camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
-                asset_condition_kind=["asset_uncond"] * batch_size,
-                return_mid=False,
-                control_drop_mask=drop_all_control,
-                frame_ids=frame_ids,
-                fps=FORMAL_SCENE_FPS,
-                flow_edit_mask=M_edit,
-            )
-            v_uncond = sf(
-                z, sigma, z_splat_n, bundle.scaffold_tok,
-                M_preserve, M_source, M_dest, F_uncond,
-                encoder_attention_mask=uncond_asset_mask,
+                M_preserve, M_source, M_dest,
                 text_tokens=text_null,
                 text_attention_mask=text_null_mask,
                 camera_condition_tokens=getattr(bundle, "camera_condition_tokens", None),
                 camera_attention_mask=getattr(bundle, "camera_attention_mask", None),
-                asset_condition_kind=["asset_uncond"] * batch_size,
                 return_mid=False,
-                control_drop_mask=drop_all_control,
+                return_dict=True,
                 frame_ids=frame_ids,
                 fps=FORMAL_SCENE_FPS,
                 flow_edit_mask=M_edit,
             )
-            v = (
-                v_uncond
-                + float(guidance_scale) * (v_text - v_uncond)
-                + asset_control_scale * (v_full - v_text)
-            )
-        else:
-            v = v_full
-        v = sampler_prediction_to_velocity(sf, v, z, sigma)
+            pred_null = out_null["video"]
+            pred = pred_null + float(guidance_scale) * (pred - pred_null)
+        v = sampler_prediction_to_velocity(sf, pred, z, sigma)
         z = masked_flow_euler_step(z, v, step_h, z_splat_n, M_edit)
 
     return project_masked_flow_state(z, z_splat_n, M_edit)
@@ -784,55 +489,9 @@ def save_gt_rgb_grid_from_sample(
 # ---------------------------------------------------------------------- #
 # Checkpoint loading                                                      #
 # ---------------------------------------------------------------------- #
-def _strip_module(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    return {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
-
-
-def _format_key_list(keys: Sequence[str], limit: int = 32) -> str:
-    shown = list(keys[:limit])
-    suffix = "" if len(keys) <= limit else f", ... (+{len(keys) - limit} more)"
-    return "[" + ", ".join(repr(k) for k in shown) + suffix + "]"
-
-
-def _raise_on_state_dict_mismatch(
-    *,
-    ckpt_path: str | Path,
-    module_name: str,
-    source: str,
-    missing: Sequence[str],
-    unexpected: Sequence[str],
-) -> None:
-    if not missing and not unexpected:
-        return
-    parts = [
-        f"{ckpt_path} is not compatible with {module_name} when loading {source}.",
-    ]
-    if missing:
-        parts.append(f"missing keys ({len(missing)}): {_format_key_list(missing)}")
-    if unexpected:
-        parts.append(f"unexpected keys ({len(unexpected)}): {_format_key_list(unexpected)}")
-    parts.append("Refusing to run offline inference with a partially loaded checkpoint.")
-    raise RuntimeError(" ".join(parts))
-
-
 def _scene_flow_prediction_type(scene_flow: nn.Module) -> str:
     cfg = getattr(unwrap_ddp(scene_flow), "config", None)
     return str(getattr(cfg, "prediction_type", "x"))
-
-
-def _checkpoint_prediction_type(payload: Any) -> str | None:
-    if not isinstance(payload, dict):
-        return None
-    cfg = payload.get("scene_flow_config")
-    if isinstance(cfg, dict) and "prediction_type" in cfg:
-        return str(cfg["prediction_type"])
-    args = payload.get("args")
-    if isinstance(args, dict) and "prediction_type" in args:
-        return str(args["prediction_type"])
-    return None
-
-
-SCENE_FLOW_CONFIG_COMPAT_FIELDS = TRAIN_SCENE_FLOW_CONFIG_COMPAT_FIELDS
 
 
 def build_scene_flow_from_checkpoint_config(
@@ -844,115 +503,53 @@ def build_scene_flow_from_checkpoint_config(
     payload = torch.load(ckpt_path, map_location="cpu")
     if not isinstance(payload, dict) or not isinstance(payload.get("scene_flow_config"), dict):
         raise ValueError(
-            f"{ckpt_path} has no scene_flow_config; formal offline inference requires a versioned checkpoint."
+            f"{ckpt_path} has no scene_flow_config; only current formal-editor checkpoints are accepted."
         )
     config = dict(payload["scene_flow_config"])
-    provenance, formal_contract = validate_metric_gauge_checkpoint_payload(
-        payload,
-        path=ckpt_path,
-        config=config,
-        require_formal_contract=True,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=patch_grid,
-    )
+    if config.get("layout_condition_version") != FORMAL_LAYOUT_CONDITION_VERSION:
+        raise ValueError(
+            f"{ckpt_path} layout_condition_version={config.get('layout_condition_version')!r}; "
+            "the formal editor is a separate layout-free model and will not ignore layout_v2."
+        )
+    for field, expected in FORMAL_LAYOUT_DISABLED_CONFIG.items():
+        if config.get(field) != expected:
+            raise ValueError(
+                f"{ckpt_path} {field}={config.get(field)!r}; "
+                f"layout-free formal checkpoints require {expected!r}"
+            )
     if tuple(config.get("patch_grid", ())) != tuple(patch_grid):
         raise ValueError(f"checkpoint patch_grid={config.get('patch_grid')} != cache patch_grid={patch_grid}")
-    model = WanSceneFlow(**config).to(device)
-    model._metric_gauge_provenance = provenance
-    model._formal_metric_gauge_contract = formal_contract
-    return model
-
-
-def _normalize_config_value(value: Any) -> Any:
-    if isinstance(value, list):
-        return tuple(_normalize_config_value(v) for v in value)
-    if isinstance(value, tuple):
-        return tuple(_normalize_config_value(v) for v in value)
-    return value
-
-
-def _config_values_match(current: Any, saved: Any) -> bool:
-    current = _normalize_config_value(current)
-    saved = _normalize_config_value(saved)
-    if isinstance(current, tuple) and isinstance(saved, tuple):
-        return len(current) == len(saved) and all(_config_values_match(c, s) for c, s in zip(current, saved))
-    if isinstance(current, float) or isinstance(saved, float):
-        try:
-            return abs(float(current) - float(saved)) <= 1e-6
-        except (TypeError, ValueError):
-            return False
-    return current == saved
+    for derived in (
+        "hidden_size",
+        "rope_layout_version",
+        "sky_rope_temporal_offset",
+        "camera_rope_spatial_mode",
+    ):
+        config.pop(derived, None)
+    return WanSceneFlow(**config).to(device)
 
 
 def _validate_scene_flow_checkpoint_config(scene_flow: nn.Module, payload: Any, path: str | Path) -> None:
-    _validate_scene_flow_prediction_type(scene_flow, payload, path)
     if not isinstance(payload, dict):
-        raise ValueError(f"{path} is not a versioned metric/gauge SceneFlow checkpoint")
+        raise ValueError(f"{path} is not a current formal-editor checkpoint")
     saved_cfg = payload.get("scene_flow_config")
     if not isinstance(saved_cfg, dict):
-        raise ValueError(f"{path} is missing scene_flow_config; old checkpoints are rejected")
-    provenance, formal_contract = validate_metric_gauge_checkpoint_payload(
-        payload,
-        path=path,
-        config=saved_cfg,
-        require_formal_contract=True,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=saved_cfg.get("patch_grid"),
-    )
-    current_provenance = getattr(unwrap_ddp(scene_flow), "_metric_gauge_provenance", None)
-    current_formal_contract = getattr(
-        unwrap_ddp(scene_flow), "_formal_metric_gauge_contract", None
-    )
-    if current_provenance is not None and dict(current_provenance) != provenance:
-        raise ValueError(
-            f"{path} metric_gauge_provenance does not match the active model contract"
-        )
-    if current_formal_contract is not None and dict(current_formal_contract) != formal_contract:
-        raise ValueError(
-            f"{path} formal_metric_gauge_contract does not match the active model contract"
-        )
-    if saved_cfg.get("sky_representation_version") != "rgb_patch_teacher_anchor_v3":
-        raise ValueError(f"{path} is not an rgb_patch_teacher_anchor_v3 sky checkpoint.")
-    if "rope_layout_version" not in saved_cfg and "mrope_temporal_margin" in saved_cfg:
-        raise ValueError(
-            f"{path} was saved with the legacy global mrope_temporal_margin RoPE layout. "
-            "The current SceneFlow model uses the fixed A3 layout "
-            "(video/asset/camera shared video time, camera center, spherical sky coordinates near 15000); "
-            "do not run inference across these incompatible position semantics."
-        )
+        raise ValueError(f"{path} is missing scene_flow_config")
+    if saved_cfg.get("layout_condition_version") != FORMAL_LAYOUT_CONDITION_VERSION:
+        raise ValueError(f"{path} is not a layout-free formal-editor checkpoint")
     current_cfg = getattr(unwrap_ddp(scene_flow), "config", None)
-    mismatches: list[str] = []
-    for field in SCENE_FLOW_CONFIG_COMPAT_FIELDS:
-        if field not in saved_cfg or not hasattr(current_cfg, field):
-            continue
+    for field in (
+        "layout_condition_version",
+        *FORMAL_LAYOUT_DISABLED_CONFIG,
+        "patch_grid",
+        "out_channels",
+        "prediction_type",
+    ):
         current_value = getattr(current_cfg, field)
         saved_value = saved_cfg[field]
-        if not _config_values_match(current_value, saved_value):
-            mismatches.append(f"{field}: checkpoint={saved_value!r}, current={current_value!r}")
-    if mismatches:
-        joined = "; ".join(mismatches)
-        raise ValueError(
-            f"{path} SceneFlow config does not match the current model: {joined}. "
-            "Do not run inference across incompatible RoPE/model geometry settings."
-        )
-
-
-def _validate_scene_flow_prediction_type(scene_flow: nn.Module, payload: Any, path: str | Path) -> None:
-    current = _scene_flow_prediction_type(scene_flow)
-    saved = _checkpoint_prediction_type(payload)
-    if saved is None:
-        if current == "v":
-            raise ValueError(
-                f"{path} does not record SceneFlow prediction_type. Refusing to load it into "
-                "a velocity-prediction model because legacy checkpoints were x-prediction by default. "
-                "Use --prediction_type x for that checkpoint or use a checkpoint saved with scene_flow_config."
-            )
-        return
-    if saved != current:
-        raise ValueError(
-            f"{path} prediction_type={saved!r} does not match current model prediction_type={current!r}. "
-            "Do not run inference across x-prediction and velocity-prediction checkpoints."
-        )
+        same = tuple(current_value) == tuple(saved_value) if field == "patch_grid" else current_value == saved_value
+        if not same:
+            raise ValueError(f"{path} config {field}={saved_value!r} != model {current_value!r}")
 
 
 def load_scene_flow_ckpt(
@@ -964,12 +561,14 @@ def load_scene_flow_ckpt(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     payload = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(payload, dict):
+        raise ValueError(f"{ckpt_path} must be a current formal-editor checkpoint dictionary")
     flow_schedule = resolve_inference_flow_schedule(payload, args, ckpt_path)
     saved_flow_domain = payload.get("formal_flow_domain_version") if isinstance(payload, dict) else None
     if saved_flow_domain != FORMAL_FLOW_DOMAIN_VERSION:
         raise ValueError(
             f"{ckpt_path} formal_flow_domain_version={saved_flow_domain!r}, expected "
-            f"{FORMAL_FLOW_DOMAIN_VERSION!r}. Refusing to combine a legacy soft-mask-flow "
+            f"{FORMAL_FLOW_DOMAIN_VERSION!r}. Refusing to combine an earlier soft-mask-flow "
             "checkpoint with the corrected binary-domain sampler."
         )
     _validate_scene_flow_checkpoint_config(scene_flow, payload, ckpt_path)
@@ -977,103 +576,49 @@ def load_scene_flow_ckpt(
         "ckpt_path": ckpt_path,
         "ema_used": False,
         "prediction_type": _scene_flow_prediction_type(scene_flow),
-        "checkpoint_prediction_type": _checkpoint_prediction_type(payload),
+        "checkpoint_prediction_type": payload["scene_flow_config"]["prediction_type"],
         "flow_schedule_config": flow_schedule,
     }
 
-    if not disable_ema and isinstance(payload, dict) and "ema_scene_flow_state_dict" in payload:
+    if not disable_ema and "ema_scene_flow_state_dict" in payload:
         sf_state = payload["ema_scene_flow_state_dict"]
         info["step"] = int(payload.get("step", -1))
         info["ema_used"] = True
         info["source"] = "ema_scene_flow_state_dict"
-    elif not disable_ema and isinstance(payload, dict) and payload.get("is_ema_weights") and "scene_flow" in payload:
+    elif payload.get("is_ema_weights") and "scene_flow" in payload:
+        if disable_ema:
+            raise ValueError("--no_ema cannot be used with an EMA-only checkpoint")
         sf_state = payload["scene_flow"]
         info["step"] = int(payload.get("step", -1))
         info["ema_used"] = True
         info["source"] = "ema_weights_only"
-    elif isinstance(payload, dict) and "scene_flow" in payload:
+    elif "scene_flow" in payload:
         sf_state = payload["scene_flow"]
         info["step"] = int(payload.get("step", -1))
         info["source"] = "scene_flow"
-    elif isinstance(payload, dict) and "state_dict" in payload and "scene_flow" not in payload:
-        sf_state = payload["state_dict"]
-        info["source"] = "state_dict"
     else:
-        sf_state = payload  # raw module state_dict
-        info["source"] = "raw_state_dict"
+        raise ValueError(f"{ckpt_path} is missing scene_flow weights")
 
-    missing, unexpected = scene_flow.load_state_dict(_strip_module(sf_state), strict=False)
-    _raise_on_state_dict_mismatch(
-        ckpt_path=ckpt_path,
-        module_name="WanSceneFlow",
-        source=str(info["source"]),
-        missing=missing,
-        unexpected=unexpected,
-    )
-    info["missing"] = len(missing)
-    info["unexpected"] = len(unexpected)
+    scene_flow.load_state_dict(sf_state, strict=True)
 
-    # EMA shadow weights are used by default when carried by the formal full
-    # checkpoint. Raw mid-training weights generally give worse diffusion
-    # samples, so validation/inference should normally use the formal EMA export.
-    has_ema = isinstance(payload, dict) and "ema_scene_flow" in payload
-    info["ema_in_ckpt"] = bool(has_ema)
     if disable_ema:
         info["ema_note"] = "--no_ema set; using raw scene_flow weights"
-        print("[ckpt:scene_flow] --no_ema set: using RAW weights "
-              "(diffusion samples will be worse than the model actually is).",
-              flush=True)
+        print("[ckpt:scene_flow] --no_ema set: using raw weights.", flush=True)
     elif info["ema_used"]:
         print(f"[ckpt:scene_flow] using EMA weights from {info['source']}.", flush=True)
-    elif has_ema:
-        try:
-            from diffusers.training_utils import EMAModel
-
-            ema = EMAModel(scene_flow.parameters())
-            ema.load_state_dict(payload["ema_scene_flow"])
-            ema.copy_to(scene_flow.parameters())
-            info["ema_used"] = True
-            info["source"] = "ema_scene_flow"
-            print("[ckpt:scene_flow] using EMA weights.", flush=True)
-        except Exception as exc:  # pragma: no cover - best effort
-            info["ema_error"] = repr(exc)
-            print(f"[warn] EMA load failed ({exc!r}); falling back to raw weights.",
-                  flush=True)
     else:
-        info["ema_note"] = "no ema_scene_flow in checkpoint"
-        is_weights_only = str(ckpt_path).endswith("_weights_only.pt")
-        print(
-            "[warn] checkpoint has NO ema_scene_flow"
-            + (" (this is a *_weights_only.pt which stores ONLY raw weights)"
-               if is_weights_only else "")
-            + ". Raw mid-training weights generally produce worse samples; prefer "
-            "a formal flow_step{N}_ema_weights_only.pt export or a formal full "
-            "checkpoint carrying EMA weights.",
-            flush=True,
-        )
+        info["ema_note"] = "checkpoint carries only raw scene_flow weights"
+        print("[warn] checkpoint carries only raw SceneFlow weights.", flush=True)
 
     # The formal trainer also trains assembler.scaffold_packer.  Formal
     # inference is invalid without it: using the constructor initialization
     # would change edit-control conditioning while appearing to load cleanly.
-    if isinstance(payload, dict) and "scaffold_packer" in payload:
-        sp_missing, sp_unexpected = assembler.scaffold_packer.load_state_dict(
-            _strip_module(payload["scaffold_packer"]), strict=False
-        )
-        _raise_on_state_dict_mismatch(
-            ckpt_path=ckpt_path,
-            module_name="FlowFeatureAssembler.scaffold_packer",
-            source="scaffold_packer",
-            missing=sp_missing,
-            unexpected=sp_unexpected,
-        )
-        info["scaffold_packer_missing"] = len(sp_missing)
-        info["scaffold_packer_unexpected"] = len(sp_unexpected)
+    if "scaffold_packer" in payload:
+        assembler.scaffold_packer.load_state_dict(payload["scaffold_packer"], strict=True)
     else:
         raise ValueError(
             f"{ckpt_path} does not contain the trained scaffold_packer. "
-            "Legacy formal *_weights_only.pt exports omitted it and cannot "
-            "reproduce the trained model; use a full checkpoint or a newly "
-            "exported *_ema_weights_only.pt checkpoint."
+            "A current formal checkpoint must carry this trainable module."
         )
 
     scene_flow.to(device).eval()
@@ -1137,10 +682,10 @@ def _load_formal_offline_payload(
 ) -> dict[str, Any]:
     """Load a full clip in the same cached representation formal training uses.
 
-    Chunked formal training consumes the precomputed ``flow_inputs`` fast path.
+    Formal training consumes the precomputed ``flow_inputs`` path.
     Offline inference additionally needs RGB and DGGT pose data for rendering,
-    so use the corresponding fast-RGB consumer rather than reconstructing the
-    legacy cache and recomputing the flow conditions online.
+    so use the corresponding fast-RGB consumer without recomputing flow
+    conditions online.
     """
     if is_chunked_flow_cache(cache_path):
         probe = load_chunked_flow_cache_probe(cache_path)
@@ -1149,15 +694,18 @@ def _load_formal_offline_payload(
             cache_path=cache_path,
             entry=entry,
         )
+        if not bool(probe.get("_chunked_summary", {}).get("has_flow_inputs", False)):
+            raise RuntimeError(
+                f"{cache_path} has no precomputed flow_inputs; rebuild it with the "
+                "current offline feature pipeline"
+            )
         all_frames = torch.arange(int(probe["meta"]["num_frames"]), dtype=torch.long)
         payload = load_chunked_flow_cache_subset(
             cache_path,
             all_frames,
             consumer="scene_flow_fast_rgb",
-            asset_lut_level_indices=dataset.asset_lut_level_indices,
         )
     else:
-        # Plain caches follow the same legacy fallback in the training dataset.
         payload = load_flow_cache(
             cache_path,
             map_location="cpu",
@@ -1212,14 +760,9 @@ def main() -> None:
     if args.manifest_path is None and args.cache_root is None:
         raise ValueError("Provide either --cache_root or --manifest_path.")
     if not args.tokenizer_ckpt_path:
-        raise ValueError(
-            "Formal metric/gauge inference requires an explicit --tokenizer_ckpt_path "
-            "for content-hash verification"
-        )
-    if not args.pullback_calibration_path:
-        raise ValueError(
-            "Formal metric/gauge inference requires --pullback_calibration_path"
-        )
+        raise ValueError("Formal editor inference requires an explicit --tokenizer_ckpt_path")
+    if not args.feature_stats_path:
+        raise ValueError("Formal editor inference requires --feature_stats_path")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         print("[warn] CUDA not available; 3DGS rendering / VGGT-L will be very slow.",
@@ -1257,17 +800,15 @@ def main() -> None:
         max_frames=1,
         seed=args.seed,
         caption_root=None if bool(args.no_text_condition) else args.caption_root,
-        require_metric_gauge_provenance=True,
     )
     patch_grid = _infer_cache_patch_grid(dataset)
     args.patch_grid = (int(patch_grid[0]), int(patch_grid[1]))
-    args.sky_grid = (int(args.sky_grid_h), int(args.sky_grid_w))
     h_splat, w_splat = patch_grid[0] * 4, patch_grid[1] * 4
     print(f"[setup] cache patch_grid={patch_grid} H_splat={h_splat} W_splat={w_splat} "
           f"rows={len(dataset)}", flush=True)
 
-    # The checkpoint is authoritative for all SceneFlow architecture fields,
-    # including latent and camera dimensions. Construct it before dependent
+    # The checkpoint is authoritative for all SceneFlow architecture fields.
+    # Construct it before dependent
     # modules such as the scaffold packer.
     scene_flow = build_scene_flow_from_checkpoint_config(
         args.scene_flow_ckpt_path,
@@ -1276,79 +817,7 @@ def main() -> None:
     )
     args.latent_dim = int(scene_flow.config.out_channels)
     args.prediction_type = str(scene_flow.config.prediction_type)
-    if str(scene_flow.config.asset_position_mode) != str(args.asset_position_mode):
-        raise ValueError(
-            f"checkpoint asset_position_mode={scene_flow.config.asset_position_mode!r} "
-            f"!= --asset_position_mode={args.asset_position_mode!r}"
-        )
-
     checkpoint_payload = torch.load(args.scene_flow_ckpt_path, map_location="cpu")
-    dggt_sha256 = checkpoint_sha256(args.ckpt_path)
-    tokenizer_sha256 = checkpoint_sha256(args.tokenizer_ckpt_path)
-    provenance, formal_metric_gauge_contract = validate_metric_gauge_checkpoint_payload(
-        checkpoint_payload,
-        path=args.scene_flow_ckpt_path,
-        config=scene_flow.config,
-        require_formal_contract=True,
-        expected_dggt_sha256=dggt_sha256,
-        expected_tokenizer_sha256=tokenizer_sha256,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=patch_grid,
-    )
-    if formal_metric_gauge_contract is None:
-        raise AssertionError("formal contract validation returned no contract")
-    cache_scene_gauge_sha256 = resolve_inference_cache_scene_gauge_sha256(
-        split=args.split,
-        checkpoint_scene_gauge_sha256=provenance["gauge_table_sha256"],
-        explicit_cache_scene_gauge_sha256=args.cache_scene_gauge_sha256,
-    )
-    dataset.bind_metric_gauge_provenance(
-        expected_scene_gauge_sha256=cache_scene_gauge_sha256,
-        expected_dggt_sha256=dggt_sha256,
-    )
-    pullback_calibration = load_pullback_calibration(
-        args.pullback_calibration_path,
-        tokenizer_checkpoint_path=args.tokenizer_ckpt_path,
-        dggt_checkpoint_path=args.ckpt_path,
-        expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-        expected_patch_grid=patch_grid,
-        expected_artifact_sha256=provenance["pullback_artifact_sha256"],
-    )
-    if (
-        provenance["pullback_runtime_contract_version"]
-        != pullback_calibration.runtime_contract_version
-    ):
-        raise ValueError(
-            "checkpoint pullback runtime contract does not match the loaded artifact: "
-            f"checkpoint={provenance['pullback_runtime_contract_version']!r}, "
-            f"artifact={pullback_calibration.runtime_contract_version!r}"
-        )
-    scene_flow._pullback_calibration = pullback_calibration
-    print(
-        "[pullback] verified formal render identity contract "
-        f"{pullback_calibration.path} "
-        f"(sha256={pullback_calibration.artifact_sha256})",
-        flush=True,
-    )
-    stats_sha256 = None
-    if args.feature_stats_path:
-        stats_sha256 = validate_formal_feature_stats_artifact(
-            args.feature_stats_path,
-            provenance=provenance,
-            expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-            expected_patch_grid=patch_grid,
-        )
-        validate_metric_gauge_checkpoint_payload(
-            checkpoint_payload,
-            path=args.scene_flow_ckpt_path,
-            config=scene_flow.config,
-            require_formal_contract=True,
-            expected_dggt_sha256=dggt_sha256,
-            expected_tokenizer_sha256=tokenizer_sha256,
-            expected_feature_stats_sha256=stats_sha256,
-            expected_window_len=FORMAL_TOKENIZER_WINDOW_LEN,
-            expected_patch_grid=patch_grid,
-        )
 
     # Full VGGT (aggregator + dense heads + scene_tokenizer). Formal rendering
     # preserves GT sky RGB directly and does not call the frozen sky_model.
@@ -1376,24 +845,17 @@ def main() -> None:
     )
     print(f"[ckpt:scene_flow] {ckpt_info}", flush=True)
     validate_formal_flow_domain_config(checkpoint_payload, args, args.scene_flow_ckpt_path)
-    if args.feature_stats_path:
-        load_all_stats_into_buffers(
-            scene_flow,
-            args.feature_stats_path,
-            token_dim=int(args.latent_dim),
-            expected_dggt_sha256=dggt_sha256,
-            expected_tokenizer_sha256=tokenizer_sha256,
-            expected_scene_gauge_sha256=provenance["gauge_table_sha256"],
-            expected_sequence_length=FORMAL_TOKENIZER_WINDOW_LEN,
-            require_existing_match=True,
-        )
-        print(
-            f"[stats] verified latent+camera+gauge+placement stats against the inference checkpoint and loaded "
-            f"{args.feature_stats_path} (sha256={stats_sha256})",
-            flush=True,
-        )
-    scene_flow.require_camera_stats()
-    scene_flow.require_gauge_stats()
+    load_formal_latent_stats(
+        scene_flow,
+        args.feature_stats_path,
+        token_dim=int(args.latent_dim),
+        require_existing_match=True,
+    )
+    print(
+        f"[stats] verified tokenizer latent statistics against the checkpoint: "
+        f"{args.feature_stats_path}",
+        flush=True,
+    )
     scene_flow.eval()
     text_encoder = setup_text_encoder(args, device)
 
@@ -1431,15 +893,13 @@ def main() -> None:
         ]
 
         # Full-clip bundle drives stepwise sliding sampling; model forward still
-        # receives only window slices, so asset/camera token counts stay bounded.
+        # receives only window slices, so conditioning token counts stay bounded.
         all_frames_t = torch.arange(num_frames, dtype=torch.long)
         item_full = _item_for_subset(
             dataset, payload, entry, cache_path, idx, all_frames_t
         )
         render_pose_full = cached_render_pose_from_item(item_full)
-        bundle_full, sample_full = build_bundle(
-            item_full, assembler, scene_flow, device
-        )
+        bundle_full, sample_full = build_bundle(item_full, assembler, device)
         ldim_full = int(bundle_full.z_clean.shape[-1])
         if ldim_full != int(args.latent_dim):
             raise ValueError(
@@ -1469,9 +929,7 @@ def main() -> None:
             item_w = _item_for_subset(
                 dataset, payload, entry, cache_path, idx, subset_t
             )
-            bundle_w, sample_w = build_bundle(
-                item_w, assembler, scene_flow, device
-            )
+            bundle_w, sample_w = build_bundle(item_w, assembler, device)
 
             ldim = int(bundle_w.z_clean.shape[-1])
             if ldim != int(args.latent_dim):
@@ -1482,12 +940,15 @@ def main() -> None:
 
             win_dir = win_root / f"win{fsel[0]:03d}_{fsel[-1]:03d}"
             win_dir.mkdir(parents=True, exist_ok=True)
-            # Per-window formal-training viz op (train_scene_flow.py:_dump_vis).
-            win_flow_summary = dump_flow_features(
-                bundle_w, win_dir,
-                save_tensors=not args.no_flow_tensors,
-                save_masks=True, save_coverage=True, save_scaffold=True,
-                save_splat_pca=args.splat_pca,
+            z_clean_w = sf.normalize(bundle_w.z_clean.float())
+            save_clean_mask_grids(
+                z_clean_w,
+                bundle_w.M_preserve.float(),
+                bundle_w.M_source.float(),
+                bundle_w.M_dest.float(),
+                win_dir,
+                args,
+                min(int(args.val_log_images), len(fsel)),
             )
             save_gt_rgb_grid_from_sample(
                 sample_w,
@@ -1498,8 +959,7 @@ def main() -> None:
             window_summaries.append({
                 "window": [fsel[0], fsel[-1]],
                 "shift": float(args.shift),
-                "asset_condition_kind": getattr(bundle_w, "asset_condition_kind", None),
-                "flow_features": win_flow_summary,
+                "latent_shape": list(bundle_w.z_clean.shape),
                 "per_scale": [],
             })
             window_records.append({
@@ -1600,7 +1060,6 @@ def main() -> None:
         summary = {
             "row_index": idx,
             "cache_path": str(cache_path),
-            "cache_scene_gauge_sha256": cache_scene_gauge_sha256,
             "tag": tag,
             "scene_name": sample_full.get("scene_name"),
             "clip_name": sample_full.get("clip_name"),
@@ -1616,24 +1075,13 @@ def main() -> None:
             "render_per_window": bool(args.render_per_window),
             "patch_grid": list(args.patch_grid),
             "guidance_scales": guidance_scales,
-            "asset_control_guidance_scale": float(args.asset_control_guidance_scale),
             "sample_steps": int(args.sample_steps),
             "shift": float(args.shift),
             "prediction_type": str(args.prediction_type),
             "non_edit_clamp": "z_splat_each_step",
-            "legacy_clean_preserve_blend": False,
             "sliding_sampling": "stepwise_velocity_blend",
             "rgb_compositing": "gsplat_premultiplied_over_background",
             "ckpt": ckpt_info,
-            "pullback": {
-                "path": str(pullback_calibration.path),
-                "artifact_sha256": pullback_calibration.artifact_sha256,
-                "tokenizer_sha256": pullback_calibration.tokenizer_sha256,
-                "dggt_checkpoint_sha256": pullback_calibration.dggt_sha256,
-                "window_len": pullback_calibration.window_len,
-                "patch_grid_hw": list(pullback_calibration.patch_grid_hw),
-                "render_boundary": "identity",
-            },
             "per_scale_stitched": scale_summaries,
             "windows": window_summaries,
         }
@@ -1648,10 +1096,8 @@ def main() -> None:
             {
                 "num_rows": len(all_summaries),
                 "scene_flow_ckpt": args.scene_flow_ckpt_path,
-                "pullback_artifact_sha256": pullback_calibration.artifact_sha256,
                 "manifest_path": args.manifest_path,
                 "cache_root": args.cache_root,
-                "cache_scene_gauge_sha256": cache_scene_gauge_sha256,
                 "rows": all_summaries,
             },
             indent=2,

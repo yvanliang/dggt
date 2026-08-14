@@ -12,7 +12,6 @@ import gzip
 import io
 import json
 import os
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -23,6 +22,10 @@ from typing import Any
 import torch
 
 from dggt.utils.gaussian_time import GAUSSIAN_TIME_REPRESENTATION
+from dggt.utils.scene_gauge import (
+    SCENE_GAUGE_TABLE_SCHEMA,
+    SCENE_GAUGE_TABLE_SCHEMA_VERSION,
+)
 
 
 GZIP_MAGIC = b"\x1f\x8b"
@@ -30,8 +33,7 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 SQLITE_MAGIC = b"SQLite format 3\x00"
 CHUNKED_FLOW_CACHE_FORMAT = "flow_cache_chunked_zstd_sqlite"
 CHUNKED_FLOW_CACHE_FORMAT_VERSION = 2
-CURRENT_FLOW_CACHE_SCHEMA_VERSION = 10
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CURRENT_FLOW_CACHE_SCHEMA_VERSION = 11
 
 
 def is_current_flow_cache_summary(summary: dict[str, Any]) -> bool:
@@ -46,18 +48,19 @@ def is_current_flow_cache_summary(summary: dict[str, Any]) -> bool:
     if not base_current:
         return False
     mapping_mode = summary.get("metric_box_mapping_mode")
-    dggt_sha256 = str(summary.get("dggt_checkpoint_sha256", ""))
     if mapping_mode not in ("metric_gauge_v4", "generic_sim3"):
         return False
-    if _SHA256_RE.fullmatch(dggt_sha256) is None:
-        return False
-    table_sha256 = summary.get("scene_gauge_table_sha256")
     if mapping_mode == "generic_sim3":
-        return table_sha256 is None
-    if _SHA256_RE.fullmatch(str(table_sha256)) is None:
-        return False
+        return True
     return (
-        summary.get("metric_box_gauge_fallback_policy")
+        summary.get("scene_gauge_schema") == SCENE_GAUGE_TABLE_SCHEMA
+        and summary.get("scene_gauge_schema_version")
+        == SCENE_GAUGE_TABLE_SCHEMA_VERSION
+        and isinstance(summary.get("scene_gauge_split"), str)
+        and bool(str(summary.get("scene_gauge_split")).strip())
+        and isinstance(summary.get("scene_gauge_keys"), list)
+        and bool(summary.get("scene_gauge_keys"))
+        and summary.get("metric_box_gauge_fallback_policy")
         == "production_valid_channel_mean_v1"
         and isinstance(summary.get("metric_box_gauge_fallback_channel_count"), int)
         and isinstance(summary.get("metric_box_gauge_fallback_frame_count"), int)
@@ -455,14 +458,14 @@ def save_flow_cache_chunked(
             "num_frames": num_frames,
             "patch_grid": list(meta.get("patch_grid", [])),
             "patch_start_idx": int(meta.get("patch_start_idx", 0)),
-            # Schema v10 binds every cache to the edit-coordinate convention,
-            # scene-gauge table, and DGGT checkpoint that produced it.  Keep
-            # the same values in both the cheap SQLite summary and global/meta
-            # so skip/probe paths cannot silently accept a cache from another
-            # geometry contract.
+            # Schema v11 binds caches through an explicit structural and
+            # numeric metric-gauge contract. Runtime file fingerprints are not
+            # part of the training or inference protocol.
             "metric_box_mapping_mode": meta.get("metric_box_mapping_mode"),
-            "scene_gauge_table_sha256": meta.get("scene_gauge_table_sha256"),
-            "dggt_checkpoint_sha256": meta.get("dggt_checkpoint_sha256"),
+            "scene_gauge_schema": meta.get("scene_gauge_schema"),
+            "scene_gauge_schema_version": meta.get("scene_gauge_schema_version"),
+            "scene_gauge_split": meta.get("scene_gauge_split"),
+            "scene_gauge_keys": meta.get("scene_gauge_keys"),
             "asset_object_keys": asset_keys,
             "asset_num_levels": asset_num_levels,
             "consumers": ["scene_flow", "tokenizer_stage_b"],
@@ -1141,7 +1144,7 @@ def load_chunked_flow_cache_subset(
                 if not torch.is_tensor(patch_valid_full):
                     raise RuntimeError(
                         f"Mode-A cache asset {obj_key} is missing asset_patch_valid_mask; "
-                        "regenerate the Mode-A cache with schema v10."
+                        f"regenerate the Mode-A cache with schema v{CURRENT_FLOW_CACHE_SCHEMA_VERSION}."
                     )
                 if patch_valid_full.ndim != 2 or int(patch_valid_full.shape[0]) != int(summary["num_frames"]):
                     raise ValueError(

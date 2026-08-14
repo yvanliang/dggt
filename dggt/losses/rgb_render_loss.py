@@ -57,7 +57,7 @@ class RGBRenderLossResult:
     loss: torch.Tensor
     level_loss: torch.Tensor
     head_loss: torch.Tensor
-    logs: dict[str, float]
+    logs: dict[str, float | torch.Tensor]
     rendered: torch.Tensor | None = None
     generated_depth: torch.Tensor | None = None
 
@@ -507,16 +507,6 @@ def _render_one_sample(
             world_to_camera=world_to_camera.unsqueeze(0),
             intrinsics=intrinsics.unsqueeze(0),
         )
-    elif background_mode == "sky_model":
-        # Legacy/frozen sky-model background retained for non-formal callers.
-        with torch.no_grad():
-            full_nhwc = vggt_model.sky_model(
-                images.unsqueeze(0), world_to_camera, intrinsics_b[0]
-            ).float()
-            minimum = full_nhwc.amin()
-            full_nhwc = (full_nhwc - minimum) / (full_nhwc.amax() - minimum).clamp_min(1.0e-8)
-            full = full_nhwc.clamp(0.0, 1.0).permute(0, 3, 1, 2)
-            background = F.interpolate(full, (render_h, render_w), mode="area").permute(0, 2, 3, 1)
     else:
         background = images.new_zeros((seq_len, render_h, render_w, 3), dtype=torch.float32)
 
@@ -661,6 +651,8 @@ def compute_rgb_render_loss(
     return_debug_tensors: bool = False,
     return_generated_depth: bool = False,
     pullback_calibration: PullbackCalibration | None = None,
+    defer_log_values: bool = False,
+    collect_logs: bool = True,
 ) -> RGBRenderLossResult:
     conf_weight_power = float(conf_weight_power)
     if conf_weight_power != 0.0:
@@ -776,6 +768,8 @@ def compute_rgb_render_loss(
             sample_weight=sample_weight,
             conf_weight_power=conf_weight_power,
             conf_weight_floor=conf_weight_floor,
+            defer_log_values=defer_log_values,
+            collect_logs=collect_logs,
         )
         del teacher_geometry
 
@@ -844,7 +838,7 @@ def compute_rgb_render_loss(
             .clamp(conf_weight_floor, 1.0)
             .pow(conf_weight_power)
         )
-        conf_factor_mean = conf_factor.mean()
+        conf_factor_mean = conf_factor.mean() if collect_logs else None
         conf_factor = conf_factor / conf_factor.mean(
             dim=(1, 2, 3, 4), keepdim=True
         ).clamp_min(1.0e-6)
@@ -853,33 +847,41 @@ def compute_rgb_render_loss(
     denominator = photometric_weight.sum().clamp_min(1.0e-6) * 3.0
     sample_scale = sample_weight.view(batch_size, 1, 1, 1, 1)
     charbonnier_map = torch.sqrt(difference.square() + 1.0e-6)
-    charbonnier_unweighted = (
-        charbonnier_map * photometric_weight
-    ).sum() / denominator
     charbonnier = (
         charbonnier_map * photometric_weight * sample_scale
     ).sum() / denominator
-    l1_unweighted = (difference.abs() * photometric_weight).sum() / denominator
-    l1 = (
-        difference.abs() * photometric_weight * sample_scale
-    ).sum() / denominator
     loss = charbonnier
-    logs = {
-        "loss_rgb_render": float(charbonnier.detach().item()),
-        "loss_rgb_render_unweighted": float(charbonnier_unweighted.detach().item()),
-        "loss_rgb_render_l1": float(l1.detach().item()),
-        "loss_rgb_render_l1_unweighted": float(l1_unweighted.detach().item()),
-        "rgb_render_sample_weight_mean": float(sample_weight.detach().mean().item()),
-        "rgb_render_weight_mean": float(weight.detach().mean().item()),
-        "rgb_render_alpha_mean": float(alpha_b.detach().mean().item()),
-        "rgb_render_depth_mean": float(depth.detach().mean().item()),
-        "rgb_render_camera_grad_scale": float(camera_grad_scale),
-        "rgb_render_gauge_pose_grad_scale": float(gauge_pose_grad_scale),
-        "rgb_render_sky_mask_grad_scale": float(sky_mask_grad_scale),
-        "rgb_render_frames": float(frames),
-        "rgb_render_samples": float(batch_size),
-    }
-    if conf_factor_mean is not None:
+    def log_value(value: torch.Tensor) -> float | torch.Tensor:
+        detached = value.detach().float().reshape(())
+        return detached if defer_log_values else float(detached.item())
+
+    if collect_logs:
+        charbonnier_unweighted = (
+            charbonnier_map * photometric_weight
+        ).sum() / denominator
+        difference_abs = difference.abs()
+        l1_unweighted = (difference_abs * photometric_weight).sum() / denominator
+        l1 = (
+            difference_abs * photometric_weight * sample_scale
+        ).sum() / denominator
+        logs = {
+            "loss_rgb_render": log_value(charbonnier),
+            "loss_rgb_render_unweighted": log_value(charbonnier_unweighted),
+            "loss_rgb_render_l1": log_value(l1),
+            "loss_rgb_render_l1_unweighted": log_value(l1_unweighted),
+            "rgb_render_sample_weight_mean": log_value(sample_weight.mean()),
+            "rgb_render_weight_mean": log_value(weight.mean()),
+            "rgb_render_alpha_mean": log_value(alpha_b.mean()),
+            "rgb_render_depth_mean": log_value(depth.mean()),
+            "rgb_render_camera_grad_scale": float(camera_grad_scale),
+            "rgb_render_gauge_pose_grad_scale": float(gauge_pose_grad_scale),
+            "rgb_render_sky_mask_grad_scale": float(sky_mask_grad_scale),
+            "rgb_render_frames": float(frames),
+            "rgb_render_samples": float(batch_size),
+        }
+    else:
+        logs = {}
+    if collect_logs and conf_factor_mean is not None:
         no_conf_denominator = weight.sum().clamp_min(1.0e-6) * 3.0
         charbonnier_no_conf = (
             charbonnier_map * weight * sample_scale
@@ -888,21 +890,17 @@ def compute_rgb_render_loss(
             raise FloatingPointError("RGB render loss without confidence is non-finite")
         logs.update(
             {
-                "loss_rgb_render_no_conf": float(
-                    charbonnier_no_conf.detach().item()
-                ),
-                "rgb_render_conf_weight_mean": float(
-                    conf_factor_mean.detach().item()
-                ),
+                "loss_rgb_render_no_conf": log_value(charbonnier_no_conf),
+                "rgb_render_conf_weight_mean": log_value(conf_factor_mean),
             }
         )
     zero = z_clean_pred_n.sum() * 0.0
     level_loss = zero if feedback is None else feedback.level_loss
     head_loss = zero if feedback is None else feedback.head_loss
-    if feedback is None:
+    if feedback is None and collect_logs:
         logs["loss_level_consistency"] = 0.0
         logs["loss_head_consistency"] = 0.0
-    else:
+    elif feedback is not None and collect_logs:
         logs.update(feedback.logs)
     if lpips_model is not None and float(lpips_weight) > 0.0:
         pred_flat = rendered_b.reshape(batch_size * frames, 3, *rendered_b.shape[-2:]).clamp(0.0, 1.0)
@@ -917,7 +915,8 @@ def compute_rgb_render_loss(
             sample_weight=lpips_sample_weight,
         )
         loss = loss + float(lpips_weight) * lpips_value
-        logs["loss_rgb_render_lpips"] = float(lpips_value.detach().item())
+        if collect_logs:
+            logs["loss_rgb_render_lpips"] = log_value(lpips_value)
     return RGBRenderLossResult(
         loss=loss,
         level_loss=level_loss,

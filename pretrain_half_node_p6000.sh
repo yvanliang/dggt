@@ -26,6 +26,8 @@ CONDA_ENV="${CONDA_ENV:-dggt}"
 # ============================================================
 WAYMO_DGGT_ROOT="${DATASET_ROOT}/training"
 WAYMO_DGGT_VAL_ROOT="${DATASET_ROOT}/validation"
+HDMAP_ROOT="${HDMAP_ROOT:-${DATASET_ROOT}/training_hdmap}"
+VAL_HDMAP_ROOT="${VAL_HDMAP_ROOT:-${DATASET_ROOT}/validation_hdmap}"
 DGGT_CKPT="${DGGT_CKPT:-/data/disk2/lyy_dataset/model/dggt/model_latest_waymo.pt}"
 TOKENIZER_CKPT="${TOKENIZER_CKPT:-${PROJECT_ROOT}/logs/tokenizer_t0_v2_stageA/ckpt/scene_tokenizer_step_100000.pt}"
 FEATURE_STATS="${FEATURE_STATS:-${PROJECT_ROOT}/logs/scene_flow_pretrain_1024/feature_stats_pretrain_v5.pt}"
@@ -36,8 +38,8 @@ SCENE_CAPTION_ROOT="${DATASET_ROOT}/training_captions"
 SCENE_CAPTION_VAL_ROOT="${DATASET_ROOT}/validation_captions"
 QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-/home/dancer/model/Qwen/Qwen3-0.6B}"
 
-LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_tokenizer_v2}"
-LAUNCH_LOG_DIR="${PROJECT_ROOT}/logs/single_node_launch"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_v6}"
+LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/single_node_v6_launch}"
 
 # ============================================================
 # Training config. Aligned with pretrain_two_nodes.sh except:
@@ -52,16 +54,16 @@ NUM_WORKERS=8
 PREFETCH_FACTOR=2
 
 TEXT_UNCOND_DROP_PROB=0.1
-JOINT_GENERATION_PROB=0.2
-CAMERA_CONTROLLED_PROB=0.2
-ASSET_CAMERA_CONTROLLED_PROB=0.6
 
-GUIDANCE_SCALE=1.0
-ASSET_CONTROL_GUIDANCE_SCALE=1.0
-CAMERA_GUIDANCE_SCALE=1.0
-VAL_GUIDANCE_SCALES="1.0,2.0,4.0"
+CFG_SCALE="${CFG_SCALE:-1.0}"
+LAYOUT_GUIDANCE_SCALE="${LAYOUT_GUIDANCE_SCALE:-1.0}"
+ASSET_CONTROL_GUIDANCE_SCALE="${ASSET_CONTROL_GUIDANCE_SCALE:-1.0}"
+VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
+LAYOUT_MAX_ACTORS="${LAYOUT_MAX_ACTORS:-96}"
+STATIC_FAR_PLANE_M="${STATIC_FAR_PLANE_M:-120}"
 
-WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb32_lr1e4_v5}"
+WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb32_lr1e4_v6}"
+WANDB_RESUME="${WANDB_RESUME:-never}"
 GLOBAL_BATCH_SIZE=$((NNODES * NPROC_PER_NODE * BATCH_SIZE_PER_GPU * GRAD_ACCUM_STEPS))
 
 cuda_visible_devices() {
@@ -154,6 +156,8 @@ build_train_args() {
         train_scene_flow_pretrain.py
         --image_dir "${WAYMO_DGGT_ROOT}"
         --val_image_dir "${WAYMO_DGGT_VAL_ROOT}"
+        --hdmap_root "${HDMAP_ROOT}"
+        --val_hdmap_root "${VAL_HDMAP_ROOT}"
         --dggt_ckpt_path "${DGGT_CKPT}"
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
@@ -169,7 +173,6 @@ build_train_args() {
         --sequence_length 10
         --val_sliding_window 10
         --val_sliding_stride 7
-        --camera_anchor_context_dropout 0.25
         --patch_grid_h 25
         --patch_grid_w 37
         --latent_dim 1024
@@ -194,28 +197,21 @@ build_train_args() {
         --lambda_repa 0.5
         --base_model_coeff 0.25
         --lambda_boundary 0.25
-        --lambda_camera_flow 0.1
-        --lambda_camera_pose 0.25
-        --camera_pose_start_step 0
-        --camera_pose_warmup_steps 10000
-        --camera_absolute_translation_scale_m 10.0
-        --camera_relative_translation_scale_m 1.0
-        --camera_acceleration_translation_scale_m 1.0
         --lambda_sky_flow 0.1
+        --lambda_rgb_render 0.005
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
-        --joint_generation_prob "${JOINT_GENERATION_PROB}"
-        --camera_controlled_prob "${CAMERA_CONTROLLED_PROB}"
-        --asset_camera_controlled_prob "${ASSET_CAMERA_CONTROLLED_PROB}"
-        --guidance_scale "${GUIDANCE_SCALE}"
+        --cfg "${CFG_SCALE}"
+        --layout_guidance_scale "${LAYOUT_GUIDANCE_SCALE}"
         --asset_control_guidance_scale "${ASSET_CONTROL_GUIDANCE_SCALE}"
-        --camera_guidance_scale "${CAMERA_GUIDANCE_SCALE}"
+        --layout_max_actors "${LAYOUT_MAX_ACTORS}"
+        --static_far_plane_m "${STATIC_FAR_PLANE_M}"
         --val_guidance_scales "${VAL_GUIDANCE_SCALES}"
         --val_scene_start 0
         --val_scene_end 100
-        --val_every 1000
+        --val_every 2000
         --val_batches 1
         --val_log_images 10
-        --val_sample_steps 35
+        --val_sample_steps 50
         --grad_clip_norm 1.0
         --seed 0
         --precision bf16
@@ -223,6 +219,7 @@ build_train_args() {
         --wandb
         --wandb_project dggt-flow
         --wandb_name "${WANDB_NAME}"
+        --wandb_resume "${WANDB_RESUME}"
     )
 }
 
@@ -238,6 +235,8 @@ check_file "train_scene_flow_pretrain.py" "${PROJECT_ROOT}/train_scene_flow_pret
 check_file "CONDA_SH" "${CONDA_SH}"
 check_dir "WAYMO_DGGT_ROOT" "${WAYMO_DGGT_ROOT}"
 check_dir "WAYMO_DGGT_VAL_ROOT" "${WAYMO_DGGT_VAL_ROOT}"
+check_dir "HDMAP_ROOT" "${HDMAP_ROOT}"
+check_dir "VAL_HDMAP_ROOT" "${VAL_HDMAP_ROOT}"
 check_file "DGGT_CKPT" "${DGGT_CKPT}"
 check_file "TOKENIZER_CKPT" "${TOKENIZER_CKPT}"
 check_file "FEATURE_STATS" "${FEATURE_STATS}"

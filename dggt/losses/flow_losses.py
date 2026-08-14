@@ -124,7 +124,9 @@ def compute_total_loss(
     lambda_identity: float = 0.0,
     identity_batch: bool | torch.Tensor = False,
     preserve_floor: float = 0.2,
-) -> tuple[torch.Tensor, dict[str, float]]:
+    defer_log_values: bool = False,
+    collect_logs: bool = True,
+) -> tuple[torch.Tensor, dict[str, float | torch.Tensor]]:
     z_clean = getattr(bundle, "z_clean_n", None)
     if z_clean is None:
         z_clean = bundle.z_clean
@@ -209,16 +211,20 @@ def compute_total_loss(
         + float(lambda_identity) * loss_identity
         + float(base_model_coeff) * loss_base
     )
+    def log_value(value: torch.Tensor) -> float | torch.Tensor:
+        detached = value.detach().float().reshape(())
+        return detached if defer_log_values else float(detached.item())
+
     logs = {
-        "loss": float(total.detach().item()),
-        "loss_flow": float(loss_flow.detach().item()),
-        "loss_flow_edit": float(loss_flow.detach().item()),
-        "loss_preserve": float(loss_preserve.detach().item()),
-        "loss_boundary": float(loss_boundary.detach().item()),
-        "loss_repa": float(loss_repa.detach().item()),
-        "loss_identity": float(loss_identity.detach().item()),
-        "loss_base": float(loss_base.detach().item()),
-    }
+        "loss": log_value(total),
+        "loss_flow": log_value(loss_flow),
+        "loss_flow_edit": log_value(loss_flow),
+        "loss_preserve": log_value(loss_preserve),
+        "loss_boundary": log_value(loss_boundary),
+        "loss_repa": log_value(loss_repa),
+        "loss_identity": log_value(loss_identity),
+        "loss_base": log_value(loss_base),
+    } if collect_logs else {}
     return total, logs
 
 

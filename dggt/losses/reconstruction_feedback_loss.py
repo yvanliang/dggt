@@ -21,13 +21,15 @@ TOKENIZER_LEVELS = (4, 11, 17, 23)
 class ReconstructionFeedbackLossResult:
     level_loss: torch.Tensor
     head_loss: torch.Tensor
-    logs: dict[str, float]
+    logs: dict[str, float | torch.Tensor]
 
 
 def _masked_sample_mean(
     value: torch.Tensor,
     weight: torch.Tensor,
     sample_weight: torch.Tensor,
+    *,
+    compute_unweighted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return sigma-weighted and unweighted masked means.
 
@@ -49,8 +51,12 @@ def _masked_sample_mean(
     sample_scale = sample_weight.to(device=value.device, dtype=torch.float32)
     sample_scale = sample_scale.view(value.shape[0], *([1] * (value.ndim - 1)))
     denominator = weight.sum().clamp_min(1.0e-6)
-    unweighted = (value * weight).sum() / denominator
     weighted = (value * weight * sample_scale).sum() / denominator
+    unweighted = (
+        (value * weight).sum() / denominator
+        if compute_unweighted
+        else weighted.detach()
+    )
     return weighted, unweighted
 
 
@@ -208,6 +214,7 @@ def _level_consistency(
     patches: int,
     patch_weight: torch.Tensor,
     sample_weight: torch.Tensor,
+    compute_unweighted: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     student_levels = _selected_patch_tokens(
         student_geometry,
@@ -235,7 +242,12 @@ def _level_consistency(
         )
         cosine = torch.where(both_zero, torch.zeros_like(cosine), cosine)
         level_map = normalized_l1 + cosine
-        weighted, unweighted = _masked_sample_mean(level_map, patch_weight, sample_weight)
+        weighted, unweighted = _masked_sample_mean(
+            level_map,
+            patch_weight,
+            sample_weight,
+            compute_unweighted=compute_unweighted,
+        )
         weighted_levels.append(weighted)
         unweighted_levels.append(unweighted)
     return torch.stack(weighted_levels).mean(), torch.stack(unweighted_levels).mean()
@@ -391,6 +403,8 @@ def compute_reconstruction_feedback_losses(
     sample_weight: torch.Tensor,
     conf_weight_power: float = 1.0,
     conf_weight_floor: float = 0.05,
+    defer_log_values: bool = False,
+    collect_logs: bool = True,
 ) -> ReconstructionFeedbackLossResult:
     """Compute four-level and rendering-head consistency losses.
 
@@ -414,7 +428,7 @@ def compute_reconstruction_feedback_losses(
             logs={
                 "loss_level_consistency": 0.0,
                 "loss_head_consistency": 0.0,
-            },
+            } if collect_logs else {},
         )
     gh, gw = int(patch_grid[0]), int(patch_grid[1])
     patches = gh * gw
@@ -433,6 +447,7 @@ def compute_reconstruction_feedback_losses(
         patches=patches,
         patch_weight=patch_weight,
         sample_weight=sample_weight[:batch_size],
+        compute_unweighted=collect_logs,
     )
 
     height, width = int(student_depth.shape[2]), int(student_depth.shape[3])
@@ -476,6 +491,7 @@ def compute_reconstruction_feedback_losses(
             value,
             map_weight,
             sample_weight[:batch_size],
+            compute_unweighted=collect_logs,
         )
         head_losses[name] = weighted
         head_unweighted[name] = unweighted
@@ -494,12 +510,13 @@ def compute_reconstruction_feedback_losses(
         + head_unweighted["dynamic"]
     )
     head_loss_no_conf = None
-    if conf_weight is not None:
+    if collect_logs and conf_weight is not None:
         no_conf_losses = {
             name: _masked_sample_mean(
                 value,
                 dense_weight,
                 sample_weight[:batch_size],
+                compute_unweighted=False,
             )[0]
             for name, value in head_maps.items()
         }
@@ -510,28 +527,36 @@ def compute_reconstruction_feedback_losses(
             + 0.1 * no_conf_losses["gs_conf"]
             + no_conf_losses["dynamic"]
         )
-    for name, value in (
-        ("level consistency", level_loss),
-        ("head consistency", head_loss),
-        ("unweighted level consistency", level_unweighted),
-        ("unweighted head consistency", head_loss_unweighted),
-    ):
-        if not bool(torch.isfinite(value)):
-            raise FloatingPointError(f"{name} loss is non-finite")
+    checked = [level_loss, head_loss]
+    if collect_logs:
+        checked.extend((level_unweighted, head_loss_unweighted))
+    if not bool(torch.stack([value.detach() for value in checked]).isfinite().all()):
+        raise FloatingPointError("reconstruction feedback loss is non-finite")
+    if not collect_logs:
+        return ReconstructionFeedbackLossResult(
+            level_loss=level_loss,
+            head_loss=head_loss,
+            logs={},
+        )
+
+    def log_value(value: torch.Tensor) -> float | torch.Tensor:
+        detached = value.detach().float().reshape(())
+        return detached if defer_log_values else float(detached.item())
+
     logs = {
-        "loss_level_consistency": float(level_loss.detach().item()),
-        "loss_level_consistency_unweighted": float(level_unweighted.detach().item()),
-        "loss_head_consistency": float(head_loss.detach().item()),
-        "loss_head_consistency_unweighted": float(head_loss_unweighted.detach().item()),
-        "loss_head_depth": float(head_losses["depth"].detach().item()),
-        "loss_head_depth_conf": float(head_losses["depth_conf"].detach().item()),
-        "loss_head_gaussian": float(head_losses["gaussian"].detach().item()),
-        "loss_head_gs_conf": float(head_losses["gs_conf"].detach().item()),
-        "loss_head_dynamic": float(head_losses["dynamic"].detach().item()),
+        "loss_level_consistency": log_value(level_loss),
+        "loss_level_consistency_unweighted": log_value(level_unweighted),
+        "loss_head_consistency": log_value(head_loss),
+        "loss_head_consistency_unweighted": log_value(head_loss_unweighted),
+        "loss_head_depth": log_value(head_losses["depth"]),
+        "loss_head_depth_conf": log_value(head_losses["depth_conf"]),
+        "loss_head_gaussian": log_value(head_losses["gaussian"]),
+        "loss_head_gs_conf": log_value(head_losses["gs_conf"]),
+        "loss_head_dynamic": log_value(head_losses["dynamic"]),
         "feedback_frames": float(frames),
         "feedback_stride": float(max(1, int(render_stride))),
-        "feedback_sample_weight_mean": float(
-            sample_weight[:batch_size].detach().float().mean().item()
+        "feedback_sample_weight_mean": log_value(
+            sample_weight[:batch_size].mean()
         ),
     }
     if conf_weight is not None:
@@ -549,12 +574,8 @@ def compute_reconstruction_feedback_losses(
         )
         logs.update(
             {
-                "loss_head_consistency_no_conf": float(
-                    head_loss_no_conf.detach().item()
-                ),
-                "feedback_conf_weight_mean": float(
-                    raw_teacher_conf.detach().float().mean().item()
-                ),
+                "loss_head_consistency_no_conf": log_value(head_loss_no_conf),
+                "feedback_conf_weight_mean": log_value(raw_teacher_conf.mean()),
                 "feedback_conf_weight_power": float(conf_weight_power),
             }
         )
