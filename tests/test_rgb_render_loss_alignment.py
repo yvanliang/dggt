@@ -520,9 +520,23 @@ def test_pretrain_rgb_defaults_use_every_full_resolution_frame():
     assert args.rgb_render_max_frames == 0  # 0 means every frame in the clip.
     assert args.rgb_render_stride == 1
     assert args.rgb_render_sigma_power == 2.0
-    assert args.lambda_rgb_render == pytest.approx(0.005)
-    assert args.lambda_level_consistency == pytest.approx(0.1)
-    assert args.lambda_head_consistency == pytest.approx(0.1)
+    # World-feedback balance.  These three moved together with the switch to
+    # ``--head_dynamic_space probability``: at 0.1/0.1/0.1 the head term was
+    # 97.8% unbounded dynamic logit, and the parts that describe the rendered
+    # scene came to 0.035% of the training loss.
+    # All three read the same decode of the same predicted latent, so they carry
+    # the same weight.  0.05 and the 0.1 that briefly replaced it were both set
+    # against the wrong reference (the unused 0.005 code default, then v5's
+    # launcher pin), and left the only term that reads pixels 23x below the one
+    # that reads the frozen heads.
+    assert args.lambda_rgb_render == pytest.approx(1.0)
+    assert args.lambda_level_consistency == pytest.approx(1.0)
+    assert args.lambda_head_consistency == pytest.approx(1.0)
+    assert args.lambda_rgb_render == pytest.approx(args.lambda_head_consistency)
+    # L1 and L2 read the same decode under the same sigma weighting, so they
+    # stay equal to each other the way v5 had them.
+    assert args.lambda_level_consistency == pytest.approx(args.lambda_head_consistency)
+    assert args.head_dynamic_space == "probability"
     assert args.feedback_conf_weight_power == pytest.approx(1.0)
     assert args.feedback_conf_weight_floor == pytest.approx(0.05)
     assert args.val_sample_steps == 50
@@ -644,6 +658,13 @@ def test_pretrain_launch_scripts_do_not_override_rgb_coverage_defaults():
         "--rgb_render_every",
         "--rgb_render_max_frames",
         "--rgb_render_stride",
+        # The three world-feedback weights are a balance argument that lives
+        # with the loss code.  A launcher override silently pins one side of it
+        # across a rebalance, which is how v6 ended up running the render loss
+        # at 1/20 of the value it had just connected a new gradient path to.
+        "--lambda_rgb_render",
+        "--lambda_level_consistency",
+        "--lambda_head_consistency",
     )
     for script_name in PRETRAIN_LAUNCH_SCRIPTS:
         script = (REPO_ROOT / script_name).read_text()
@@ -718,7 +739,8 @@ def test_directional_sky_projection_matches_validation_path():
 
     torch.manual_seed(7)
     seq_len, height, width = 2, 11, 17
-    sky_tokens = torch.rand((1, 32, 8)) * 2.0 - 1.0
+    # Both renderers take the decoded RGB atlas, one row per atlas direction.
+    sky_tokens = torch.rand((1, 32, 3)) * 2.0 - 1.0
     world_to_camera = torch.eye(4).view(1, 1, 4, 4).expand(1, seq_len, 4, 4).clone()
     world_to_camera[0, 1, 0, 3] = 0.2
     intrinsics = torch.tensor(

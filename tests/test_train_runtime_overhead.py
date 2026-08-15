@@ -263,13 +263,14 @@ def test_continuous_sampler_preserves_drop_last_at_each_logical_epoch() -> None:
 def test_validation_defaults_and_ppu_launchers_use_requested_cadence() -> None:
     parser = trainer.build_argparser()
     assert parser.get_default("val_every") == 2000
-    assert parser.get_default("val_inference_scenes") == 1
+    # Ten scenes: five pinned carry the numbers, five rotate for the pictures.
+    assert parser.get_default("val_inference_scenes") == 10
 
     root = Path(trainer.__file__).resolve().parent
     for name in ("pretrain_ppu.sh", "pretrain_ppu_two_nodes_dlc.sh"):
         source = (root / name).read_text(encoding="utf-8")
         assert 'VAL_EVERY="${VAL_EVERY:-2000}"' in source
-        assert 'VAL_INFERENCE_SCENES="${VAL_INFERENCE_SCENES:-5}"' in source
+        assert 'VAL_INFERENCE_SCENES="${VAL_INFERENCE_SCENES:-10}"' in source
         assert '--val_inference_scenes "${VAL_INFERENCE_SCENES}"' in source
 
     for name in (
@@ -299,15 +300,26 @@ def test_five_scene_three_cfg_validation_maps_one_job_to_fifteen_ranks() -> None
     assert trainer.effective_validation_scene_count(3, 5, world_size=64) == 5
 
 
-def test_validation_falls_back_to_one_scene_below_fifteen_ranks() -> None:
+def test_validation_falls_back_to_two_scenes_when_ranks_are_short() -> None:
+    """One pinned and one rotating, so neither half disappears.
+
+    Falling back to a single scene would drop the rotating half entirely, and
+    falling back on the pinned half would leave the sample_* series with no
+    fixed reference at all.
+    """
+
+    assert trainer.effective_validation_scene_count(3, 10, world_size=29) == 2
+    assert trainer.effective_validation_scene_count(3, 10, world_size=30) == 10
+    # Six jobs fit inside one eight-accelerator node.
     assignments = [
-        trainer.validation_sampling_tasks_for_rank(
-            3, 5, rank=rank, world_size=2
-        )
-        for rank in range(2)
+        trainer.validation_sampling_tasks_for_rank(3, 10, rank=rank, world_size=8)
+        for rank in range(8)
     ]
-    assert assignments == [((0, 0), (0, 2)), ((0, 1),)]
-    assert trainer.effective_validation_scene_count(3, 5, world_size=14) == 1
+    assert assignments[:6] == [
+        ((scene, scale),) for scene in range(2) for scale in range(3)
+    ]
+    assert assignments[6:] == [(), ()]
+    assert trainer.validation_pinned_scene_count(2) == 1
 
 
 def _mosaic_row(slot: int, group: str, order: int) -> dict[str, object]:

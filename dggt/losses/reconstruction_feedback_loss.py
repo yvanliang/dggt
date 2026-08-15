@@ -281,6 +281,21 @@ def _scalar_dense_error_map(value: torch.Tensor, *, name: str) -> torch.Tensor:
     )
 
 
+DYNAMIC_HEAD_SPACES = ("probability", "logit")
+
+DYNAMIC_HEAD_LOSS_WEIGHT = 4.0
+"""Weight of the dynamic-confidence term inside the head-consistency loss.
+
+Moving the comparison into probability space fixed a term that was carrying
+97.8% of the head loss, but it overshot: measured on v6 at step 7.5k the split
+became gaussian 47.2%, ``0.1 * gs_conf`` 40.6%, depth 9.8%, dynamic **2.2%**.
+Dynamic is the channel that separates a moving actor from static background,
+which is the capability this model is being built for, so it should not sit at
+a fifth of depth.  4.0 is the measured ratio that brings it to parity with
+depth (2.53e-4 / 5.74e-5 = 4.4) without touching the two GS terms.
+"""
+
+
 def _head_error_maps(
     student_geometry: Any,
     teacher_geometry: Any,
@@ -288,6 +303,7 @@ def _head_error_maps(
     batch_size: int,
     frames: int,
     stride: int,
+    dynamic_space: str = "probability",
 ) -> dict[str, torch.Tensor]:
     student_depth = _slice_dense(
         student_geometry.depth, batch_size=batch_size, frames=frames, stride=stride
@@ -372,11 +388,27 @@ def _head_error_maps(
     teacher_dynamic = _slice_dense(
         teacher_geometry.dynamic_conf, batch_size=batch_size, frames=frames, stride=stride
     ).detach().float()
+    if dynamic_space not in DYNAMIC_HEAD_SPACES:
+        raise ValueError(
+            f"dynamic_space must be one of {DYNAMIC_HEAD_SPACES}, got {dynamic_space!r}"
+        )
+    if dynamic_space == "probability":
+        # ``instance_head`` is built with ``activation="linear"`` (vggt.py), so
+        # ``dynamic_conf`` is an unbounded logit while every other term here is
+        # already bounded: depth and GS scale are compared in log space, the two
+        # confidences through ``log1p``, and RGB/opacity are sigmoid outputs in
+        # [0,1].  Comparing raw logits let this single term carry ~98% of the
+        # head loss and stall, so match the renderer instead: it multiplies
+        # ``sigmoid(dynamic_conf)`` into static opacity, and probability space
+        # concentrates the gradient exactly at the 0.5 membership threshold
+        # while saturating far away from it.
+        student_dynamic = student_dynamic.sigmoid()
+        teacher_dynamic = teacher_dynamic.sigmoid()
     dynamic = _scalar_dense_error_map(
         F.smooth_l1_loss(
             student_dynamic,
             teacher_dynamic,
-            beta=0.5,
+            beta=0.1 if dynamic_space == "probability" else 0.5,
             reduction="none",
         ),
         name="dynamic_conf",
@@ -403,6 +435,7 @@ def compute_reconstruction_feedback_losses(
     sample_weight: torch.Tensor,
     conf_weight_power: float = 1.0,
     conf_weight_floor: float = 0.05,
+    dynamic_space: str = "probability",
     defer_log_values: bool = False,
     collect_logs: bool = True,
 ) -> ReconstructionFeedbackLossResult:
@@ -470,6 +503,7 @@ def compute_reconstruction_feedback_losses(
         batch_size=batch_size,
         frames=frames,
         stride=render_stride,
+        dynamic_space=dynamic_space,
     )
     teacher_depth_conf = teacher_geometry.depth_conf[:batch_size, :frames]
     conf_weight = _teacher_conf_weight(
@@ -500,14 +534,14 @@ def compute_reconstruction_feedback_losses(
         + 0.1 * head_losses["depth_conf"]
         + head_losses["gaussian"]
         + 0.1 * head_losses["gs_conf"]
-        + head_losses["dynamic"]
+        + DYNAMIC_HEAD_LOSS_WEIGHT * head_losses["dynamic"]
     )
     head_loss_unweighted = (
         head_unweighted["depth"]
         + 0.1 * head_unweighted["depth_conf"]
         + head_unweighted["gaussian"]
         + 0.1 * head_unweighted["gs_conf"]
-        + head_unweighted["dynamic"]
+        + DYNAMIC_HEAD_LOSS_WEIGHT * head_unweighted["dynamic"]
     )
     head_loss_no_conf = None
     if collect_logs and conf_weight is not None:
@@ -525,7 +559,7 @@ def compute_reconstruction_feedback_losses(
             + 0.1 * no_conf_losses["depth_conf"]
             + no_conf_losses["gaussian"]
             + 0.1 * no_conf_losses["gs_conf"]
-            + no_conf_losses["dynamic"]
+            + DYNAMIC_HEAD_LOSS_WEIGHT * no_conf_losses["dynamic"]
         )
     checked = [level_loss, head_loss]
     if collect_logs:

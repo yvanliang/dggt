@@ -366,21 +366,21 @@ scene-global 尺度/FOV。
 
 ## 10. Sky Token 设计
 
-sky generation 只属于 full-scene pretrain。sky token 是 scene-level directional atlas token：先构造 `32x64` RGB atlas，再用固定 `2x2` pixel-unshuffle 打包为默认 `16x32` grid，每个 token 12 维：
+sky generation 只属于 full-scene pretrain。`rgb_patch_teacher_anchor_v4` 的 sky token 是 scene-level directional atlas token：先构造 `128x256` RGB atlas，再用固定 `8x8` pixel-unshuffle 打包为默认 `16x32` grid，每个 token 192 维；token 总数仍为 512，主干序列长度不变：
 
 ```text
-2x2 atlas patch x [r, g, b]
+8x8 atlas patch x [r, g, b]
 ```
 
 训练时从输入图像、sky mask、冻结 DGGT teacher c2w 和离线 gauge GT 构造 sky token
 target。teacher c2w 保留 camera-anchor 的 `-y-up` atlas 世界，FOV 由 trunk-constant gauge K
 提供；因此 atlas 整个 29 帧 trunk 的写入内参不再跟随 teacher 逐帧抖动。sky mask
-只用于构造 RGB target 和逐输出通道的 `sky_gen_loss_weight [B,512,12]`，绝不能
+只用于构造 RGB target 和逐输出通道的 `sky_gen_loss_weight [B,512,192]`，绝不能
 作为模型输入 attention mask；训练和开放推理都 pack 完整 `16x32` sky atlas。
 每个 atlas cell 对应上半球一个无穷远方向 bin；target 投影只使用 world-to-camera
 rotation，不使用 translation，和 renderer 的 camera-ray 环境贴图定义严格互逆。该方向
 投影到各帧后，在 GT sky mask 内采样 RGB，并选择置信度最高的可见帧，避免跨帧
-位姿误差模糊纹理。未观测方向使用带经度环绕的球面邻域补全，且只按默认 `0.05`
+位姿误差模糊纹理。未观测方向使用带经度环绕的球面邻域补全，且只按默认 `0.005`
 低权重监督；整段完全没有有效 sky 观测时仍为零权重。visibility 使用和 RGB 完全相同的
 pixel-unshuffle 顺序打包，因此一个 token 内未观测的子像素不会因相邻子像素可见而
 被错误监督；可用 `--sky_unobserved_loss_weight` 调整低权重。
@@ -480,10 +480,10 @@ lambda_sky_mask_refine = 0.10
 sky_mask_dice_weight = 0.5
 sky_mask_pos_weight_max = 10.0
 sky_mask_refine_boundary_weight = 4.0
-sky_mask_refine_boundary_loss_weight = 0.25
+sky_mask_refine_boundary_loss_weight = 0.125
 ```
 
-`pos_weight` 按当前 batch 的 sky/non-sky 比例动态计算并 clamp，避免天空正类比例低时被 BCE 淹没。Dice 约束区域重叠，boundary BCE 专门提高地平线、树冠、电线杆等边界附近的监督强度。
+`pos_weight` 按当前 batch 的 sky/non-sky 比例动态计算并 clamp，避免天空正类比例低时被 BCE 淹没。Dice 约束区域重叠，boundary BCE 专门提高地平线、树冠、电线杆等边界附近的监督强度；默认 boundary 系数乘积为 `0.125 * 4.0 = 0.5`。
 
 sky mask 的 patch head 与 refined head 都在和 video clean prediction 相同的随机 `sigma` denoising forward 上接受辅助监督。它们与生成器的 clean-state prediction 共用主干，但保持两个独立输出头：patch head 预测面积池化后的概率，refined head 提供 RGB render 使用的稠密边界。训练只运行这一次主 SceneFlow forward；RGB render 直接读取该 forward 的 refined 概率，高噪声行继续由 $(1-\sigma)^2$ 连续降权，不再有额外的 `sigma=0` 辅助 forward 或 endpoint 监督。
 

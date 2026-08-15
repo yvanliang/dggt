@@ -202,10 +202,11 @@ torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
     --camera_guidance_scale 1.0 \
     --val_guidance_scales "1.0,2.0,4.0" \
     --val_scene_start 0 --val_scene_end 100 \
-    --val_every 1000 \
-    --val_batches 1 \
+    --val_every 2000 \
+    --val_batches 8 \
     --val_log_images 10 \
-    --val_sample_steps 35 \
+    --val_inference_scenes 10 \
+    --val_sample_steps 50 \
     --grad_clip_norm 1.0 \
     --seed 0 \
     --precision bf16 \
@@ -219,31 +220,32 @@ torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
 在双 200G HDR IB（`mlx5_4/5`）→ `mlx5_bond_0` RDMA → `bond0` socket 之间自动降级，
 并把日志/PID 写到 `logs/distributed_launch/`。
 
-**启动器里没有显式传、但依赖默认值的参数**（默认值恰好等于本文件旧版显式写出的取值，
-所以省略不改变行为）：
+**启动器里没有显式传、但依赖 trainer 默认值的参数**。这些损失权重有意只在
+`train_scene_flow_pretrain.py` 维护，避免重平衡后被某个启动器静默钉回旧值：
 
 ```text
---camera_anchor_window_probability 0.5   --scheduler_type linear
+--scheduler_type linear
 --decay_end_steps 0  → 回退成 max_steps=200000
---lambda_rgb_render 0.1   --lambda_level_consistency 0.1   --lambda_head_consistency 0.1
+--lambda_rgb_render 1.0   --lambda_level_consistency 1.0   --lambda_head_consistency 1.0
 --rgb_render_every 1   --rgb_render_start_step 5000   --rgb_render_warmup_steps 5000   --rgb_render_sigma_power 2.0
 --rgb_render_max_samples 1  --rgb_render_max_frames 0  --rgb_render_stride 1
 --rgb_render_sky_mask_grad_scale 0.05
 --rgb_render_lpips_weight 0.01   --rgb_render_sky_weight 1.0
 --lambda_sky_mask 0.05   --lambda_sky_mask_refine 0.1
---sky_mask_endpoint_start_step 5000   --sky_mask_endpoint_every 4
---sky_unobserved_loss_weight 0.05   --lambda_sky_view_reconstruction 0.1
---camera_{translation,rotation,absolute,relative}_weight 1.0   --camera_smoothness_weight 0.25
+--sky_mask_refine_boundary_weight 4.0   --sky_mask_refine_boundary_loss_weight 0.125
+--sky_atlas_h 128   --sky_atlas_w 256   --sky_grid_h 16   --sky_grid_w 32
+--sky_unobserved_loss_weight 0.005   --lambda_sky_view_reconstruction 1.0
 --lambda_gauge_flow 0.1   --lambda_gauge_direct 1.0
---metric_depth_diagnostic_every 50   --metric_depth_diagnostic_start_step 0
+--metric_depth_diagnostic_every 500   --metric_depth_diagnostic_start_step 0
 --metric_depth_diagnostic_max_samples 1
---camera_text_guidance_scale 1.0
 ```
+
+head-consistency 内部对 dynamic-confidence 通道使用
+`DYNAMIC_HEAD_LOSS_WEIGHT=4.0`；它是损失实现常量，不是启动器可覆盖的 CLI 参数。
 
 ### 1.2 启动器参数复核结论
 
-以下是对 `pretrain_*.sh` 现有取值的逐项复核。**打勾的不需要改；标 ⚠️ 的是运行隐患，
-本文档只记录，未改动脚本。**
+以下是对 `pretrain_*.sh` 现有取值的逐项复核。**打勾的是当前正式配置；标 ⚠️ 的是仍需调用方留意的运行隐患。**
 
 | 项 | 取值 | 结论 |
 |---|---|---|
@@ -251,7 +253,7 @@ torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
 | `--feature_stats_path` | `feature_stats_pretrain_v5.pt` | tokenizer v2 正式统计；必须包含 9D metric camera、3D gauge、factorized-v3 16D placement 统计和 v2 tokenizer provenance |
 | `--latent_dim 1024` / `--patch_grid_h 25 --patch_grid_w 37` | — | ✅ 与 tokenizer / 数据一致 |
 | gradient checkpointing | DLC 默认 three_quarter | ✅ 公共 DLC launcher 传 `--three_quarter_gradient_checkpointing`，交错 checkpoint 21/28 encoder blocks，DDT 为 0/2；`GRADIENT_CHECKPOINTING=1` 使用 full，`half` 使用 14/28 + 1/2，`0` 完全关闭 |
-| `--shift 10 --weighting_scheme waver --mode_scale 1.29 --prediction_type x` | — | ✅ 与 RAEv2 数值对拍一致；`--val_sample_steps 35` 满足 `steps ≤ shift/t_eps-shift+1 = 191` |
+| `--shift 10 --weighting_scheme waver --mode_scale 1.29 --prediction_type x` | — | ✅ 与 RAEv2 数值对拍一致；冻结的 `--val_sample_steps 50` 满足 `steps ≤ shift/t_eps-shift+1 = 191` |
 | 全局 batch | 64（3 节点为 72） | ✅ 但 3 节点的 72 与其它拓扑不可严格互比，`WANDB_NAME` 已按 `gb72` 区分 |
 | `--lr 1e-4 --final_lr 1e-5` | — | ✅ 可用。RAEv2 t2i 在 gmuon + 全局 batch 1024 下用 2e-4；这里 batch 64 用 1e-4 偏保守，若前 2 万步 loss 下降过慢可以试 2e-4 |
 | `--warmup_steps 4000` | — | ✅ 未传 `--warmup_from_zero`，所以这是 4000 步的**初始 LR 平台**，不是从 0 升温 |
@@ -260,7 +262,7 @@ torchrun --nproc_per_node=8 train_scene_flow_pretrain.py \
 | `--camera_anchor_context_dropout 0.25` | — | ✅ 启动器有意保留的生成分支鲁棒性训练：只对确实含全局 anchor 的窗口隐藏 anchor，并 mask 对应 camera anchor/absolute-pose 监督。D3 后 RGB render 使用 detached teacher pose，**不再**因该 dropout 排除样本；内部日志会报告实际 dropout fraction。argparse 的 `0.0` 仍用于无额外消融的裸命令。 |
 | `--lambda_camera_pose 1.0` | — | ✅ 与 argparse 默认及 `lambda_gauge_direct=1.0` 对齐；各拓扑启动器均显式固定该值 |
 | RGB render cadence/window flags | 启动器不显式覆盖 | ✅ 统一服从入口的正式默认值，避免不同拓扑静默分叉 |
-| `--val_batches 1` | — | ⚠️ 只用 1 个 batch 估计 validation loss，噪声很大，曲线不可读。采样出图才是大头，建议至少 4 |
+| `--val_batches 8` | — | ✅ 与 argparse 默认一致；固定的黄金比例散布覆盖集提供 8 个 validation batch，不再连续停留在同一 scene/trunk |
 | `--num_workers 8 --prefetch_factor 2` | — | ✅ 真实 raw-data benchmark 为 3.065 sample/s/rank；8 workers 明显优于 4 workers 的 1.464 sample/s/rank |
 | `--pin_memory` | `True` | ✅ 所有正式 pretrain 启动器均显式开启；CUDA 0 实测将中位 H2D 从 10.35 ms 降到 2.43 ms |
 | `--resume_path` | 启动器不传 | ✅ metric-gauge v4 按 clean cut 从头训练；旧 v3 checkpoint 会被入口拒绝 |
@@ -308,7 +310,7 @@ Pinned-memory 预算约为每 rank `8 workers × 2 prefetch × 50 MiB ≈ 0.8 Gi
 * 增大 `GRAD_ACCUM_STEPS`、保持 `BATCH_SIZE_PER_GPU=1`（有效 batch 不变）
 * `sequence_length` 不能降到 6：v4 pullback 与 tokenizer 正式契约固定为 10 帧，入口会拒绝其它值。
   仍 OOM 时应关闭训练期 RGB/LPIPS 辅助项或减少 validation 渲染帧数，再用更大的梯度累积保持有效 batch。
-* 仍不够：`--val_batches 1 --val_log_images 2 --no_val_render_rgb`（只降验证开销，不动训练）
+* 仍不够：可显式用 `--val_batches 1 --val_log_images 2 --no_val_render_rgb` 做应急降级；这会覆盖正式默认的 8 个 validation batch，只适合排障，不适合比较标量曲线。
 
 > 旧的 4 卡 `--sequence_length 4 --batch_size 1` 与 `2 GPU × batch_size 8` 有效 batch 16 的配置都已弃用；
 > 当前统一使用 `--sequence_length 10 --latent_dim 1024`、全局 batch 64。
@@ -321,24 +323,25 @@ Pinned-memory 预算约为每 rank `8 workers × 2 prefetch × 50 MiB ≈ 0.8 Gi
   29 帧 teacher DGGT pose（D3 gate）。旧 `--rgb_render_camera_grad_scale` CLI 已删除；底层兼容参数
   只接受 `0.0`，非零会 fail-fast。`--render_use_predicted_gauge` 只用于显式消融：它替换尺度/FOV gauge，不替换
   teacher 的旋转与轨迹形状。
-* `metric_depth_rel_err` 有独立 cadence（默认每 50 optimizer step、从 step 0 开始），不再等到
+* `metric_depth_rel_err` 有独立 cadence（默认每 500 optimizer step、从 step 0 开始），不再等到
   RGB loss 的 5000-step warm-up；非诊断步保留 `available=0` sentinel。
 * `--seed` 会设置 Python/NumPy/PyTorch/CUDA 随机种子；DDP 下每个 rank 使用 `seed + rank`。
 * `--val_image_dir` 指定 validation split 根目录；`--val_scene_start/--val_scene_end` 是在该 validation split 内部选 scene 范围，不要用 training split 的 800-850 做验证。
-* `--val_every 1000` 表示每 1000 个 optimizer step 跑一次 validation；不是每 1000 个 batch，也不是每 1000 个 epoch。
-* `--val_batches` 表示每次 validation 只遍历几个 validation batch 估计 loss，用来控制验证耗时；它不会限制训练数据量。启动器当前用 `1`，loss 曲线噪声较大，只能看趋势；想读数值建议至少 `4`。
-* pretrain validation 的局部 loss 会按与长窗相同的 clip-global 起点轮转；10 帧、stride 7 时为 `0/7/14/19`，因此同时覆盖含唯一 anchor 的首窗和三个 delta-only 后窗。采样可视化固定使用完整 29 帧 clip，并以训练 `sequence_length` 作为窗口做滑窗 rollout；若配置 stride 不适用于更短的训练窗口（例如 `sequence_length=6, stride=7`），会自动改用该窗口的三帧重叠默认值。
+* 正式启动器的 `--val_every 2000` 表示每 2000 个 optimizer step 跑一次 validation；不是每 2000 个 batch，也不是每 2000 个 epoch。
+* `--val_batches` 表示每次 validation 遍历几个 validation batch 估计 loss，用来控制验证耗时；它不会限制训练数据量。argparse 和全部正式启动器当前都用 `8`，并由固定的黄金比例散布 sampler 覆盖不同 scene/trunk/window，而不是按已消费样本数沿 trunk-major 索引缓慢前进。
+* `--val_inference_scenes 10` 为每次采样安排 10 个场景 × 3 个 CFG scale。前 5 个场景 pinned，且只有它们进入 `validation/sample_*` 均值；后 5 个轮换且只出图。world size 小于 30 时回退到 2 个场景（1 pinned + 1 rotating，共 6 个任务），任务按 rank round-robin 分配。
+* pretrain validation 的固定 spread cover 会从与长窗相同的 clip-global 起点取样；10 帧、stride 7 时为 `0/7/14/19`，因此每次都同时覆盖含唯一 anchor 的首窗和三个 delta-only 后窗。采样可视化固定使用完整 29 帧 clip，并以训练 `sequence_length` 作为窗口做滑窗 rollout；若配置 stride 不适用于更短的训练窗口（例如 `sequence_length=6, stride=7`），会自动改用该窗口的三帧重叠默认值。
 * pretrain 现在固定为 full_scene；旧的 `pseudo_edit/random_inpaint/mixed` CLI 参数已经删除。
 * `--uncond_drop_prob` 仅作为 `--text_uncond_drop_prob` 的兼容别名。asset/camera 不再独立 dropout，而由 `--joint_generation_prob --camera_controlled_prob --asset_camera_controlled_prob` 三项结构化任务概率控制；三者必须和为 1，且不会产生 asset-without-camera。
 * 默认训练 sky generation；如需关闭，加 `--no_sky_generation`。
-* sky target 是 `32×64` 上半球 RGB atlas，每个方向选置信度最高的可见帧；未观测区域 observation weight 为零，不再填全局均色。通过固定 `2×2` pixel-unshuffle 打包为 `16×32×12`，SceneFlow 仍只处理 512 个 sky token，不需要独立 sky tokenizer 或额外 checkpoint。
-* validation 图像会保存到 `${LOG_DIR}/validation/step_xxxxxx/`（默认启动器目录为
-  `logs/scene_flow_pretrain_tokenizer_v2`）；默认包含生成渲染、sky、mask、latent PCA
-  和误差图。额外 CFG scale 会追加 `*_cfg{scale}` 后缀。相邻 validation event 按
-  `joint_generation -> camera_controlled -> asset_camera_controlled` 循环结构条件任务；
-  同一次 event 的全部 CFG scale 保持相同任务和初始噪声，便于直接比较。
+* sky target 是 `128×256` 上半球 RGB atlas，每个方向选置信度最高的可见帧；未观测区域经球面邻域补全，并以 `--sky_unobserved_loss_weight 0.005` 参与训练监督。通过固定 `8×8` pixel-unshuffle 打包为 `16×32×192`，SceneFlow 仍只处理 512 个 sky token，不增加主干序列长度，也不需要独立 sky tokenizer 或额外 checkpoint。该布局属于 `rgb_patch_teacher_anchor_v4`，checkpoint 会严格校验。
+* validation 图像会保存到 `${LOG_DIR}/validation/step_xxxxxx/`（多数启动器默认
+  `${PROJECT_ROOT}/logs/scene_flow_pretrain_v6`）；默认包含生成渲染、sky、mask、latent PCA
+  和误差图。额外 CFG scale 会追加 `*_cfg{scale}` 后缀。validation 的基准条件固定为
+  完整 TCMGA；相邻 event 只轮换后半部分的可视化场景，不轮换结构条件任务。固定
+  slot 跨 event 保持相同初始噪声，同一 slot 的全部 CFG scale 也共享该噪声，便于直接比较。
 * pretrain offline inference 在 checkpoint 加载后只接受与 checkpoint 内 `mu_z/sigma_z` 和四组 camera anchor/delta buffers **逐元素完全一致**的 stats 文件；不一致会报错，不会再用外部文件覆盖 checkpoint 坐标系。
-* `--val_sample_steps` 只控制 validation 图像采样步数，不影响训练本身。启动器用 `35`。`15` 偏少，只适合 smoke test；需要更稳定的样本可用 `50`。FlowMatch/RAE 的生成采样也不是训练时的 1000 timestep 全跑，而是在 scheduler timestep 上做几十步推理。RAE 的 target 使用 `max(sigma,t_eps)`，因此最后一个非零采样点不能低于 `t_eps`；代码会拒绝越界配置。默认 `shift=10,t_eps=0.05` 时最多 191 步。
+* `--val_sample_steps` 只控制 validation 图像采样步数，不影响训练本身。当前值冻结为 `50`，入口会拒绝其它值。FlowMatch/RAE 的生成采样不是训练时的 1000 timestep 全跑，而是在 scheduler timestep 上做几十步推理。RAE 的 target 使用 `max(sigma,t_eps)`，因此最后一个非零采样点不能低于 `t_eps`；默认 `shift=10,t_eps=0.05` 时最多 191 步。
 * 训练内 validation 默认 `--val_sliding_window 10 --val_sliding_stride 7`，即相邻窗口重叠 3 帧。长序列必须满足 `1 <= stride < window`；`stride>=window` 直接报错。采样维护 full video/camera/sky 状态，对 video/camera/mask logits 用 cosine coverage 逐帧归一化；scene-global sky 使用 `sum(w/C)` 窗口权重，使每个全局帧贡献相等。
 * 如需只记录 latent/mask 诊断图并跳过较慢的 3DGS RGB 渲染，可额外加 `--no_val_render_rgb`。
 * 若当前机器未登录 wandb，可先执行 `wandb login`，或临时去掉 `--wandb` 相关参数。
@@ -521,7 +524,7 @@ gauge table/tokenizer/DGGT/pullback SHA 完全一致的新 checkpoint。
 ## 4. 四类 validation / offline inference
 
 训练内 pretrain validation 使用 `train_scene_flow_pretrain.py` 的
-`--val_sliding_window 10 --val_sliding_stride 7 --val_sample_steps 35`，其采样可视化会使用完整
+`--val_sliding_window 10 --val_sliding_stride 7 --val_sample_steps 50`，其采样可视化会使用完整
 29 帧 clip。正式训练 validation 使用 `train_scene_flow.py`，但默认 validation dataset 仍输出
 10 帧窗口；同名滑窗参数不会把样本自动扩展成 29 帧。完整 29 帧的 T1 滑窗链路应使用下面的
 formal offline inference 验证。正式 validation 不 pack、不加噪，也不启动 pretrain 的

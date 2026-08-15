@@ -81,7 +81,10 @@ from dggt.utils.sliding_window import (
     window_slices,
 )
 from train_scene_flow_pretrain import (
+    DEFAULT_SKY_ATLAS_HW,
     DEFAULT_SKY_GRID,
+    SKY_REPRESENTATION_VERSION,
+    SKY_TOKEN_DIM,
     T59_VALIDATION_SAMPLE_STEPS,
     build_layout_condition_from_batch,
     build_pretrain_bundle_from_batch,
@@ -122,6 +125,55 @@ SCENE_FLOW_DERIVED_CONFIG_KEYS = (
     "sky_rope_temporal_offset",
     "camera_rope_spatial_mode",
 )
+
+
+CURRENT_PRETRAIN_SKY_CHECKPOINT_CONTRACT = {
+    "sky_representation_version": SKY_REPRESENTATION_VERSION,
+    "sky_atlas_hw": DEFAULT_SKY_ATLAS_HW,
+    "sky_grid": DEFAULT_SKY_GRID,
+    "sky_token_dim": SKY_TOKEN_DIM,
+}
+
+
+def _require_current_pretrain_sky_checkpoint_config(
+    config: dict[str, Any],
+    checkpoint_path: str | Path,
+) -> None:
+    """Reject checkpoints that the current pretrain inference helpers cannot decode."""
+
+    actual = {
+        "sky_representation_version": config.get("sky_representation_version"),
+        "sky_atlas_hw": config.get("sky_atlas_hw"),
+        "sky_grid": config.get("sky_grid"),
+        "sky_token_dim": config.get("sky_token_dim"),
+    }
+    mismatches: list[str] = []
+    for name, expected in CURRENT_PRETRAIN_SKY_CHECKPOINT_CONTRACT.items():
+        value = actual[name]
+        if name in ("sky_atlas_hw", "sky_grid"):
+            try:
+                value = tuple(int(item) for item in value)
+            except (TypeError, ValueError):
+                pass
+            expected = tuple(int(item) for item in expected)
+        elif name == "sky_token_dim":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                pass
+            expected = int(expected)
+        if value != expected:
+            mismatches.append(f"{name}: checkpoint={actual[name]!r}, required={expected!r}")
+    if mismatches:
+        raise ValueError(
+            f"{checkpoint_path} has an unsupported sky representation for offline "
+            "SceneFlow pretrain inference; current inference requires the complete "
+            f"{SKY_REPRESENTATION_VERSION} contract ("
+            + "; ".join(mismatches)
+            + "). Old v3 sky checkpoints are intentionally rejected before model "
+            "construction because the target, sampler, and renderer helpers decode "
+            "only the current representation."
+        )
 
 
 def parse_cfg_scales(values: Sequence[str]) -> list[float]:
@@ -476,6 +528,7 @@ def _require_current_checkpoint(
         raise ValueError(f"{checkpoint_path} is missing scene_flow_config")
     if not isinstance(schedule, dict):
         raise ValueError(f"{checkpoint_path} is missing flow_schedule_config")
+    _require_current_pretrain_sky_checkpoint_config(config, checkpoint_path)
     if config.get("layout_condition_version") != LAYOUT_CONDITION_VERSION:
         raise ValueError("inference requires the layout-v2 model contract")
     if config.get("raster_schema_hash") != RASTER_SCHEMA_HASH:
@@ -582,7 +635,8 @@ def _sync_args_from_model(
     args.sky_grid = tuple(int(value) for value in config.sky_grid)
     args.sky_grid_h, args.sky_grid_w = args.sky_grid
     args.sky_atlas_hw = tuple(
-        int(value) for value in getattr(config, "sky_atlas_hw", (32, 64))
+        int(value)
+        for value in getattr(config, "sky_atlas_hw", DEFAULT_SKY_ATLAS_HW)
     )
     args.sky_mask_refine_scale = int(config.sky_mask_refine_scale)
     args.sky_mask_refine_channels = int(config.sky_mask_refine_channels)

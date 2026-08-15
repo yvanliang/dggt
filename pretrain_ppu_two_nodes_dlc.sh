@@ -145,9 +145,17 @@ MAX_STEPS="${MAX_STEPS:-200000}"
 DECAY_END_STEPS="${DECAY_END_STEPS:-0}"
 SAVE_EVERY="${SAVE_EVERY:-2500}"
 VAL_EVERY="${VAL_EVERY:-2000}"
-VAL_BATCHES="${VAL_BATCHES:-1}"
+# Match the trainer default.  One batch made every validation/* scalar a single
+# window, and with the fixed spread cover that window is always the same scene;
+# eight rank-0 forwards cost ~1% of a validation that already spends ~23 minutes
+# on the sampling path, and buy an eight-scene mean instead of one reading.
+VAL_BATCHES="${VAL_BATCHES:-8}"
 VAL_LOG_IMAGES="${VAL_LOG_IMAGES:-10}"
-VAL_INFERENCE_SCENES="${VAL_INFERENCE_SCENES:-5}"
+# Ten scenes x three CFG scales = 30 sampling jobs, one per rank.  The first
+# five are pinned and are the only source of the validation/sample_* numbers;
+# the last five rotate through the split for fresh mosaics.  Below 30 ranks the
+# trainer falls back to two scenes (one pinned, one rotating).
+VAL_INFERENCE_SCENES="${VAL_INFERENCE_SCENES:-10}"
 VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-50}"
 # Keep a one-step fallback cadence if a caller explicitly switches back to
 # --no_tqdm. The default PPU path below forces tqdm through the Web log pipe so
@@ -370,8 +378,12 @@ build_train_args() {
         --lambda_repa 0.5
         --base_model_coeff 0.25
         --lambda_boundary 0.25
-        --lambda_sky_flow 0.1
-        --lambda_rgb_render 0.005
+        --lambda_sky_flow 0.5
+        # World-feedback weights (rgb render / level / head consistency) are
+        # deliberately NOT overridden here: they are a balance argument that
+        # lives with the loss code, in RGB_RENDER_LAMBDA_DEFAULT and its two
+        # neighbours in train_scene_flow_pretrain.py.  A launcher override
+        # silently pins an old value across a rebalance.
         --cfg "${CFG_SCALE}"
         --layout_guidance_scale "${LAYOUT_GUIDANCE_SCALE}"
         --asset_control_guidance_scale "${ASSET_CONTROL_GUIDANCE_SCALE}"
@@ -438,7 +450,7 @@ echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+
 echo "training start: step 0 (layout-v2 v6; no legacy checkpoint)"
 echo "training steps: max=${MAX_STEPS}, lr_decay_end=${DECAY_END_STEPS}, save_every=${SAVE_EVERY}"
 echo "training logs: tqdm Web-console mode (ETA/rate enabled; one update per optimizer step)"
-echo "validation: every=${VAL_EVERY}, batches=${VAL_BATCHES}, inference_scenes=${VAL_INFERENCE_SCENES} (5 scenes x 3 CFG on >=15 ranks; otherwise 1 scene), log_images=${VAL_LOG_IMAGES}, sample_steps=${VAL_SAMPLE_STEPS}"
+echo "validation: every=${VAL_EVERY}, batches=${VAL_BATCHES}, inference_scenes=${VAL_INFERENCE_SCENES} (10 scenes x 3 CFG on >=30 ranks; otherwise 2 scenes: 1 pinned + 1 rotating), log_images=${VAL_LOG_IMAGES}, sample_steps=${VAL_SAMPLE_STEPS}"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG}"
 echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME} (resume=${WANDB_RESUME})"

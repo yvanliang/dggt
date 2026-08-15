@@ -77,6 +77,37 @@ def should_apply_rgb_render_loss(args: Any, step: int | None, *, training: bool)
     return step is None or int(step) % every == 0
 
 
+def should_apply_sky_view_loss(args: Any, step: int | None, *, training: bool) -> bool:
+    """Gate for the sky-view reconstruction loss.
+
+    Separate from :func:`should_apply_rgb_render_loss` because the sky atlas is
+    an environment map at infinity whose renderer uses camera rotation only: it
+    needs the gauge field of view for ray directions but neither the scene
+    latent nor the gauge scale, so it does not have to wait for the 3DGS render
+    to become meaningful.  It follows ``--rgb_render_every`` so the two losses
+    stay on the same cadence when both are on.
+    """
+    if not bool(training) or not rgb_render_loss_enabled(args):
+        return False
+    every = max(1, int(getattr(args, "rgb_render_every", 2)))
+    if step is not None and int(step) < max(0, int(getattr(args, "sky_view_start_step", 0))):
+        return False
+    return step is None or int(step) % every == 0
+
+
+def sky_view_loss_ramp(args: Any, step: int | None) -> float:
+    """Delayed linear ramp for the sky-view loss; can stay exactly zero."""
+    if step is None:
+        return 1.0
+    start = max(0, int(getattr(args, "sky_view_start_step", 0)))
+    if int(step) < start:
+        return 0.0
+    warmup = max(0, int(getattr(args, "sky_view_warmup_steps", 0)))
+    if warmup == 0:
+        return 1.0
+    return max(0.0, min(1.0, float(int(step) - start) / float(warmup)))
+
+
 def rgb_render_loss_ramp(args: Any, step: int | None) -> float:
     """Delayed linear ramp; unlike the legacy ramp this can stay exactly zero."""
     if step is None:
@@ -383,9 +414,25 @@ def sky_tokens_to_background(
     world_to_camera: torch.Tensor,
     intrinsics: torch.Tensor,
 ) -> torch.Tensor:
-    """Differentiably project the generated directional sky atlas."""
+    """Differentiably project the generated directional sky atlas.
+
+    ``sky_tokens`` must already be the decoded per-cell RGB atlas, one row per
+    atlas direction.  The packed patch token is laid out as ``c * patch**2 +
+    sub``, so passing it here unpacked would read ``[..., :3]`` as three *red*
+    subpixels and render a plausible-looking but wrong sky; assert the width
+    rather than let that happen silently.
+    """
+    if sky_tokens.ndim != 3 or int(sky_tokens.shape[-1]) != 3:
+        raise ValueError(
+            "sky_tokens must be the decoded RGB atlas [B,K,3]; decode patch "
+            f"tokens before rendering, got {tuple(sky_tokens.shape)}"
+        )
     tokens = sky_tokens[:1].float()
     gh, gw = _sky_grid_shape(int(tokens.shape[1]), int(grid_h), int(grid_w))
+    if gh * gw != int(tokens.shape[1]):
+        raise ValueError(
+            f"sky atlas grid {(gh, gw)} does not cover {int(tokens.shape[1])} directions"
+        )
     rgb = ((tokens[..., :3] + 1.0) * 0.5).clamp(0.0, 1.0)
     atlas = rgb.reshape(1, gh, gw, 3).permute(0, 3, 1, 2).contiguous()
     atlas = torch.cat((atlas[..., -1:], atlas, atlas[..., :1]), dim=-1)
@@ -648,6 +695,7 @@ def compute_rgb_render_loss(
     loss_sample_weight: torch.Tensor | None = None,
     conf_weight_power: float = 1.0,
     conf_weight_floor: float = 0.05,
+    dynamic_space: str = "probability",
     return_debug_tensors: bool = False,
     return_generated_depth: bool = False,
     pullback_calibration: PullbackCalibration | None = None,
@@ -768,6 +816,7 @@ def compute_rgb_render_loss(
             sample_weight=sample_weight,
             conf_weight_power=conf_weight_power,
             conf_weight_floor=conf_weight_floor,
+            dynamic_space=dynamic_space,
             defer_log_values=defer_log_values,
             collect_logs=collect_logs,
         )

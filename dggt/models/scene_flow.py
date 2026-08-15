@@ -109,6 +109,53 @@ DEFAULT_ROPE_MAX_POSITION = 16384
 CAMERA_ROPE_SPATIAL_MODE = "center"
 ACTOR_METRIC_VELOCITY_REF_MPS = 1.0
 ACTOR_METRIC_SPEED_MAX_MPS = 100.0
+CURRENT_SKY_REPRESENTATION_VERSION = "rgb_patch_teacher_anchor_v5"
+CURRENT_SKY_TOKEN_DIM = 192
+CURRENT_SKY_ATLAS_HW = (128, 256)
+CURRENT_SKY_GRID = (16, 32)
+# v5 keeps every shape v4 had and changes only the units the sky token is
+# expressed in: it is standardized per RGB channel so the flow target matches
+# the scene latent's scale.  That makes a v4 checkpoint load-compatible by
+# shape and wrong by meaning, so the version string -- not the tensor width --
+# is what has to separate them.  ``sky_representation_version`` is a critical
+# resume argument for exactly this reason.
+SKY_REPRESENTATION_CONTRACTS = {
+    CURRENT_SKY_REPRESENTATION_VERSION: (
+        CURRENT_SKY_TOKEN_DIM,
+        CURRENT_SKY_ATLAS_HW,
+        CURRENT_SKY_GRID,
+    ),
+    "rgb_patch_teacher_anchor_v4": (192, (128, 256), (16, 32)),
+    "rgb_patch_teacher_anchor_v3": (12, (32, 64), (16, 32)),
+}
+
+
+def _current_sky_contract_mismatches(config: dict[str, Any]) -> list[str]:
+    expected = {
+        "sky_representation_version": CURRENT_SKY_REPRESENTATION_VERSION,
+        "sky_token_dim": CURRENT_SKY_TOKEN_DIM,
+        "sky_atlas_hw": CURRENT_SKY_ATLAS_HW,
+        "sky_grid": CURRENT_SKY_GRID,
+    }
+    actual = {name: config.get(name) for name in expected}
+    mismatches: list[str] = []
+    for name, required in expected.items():
+        value = actual[name]
+        if name in ("sky_atlas_hw", "sky_grid"):
+            try:
+                value = tuple(int(item) for item in value)
+            except (TypeError, ValueError):
+                pass
+        elif name == "sky_token_dim":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                pass
+        if value != required:
+            mismatches.append(
+                f"{name}: checkpoint={actual[name]!r}, required={required!r}"
+            )
+    return mismatches
 
 
 def _validate_video_frame_ids(frame_ids: torch.Tensor) -> None:
@@ -730,6 +777,37 @@ class SkyMaskRefineDecoder(nn.Module):
         return x.reshape(b, int(seq_len), 1, gh * self.refine_scale, gw * self.refine_scale)
 
 
+def decode_scene_gauge(
+    decoder: nn.Module,
+    gauge_hidden: torch.Tensor,
+    t_base: torch.Tensor,
+    *,
+    batch: int,
+    gauge_dim: int,
+) -> torch.Tensor:
+    """Decode the scene-global gauge in float32, whatever the outer autocast is.
+
+    The gauge is three numbers that every metric quantity in this model is
+    derived through -- ``_clean_predicted_gauge``, the late metric reader, and
+    the offline diagnostics -- so its readout resolution is the resolution of
+    every metre downstream.  Left under bf16 autocast the final Linear returns
+    eight significant bits, so the normalized gauge lands on a grid of spacing
+    ``2**-7`` in the binade the validation scene sits in (~1.3 sigma).  At the
+    measured ``gauge_std`` of 0.317 that is 0.0025 in log-metres, i.e. 0.25% of
+    the scene scale -- about a sixth of the model's own error at step 8k, and
+    coarse enough that a single-sample validation diagnostic sat bit-identical
+    across 4000 training steps and read as "converged" when it was really
+    "unresolvable".
+
+    The decoder is one token wide against an ``S*P`` video stream, so float32
+    here costs nothing measurable.
+    """
+
+    with torch.amp.autocast(device_type=gauge_hidden.device.type, enabled=False):
+        gauge_cond = F.silu(gauge_hidden.float() + t_base.float())
+        return decoder(gauge_cond).reshape(int(batch), 1, int(gauge_dim))
+
+
 class RAEVideoSceneFlow(nn.Module):
     """RAEv2-style full-attention trunk with RAE timestep tokens and 3D mRoPE."""
 
@@ -785,8 +863,8 @@ class RAEVideoSceneFlow(nn.Module):
         layout_to_gauge_grad_scale: float = 1.0,
         raster_schema_hash: str = RASTER_SCHEMA_HASH,
         static_far_plane_m: float = STATIC_FAR_PLANE_M,
-        sky_token_dim: int = 3,
-        sky_grid: tuple[int, int] | list[int] | None = (16, 32),
+        sky_token_dim: int = CURRENT_SKY_TOKEN_DIM,
+        sky_grid: tuple[int, int] | list[int] | None = CURRENT_SKY_GRID,
         max_sky_tokens: int = 512,
         video_state_dim: int = VIDEO_STATE_DIM,
         sky_mask_refine_scale: int = 4,
@@ -797,7 +875,7 @@ class RAEVideoSceneFlow(nn.Module):
         ddt_mrope_section: tuple[int, int, int] | list[int] | None = None,
         t_eps: float = 0.05,
         sky_representation_version: str | None = None,
-        sky_atlas_hw: tuple[int, int] | list[int] = (32, 64),
+        sky_atlas_hw: tuple[int, int] | list[int] = CURRENT_SKY_ATLAS_HW,
     ) -> None:
         super().__init__()
         if tuple(patch_size) != (1, 1, 1):
@@ -916,13 +994,36 @@ class RAEVideoSceneFlow(nn.Module):
             sky_grid_t = (int(sky_grid[0]), int(sky_grid[1]))
             if sky_grid_t[0] <= 0 or sky_grid_t[1] <= 0:
                 raise ValueError(f"sky_grid entries must be positive, got {sky_grid_t}")
+        # v4 raised the atlas from 32x64 to 128x256 while keeping the same 512
+        # sky tokens: the patch grew from 2x2 to 8x8, so the token carries 192
+        # channels instead of 12 and the attended sequence is unchanged.  v5
+        # keeps those shapes and standardizes the token.  The generic
+        # constructor still accepts the older contracts by name for checkpoint
+        # inspection/conversion; production pretrain inference is deliberately
+        # current-version-only and rejects them before constructing the model.
+        # Width alone cannot separate v4 from v5, so an unnamed contract
+        # resolves to the current version first.
         if sky_representation_version is None:
-            sky_representation_version = "rgb_patch_teacher_anchor_v3" if int(sky_token_dim) == 12 else "rgb_token_v1"
-        if str(sky_representation_version) == "rgb_patch_teacher_anchor_v3":
-            if int(sky_token_dim) != 12 or tuple(int(v) for v in sky_atlas_hw) != (32, 64) or sky_grid_t != (16, 32):
+            sky_representation_version = next(
+                (
+                    name
+                    for name, (dim, _, _) in SKY_REPRESENTATION_CONTRACTS.items()
+                    if int(sky_token_dim) == dim
+                ),
+                "rgb_token_v1",
+            )
+        expected = SKY_REPRESENTATION_CONTRACTS.get(str(sky_representation_version))
+        if expected is not None:
+            want_dim, want_atlas, want_grid = expected
+            if (
+                int(sky_token_dim) != want_dim
+                or tuple(int(v) for v in sky_atlas_hw) != want_atlas
+                or sky_grid_t != want_grid
+            ):
                 raise ValueError(
-                    "rgb_patch_teacher_anchor_v3 requires sky_token_dim=12, "
-                    "sky_atlas_hw=(32,64), and sky_grid=(16,32)"
+                    f"{sky_representation_version} requires "
+                    f"sky_token_dim={want_dim}, sky_atlas_hw={want_atlas}, "
+                    f"and sky_grid={want_grid}"
                 )
         video_state_dim = int(video_state_dim)
         if video_state_dim != VIDEO_STATE_DIM:
@@ -2702,13 +2803,12 @@ class RAEVideoSceneFlow(nn.Module):
             gauge_hidden = full_seq[:, gauge_start : gauge_start + gauge_gen_len]
         gauge_out = None
         if gauge_hidden is not None:
-            gauge_cond = F.silu(
-                gauge_hidden + t_base.to(dtype=gauge_hidden.dtype)
-            )
-            gauge_out = self.gauge_gen_decoder(gauge_cond).reshape(
-                b,
-                1,
-                int(self.config.gauge_gen_dim),
+            gauge_out = decode_scene_gauge(
+                self.gauge_gen_decoder,
+                gauge_hidden,
+                t_base,
+                batch=b,
+                gauge_dim=int(self.config.gauge_gen_dim),
             )
         gauge_context = enc_video.new_zeros((b, 1, int(self.config.hidden_size)))
         if gauge_hidden is not None:
@@ -2885,6 +2985,17 @@ class RAEVideoSceneFlow(nn.Module):
     def from_pretrained(cls, load_directory: str | Path, map_location: str | torch.device = "cpu") -> "RAEVideoSceneFlow":
         load_path = Path(load_directory)
         config = json.loads((load_path / "config.json").read_text())
+        sky_mismatches = _current_sky_contract_mismatches(config)
+        if sky_mismatches:
+            raise ValueError(
+                f"{load_path} contains unsupported old sky checkpoint weights; "
+                f"RAEVideoSceneFlow.from_pretrained requires the complete "
+                f"{CURRENT_SKY_REPRESENTATION_VERSION} contract ("
+                + "; ".join(sky_mismatches)
+                + "). Use the raw RAEVideoSceneFlow constructor explicitly for "
+                "checkpoint inspection or conversion; standard weight loading does "
+                "not accept v3."
+            )
         for derived_name in (
             "hidden_size",
             "rope_layout_version",

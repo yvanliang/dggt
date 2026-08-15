@@ -31,7 +31,7 @@ import re
 import sys
 import time
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +41,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, DistributedSampler, Sampler
@@ -56,6 +57,7 @@ from dggt.losses.flow_losses import (
     compute_total_loss,
     rae_t_grid,
 )
+from dggt.losses.reconstruction_feedback_loss import DYNAMIC_HEAD_SPACES
 from dggt.losses.rgb_render_loss import (
     compute_rgb_render_loss,
     decode_generated_dggt_geometry,
@@ -64,6 +66,8 @@ from dggt.losses.rgb_render_loss import (
     rgb_render_sigma_weight,
     setup_lpips_for_rgb_loss,
     should_apply_rgb_render_loss,
+    should_apply_sky_view_loss,
+    sky_view_loss_ramp,
 )
 from dggt.models.scene_flow import WanSceneFlow
 from dggt.models.canonical_asset_encoder import CanonicalAssetEncoder
@@ -170,13 +174,73 @@ def _tokenizer_window_len(scene_flow: nn.Module, args: argparse.Namespace) -> in
     return value
 SKY_CLASS_INDEX = 9
 SKY_RGB_DIM = 3
-SKY_REPRESENTATION_VERSION = "rgb_patch_teacher_anchor_v3"
-DEFAULT_SKY_ATLAS_HW = (32, 64)
+SKY_REPRESENTATION_VERSION = "rgb_patch_teacher_anchor_v5"
+# The atlas is an upper-hemisphere environment map: ``_sky_direction_grid``
+# spans elevation 0..90 deg over its rows and azimuth 0..360 deg over its
+# columns, so a cell is (90/H) x (360/W) degrees.
+#
+# At the previous 32x64 a cell was 2.81 x 5.62 deg.  The Waymo front camera is
+# 49.2 x 35.0 deg, so the whole frame landed on 12 x 9 cells and the *sky part*
+# of a typical frame -- 20% of the height, 7 deg -- landed on about 22.  That
+# number is confirmed by the run itself: v6 logged
+# ``sky_token_loss_weight_mean = 0.0601`` which, against
+# ``sky_unobserved_loss_weight``, inverts to 1.06% of 2048 cells = 21.8.
+# Twenty-two colours cannot draw a cloud; handed the ground-truth sky, the best
+# a 32x64 atlas can reconstruct is L1 0.066 on a clear-sky frame, and the flat
+# blue wash that comes out of it is what the run produced at 50k steps.
+#
+# 128x256 puts a cell at 0.70 x 1.41 deg and the frame on 50 x 35 cells, taking
+# best-case L1 to 0.028.  It stays at 512 tokens by packing 8x8 atlas patches
+# instead of 2x2, so the sequence the trunk attends over is unchanged and only
+# the two sky Linear layers get wider (12 -> 192 channels).
+DEFAULT_SKY_ATLAS_HW = (128, 256)
 DEFAULT_SKY_GRID = (16, 32)
-SKY_PATCH_SIZE = 2
+SKY_PATCH_SIZE = 8
 SKY_TOKEN_DIM = SKY_RGB_DIM * SKY_PATCH_SIZE * SKY_PATCH_SIZE
 DEFAULT_SKY_VALID_THRESHOLD = 0.5
-DEFAULT_SKY_UNOBSERVED_LOSS_WEIGHT = 0.05
+# The scene latent the generator lives in is standardized -- the run logs
+# ``sample_latent_target_std`` at 1.0011 -- but the sky token was packed as raw
+# ``rgb * 2 - 1`` and was not.  Measured over observed atlas cells it carries
+# mean +0.55 and std 0.42, and per channel blue is the worst: nearly saturated
+# with the *smallest* spread, which is exactly where cloud contrast lives.
+#
+# Flow matching adds ``eps ~ N(0, I)`` at unit scale, so at the training sigma
+# (waver, shift 10, mean 0.864) the signal-to-noise of what the model has to
+# recover was
+#
+#     scene latent  std 1.00  ->  1 : 6
+#     sky token     std 0.42  ->  1 : 15
+#     blue channel  std 0.26  ->  1 : 24
+#     within-token  std 0.15  ->  1 : 42
+#
+# A flat blue sky is the correct answer to that problem: the mean is nearly
+# free and the cloud is the lowest-variance direction in the whole target.
+# Standardizing per channel puts the sky on the same footing as the scene, and
+# it is a per-dimension affine so ``pack_sky_atlas_loss_weight`` -- which is
+# per atlas cell -- keeps applying unchanged.
+#
+# Constants are frozen from ``datasets/tools/compute_sky_token_stats.py`` over
+# observed cells only; the spherical completion covers the rest of the sphere
+# with a wider spread that must not set the scale for the sky that renders.
+SKY_TOKEN_CHANNEL_MEAN = (0.205424, 0.454743, 0.745609)
+SKY_TOKEN_CHANNEL_STD = (0.466658, 0.389231, 0.321221)
+# 0.005, not 0.05. Unobserved atlas directions carry a deterministic spherical
+# completion prior, not a measurement, so they must remain low-confidence.
+# ``sky_flow_loss`` is a weighted mean and a region's gradient share is exactly
+# its weight share. At 0.05 with ~1% of the atlas observed, the completion prior
+# took 82.4% of the sky-flow gradient, leaving 17.6% for the sky that actually
+# renders. At 0.005 that flips to 68% observed.
+DEFAULT_SKY_UNOBSERVED_LOSS_WEIGHT = 0.005
+# ``sky_flow_loss`` normalizes the observed and unobserved atlas separately
+# instead of sharing one ``sum(w*e)/sum(w)`` denominator.  A single weighted
+# mean makes the observed sky's share of the gradient depend on how much sky
+# the clip happens to contain -- measured across Waymo clips it swings from
+# 42% on an 11%-sky frame to 78% on a 32%-sky frame -- so the sky term changed
+# meaning from clip to clip.  Separate means pin it at ``1 / (1 + beta)`` for
+# every clip.  beta=0.05 leaves the spherical completion prior 4.8% of the sky
+# gradient: enough to keep the unseen hemisphere plausible for a requested
+# trajectory that turns, far less than the 36% it used to take.
+DEFAULT_SKY_UNOBSERVED_LOSS_BETA = 0.05
 T59_VALIDATION_SAMPLE_STEPS = 50
 
 
@@ -404,6 +468,75 @@ class CyclicSequentialSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return len(self.data_source)
+
+
+class SpreadSequentialSampler(Sampler[int]):
+    """A fixed cover spread across a dataset, identical at every validation.
+
+    The scalar validation block exists to be *compared across steps*, so its
+    samples must not move.  ``CyclicSequentialSampler`` moved them: the trunk-
+    major index is ordered trunk -> scene -> window offset, so advancing by the
+    number of samples consumed (``val_batches * batch_size``) walks the
+    innermost axis first.  At ``--val_batches 1`` that is one window offset per
+    validation, and with the four pretraining offsets ``(0, 7, 14, 19)`` the
+    whole ``validation/*`` scalar block spent its first four validations inside
+    scene 000 trunk 0 and would have needed 800k steps -- four times the
+    planned run -- to see the 100 configured validation scenes.  Two symptoms
+    followed: the per-scene gauge diagnostics were bit-identical because
+    ``log_metric_scale`` is a per-scene/trunk constant, and ``validation/loss``
+    was about to step discontinuously every fourth validation as the cover
+    crossed into the next scene.
+
+    Spreading a fixed set across the split fixes both: the same windows are
+    scored at every step, and they come from different scenes and trunks
+    instead of from overlapping frames of one clip.
+
+    Positions come from the golden-ratio low-discrepancy sequence rather than
+    from even spacing, because this index aliases badly: its length factorizes
+    as ``trunks * scenes * offsets`` with the offset innermost, so any stride
+    that shares a factor with the scene axis revisits the same scenes.  Evenly
+    spacing eight samples over 100 scenes and four offsets covers four scenes,
+    each twice; nudging the stride to be coprime with the length fixes eight
+    but still collapses four samples onto two scenes.  The golden ratio is
+    irrational, so it aliases with no period: measured on the real shape it
+    yields ``count`` distinct scenes at every count from 2 to 24.
+    """
+
+    _GOLDEN_RATIO_CONJUGATE = 0.6180339887498949
+
+    def __init__(self, data_source, count: int) -> None:
+        length = len(data_source)
+        if int(count) <= 0:
+            raise ValueError(f"spread sampler count must be positive, got {count}")
+        self.data_source = data_source
+        self.count = int(count)
+        if length <= 0:
+            self._indices: tuple[int, ...] = ()
+        elif self.count >= length:
+            self._indices = tuple(range(length))
+        else:
+            picked: list[int] = []
+            seen: set[int] = set()
+            step = 0
+            # The sequence only repeats an index when two turns land in the
+            # same bucket, which is rare; the bound just keeps this finite.
+            while len(picked) < self.count and step < 100 * self.count:
+                index = int(((step * self._GOLDEN_RATIO_CONJUGATE) % 1.0) * length)
+                if index not in seen:
+                    seen.add(index)
+                    picked.append(index)
+                step += 1
+            self._indices = tuple(picked)
+
+    @property
+    def indices(self) -> tuple[int, ...]:
+        return self._indices
+
+    def __iter__(self):
+        return iter(self._indices)
+
+    def __len__(self) -> int:
+        return len(self._indices)
 
 
 class ContinuousDistributedBatchSampler(Sampler[list[int]]):
@@ -826,6 +959,17 @@ def requested_render_pose_for_rows(
     )
 
 
+METRIC_UNAVAILABLE = -1.0
+"""Sentinel written when a step produced no measurement for a gated metric.
+
+Every series that can legitimately have no data on a step -- LiDAR AbsRel, and
+the per-channel gauge diagnostics -- writes this value together with an
+``*_available`` flag.  The flag, not the value, decides whether the observation
+enters a W&B window mean, so a missing measurement never masquerades as a
+perfect one.
+"""
+
+
 @torch.no_grad()
 def gauge_diagnostic_metrics(
     predicted_gauge: torch.Tensor,
@@ -880,25 +1024,44 @@ def gauge_diagnostic_metrics(
     predicted_log_scale_error = (
         (pred_error * scale_weights).sum().div(scale_denominator)
     )
+    fov_denominator = fov_weights.sum()
+    fov_error_deg = (
+        (torch.rad2deg((fov_pred - fov_gt).abs()) * fov_weights)
+        .sum()
+        .div(fov_denominator.clamp_min(1.0))
+    )
+    # A sample whose offline gauge row has no valid ``log_metric_scale`` makes
+    # both the numerator and ``clamp_min`` denominator above degenerate, and the
+    # ratio lands on exactly 0.0 -- which in an absolute-error series reads as a
+    # perfect prediction.  Emit the shared unavailable sentinel instead and let
+    # the availability gate drop the observation, the same contract the LiDAR
+    # AbsRel diagnostic already uses.  Scale and FOV are masked per channel, so
+    # they need independent gates.
+    scale_available = scale_weights.sum().gt(0.0).float()
+    fov_available = fov_denominator.gt(0.0).float()
+    unavailable = torch.full_like(predicted_log_scale_error, METRIC_UNAVAILABLE)
+
+    def _gated(value: torch.Tensor, available: torch.Tensor) -> TrainLogValue:
+        return deferred_log_value(
+            torch.where(available.gt(0.0), value, unavailable),
+            defer=defer_log_values,
+        )
+
     return {
         "gauge_valid_frac": deferred_log_value(
             weights.mean(), defer=defer_log_values
         ),
-        "gauge_log_scale_error": deferred_log_value(
-            predicted_log_scale_error, defer=defer_log_values
+        "gauge_scale_available": deferred_log_value(
+            scale_available, defer=defer_log_values
         ),
-        "gauge_prior_log_scale_error": deferred_log_value(
-            prior_log_scale_error, defer=defer_log_values
+        "gauge_fov_available": deferred_log_value(
+            fov_available, defer=defer_log_values
         ),
-        "gauge_fov_error_deg": deferred_log_value(
-            (torch.rad2deg((fov_pred - fov_gt).abs()) * fov_weights)
-            .sum()
-            .div(fov_weights.sum().clamp_min(1.0)),
-            defer=defer_log_values,
-        ),
-        "gauge_vs_prior_gain": deferred_log_value(
-            prior_log_scale_error - predicted_log_scale_error,
-            defer=defer_log_values,
+        "gauge_log_scale_error": _gated(predicted_log_scale_error, scale_available),
+        "gauge_prior_log_scale_error": _gated(prior_log_scale_error, scale_available),
+        "gauge_fov_error_deg": _gated(fov_error_deg, fov_available),
+        "gauge_vs_prior_gain": _gated(
+            prior_log_scale_error - predicted_log_scale_error, scale_available
         ),
     }
 
@@ -930,8 +1093,13 @@ def sampled_gauge_validation_metrics(
     # Keep the sampled-gauge API stable and intentionally compact. The
     # training-only prior error is already encoded by ``vs_prior_gain`` plus
     # ``log_scale_error`` and should not silently create a fifth W&B series.
+    # The two ``*_available`` gates travel with the errors they guard: without
+    # them a masked channel is logged as an exact 0.0, which is the best
+    # possible score rather than the absence of one.
     sampled_names = (
         "gauge_valid_frac",
+        "gauge_scale_available",
+        "gauge_fov_available",
         "gauge_log_scale_error",
         "gauge_fov_error_deg",
         "gauge_vs_prior_gain",
@@ -942,7 +1110,107 @@ def sampled_gauge_validation_metrics(
     }
 
 
-METRIC_DEPTH_UNAVAILABLE = -1.0
+@torch.no_grad()
+def sampled_latent_validation_metrics(
+    generated_latent_n: torch.Tensor,
+    target_latent_n: torch.Tensor,
+    *,
+    prefix: str = "sample_latent",
+) -> dict[str, float]:
+    """Score the sampled scene latent, which is what this run actually produces.
+
+    Gauge, sky and sky-mask are side channels; the latent is what the frozen
+    tokenizer decoder and DGGT heads turn into the scene, and it used to leave
+    validation only as a PCA thumbnail and an absolute-error image.
+
+    ``z`` is per-channel standardized by ``feature_stats``, so ``mse`` reads
+    directly as the fraction of latent variance the sample fails to explain:
+    1.0 is "no better than the marginal mean", 2.0 is "an independent draw".
+    ``pred_std`` separates the two ways to land on 1.0 -- a blurred mean-like
+    prediction collapses it toward 0, a correctly scaled but wrong sample keeps
+    it near 1 -- which is the cheapest mode-collapse alarm available here.
+    """
+
+    if not prefix:
+        raise ValueError("sampled latent metric prefix must be non-empty")
+    predicted = generated_latent_n.detach().float()
+    target = target_latent_n.detach().to(device=predicted.device, dtype=torch.float32)
+    if predicted.shape != target.shape:
+        raise ValueError(
+            f"sampled latent shape {tuple(predicted.shape)} != target "
+            f"{tuple(target.shape)}"
+        )
+    difference = predicted - target
+    cosine = F.cosine_similarity(predicted, target, dim=-1, eps=1.0e-6)
+    values = torch.stack(
+        [
+            difference.square().mean(),
+            difference.abs().mean(),
+            cosine.mean(),
+            predicted.std(),
+            target.std(),
+        ]
+    ).cpu()
+    return {
+        f"{prefix}_mse": float(values[0]),
+        f"{prefix}_mae": float(values[1]),
+        f"{prefix}_cosine": float(values[2]),
+        f"{prefix}_pred_std": float(values[3]),
+        f"{prefix}_target_std": float(values[4]),
+    }
+
+
+@torch.no_grad()
+def sampled_render_validation_metrics(
+    rendered_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    *,
+    prefix: str = "sample_render",
+) -> dict[str, float]:
+    """PSNR/MAE of the sampled scene's 3DGS render against the real frames.
+
+    ``loss_rgb_render_*`` during training measures the one-step x-prediction at
+    a random sigma; it says nothing about what 50 Euler steps from noise
+    actually look like.  Both tensors are ``[frames, 3, H, W]`` in [0,1] -- the
+    same pair already written to disk as ``generated_raw_3dgs_rgb`` and
+    ``input_rgb_gt`` -- so this is a subtraction over images that exist anyway.
+    """
+
+    if not prefix:
+        raise ValueError("sampled render metric prefix must be non-empty")
+    predicted = rendered_rgb.detach().float().clamp(0.0, 1.0)
+    target = target_rgb.detach().to(device=predicted.device, dtype=torch.float32)
+    if target.dtype == torch.uint8:
+        target = target.float().div(255.0)
+    target = target.clamp(0.0, 1.0)
+    if predicted.ndim != 4 or target.ndim != 4:
+        raise ValueError(
+            "sampled render metrics need [frames,3,H,W] tensors, got "
+            f"{tuple(predicted.shape)} and {tuple(target.shape)}"
+        )
+    if predicted.shape[:2] != target.shape[:2]:
+        raise ValueError(
+            f"rendered RGB shape {tuple(predicted.shape)} != target "
+            f"{tuple(target.shape)}"
+        )
+    if predicted.shape[-2:] != target.shape[-2:]:
+        # ``_fixed_render_hw`` renders at ``patch_grid * 14``; a dataset served
+        # at a different resolution should downscale rather than abort a
+        # validation pass over a diagnostic.
+        target = F.interpolate(target, size=predicted.shape[-2:], mode="area")
+    difference = predicted - target
+    mse = difference.square().mean()
+    values = torch.stack(
+        [mse, difference.abs().mean(), -10.0 * torch.log10(mse.clamp_min(1.0e-10))]
+    ).cpu()
+    return {
+        f"{prefix}_mse": float(values[0]),
+        f"{prefix}_mae": float(values[1]),
+        f"{prefix}_psnr": float(values[2]),
+    }
+
+
+METRIC_DEPTH_UNAVAILABLE = METRIC_UNAVAILABLE
 """Sentinel written when a step produced no LiDAR-anchored measurement."""
 
 
@@ -1040,7 +1308,90 @@ def metric_depth_relative_error(
     return ((metric_depth - lidar).abs() / lidar.clamp_min(1.0e-6))[support].median()
 
 
-RGB_RENDER_LAMBDA_DEFAULT = 0.005
+# World-feedback weights.
+#
+# The v5 run measured these three at 0.1/0.1/0.1 and, after weighting, they came
+# to 0.76% of the training loss -- of which 97.8% sat in the dynamic-conf term,
+# an unbounded logit that never improved.  The parts that describe the rendered
+# scene (depth, GS attributes, the decoded feature levels, the render itself)
+# together carried 0.035%.  ``--head_dynamic_space probability`` removes the
+# parasitic channel; these weights restore the remainder to a level where it can
+# actually shape the trunk.
+#
+# Why raising them cannot drown the flow objective: the flow target carries
+# ``1/sigma**2`` and every term below carries ``(1-sigma)**2``, so their relative
+# scale is ``(1-sigma)**2 * sigma**2 <= 1/16``, maximal at sigma=0.5.  Whatever
+# lambda is chosen, at no noise level can these outweigh generation.  The terms
+# that genuinely compete are the ones with no sigma attenuation -- repa (0.5),
+# the early-head coefficient (0.25) and the refined sky mask (0.1) -- and those
+# are deliberately left alone.
+# 1.0, matching its two siblings below.  The history here is a chain of wrong
+# reference points: 0.005 was the unused code default, 0.05 was set against that
+# rather than against the 0.1 the v5 launcher actually pinned, and 0.1 only
+# restores v5 -- where the weight demonstrably did nothing.  In v5 the render
+# term's effective weight quadrupled between step 5k and 10k as the ramp filled,
+# and the render loss did not accelerate at all (-0.80%/1k against the flow
+# loss's -0.58%/1k); it was riding the latent improving, not driving it.
+#
+# Measured on v6 at step 7.5k, at full ramp:
+#
+#     lambda    share of the training loss
+#     0.05      0.0039%
+#     0.1       0.0078%
+#     1.0       0.0781%     <- level_consistency sits at 0.112%, head at 0.179%
+#     13.0      1.01%
+#
+# The 41.6x attenuation between the raw pixel L1 (0.0466) and the weighted term
+# (0.00112) is the sigma window, not the lambda, so lambda has to carry the
+# whole correction.  At 0.1 this term is 23x below head_consistency, which was
+# just deliberately raised to 1.0 -- and all four read the same decode of the
+# same predicted latent, so that gap is not a considered ratio, it is an
+# accident.  1.0 puts it in the same band as its siblings.
+#
+# Two independent reasons this is safe: the worst-case weight ratio against the
+# flow target is lambda/16 = 0.062, so it cannot outrun generation at any noise
+# level; and empirically the entire world-feedback stack switching on at step
+# 5000 and ramping to 49% moved grad_norm by 0.45 of its own pre-existing
+# standard deviation, in the negative direction.  ``grad_clip_active`` is the
+# thing to watch -- it sat at 0.15-0.18 through v6, and a persistent move toward
+# 1.0 is the signal to come back down.
+RGB_RENDER_LAMBDA_DEFAULT = 1.0
+# The sky dome's only pixel-space supervision, and the only term that can teach
+# it detail finer than the atlas cells the flow loss sees.  It sat at 0.1 --
+# 0.012% of the training loss, the second smallest term in the objective -- next
+# to a dome that was still a flat blue wash at 50k steps.  It reads the same
+# decode under the same sigma window as the three weights above, so it joins
+# them at 1.0.
+SKY_VIEW_LAMBDA_DEFAULT = 1.0
+# The only term that measures sky *texture* rather than sky colour.  At 0.25 it
+# was 0.014% of the total loss and, measured over the 3800 steps after the
+# world-feedback ramp opened, the only sky term that did not move: charbonnier
+# fell 4.88%/1k step and the flow loss 7.23%/1k while this sat at 0.18%/1k.
+SKY_VIEW_HIGH_FREQUENCY_WEIGHT_DEFAULT = 1.0
+# The sky atlas is an environment map at infinity and its renderer transforms
+# camera rays by rotation only, so this loss touches neither the scene latent
+# nor the gauge scale -- it shares the 5000-step gate with the 3DGS render only
+# because it sits in the same block.  It does read the gauge FOV for ray
+# directions, and ``train/gauge/fov_error`` is 5.7 deg at step 50 against a
+# 1.41 deg atlas cell, so starting at 0 would teach the atlas through rays that
+# are four cells off.  By step 1150 that is 1.13 deg, under one cell.
+SKY_VIEW_START_STEP_DEFAULT = 1500
+SKY_VIEW_WARMUP_STEPS_DEFAULT = 5000
+# Sky tokens are 512 of the 9763 the trunk attends over -- 5.2% -- but the sky
+# flow term was 0.170% of the loss while the sky *mask* family took 4.12%, a
+# 15:1 split against the thing that decides what the sky looks like.
+# Standardizing the target already multiplies this term by about 4.1x on its
+# own, so 0.5 lands the sky at 4.0% of the loss; 1.0 would overshoot to 7.6%
+# and cost the scene twice as much share.
+DEFAULT_LAMBDA_SKY_FLOW = 0.5
+SKY_MASK_REFINE_BOUNDARY_LOSS_WEIGHT_DEFAULT = 0.125
+# Feature-level (L1) and frozen-head (L2) consistency.  Kept equal to each other,
+# as in v5: both are read off the same decode of the same predicted latent under
+# the same sigma weighting and the same masks, so there is no reason for one to
+# outrank the other.  At 1.0 the head term reproduces v5's dynamic-conf gradient
+# contribution exactly while giving depth/GS ten times the pull they had.
+LEVEL_CONSISTENCY_LAMBDA_DEFAULT = 1.0
+HEAD_CONSISTENCY_LAMBDA_DEFAULT = 1.0
 RGB_RENDER_ROW_CAP = "per_rank_input_order_v1"
 RGB_RENDER_CONTINUOUS_SIGMA_WEIGHT = "(1-sigma)^rgb_render_sigma_power"
 PRETRAIN_RESUME_CONTRACT_VERSION = "layout_v2_pretrain_resume_v2"
@@ -1048,10 +1399,24 @@ PRETRAIN_RESUME_REPRODUCIBILITY = (
     "model_optimizer_scheduler_ema_only_rng_and_data_stream_not_restored"
 )
 
+
+def sky_mask_refine_boundary_loss_weight(args: argparse.Namespace) -> float:
+    """Resolve the refined-mask boundary coefficient from one shared default."""
+
+    return float(
+        getattr(
+            args,
+            "sky_mask_refine_boundary_loss_weight",
+            SKY_MASK_REFINE_BOUNDARY_LOSS_WEIGHT_DEFAULT,
+        )
+    )
+
+
 RGB_RENDER_RESUME_ARGS = (
     "lambda_rgb_render",
     "lambda_level_consistency",
     "lambda_head_consistency",
+    "head_dynamic_space",
     "rgb_render_every",
     "rgb_render_start_step",
     "rgb_render_warmup_steps",
@@ -1068,11 +1433,14 @@ RGB_RENDER_RESUME_ARGS = (
     "lambda_sky_view_reconstruction",
     "sky_view_lpips_weight",
     "sky_view_high_frequency_weight",
+    "sky_view_start_step",
+    "sky_view_warmup_steps",
 )
 RGB_RENDER_RESUME_DEFAULTS = {
     "lambda_rgb_render": RGB_RENDER_LAMBDA_DEFAULT,
-    "lambda_level_consistency": 0.1,
-    "lambda_head_consistency": 0.1,
+    "lambda_level_consistency": LEVEL_CONSISTENCY_LAMBDA_DEFAULT,
+    "lambda_head_consistency": HEAD_CONSISTENCY_LAMBDA_DEFAULT,
+    "head_dynamic_space": "probability",
     "rgb_render_every": 1,
     "rgb_render_start_step": 5000,
     "rgb_render_warmup_steps": 5000,
@@ -1086,9 +1454,11 @@ RGB_RENDER_RESUME_DEFAULTS = {
     "rgb_render_sky_mask_grad_scale": 0.05,
     "rgb_render_lpips_weight": 0.01,
     "rgb_render_lpips_net": "alex",
-    "lambda_sky_view_reconstruction": 0.1,
+    "lambda_sky_view_reconstruction": SKY_VIEW_LAMBDA_DEFAULT,
     "sky_view_lpips_weight": 0.01,
-    "sky_view_high_frequency_weight": 0.25,
+    "sky_view_high_frequency_weight": SKY_VIEW_HIGH_FREQUENCY_WEIGHT_DEFAULT,
+    "sky_view_start_step": SKY_VIEW_START_STEP_DEFAULT,
+    "sky_view_warmup_steps": SKY_VIEW_WARMUP_STEPS_DEFAULT,
 }
 
 PRETRAIN_RESUME_CRITICAL_ARGS = (
@@ -1135,6 +1505,11 @@ PRETRAIN_RESUME_CRITICAL_ARGS = (
     "lambda_gauge_direct",
     "no_sky_generation",
     "sky_unobserved_loss_weight",
+    # v5 standardizes the sky flow target.  Its tensors are shape-identical to
+    # v4, so nothing else would stop a v4 checkpoint from loading into code
+    # that means something different by the same numbers.
+    "sky_representation_version",
+    "sky_unobserved_loss_beta",
     "lambda_sky_flow",
     "lambda_sky_mask",
     "lambda_sky_mask_refine",
@@ -1333,11 +1708,17 @@ def validation_sampling_tasks_for_rank(
 ) -> tuple[tuple[int, int], ...]:
     """Assign ``(scene_offset, scale_index)`` validation jobs to one rank.
 
-    A full PPU validation uses five scenes and three CFG scales.  When all 15
-    jobs can run concurrently, scene-major assignment maps them one-to-one to
-    ranks 0..14.  A smaller job deliberately falls back to one scene instead
-    of serializing five expensive rollouts on too few accelerators; its three
-    CFG scales are still sharded round-robin and share the same scene/noise.
+    A full validation uses ten scenes and three CFG scales.  When all 30 jobs
+    can run concurrently, scene-major assignment maps them one-to-one to ranks
+    0..29.  A smaller job falls back to :data:`VALIDATION_SCENE_FALLBACK`
+    scenes rather than serializing ten expensive rollouts on too few
+    accelerators; the CFG scales are still sharded round-robin and share the
+    same scene and noise.
+
+    The fallback is two, not one, because the scene set is split into a pinned
+    half and a rotating half (see :func:`validation_pinned_scene_count`).  One
+    scene would leave nothing rotating, so the smallest useful set is one of
+    each -- six jobs, which fits the eight-accelerator floor.
     """
 
     if num_scales <= 0:
@@ -1351,14 +1732,24 @@ def validation_sampling_tasks_for_rank(
     if rank < 0 or rank >= world_size:
         raise ValueError(f"rank {rank} is outside world_size={world_size}")
 
-    full_task_count = int(num_scales) * int(requested_scenes)
-    scene_count = int(requested_scenes) if world_size >= full_task_count else 1
+    scene_count = effective_validation_scene_count(
+        num_scales, requested_scenes, world_size=world_size
+    )
     tasks = tuple(
         (scene_offset, scale_index)
         for scene_offset in range(scene_count)
         for scale_index in range(int(num_scales))
     )
     return tasks[rank::world_size]
+
+
+VALIDATION_SCENE_FALLBACK = 2
+"""Scenes kept when the job is too small to run the full set concurrently.
+
+One pinned scene for the statistics and one rotating scene for coverage.  At
+three CFG scales that is six jobs, so it still fits inside a single eight-GPU
+node.
+"""
 
 
 def effective_validation_scene_count(
@@ -1369,19 +1760,123 @@ def effective_validation_scene_count(
 ) -> int:
     """Return the scene count selected by the validation fallback policy."""
 
-    # Reuse the task validator without depending on any particular rank's
-    # assignment (surplus ranks legitimately receive no jobs).
-    validation_sampling_tasks_for_rank(
-        num_scales,
-        requested_scenes,
-        rank=0,
-        world_size=world_size,
+    if num_scales <= 0:
+        raise ValueError(f"num_scales must be positive, got {num_scales}")
+    if requested_scenes <= 0:
+        raise ValueError(
+            f"requested_scenes must be positive, got {requested_scenes}"
+        )
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if world_size >= int(num_scales) * int(requested_scenes):
+        return int(requested_scenes)
+    return min(int(requested_scenes), VALIDATION_SCENE_FALLBACK)
+
+
+def validation_pinned_scene_count(scene_count: int) -> int:
+    """How many of the sampled scenes are pinned, i.e. never rotate.
+
+    The pinned half is the measurement set: only those scenes feed the
+    ``validation/sample_*`` series, so every point is scored on the same
+    scenes and a change between two steps is the model changing.  The rotating
+    half exists purely to put fresh pictures in the mosaic, and deliberately
+    contributes no numbers -- averaging a rotating scene into the mean is what
+    made the v6 sample series unreadable in the first place.
+    """
+
+    if int(scene_count) <= 0:
+        raise ValueError(f"scene_count must be positive, got {scene_count}")
+    return max(1, (int(scene_count) + 1) // 2)
+
+
+def validation_scene_is_pinned(scene_offset: int, *, scene_count: int) -> bool:
+    """Return whether one validation slot belongs to the fixed metric set."""
+
+    pinned = validation_pinned_scene_count(scene_count)
+    if int(scene_offset) < 0 or int(scene_offset) >= int(scene_count):
+        raise ValueError(
+            f"scene_offset {scene_offset} is outside scene_count={scene_count}"
+        )
+    return int(scene_offset) < pinned
+
+
+def validation_scene_metrics_for_merge(
+    scene_metrics: dict[str, float],
+    *,
+    scene_offset: int,
+    scene_count: int,
+) -> dict[str, float]:
+    """Keep sampled metrics only for fixed slots; rotating slots are visual-only."""
+
+    if validation_scene_is_pinned(scene_offset, scene_count=scene_count):
+        return scene_metrics
+    return {}
+
+
+def _validation_scene_entry_groups(
+    trunk_major_index: Sequence[Sequence[int]],
+) -> tuple[tuple[int, ...], ...]:
+    """Group flattened long-form dataset rows by their real scene identity."""
+
+    grouped: dict[int, list[int]] = {}
+    for dataset_index, entry in enumerate(trunk_major_index):
+        if len(entry) < 2:
+            raise ValueError(
+                "trunk_major_index entries must contain at least "
+                f"(scene_idx, trunk_idx), got {entry!r}"
+            )
+        grouped.setdefault(int(entry[0]), []).append(int(dataset_index))
+    return tuple(tuple(indices) for indices in grouped.values())
+
+
+def validation_available_scene_count(
+    trunk_major_index: Sequence[Sequence[int]],
+) -> int:
+    """Count distinct usable scenes represented by complete long-form trunks."""
+
+    return len(_validation_scene_entry_groups(trunk_major_index))
+
+
+def validation_scene_dataset_index(
+    scene_offset: int,
+    *,
+    scene_count: int,
+    validation_index: int,
+    trunk_major_index: Sequence[Sequence[int]],
+) -> int:
+    """Map a slot to a long-form dataset index for this validation.
+
+    Pinned slots select the first usable trunk of their scene forever. Rotating
+    slots sweep the remaining *scene identities* in blocks, never selecting a
+    trunk from a pinned scene. Once the rotating scene pool wraps, each scene
+    advances to its next available trunk so long-form coverage still grows.
+    """
+
+    pinned = validation_pinned_scene_count(scene_count)
+    is_pinned = validation_scene_is_pinned(
+        scene_offset, scene_count=scene_count
     )
-    return (
-        int(requested_scenes)
-        if world_size >= int(num_scales) * int(requested_scenes)
-        else 1
-    )
+    if int(validation_index) < 0:
+        raise ValueError(
+            f"validation_index must be non-negative, got {validation_index}"
+        )
+    scene_entries = _validation_scene_entry_groups(trunk_major_index)
+    if len(scene_entries) < int(scene_count):
+        raise ValueError(
+            "long-form validation contains fewer distinct usable scenes than "
+            f"scene_count: {len(scene_entries)} < {int(scene_count)}"
+        )
+    if is_pinned:
+        return int(scene_entries[int(scene_offset)][0])
+
+    rotating_total = int(scene_count) - pinned
+    rotating_slot = int(scene_offset) - pinned
+    rotating_scenes = scene_entries[pinned:]
+    ordinal = int(validation_index) * rotating_total + rotating_slot
+    scene_position = ordinal % len(rotating_scenes)
+    visit = ordinal // len(rotating_scenes)
+    entries = rotating_scenes[scene_position]
+    return int(entries[visit % len(entries)])
 
 
 def validation_scene_label(batch: dict[str, Any], scene_offset: int) -> str:
@@ -1436,6 +1931,29 @@ def all_gather_validation_results(
     return results
 
 
+# Sampled-metric suffix -> the suffix of the gate that guards it.  Validation
+# prefixes are built at runtime (``sample_gauge``, ``sample_gauge_cfg2``, ...),
+# so the pairing is resolved by suffix instead of by a fixed key list.  Without
+# this, one validation scene whose offline gauge row has no ``log_metric_scale``
+# would drag the ``METRIC_UNAVAILABLE`` sentinel into the mean over the five
+# sampled scenes.
+_SAMPLED_METRIC_AVAILABILITY_SUFFIXES: tuple[tuple[str, str], ...] = (
+    ("_prior_log_scale_error", "_scale_available"),
+    ("_log_scale_error", "_scale_available"),
+    ("_vs_prior_gain", "_scale_available"),
+    ("_fov_error_deg", "_fov_available"),
+)
+
+
+def sampled_metric_availability_key(key: str) -> str | None:
+    """Return the gate guarding ``key``, or None when it is always measured."""
+
+    for suffix, gate_suffix in _SAMPLED_METRIC_AVAILABILITY_SUFFIXES:
+        if key.endswith(suffix):
+            return f"{key[: -len(suffix)]}{gate_suffix}"
+    return None
+
+
 def merge_validation_rank_results(
     rank_results: list[dict[str, Any]],
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
@@ -1451,8 +1969,16 @@ def merge_validation_rank_results(
     mosaic_rows: list[dict[str, Any]] = []
     seen_rows: set[tuple[int, str, int]] = set()
     for rank_result in rank_results:
-        for key, value in rank_result["metrics"].items():
-            sampled_metric_values.setdefault(str(key), []).append(float(value))
+        metrics = rank_result["metrics"]
+        for key, value in metrics.items():
+            key = str(key)
+            gate = sampled_metric_availability_key(key)
+            if gate is not None and float(metrics.get(gate, 1.0)) <= 0.0:
+                # Keep the key so the series never vanishes from the dashboard,
+                # but contribute no sample to its mean.
+                sampled_metric_values.setdefault(key, [])
+                continue
+            sampled_metric_values.setdefault(key, []).append(float(value))
         for row in rank_result.get("mosaic_rows", ()):
             identity = (int(row["slot"]), str(row["group"]), int(row["order"]))
             if identity in seen_rows:
@@ -1462,7 +1988,7 @@ def merge_validation_rank_results(
             seen_rows.add(identity)
             mosaic_rows.append(row)
     averaged_metrics = {
-        key: sum(values) / len(values)
+        key: (sum(values) / len(values) if values else METRIC_UNAVAILABLE)
         for key, values in sampled_metric_values.items()
     }
     return averaged_metrics, mosaic_rows
@@ -2128,16 +2654,43 @@ def log_wandb(run, metrics: dict[str, float], step: int, prefix: str) -> None:
     run.log({f"{prefix}/{key}": value for key, value in metrics.items()}, step=step)
 
 
-_METRIC_DEPTH_WANDB_AVAILABILITY = {
+# Measurement -> availability gate.  A metric listed here is only averaged into
+# a W&B window on the steps where its gate is positive; on every other step it
+# carries ``METRIC_UNAVAILABLE`` and is skipped outright.  Register any series
+# that a masked channel or a missing sensor can legitimately leave undefined,
+# otherwise the degenerate value silently enters the mean.
+_WANDB_METRIC_AVAILABILITY = {
     "metric_depth_rel_err": "metric_depth_rel_err_available",
+    # The same generated depth measured against the offline LiDAR-calibrated
+    # gauge instead of the generated one.  Its gap to the line above is the only
+    # read on how much of the residual metric error is scale rather than
+    # geometry, so it is a second measurement and not a prefix alias.
+    "metric_depth_rel_err_teacher_gauge": (
+        "metric_depth_rel_err_teacher_gauge_available"
+    ),
+    # ``scene_gauge_valid`` masks scale and FOV independently, and roughly one
+    # sample in eight has no valid ``log_metric_scale`` at all.
+    "gauge/log_scale_error": "gauge_scale_available",
+    "gauge_prior_log_scale_error": "gauge_scale_available",
+    "gauge_vs_prior_gain": "gauge_scale_available",
+    "gauge/fov_error": "gauge_fov_available",
 }
+_METRIC_DEPTH_WANDB_AVAILABILITY = _WANDB_METRIC_AVAILABILITY
 _METRIC_DEPTH_WANDB_HIDDEN_KEYS = frozenset(
-    # The availability flag gates the mean above and doubles as control flow in
-    # ``train_step``; it is a gate, never a measurement, so it stays out of W&B.
-    # The measurement itself is reported: the LiDAR AbsRel is the only absolute
-    # scale check in the run, and the ``_pred_gauge`` / ``_teacher_gauge``
-    # aliases that used to shadow it were never filled with a real value.
-    _METRIC_DEPTH_WANDB_AVAILABILITY.values()
+    {
+        # These two are pure control flow: ``train_step`` also branches on them,
+        # and they only say whether the every-N-steps LiDAR diagnostic ran.  The
+        # measurements themselves are reported -- LiDAR AbsRel is the only
+        # absolute scale check in the run, and the ``_pred_gauge`` alias that
+        # used to shadow it was never filled with an independent value.
+        "metric_depth_rel_err_available",
+        "metric_depth_rel_err_teacher_gauge_available",
+    }
+    # ``gauge_scale_available`` / ``gauge_fov_available`` are deliberately NOT
+    # hidden.  Averaged over a logging window each one is the coverage rate of
+    # its gauge channel -- how much of the training data has a metric scale to
+    # learn from at all -- which is a measurement in its own right and the only
+    # place that number is visible.
 )
 
 
@@ -2198,10 +2751,13 @@ ALL_RANK_TRAIN_LOG_KEYS: tuple[str, ...] = (
     "feedback_sample_weight_mean",
     "gauge/fov_error",
     "gauge/log_scale_error",
+    "gauge_fov_available",
     "gauge_prior_log_scale_error",
+    "gauge_scale_available",
     "gauge_valid_frac",
     "gauge_vs_prior_gain",
     "layout/actor_count_mean",
+    "layout/actor_metric_support_fraction",
     "layout/actor_residual_rms",
     "layout/appearance_binding_rate",
     "layout/appearance_invalid_all_window_count",
@@ -2247,9 +2803,12 @@ ALL_RANK_TRAIN_LOG_KEYS: tuple[str, ...] = (
     "loss_sky_view_charbonnier",
     "loss_sky_view_high_frequency",
     "loss_sky_view_lpips",
+    "sky_view_detail_ratio",
     "loss_sky_view_weighted",
     "metric_depth_rel_err",
     "metric_depth_rel_err_available",
+    "metric_depth_rel_err_teacher_gauge",
+    "metric_depth_rel_err_teacher_gauge_available",
     "rgb_render_active",
     "rgb_render_alpha_mean",
     "rgb_render_conf_weight_mean",
@@ -2269,6 +2828,8 @@ ALL_RANK_TRAIN_LOG_KEYS: tuple[str, ...] = (
     "sky_mask_refine_pred_frac",
     "sky_mask_refine_target_frac",
     "sky_mask_target_frac",
+    "sky_token_loss_weight_mean",
+    "sky_view_ramp",
     "sky_view_sample_weight_mean",
     "task/TCMG_frac",
     "task/TCMGA_frac",
@@ -2340,12 +2901,18 @@ def all_rank_log_mean(
         if index is None or (torch.is_tensor(raw_value) and raw_value.numel() != 1):
             protocol_errors += 1
             continue
-        availability_key = _METRIC_DEPTH_WANDB_AVAILABILITY.get(key)
+        availability_key = _WANDB_METRIC_AVAILABILITY.get(key)
+        if availability_key is not None and availability_key not in logs:
+            # Route this through the same all-reduced error slot as an
+            # unregistered key: raising here would abort one rank inside a
+            # collective and hang every other rank in ``all_reduce``.
+            protocol_errors += 1
+            continue
         mask = (
             one
             if availability_key is None
             else torch.where(
-                scalar_tensor(logs.get(availability_key, 0.0)).gt(0.0),
+                scalar_tensor(logs[availability_key]).gt(0.0),
                 one,
                 zero,
             )
@@ -2395,6 +2962,9 @@ PROGRESS_POSTFIX_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("mask", "loss_sky_mask_refine", ".3f"),
     ("rgb", "loss_rgb_render", ".3f"),
     ("fov", "gauge/fov_error", ".1f"),
+    # Leads the loss weights: above --grad_clip_norm every lambda is competing
+    # for a fixed budget rather than adding to it.
+    ("gnorm", "grad_norm", ".2f"),
     ("lr", "lr", ".1e"),
 )
 
@@ -2501,12 +3071,19 @@ def accumulate_wandb_metrics(
     """Accumulate one W&B observation without averaging missing diagnostics."""
 
     for key, raw_value in metrics.items():
-        availability_key = _METRIC_DEPTH_WANDB_AVAILABILITY.get(key)
-        if (
-            availability_key is not None
-            and float(metrics.get(availability_key, 0.0)) <= 0.0
-        ):
-            continue
+        availability_key = _WANDB_METRIC_AVAILABILITY.get(key)
+        if availability_key is not None:
+            if availability_key not in metrics:
+                # Silently treating a missing gate as "unavailable" would drop
+                # the series from W&B with no diagnosis; treating it as
+                # "available" would let a sentinel into the mean.  Both are
+                # worse than saying which emitter forgot the gate.
+                raise KeyError(
+                    f"log metric {key!r} is availability-gated but its gate "
+                    f"{availability_key!r} was not emitted on the same step"
+                )
+            if float(metrics[availability_key]) <= 0.0:
+                continue
         value: TrainLogValue
         if torch.is_tensor(raw_value):
             value = raw_value.detach().float().reshape(())
@@ -2610,23 +3187,93 @@ def captions_from_pretrain_batch(batch: dict[str, Any], batch_size: int) -> list
     return [str(c) if c is not None else "" for c in list(captions)]
 
 
-def _latent_pca_grid(z: torch.Tensor, patch_grid: tuple[int, int], max_frames: int) -> torch.Tensor:
+LATENT_PCA_BASIS_SEED = 0
+"""Fixed seed for the randomized PCA behind the latent thumbnails.
+
+Visualization only.  It never touches the sampling or noise RNG -- the fit runs
+inside ``torch.random.fork_rng``.
+"""
+
+
+@dataclass(frozen=True)
+class LatentPcaBasis:
+    """One projection shared by every latent row of a mosaic.
+
+    Fitting ``pca_lowrank`` separately per row -- which is what the mosaic did
+    at first -- gives each row its own axes and its own contrast stretch, so
+    the same colour means something different in the GT row and in each CFG
+    row.  The group caption invites exactly the comparison that setup cannot
+    support.  Fitting once on the ground-truth latent and projecting every row
+    through it makes colour mean one thing per mosaic, and lets a generated
+    latent that drifts out of the GT range say so by clipping.
+    """
+
+    mean: torch.Tensor
+    components: torch.Tensor
+    lo: torch.Tensor
+    hi: torch.Tensor
+
+
+def _latent_pca_basis(z: torch.Tensor, max_frames: int) -> LatentPcaBasis:
+    """Fit the shared basis on one reference latent, with a stable sign."""
+
+    reference = z[:1, :max_frames].detach().float().cpu()
+    flat = reference.reshape(-1, int(reference.shape[-1]))
+    mean = flat.mean(dim=0, keepdim=True)
+    centered = flat - mean
+    if centered.shape[0] < 3 or centered.shape[1] < 3:
+        components = torch.zeros((centered.shape[1], 3), dtype=centered.dtype)
+        width = min(3, centered.shape[1])
+        components[:width, :width] = torch.eye(width, dtype=centered.dtype)
+    else:
+        # ``pca_lowrank`` projects onto a *random* subspace, so back-to-back
+        # calls on the same tensor return different axes -- the per-row fit this
+        # replaces was not even reproducible for one latent across two steps.
+        # Every rank has to land on the same basis without talking to the
+        # others, so pin the projection with a local seed instead of leaking one
+        # into the sampling RNG.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(LATENT_PCA_BASIS_SEED)
+            _, _, vh = torch.pca_lowrank(centered, q=3, center=False)
+        components = vh[:, :3]
+        # Pin the sign as well: it is free, and it keeps the colours stable when
+        # the reference latent shifts slightly between steps.  A flipped
+        # component would repaint a whole row in the complementary colour.
+        dominant = components.abs().argmax(dim=0)
+        signs = torch.sign(components[dominant, torch.arange(components.shape[1])])
+        components = components * torch.where(
+            signs == 0, torch.ones_like(signs), signs
+        )
+    projected = centered @ components
+    return LatentPcaBasis(
+        mean=mean,
+        components=components,
+        lo=projected.quantile(0.01, dim=0, keepdim=True),
+        hi=projected.quantile(0.99, dim=0, keepdim=True),
+    )
+
+
+def _latent_pca_grid(
+    z: torch.Tensor,
+    patch_grid: tuple[int, int],
+    max_frames: int,
+    basis: LatentPcaBasis | None = None,
+) -> torch.Tensor:
     """Project `[B,S,P,C]` latent tokens to an RGB patch grid for qualitative checks."""
     z = z[:1, :max_frames].detach().float().cpu()
     _, seq_len, num_patches, channels = z.shape
     gy, gx = patch_grid
     if num_patches != gy * gx:
         raise ValueError(f"latent patch count {num_patches} != patch_grid {patch_grid}")
-    flat = z.reshape(-1, channels)
-    flat = flat - flat.mean(dim=0, keepdim=True)
-    if flat.shape[0] < 3:
-        rgb = flat[:, :3]
-    else:
-        _, _, vh = torch.pca_lowrank(flat, q=3, center=False)
-        rgb = flat @ vh[:, :3]
-    lo = rgb.quantile(0.01, dim=0, keepdim=True)
-    hi = rgb.quantile(0.99, dim=0, keepdim=True)
-    rgb = ((rgb - lo) / (hi - lo).clamp_min(1e-6)).clamp(0.0, 1.0)
+    if basis is None:
+        basis = _latent_pca_basis(z, max_frames)
+    if int(basis.components.shape[0]) != channels:
+        raise ValueError(
+            f"latent PCA basis has {int(basis.components.shape[0])} channels, "
+            f"latent has {channels}"
+        )
+    rgb = (z.reshape(-1, channels) - basis.mean) @ basis.components
+    rgb = ((rgb - basis.lo) / (basis.hi - basis.lo).clamp_min(1e-6)).clamp(0.0, 1.0)
     return rgb.reshape(1, seq_len, gy, gx, 3).reshape(seq_len, gy, gx, 3).permute(0, 3, 1, 2)
 
 
@@ -2790,15 +3437,52 @@ def sky_atlas_shape(args: argparse.Namespace) -> tuple[int, int]:
     return h, w
 
 
-def pack_sky_rgb_atlas(atlas_rgb: torch.Tensor) -> torch.Tensor:
-    """Deterministically pack a 32x64 RGB atlas into 512 12D tokens."""
+def sky_token_channel_stats(
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-token-channel ``(mean, std)`` of shape ``[SKY_TOKEN_DIM]``.
+
+    ``pixel_unshuffle`` lays the packed channel out as ``c * patch**2 + sub``,
+    so the 192 token channels are 64 red, then 64 green, then 64 blue.  The
+    standardization is therefore one constant per RGB channel repeated over its
+    64 sub-positions, which keeps it a per-dimension affine.
+    """
+    repeat = SKY_PATCH_SIZE * SKY_PATCH_SIZE
+    mean = torch.tensor(SKY_TOKEN_CHANNEL_MEAN, device=device, dtype=dtype)
+    std = torch.tensor(SKY_TOKEN_CHANNEL_STD, device=device, dtype=dtype)
+    if not bool(std.gt(0.0).all()):
+        raise ValueError(f"SKY_TOKEN_CHANNEL_STD must be positive, got {SKY_TOKEN_CHANNEL_STD}")
+    return mean.repeat_interleave(repeat), std.repeat_interleave(repeat)
+
+
+def pack_sky_rgb_atlas(atlas_rgb: torch.Tensor, *, standardize: bool = True) -> torch.Tensor:
+    """Pack a ``DEFAULT_SKY_ATLAS_HW`` RGB atlas into the sky token grid.
+
+    Under ``SKY_REPRESENTATION_VERSION`` that is a 128x256 atlas packed as 8x8
+    patches into 512 tokens of 192 channels.  The token count is what the
+    trunk attends over and is deliberately held fixed across atlas sizes; the
+    patch absorbs the resolution instead.
+
+    The packed token is then standardized per RGB channel so the flow target
+    has zero mean and unit variance like the scene latent.  Pass
+    ``standardize=False`` only to measure the constants themselves.
+    """
     if atlas_rgb.ndim != 4 or int(atlas_rgb.shape[1]) != SKY_RGB_DIM:
         raise ValueError(f"sky atlas must be [B,3,H,W], got {tuple(atlas_rgb.shape)}")
     ah, aw = int(atlas_rgb.shape[-2]), int(atlas_rgb.shape[-1])
     if (ah, aw) != DEFAULT_SKY_ATLAS_HW:
-        raise ValueError(f"sky atlas must be {DEFAULT_SKY_ATLAS_HW}, got {(ah, aw)}")
+        raise ValueError(
+            f"sky atlas must be {DEFAULT_SKY_ATLAS_HW} for "
+            f"{SKY_REPRESENTATION_VERSION}, got {(ah, aw)}"
+        )
     packed = torch.nn.functional.pixel_unshuffle(atlas_rgb.float() * 2.0 - 1.0, SKY_PATCH_SIZE)
-    return packed.permute(0, 2, 3, 1).reshape(atlas_rgb.shape[0], -1, SKY_TOKEN_DIM).contiguous()
+    tokens = packed.permute(0, 2, 3, 1).reshape(atlas_rgb.shape[0], -1, SKY_TOKEN_DIM).contiguous()
+    if not standardize:
+        return tokens
+    mean, std = sky_token_channel_stats(device=tokens.device, dtype=tokens.dtype)
+    return (tokens - mean) / std
 
 
 def pack_sky_atlas_loss_weight(
@@ -2806,9 +3490,9 @@ def pack_sky_atlas_loss_weight(
     *,
     unobserved_weight: float = 0.0,
 ) -> torch.Tensor:
-    """Pack per-atlas-pixel visibility into weights aligned with 12D RGB tokens.
+    """Pack per-atlas-pixel visibility into weights aligned with 192D RGB tokens.
 
-    A sky token contains the RGB values of a 2x2 atlas patch.  Packing one
+    A sky token contains the RGB values of an 8x8 atlas patch. Packing one
     scalar weight per token would incorrectly supervise unobserved subpixels
     whenever only part of that patch is visible.  Apply the exact same
     pixel-unshuffle layout as :func:`pack_sky_rgb_atlas` so every RGB output
@@ -2834,13 +3518,26 @@ def pack_sky_atlas_loss_weight(
     return packed.permute(0, 2, 3, 1).reshape(observation_mask.shape[0], -1, SKY_TOKEN_DIM).contiguous()
 
 
-def decode_sky_patch_tokens(tokens: torch.Tensor) -> torch.Tensor:
-    """Decode [B,512,12] tokens to flattened [-1,1] 32x64 RGB atlas."""
+def decode_sky_patch_tokens(tokens: torch.Tensor, *, standardized: bool = True) -> torch.Tensor:
+    """Decode the sky token grid to a flattened [-1,1] RGB atlas.
+
+    The inverse of :func:`pack_sky_rgb_atlas`, including its per-channel
+    standardization: everything downstream of the generator -- the sky-view
+    reconstruction loss, the 3DGS background, the mosaic -- reads RGB through
+    here, so the un-standardization lives in exactly one place.  A checkpoint
+    from an older sky representation carries a different token width and fails
+    here rather than unpacking into a silently scrambled atlas, which is why
+    the version is named in the error.
+    """
     if tokens.ndim != 3 or int(tokens.shape[1]) != DEFAULT_SKY_GRID[0] * DEFAULT_SKY_GRID[1] or int(tokens.shape[2]) != SKY_TOKEN_DIM:
         raise ValueError(
-            f"sky tokens must be [B,{DEFAULT_SKY_GRID[0] * DEFAULT_SKY_GRID[1]},{SKY_TOKEN_DIM}], "
+            f"sky tokens must be [B,{DEFAULT_SKY_GRID[0] * DEFAULT_SKY_GRID[1]},"
+            f"{SKY_TOKEN_DIM}] for {SKY_REPRESENTATION_VERSION}, "
             f"got {tuple(tokens.shape)}"
         )
+    if standardized:
+        mean, std = sky_token_channel_stats(device=tokens.device, dtype=tokens.dtype)
+        tokens = tokens * std + mean
     packed = tokens.reshape(tokens.shape[0], *DEFAULT_SKY_GRID, SKY_TOKEN_DIM)
     packed = packed.permute(0, 3, 1, 2).contiguous()
     atlas = torch.nn.functional.pixel_shuffle(packed, SKY_PATCH_SIZE)
@@ -3413,6 +4110,7 @@ def build_sky_rectified_flow_target(
     video_target,
     loss_weight: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
+    observation: torch.Tensor | None = None,
 ) -> SimpleNamespace | None:
     if sky_clean is None:
         return None
@@ -3455,6 +4153,11 @@ def build_sky_rectified_flow_target(
         weights=torch.ones((b, 1, 1), device=sky_clean.device, dtype=sky_clean.dtype),
         t_eps=target_t_eps,
         loss_weight=token_weight,
+        observation=(
+            None
+            if observation is None
+            else observation.to(device=sky_clean.device, dtype=sky_clean.dtype).clamp(0.0, 1.0)
+        ),
     )
 
 
@@ -3462,30 +4165,65 @@ def sky_flow_loss(
     v_sky_pred: torch.Tensor,
     sky_target,
     sky_clean: torch.Tensor,
+    *,
+    unobserved_beta: float = DEFAULT_SKY_UNOBSERVED_LOSS_BETA,
 ) -> torch.Tensor:
+    """Flow loss on the sky atlas, normalized separately on each region.
+
+    When ``sky_target`` carries an ``observation`` map the observed atlas and
+    the spherical-completion prior get their own denominators, so the observed
+    sky's share of the gradient is ``1 / (1 + beta)`` no matter how much sky
+    the clip contains.  Without it this falls back to the single weighted mean,
+    whose split moves with the clip's sky fraction.
+    """
     del sky_clean
+    beta = float(unobserved_beta)
+    if not math.isfinite(beta) or beta < 0.0:
+        raise ValueError(f"unobserved sky loss beta must be finite and non-negative, got {unobserved_beta}")
     token_weight = getattr(sky_target, "loss_weight", None)
     if token_weight is None:
         return torch.nn.functional.mse_loss(
             v_sky_pred.float(),
             sky_target.v_gt.to(device=v_sky_pred.device, dtype=torch.float32),
         )
-    weight = token_weight.to(device=v_sky_pred.device, dtype=torch.float32).clamp_min(0.0)
-    if weight.shape == v_sky_pred.shape[:2]:
-        weight = weight.unsqueeze(-1).expand_as(v_sky_pred)
-    elif weight.shape != v_sky_pred.shape:
-        raise ValueError(
-            f"sky loss weight shape {tuple(weight.shape)} must be token-level "
-            f"{tuple(v_sky_pred.shape[:2])} or channel-level {tuple(v_sky_pred.shape)}"
-        )
+
+    def _as_channel_map(value: torch.Tensor, name: str) -> torch.Tensor:
+        tensor = value.to(device=v_sky_pred.device, dtype=torch.float32).clamp_min(0.0)
+        if tensor.shape == v_sky_pred.shape[:2]:
+            return tensor.unsqueeze(-1).expand_as(v_sky_pred)
+        if tensor.shape != v_sky_pred.shape:
+            raise ValueError(
+                f"sky {name} shape {tuple(tensor.shape)} must be token-level "
+                f"{tuple(v_sky_pred.shape[:2])} or channel-level {tuple(v_sky_pred.shape)}"
+            )
+        return tensor
+
+    weight = _as_channel_map(token_weight, "loss weight")
     if not bool(weight.gt(0.0).any().item()):
         return v_sky_pred.sum() * 0.0
     diff = (
         v_sky_pred.float()
         - sky_target.v_gt.to(device=v_sky_pred.device, dtype=torch.float32)
     ).square()
-    denom = weight.sum().clamp_min(1e-6)
-    return (diff * weight).sum() / denom
+
+    observation = getattr(sky_target, "observation", None)
+    if observation is None:
+        denom = weight.sum().clamp_min(1e-6)
+        return (diff * weight).sum() / denom
+
+    observed = _as_channel_map(observation, "observation").clamp(0.0, 1.0)
+    # A clip with no valid sky observation supervises nothing at all, exactly
+    # as the blended weight does; without this the completion prior would be
+    # the only teacher precisely where there is no measurement to complete.
+    has_observation = observed.flatten(1).amax(dim=1).gt(0.0).float().view(-1, *([1] * (observed.ndim - 1)))
+    observed = observed * has_observation
+    unobserved = (1.0 - observed) * has_observation
+
+    observed_loss = (diff * observed).sum() / observed.sum().clamp_min(1e-6)
+    if beta == 0.0:
+        return observed_loss
+    unobserved_loss = (diff * unobserved).sum() / unobserved.sum().clamp_min(1e-6)
+    return observed_loss + beta * unobserved_loss
 
 
 def _sky_grid_for_token_count(num_tokens: int, grid_h: int, grid_w: int) -> tuple[int, int]:
@@ -3508,8 +4246,15 @@ def render_sky_tokens_directional_background(
     extrinsics: torch.Tensor,
     intrinsics: torch.Tensor,
 ) -> torch.Tensor:
-    if sky_tokens.ndim != 3 or int(sky_tokens.shape[-1]) < 3:
-        raise ValueError(f"sky_tokens must be [B,K,C>=3], got {tuple(sky_tokens.shape)}")
+    # Exactly 3: this takes the decoded per-cell RGB atlas.  A packed patch
+    # token is laid out as ``c * patch**2 + sub``, so slicing [..., :3] off one
+    # would read three *red* subpixels and render a wrong sky that still looks
+    # plausible.  The twin in dggt/losses/rgb_render_loss.py enforces the same.
+    if sky_tokens.ndim != 3 or int(sky_tokens.shape[-1]) != SKY_RGB_DIM:
+        raise ValueError(
+            "sky_tokens must be the decoded RGB atlas [B,K,3]; decode patch "
+            f"tokens before rendering, got {tuple(sky_tokens.shape)}"
+        )
     tokens = sky_tokens[:1].float()
     gh, gw = _sky_grid_for_token_count(int(tokens.shape[1]), int(grid_h), int(grid_w))
     rgb = ((tokens[..., :3] + 1.0) * 0.5).clamp(0.0, 1.0)
@@ -3579,8 +4324,15 @@ def sky_tokens_to_background(
 ) -> torch.Tensor | None:
     if sky_tokens is None:
         return None
-    if sky_tokens.ndim != 3 or int(sky_tokens.shape[-1]) < 3:
-        raise ValueError(f"sky_tokens must be [B,K,C>=3], got {tuple(sky_tokens.shape)}")
+    # Exactly 3: this takes the decoded per-cell RGB atlas.  A packed patch
+    # token is laid out as ``c * patch**2 + sub``, so slicing [..., :3] off one
+    # would read three *red* subpixels and render a wrong sky that still looks
+    # plausible.  The twin in dggt/losses/rgb_render_loss.py enforces the same.
+    if sky_tokens.ndim != 3 or int(sky_tokens.shape[-1]) != SKY_RGB_DIM:
+        raise ValueError(
+            "sky_tokens must be the decoded RGB atlas [B,K,3]; decode patch "
+            f"tokens before rendering, got {tuple(sky_tokens.shape)}"
+        )
     if (extrinsics is None) != (intrinsics is None):
         raise ValueError("extrinsics and intrinsics must be provided together for directional sky rendering.")
     if extrinsics is not None and intrinsics is not None:
@@ -3642,7 +4394,13 @@ def sky_token_validation_metrics(
             f"{prefix}_rgb_mae": 0.0,
             f"{prefix}_weight_mean": 0.0,
         }
-    diff = (pred.float() - gt.to(device=pred.device, dtype=torch.float32)).abs()
+    # Report in [0,1] RGB, not in whatever units the token currently uses.
+    # The packed token is standardized per channel and ``* 0.5`` undoes the
+    # ``rgb * 2 - 1`` packing, so this number stays comparable across sky
+    # representation versions instead of moving when the scale changes.
+    _, channel_std = sky_token_channel_stats(device=pred.device, dtype=torch.float32)
+    scale = channel_std * 0.5
+    diff = (pred.float() - gt.to(device=pred.device, dtype=torch.float32)).abs() * scale
     diff = diff * weight.to(dtype=diff.dtype)
     return {
         f"{prefix}_rgb_mae": float((diff.sum() / weight.sum().clamp_min(1e-6)).detach().item()),
@@ -3672,6 +4430,7 @@ def generated_sky_view_reconstruction_loss(
     total = sky_latent.sum() * 0.0
     charbonnier_total = sky_latent.new_zeros((), dtype=torch.float32)
     high_total = sky_latent.new_zeros((), dtype=torch.float32)
+    detail_ratio_total = sky_latent.new_zeros((), dtype=torch.float32)
     lpips_total = sky_latent.new_zeros((), dtype=torch.float32)
     if loss_sample_weight is None:
         sample_weight = torch.ones(
@@ -3716,6 +4475,21 @@ def generated_sky_view_reconstruction_loss(
         wy = weight[..., 1:, :] * weight[..., :-1, :]
         high = (dx.abs() * wx).sum() / (wx.sum() * 3.0).clamp_min(1.0)
         high = high + (dy.abs() * wy).sum() / (wy.sum() * 3.0).clamp_min(1.0)
+        # ``high`` is |grad(pred) - grad(target)| and cannot tell a sky that is
+        # too smooth from one that is too noisy -- both raise it.  This ratio
+        # can: below 1 the generated sky carries less gradient than the real
+        # one (the flat-tile failure), above 1 it carries more (speckle inside
+        # a tile, the failure mode on the other side of a heavier sky weight).
+        with torch.no_grad():
+            pred_grad = (
+                ((background[..., :, 1:] - background[..., :, :-1]).abs() * wx).sum()
+                + ((background[..., 1:, :] - background[..., :-1, :]).abs() * wy).sum()
+            )
+            target_grad = (
+                ((target[..., :, 1:] - target[..., :, :-1]).abs() * wx).sum()
+                + ((target[..., 1:, :] - target[..., :-1, :]).abs() * wy).sum()
+            )
+            detail_ratio = pred_grad / target_grad.clamp_min(1e-6)
         row_loss = charb + float(high_frequency_weight) * high
         lpips_value = background.new_zeros(())
         if lpips_model is not None and float(lpips_weight) > 0.0:
@@ -3727,6 +4501,9 @@ def generated_sky_view_reconstruction_loss(
         if collect_logs:
             charbonnier_total = charbonnier_total + charb.detach().float() / float(images.shape[0])
             high_total = high_total + high.detach().float() / float(images.shape[0])
+            detail_ratio_total = (
+                detail_ratio_total + detail_ratio.detach().float() / float(images.shape[0])
+            )
             lpips_total = lpips_total + lpips_value.detach().float() / float(images.shape[0])
     if not collect_logs:
         return total, {}
@@ -3736,6 +4513,9 @@ def generated_sky_view_reconstruction_loss(
         ),
         "loss_sky_view_high_frequency": deferred_log_value(
             high_total, defer=defer_log_values
+        ),
+        "sky_view_detail_ratio": deferred_log_value(
+            detail_ratio_total, defer=defer_log_values
         ),
         "loss_sky_view_lpips": deferred_log_value(
             lpips_total, defer=defer_log_values
@@ -4414,6 +5194,40 @@ def _combine_layout_cfg_outputs(
     )
 
 
+VALIDATION_SCENE_SAMPLING_SEED_OFFSET = 20_000_033
+
+
+def validation_scene_sampling_seed(base_seed: int, scene_offset: int) -> int:
+    """Stable validation noise seed shared by every CFG scale of one slot."""
+
+    if int(scene_offset) < 0:
+        raise ValueError(f"scene_offset must be non-negative, got {scene_offset}")
+    return (
+        int(base_seed)
+        + VALIDATION_SCENE_SAMPLING_SEED_OFFSET
+        + int(scene_offset)
+    )
+
+
+def make_pretrain_sampling_generator(
+    device: torch.device,
+    args: argparse.Namespace,
+    step: int,
+    *,
+    sampling_seed: int | None = None,
+) -> torch.Generator:
+    """Build the ODE noise generator, optionally overriding the legacy step seed."""
+
+    generator = torch.Generator(device=device)
+    seed = (
+        int(args.seed) + int(step)
+        if sampling_seed is None
+        else int(sampling_seed)
+    )
+    generator.manual_seed(seed)
+    return generator
+
+
 @torch.no_grad()
 def _cfg_sample_pretrain_latents_sliding(
     scene_flow: nn.Module,
@@ -4429,6 +5243,7 @@ def _cfg_sample_pretrain_latents_sliding(
     return_sky: bool = False,
     return_gauge: bool = False,
     return_sky_mask: bool = False,
+    sampling_seed: int | None = None,
 ) -> torch.Tensor | SimpleNamespace:
     """Chained-CFG sliding sampler with the full layout bundle sliced per window."""
 
@@ -4439,8 +5254,9 @@ def _cfg_sample_pretrain_latents_sliding(
         dtype=torch.float32,
         t_eps=scene_flow_t_eps(scene_flow),
     )
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(args.seed) + int(step))
+    generator = make_pretrain_sampling_generator(
+        device, args, step, sampling_seed=sampling_seed
+    )
     z_splat = getattr(bundle, "z_splat_n", None)
     if z_splat is None:
         z_splat = torch.zeros_like(bundle.z_clean_n)
@@ -4709,6 +5525,7 @@ def cfg_sample_pretrain_latents(
     return_sky: bool = False,
     return_gauge: bool = False,
     return_sky_mask: bool = False,
+    sampling_seed: int | None = None,
 ) -> torch.Tensor | SimpleNamespace:
     """Sample video/sky/gauge with lazy four-branch chained CFG."""
 
@@ -4727,6 +5544,7 @@ def cfg_sample_pretrain_latents(
             return_sky=return_sky,
             return_gauge=return_gauge,
             return_sky_mask=return_sky_mask,
+            sampling_seed=sampling_seed,
         )
 
     t_steps = rae_t_grid(
@@ -4736,8 +5554,9 @@ def cfg_sample_pretrain_latents(
         dtype=torch.float32,
         t_eps=scene_flow_t_eps(scene_flow),
     )
-    generator = torch.Generator(device=device)
-    generator.manual_seed(int(args.seed) + int(step))
+    generator = make_pretrain_sampling_generator(
+        device, args, step, sampling_seed=sampling_seed
+    )
     z_splat = getattr(bundle, "z_splat_n", None)
     if z_splat is None:
         z_splat = torch.zeros_like(bundle.z_clean_n)
@@ -4911,6 +5730,7 @@ def build_full_scene_bundle(
     camera_attention_mask: torch.Tensor | None = None,
     sky_gen_clean: torch.Tensor | None = None,
     sky_gen_loss_weight: torch.Tensor | None = None,
+    sky_gen_observation: torch.Tensor | None = None,
     sky_gen_attention_mask: torch.Tensor | None = None,
     scene_gauge_clean_n: torch.Tensor | None = None,
     scene_gauge_clean: torch.Tensor | None = None,
@@ -4930,6 +5750,7 @@ def build_full_scene_bundle(
         camera_attention_mask=camera_attention_mask,
         sky_gen_clean=sky_gen_clean,
         sky_gen_loss_weight=sky_gen_loss_weight,
+        sky_gen_observation=sky_gen_observation,
         sky_gen_attention_mask=sky_gen_attention_mask,
         scene_gauge_clean_n=scene_gauge_clean_n,
         scene_gauge_clean=scene_gauge_clean,
@@ -4993,6 +5814,10 @@ def collect_validation_mosaic_rows(
         )
 
     cfg_caption = f"cfg {float(guidance_scale):g}" + (" · primary" if is_primary else "")
+    # Every rank fits this on the same ground-truth latent of the same scene,
+    # so the CFG rows that arrive from other ranks land in the same colour
+    # space as the GT row without any cross-rank transport.
+    latent_basis = _latent_pca_basis(bundle.z_clean_n, frames)
 
     if is_primary:
         gt_rgb = rgb_images.get("input_rgb_gt")
@@ -5006,7 +5831,9 @@ def collect_validation_mosaic_rows(
             "latent",
             GT_ROW_ORDER,
             "GT",
-            _latent_pca_grid(bundle.z_clean_n, args.patch_grid, frames),
+            _latent_pca_grid(
+                bundle.z_clean_n, args.patch_grid, frames, basis=latent_basis
+            ),
         )
 
     generated_rgb = rgb_images.get("generated_raw_3dgs_rgb")
@@ -5028,16 +5855,21 @@ def collect_validation_mosaic_rows(
         )
 
     generated_sky_rgb = rgb_images.get("generated_sky_rgb")
-    # The dome is already composited into the render above, so one row at the
-    # primary scale is enough to tell a broken sky from a broken foreground.
-    if is_primary and torch.is_tensor(generated_sky_rgb):
+    # One row per CFG scale, like every other group.  The dome is a separate
+    # generated stream from the foreground, so how it responds to guidance is
+    # its own question -- and with the dome underfitting, seeing all three
+    # side by side is how you tell "guidance washes it out" from "it was flat
+    # to begin with".
+    if torch.is_tensor(generated_sky_rgb):
         add("sky_rgb", scale_index, cfg_caption, generated_sky_rgb)
 
     add(
         "latent",
         scale_index,
         cfg_caption,
-        _latent_pca_grid(z_generated_raw, args.patch_grid, frames),
+        _latent_pca_grid(
+            z_generated_raw, args.patch_grid, frames, basis=latent_basis
+        ),
     )
     add(
         "latent_err",
@@ -5166,6 +5998,12 @@ def train_step(
     rgb_render_active = should_apply_rgb_render_loss(
         args, global_step, training=is_training
     )
+    sky_view_active = should_apply_sky_view_loss(
+        args, global_step, training=is_training
+    )
+    # Both losses read the same render context off the bundle, so the context
+    # has to be built when either one is due.
+    render_context_active = bool(rgb_render_active) or bool(sky_view_active)
     metric_depth_diagnostic_due = should_apply_metric_depth_diagnostic(
         args, global_step, training=is_training
     ) and torch.is_tensor(batch.get("metric_lidar_depth_m"))
@@ -5175,7 +6013,7 @@ def train_step(
         scene_flow,
         device,
         args,
-        include_rgb_render_context=rgb_render_active,
+        include_rgb_render_context=render_context_active,
         include_metric_depth_diagnostic=metric_depth_diagnostic_due,
     )
     full_layout = getattr(bundle, "layout_condition", None)
@@ -5235,6 +6073,7 @@ def train_step(
         target,
         loss_weight=getattr(bundle, "sky_gen_loss_weight", None),
         generator=generator,
+        observation=getattr(bundle, "sky_gen_observation", None),
     )
     gauge_target = build_gauge_rectified_flow_target(
         getattr(bundle, "scene_gauge_clean_n", None),
@@ -5355,6 +6194,20 @@ def train_step(
                 raise RuntimeError(
                     "appearance_invalid_all_window_count batch does not match the task batch"
                 )
+            # Actor-side metric coverage.  ``metric_support`` is ``frame_support``
+            # restricted to the actor-frames whose eight cuboid corners all
+            # survived the metric projection, so this ratio answers "of the
+            # actors the camera can see, how many can be placed in metres at
+            # all".  A structural hole here caps every position-control claim
+            # regardless of how well the model trains; the v5 run sat at 0.85 and
+            # the number was not logged anywhere in v6.  Two reductions over a
+            # bool tensor already in memory.
+            projected = full_layout.projected_actor_geometry
+            frame_support_total = projected.frame_support.detach().float().sum()
+            logs["layout/actor_metric_support_fraction"] = (
+                projected.metric_support.detach().float().sum()
+                / frame_support_total.clamp_min(1.0)
+            )
             invalid_all_window_total = invalid_all_window.detach().float().sum()
             tasked_binding_total = (
                 tasked_layout.appearance.binding_valid.detach().float().sum()
@@ -5373,11 +6226,33 @@ def train_step(
                 scene_flow, pred_sky, sky_target
             )
             loss_sky_flow = sky_flow_loss(
-                v_sky_pred, sky_target, bundle.sky_gen_clean
+                v_sky_pred,
+                sky_target,
+                bundle.sky_gen_clean,
+                unobserved_beta=float(
+                    getattr(
+                        args,
+                        "sky_unobserved_loss_beta",
+                        DEFAULT_SKY_UNOBSERVED_LOSS_BETA,
+                    )
+                ),
             )
             loss = loss + float(args.lambda_sky_flow) * loss_sky_flow
             if collect_logs:
                 logs["loss_sky_flow"] = loss_sky_flow.detach().float().reshape(())
+                sky_loss_weight = getattr(bundle, "sky_gen_loss_weight", None)
+                if torch.is_tensor(sky_loss_weight):
+                    # Unobserved atlas directions carry
+                    # ``--sky_unobserved_loss_weight`` instead of 1.0, so this
+                    # mean is the denominator every sky number has to be read
+                    # against, and the observed fraction inverts out of it as
+                    # ``(mean - w) / (1 - w)``.  ``loss_sky_flow`` is a weighted
+                    # mean, so the observed sky's share of the gradient is
+                    # exactly ``observed_fraction / mean``: at the old w=0.05
+                    # that was 17.6%, at w=0.005 it is 68%.
+                    logs["sky_token_loss_weight_mean"] = (
+                        sky_loss_weight.detach().float().mean()
+                    )
         elif torch.is_tensor(pred_sky):
             loss = loss + 0.0 * pred_sky.sum()
             if collect_logs:
@@ -5476,15 +6351,19 @@ def train_step(
                 dice_weight=float(getattr(args, "sky_mask_dice_weight", 0.5)),
                 pos_weight_max=float(getattr(args, "sky_mask_pos_weight_max", 10.0)),
                 boundary_weight=float(getattr(args, "sky_mask_refine_boundary_weight", 4.0)),
-                boundary_loss_weight=float(
-                    getattr(args, "sky_mask_refine_boundary_loss_weight", 0.25)
-                ),
+                boundary_loss_weight=sky_mask_refine_boundary_loss_weight(args),
                 defer_log_values=True,
                 collect_logs=collect_logs,
             )
-            loss = loss + float(
+            weighted_sky_mask_refine = float(
                 getattr(args, "lambda_sky_mask_refine", 0.1)
             ) * loss_sky_mask_refine
+            loss = loss + weighted_sky_mask_refine
+            if loss_terms_out is not None:
+                # The largest weighted auxiliary after repa/base, and unlike the
+                # world-feedback levels it carries no sigma attenuation, so it
+                # belongs in the same audit.
+                loss_terms_out["sky_mask_refine"] = weighted_sky_mask_refine
             if collect_logs:
                 logs["loss_sky_mask_refine"] = (
                     loss_sky_mask_refine.detach().float().reshape(())
@@ -5495,14 +6374,20 @@ def train_step(
             if collect_logs:
                 logs["loss_sky_mask_refine"] = 0.0
 
-        # Seed the sentinel so the availability flag below can gate both the
-        # W&B mean and the fallback diagnostic path.  There is exactly one
-        # metric-depth series: the ``_pred_gauge`` / ``_teacher_gauge`` prefixes
-        # were only ever written as sentinels and never carried a measurement.
+        # Seed the sentinels so the availability flags below can gate both the
+        # W&B mean and the fallback diagnostic path.  Two metric-depth series
+        # share the LiDAR sample: the generated gauge and the offline calibrated
+        # one.  (The old ``_pred_gauge`` prefix was a pure alias of the first and
+        # stays deleted.)
         if collect_logs:
             logs.update(metric_depth_diagnostic_log_values())
+            logs.update(
+                metric_depth_diagnostic_log_values(
+                    prefix="metric_depth_rel_err_teacher_gauge"
+                )
+            )
 
-        if rgb_render_active:
+        if render_context_active:
             if not torch.is_tensor(getattr(bundle, "rgb_render_images", None)):
                 raise RuntimeError("RGB render context is missing target images")
             if not torch.is_tensor(getattr(bundle, "rgb_render_masks", None)):
@@ -5549,13 +6434,19 @@ def train_step(
                     rgb_row_indices,
                 )
                 selected_sky_tokens = None
+                selected_sky_latent = None
                 if z_sky_pred is not None:
                     selected_sky_latent = select_rows(
                         z_sky_pred, "z_sky_pred"
                     )
+                    # The 3DGS render below uses this as its background, so it
+                    # is decoded whenever a sky exists -- not only on the steps
+                    # the sky-view loss happens to be due.  Tying the two would
+                    # silently swap the render's background to black.
                     selected_sky_tokens = decode_sky_patch_tokens(
                         selected_sky_latent
                     )
+                if sky_view_active and selected_sky_latent is not None:
                     sky_view_frames = int(args.rgb_render_max_frames)
                     sky_view_frames = (
                         int(bundle.rgb_render_images.shape[1])
@@ -5587,136 +6478,205 @@ def train_step(
                         lpips_model=lpips_model,
                         lpips_weight=float(getattr(args, "sky_view_lpips_weight", 0.01)),
                         high_frequency_weight=float(
-                            getattr(args, "sky_view_high_frequency_weight", 0.25)
+                            getattr(
+                                args,
+                                "sky_view_high_frequency_weight",
+                                SKY_VIEW_HIGH_FREQUENCY_WEIGHT_DEFAULT,
+                            )
                         ),
                         loss_sample_weight=sky_view_weights,
                         defer_log_values=True,
                         collect_logs=collect_logs,
                     )
-                    weighted_sky_view_loss = float(
-                        getattr(args, "lambda_sky_view_reconstruction", 0.1)
-                    ) * sky_view_loss
+                    sky_view_ramp = sky_view_loss_ramp(args, global_step)
+                    weighted_sky_view_loss = (
+                        float(
+                            getattr(
+                                args,
+                                "lambda_sky_view_reconstruction",
+                                SKY_VIEW_LAMBDA_DEFAULT,
+                            )
+                        )
+                        * sky_view_ramp
+                        * sky_view_loss
+                    )
                     loss = loss + weighted_sky_view_loss
                     if collect_logs:
                         logs.update(sky_view_logs)
+                        logs["sky_view_ramp"] = float(sky_view_ramp)
                         logs["loss_sky_view_weighted"] = (
                             weighted_sky_view_loss.detach().float().reshape(())
                         )
 
-                rgb_timestamps = bundle.rgb_render_timestamps
-                if rgb_timestamps.ndim != 1:
-                    rgb_timestamps = select_rows(
-                        rgb_timestamps, "rgb_render_timestamps"
-                    )
-                selected_sigma = select_rows(target.sigmas, "sigmas")
-                sigma_weights = rgb_render_sigma_weight(
-                    selected_sigma,
-                    float(getattr(args, "rgb_render_sigma_power", 2.0)),
-                )
-                rgb_result = compute_rgb_render_loss(
-                    vggt_model=vggt_model,
-                    scene_flow_root=unwrap_ddp(scene_flow),
-                    z_clean_pred_n=select_rows(z_pred, "z_pred"),
-                    z_clean_target_n=select_rows(bundle.z_clean_n, "z_clean_n"),
-                    images=select_rows(bundle.rgb_render_images, "rgb_render_images"),
-                    timestamps=rgb_timestamps,
-                    render_pose_enc_dggt=render_pose_requested,
-                    render_sky_probability=select_rows(
-                        render_sky_probability_from_primary_output(out),
-                        "render_sky_probability",
-                    ),
-                    loss_sky_mask_gt=select_rows(
-                        bundle.rgb_render_masks, "rgb_render_masks"
-                    ),
-                    patch_grid=args.patch_grid,
-                    patch_start_idx=int(bundle.rgb_render_patch_start_idx),
-                    max_samples=0,
-                    max_frames=int(args.rgb_render_max_frames),
-                    render_stride=int(args.rgb_render_stride),
-                    background_mode=(
-                        "sky_tokens" if selected_sky_tokens is not None else "black"
-                    ),
-                    sky_tokens=selected_sky_tokens,
-                    sky_grid=sky_atlas_shape(args),
-                    patch_weight_mask=select_rows(target.M_edit, "M_edit"),
-                    sky_weight=float(args.rgb_render_sky_weight),
-                    camera_grad_scale=0.0,
-                    gauge_pose_grad_scale=1.0,
-                    sky_mask_grad_scale=(
-                        float(args.rgb_render_sky_mask_grad_scale) * float(ramp)
-                    ),
-                    lpips_model=lpips_model,
-                    lpips_weight=float(args.rgb_render_lpips_weight),
-                    loss_sample_weight=sigma_weights,
-                    conf_weight_power=float(
-                        getattr(args, "feedback_conf_weight_power", 1.0)
-                    ),
-                    conf_weight_floor=float(
-                        getattr(args, "feedback_conf_weight_floor", 0.05)
-                    ),
-                    return_generated_depth=bool(metric_depth_diagnostic_due),
-                    pullback_calibration=getattr(
-                        unwrap_ddp(scene_flow), "_pullback_calibration", None
-                    ),
-                    defer_log_values=True,
-                    collect_logs=collect_logs,
-                )
-                weighted_rgb = (
-                    float(args.lambda_rgb_render)
-                    * float(ramp)
-                    * rgb_result.loss
-                )
-                weighted_level = float(
-                    getattr(args, "lambda_level_consistency", 0.0)
-                ) * float(ramp) * getattr(rgb_result, "level_loss", rgb_result.loss * 0.0)
-                weighted_head = float(
-                    getattr(args, "lambda_head_consistency", 0.0)
-                ) * float(ramp) * getattr(rgb_result, "head_loss", rgb_result.loss * 0.0)
-                loss = loss + weighted_rgb + weighted_level + weighted_head
-                if collect_logs:
-                    logs.update(rgb_result.logs)
-                    logs["rgb_render_sigma_mean"] = selected_sigma.detach().float().mean()
-                    logs["rgb_render_sigma_weight_mean"] = sigma_weights.detach().float().mean()
-                    logs["loss_rgb_render_weighted"] = weighted_rgb.detach().float().reshape(())
-                    logs["loss_level_consistency_weighted"] = weighted_level.detach().float().reshape(())
-                    logs["loss_head_consistency_weighted"] = weighted_head.detach().float().reshape(())
-                    logs["rgb_render_active"] = 1.0
-                metric_lidar = getattr(bundle, "metric_lidar_depth_m", None)
-                if (
-                    rgb_result.generated_depth is not None
-                    and torch.is_tensor(metric_lidar)
-                ):
-                    selected_metric_lidar = select_rows(
-                        metric_lidar, "metric_lidar_depth_m"
-                    )
-                    selected_scale_valid = select_rows(
-                        bundle.scene_gauge_valid[..., 0],
-                        "scene_gauge_scale_valid",
-                    )
-                    selected_lidar_valid = (
-                        select_rows(
-                            bundle.metric_lidar_depth_valid,
-                            "metric_lidar_depth_valid",
+                # The 3DGS render path is the expensive half and keeps its own
+                # 5000-step gate; the sky atlas above renders by rotation alone.
+                if rgb_render_active:
+                    rgb_timestamps = bundle.rgb_render_timestamps
+                    if rgb_timestamps.ndim != 1:
+                        rgb_timestamps = select_rows(
+                            rgb_timestamps, "rgb_render_timestamps"
                         )
-                        if torch.is_tensor(
-                            getattr(bundle, "metric_lidar_depth_valid", None)
-                        )
-                        else None
+                    selected_sigma = select_rows(target.sigmas, "sigmas")
+                    sigma_weights = rgb_render_sigma_weight(
+                        selected_sigma,
+                        float(getattr(args, "rgb_render_sigma_power", 2.0)),
                     )
-                    metric_rel_err = metric_depth_relative_error(
-                        rgb_result.generated_depth,
-                        selected_metric_lidar,
-                        select_rows(
-                            pred_gauge_physical, "pred_gauge_physical"
-                        )[..., 0],
-                        calibration=getattr(
+                    rgb_result = compute_rgb_render_loss(
+                        vggt_model=vggt_model,
+                        scene_flow_root=unwrap_ddp(scene_flow),
+                        z_clean_pred_n=select_rows(z_pred, "z_pred"),
+                        z_clean_target_n=select_rows(bundle.z_clean_n, "z_clean_n"),
+                        images=select_rows(bundle.rgb_render_images, "rgb_render_images"),
+                        timestamps=rgb_timestamps,
+                        render_pose_enc_dggt=render_pose_requested,
+                        render_sky_probability=select_rows(
+                            render_sky_probability_from_primary_output(out),
+                            "render_sky_probability",
+                        ),
+                        loss_sky_mask_gt=select_rows(
+                            bundle.rgb_render_masks, "rgb_render_masks"
+                        ),
+                        patch_grid=args.patch_grid,
+                        patch_start_idx=int(bundle.rgb_render_patch_start_idx),
+                        max_samples=0,
+                        max_frames=int(args.rgb_render_max_frames),
+                        render_stride=int(args.rgb_render_stride),
+                        background_mode=(
+                            "sky_tokens" if selected_sky_tokens is not None else "black"
+                        ),
+                        sky_tokens=selected_sky_tokens,
+                        sky_grid=sky_atlas_shape(args),
+                        patch_weight_mask=select_rows(target.M_edit, "M_edit"),
+                        sky_weight=float(args.rgb_render_sky_weight),
+                        camera_grad_scale=0.0,
+                        gauge_pose_grad_scale=1.0,
+                        sky_mask_grad_scale=(
+                            float(args.rgb_render_sky_mask_grad_scale) * float(ramp)
+                        ),
+                        lpips_model=lpips_model,
+                        lpips_weight=float(args.rgb_render_lpips_weight),
+                        loss_sample_weight=sigma_weights,
+                        conf_weight_power=float(
+                            getattr(args, "feedback_conf_weight_power", 1.0)
+                        ),
+                        conf_weight_floor=float(
+                            getattr(args, "feedback_conf_weight_floor", 0.05)
+                        ),
+                        dynamic_space=str(
+                            getattr(args, "head_dynamic_space", "probability")
+                        ),
+                        return_generated_depth=bool(metric_depth_diagnostic_due),
+                        pullback_calibration=getattr(
                             unwrap_ddp(scene_flow), "_pullback_calibration", None
                         ),
-                        scale_valid=selected_scale_valid,
-                        lidar_valid=selected_lidar_valid,
+                        defer_log_values=True,
+                        collect_logs=collect_logs,
                     )
+                    weighted_rgb = (
+                        float(args.lambda_rgb_render)
+                        * float(ramp)
+                        * rgb_result.loss
+                    )
+                    weighted_level = float(
+                        getattr(args, "lambda_level_consistency", 0.0)
+                    ) * float(ramp) * getattr(rgb_result, "level_loss", rgb_result.loss * 0.0)
+                    weighted_head = float(
+                        getattr(args, "lambda_head_consistency", 0.0)
+                    ) * float(ramp) * getattr(rgb_result, "head_loss", rgb_result.loss * 0.0)
+                    loss = loss + weighted_rgb + weighted_level + weighted_head
+                    if loss_terms_out is not None:
+                        # Kept separable so the gradient-balance audit can probe each
+                        # world-feedback level against the flow objective on the
+                        # shared trunk.  Loss share is a poor proxy for influence
+                        # here: these three are attenuated by ``(1-sigma)**2`` while
+                        # the flow target carries a ``1/sigma**2`` factor, so their
+                        # relative pull has to be measured, not inferred.
+                        loss_terms_out["rgb_render"] = weighted_rgb
+                        loss_terms_out["level_consistency"] = weighted_level
+                        loss_terms_out["head_consistency"] = weighted_head
                     if collect_logs:
-                        logs.update(metric_depth_diagnostic_log_values(metric_rel_err))
+                        logs.update(rgb_result.logs)
+                        logs["rgb_render_sigma_mean"] = selected_sigma.detach().float().mean()
+                        logs["rgb_render_sigma_weight_mean"] = sigma_weights.detach().float().mean()
+                        logs["loss_rgb_render_weighted"] = weighted_rgb.detach().float().reshape(())
+                        logs["loss_level_consistency_weighted"] = weighted_level.detach().float().reshape(())
+                        logs["loss_head_consistency_weighted"] = weighted_head.detach().float().reshape(())
+                        logs["rgb_render_active"] = 1.0
+                    metric_lidar = getattr(bundle, "metric_lidar_depth_m", None)
+                    if (
+                        rgb_result.generated_depth is not None
+                        and torch.is_tensor(metric_lidar)
+                    ):
+                        selected_metric_lidar = select_rows(
+                            metric_lidar, "metric_lidar_depth_m"
+                        )
+                        selected_scale_valid = select_rows(
+                            bundle.scene_gauge_valid[..., 0],
+                            "scene_gauge_scale_valid",
+                        )
+                        selected_lidar_valid = (
+                            select_rows(
+                                bundle.metric_lidar_depth_valid,
+                                "metric_lidar_depth_valid",
+                            )
+                            if torch.is_tensor(
+                                getattr(bundle, "metric_lidar_depth_valid", None)
+                            )
+                            else None
+                        )
+                        metric_rel_err = metric_depth_relative_error(
+                            rgb_result.generated_depth,
+                            selected_metric_lidar,
+                            select_rows(
+                                pred_gauge_physical, "pred_gauge_physical"
+                            )[..., 0],
+                            calibration=getattr(
+                                unwrap_ddp(scene_flow), "_pullback_calibration", None
+                            ),
+                            scale_valid=selected_scale_valid,
+                            lidar_valid=selected_lidar_valid,
+                        )
+                        if collect_logs:
+                            logs.update(metric_depth_diagnostic_log_values(metric_rel_err))
+                            # Same generated depth, same LiDAR, only the scale swapped
+                            # for the offline calibrated one.  The gap between the two
+                            # series is the only read on how much of the residual
+                            # metric error is the generated gauge rather than the
+                            # generated geometry; when they meet, scale has stopped
+                            # being the bottleneck.  Reuses the depth already
+                            # rendered above, so it costs one masked median.
+                            logs.update(
+                                metric_depth_diagnostic_log_values(
+                                    metric_depth_relative_error(
+                                        rgb_result.generated_depth,
+                                        selected_metric_lidar,
+                                        select_rows(
+                                            bundle.scene_gauge_clean,
+                                            "scene_gauge_clean",
+                                        )[..., 0],
+                                        calibration=getattr(
+                                            unwrap_ddp(scene_flow),
+                                            "_pullback_calibration",
+                                            None,
+                                        ),
+                                        scale_valid=selected_scale_valid,
+                                        lidar_valid=selected_lidar_valid,
+                                    ),
+                                    prefix="metric_depth_rel_err_teacher_gauge",
+                                )
+                            )
+                elif collect_logs:
+                    logs.update(
+                        {
+                            "loss_rgb_render": 0.0,
+                            "loss_rgb_render_weighted": 0.0,
+                            "loss_level_consistency": 0.0,
+                            "loss_head_consistency": 0.0,
+                            "loss_level_consistency_weighted": 0.0,
+                            "loss_head_consistency_weighted": 0.0,
+                            "rgb_render_active": 0.0,
+                        }
+                    )
         elif collect_logs:
             logs.update(
                 {
@@ -6109,6 +7069,7 @@ def build_pretrain_bundle_from_batch(
     )
     sky_gen_clean = None
     sky_gen_loss_weight = None
+    sky_gen_observation = None
     sky_atlas_clean = None
     sky_atlas_observation_mask = None
     if sky_generation_enabled(args):
@@ -6139,6 +7100,12 @@ def build_pretrain_bundle_from_batch(
             unobserved_weight=float(
                 getattr(args, "sky_unobserved_loss_weight", DEFAULT_SKY_UNOBSERVED_LOSS_WEIGHT)
             ),
+        )
+        # The same packing at zero unobserved weight is exactly the observation
+        # map, which ``sky_flow_loss`` needs to normalize the two regions apart.
+        # The blended weight above stays for logging and validation metrics.
+        sky_gen_observation = pack_sky_atlas_loss_weight(
+            sky_atlas_observation_mask, unobserved_weight=0.0
         )
 
     frame_ids_raw = batch.get("frame_ids")
@@ -6179,6 +7146,7 @@ def build_pretrain_bundle_from_batch(
         camera_attention_mask=camera_attention_mask,
         sky_gen_clean=sky_gen_clean,
         sky_gen_loss_weight=sky_gen_loss_weight,
+        sky_gen_observation=sky_gen_observation,
         sky_gen_attention_mask=None,
         scene_gauge_clean_n=scene_gauge_clean_n,
         scene_gauge_clean=scene_gauge_clean,
@@ -6408,9 +7376,15 @@ def _run_validation_impl(
         if not isinstance(long_sampler, CyclicSequentialSampler):
             raise TypeError("long-form validation requires CyclicSequentialSampler")
         scene_offsets = sorted({task[0] for task in assigned_sampling_tasks})
-        base_offset = int(validation_index) * int(effective_scene_count)
         for scene_offset in scene_offsets:
-            long_sampler.set_offset(base_offset + int(scene_offset))
+            long_sampler.set_offset(
+                validation_scene_dataset_index(
+                    scene_offset,
+                    scene_count=effective_scene_count,
+                    validation_index=validation_index,
+                    trunk_major_index=long_sampler.data_source.trunk_major_index,
+                )
+            )
             try:
                 long_batch = next(iter(long_loader))
             except StopIteration:
@@ -6440,6 +7414,7 @@ def _run_validation_impl(
             raise RuntimeError(
                 "multi-scene validation inference requires the long-form loader"
             )
+        # Single-scene fallback: that one scene is pinned by definition.
         visualization_batches[0] = first_batch
 
     metric_keys_before_sampling = set(metrics)
@@ -6465,6 +7440,11 @@ def _run_validation_impl(
                 bundle_cache[scene_offset] = first_bundle
             scale = guidance_scales[scale_index]
             is_scene_primary = scale_index == 0
+            # Rotating scenes are here for the pictures.  Their numbers stay in
+            # this local dict and are dropped, so every validation/sample_*
+            # point is a mean over the same pinned scenes and a change between
+            # two steps is the model, not the draw.
+            scene_metrics: dict[str, float] = {}
             scene_label = validation_scene_label(first_batch, scene_offset)
             generated = cfg_sample_pretrain_latents(
                 scene_flow,
@@ -6477,6 +7457,12 @@ def _run_validation_impl(
                 return_sky=sky_generation_enabled(args),
                 return_gauge=True,
                 return_sky_mask=True,
+                # Pinned sample_* series must use the same draw at every
+                # training step. A slot-specific seed also keeps all CFG
+                # scales for one scene on identical initial noise.
+                sampling_seed=validation_scene_sampling_seed(
+                    int(args.seed), int(scene_offset)
+                ),
             )
             if not isinstance(generated, SimpleNamespace):
                 raise RuntimeError("validation sampling must return structured outputs")
@@ -6485,7 +7471,7 @@ def _run_validation_impl(
             if generated.sky_mask_patch is None or generated.sky_mask_refined is None:
                 raise RuntimeError("validation sampling did not return sky masks")
             prefix_suffix = "" if is_scene_primary else f"_cfg{scale:g}"
-            metrics.update(
+            scene_metrics.update(
                 sampled_gauge_validation_metrics(
                     generated.gauge,
                     first_bundle.scene_gauge_clean,
@@ -6494,8 +7480,15 @@ def _run_validation_impl(
                     prefix=f"sample_gauge{prefix_suffix}",
                 )
             )
+            scene_metrics.update(
+                sampled_latent_validation_metrics(
+                    generated.video,
+                    first_bundle.z_clean_n,
+                    prefix=f"sample_latent{prefix_suffix}",
+                )
+            )
             if generated.sky is not None and first_bundle.sky_gen_clean is not None:
-                metrics.update(
+                scene_metrics.update(
                     sky_token_validation_metrics(
                         generated.sky,
                         first_bundle.sky_gen_clean,
@@ -6503,14 +7496,14 @@ def _run_validation_impl(
                         loss_weight=first_bundle.sky_gen_loss_weight,
                     )
                 )
-            metrics.update(
+            scene_metrics.update(
                 sky_mask_validation_metrics(
                     generated.sky_mask_patch,
                     first_bundle.sky_mask_clean,
                     prefix=f"sample_sky_mask{prefix_suffix}",
                 )
             )
-            metrics.update(
+            scene_metrics.update(
                 sky_mask_validation_metrics(
                     generated.sky_mask_refined,
                     first_bundle.sky_mask_refined_clean,
@@ -6538,6 +7531,23 @@ def _run_validation_impl(
                     generated_sky_mask_patch=generated.sky_mask_patch,
                     generated_sky_mask_refined=generated.sky_mask_refined,
                 )
+                generated_rgb = rgb_images.get("generated_raw_3dgs_rgb")
+                target_rgb = first_batch.get("images") if first_batch else None
+                if torch.is_tensor(generated_rgb) and torch.is_tensor(target_rgb):
+                    scene_metrics.update(
+                        sampled_render_validation_metrics(
+                            generated_rgb,
+                            _image_grid(target_rgb, int(generated_rgb.shape[0])),
+                            prefix=f"sample_render{prefix_suffix}",
+                        )
+                    )
+            metrics.update(
+                validation_scene_metrics_for_merge(
+                    scene_metrics,
+                    scene_offset=scene_offset,
+                    scene_count=effective_scene_count,
+                )
+            )
             local_mosaic_rows.extend(
                 collect_validation_mosaic_rows(
                     first_bundle,
@@ -6847,11 +7857,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--val_inference_scenes",
         type=int,
-        default=1,
+        default=10,
         help=(
-            "Number of scenes sampled at each validation. If world_size is "
-            "smaller than scenes times the number of CFG scales, validation "
-            "falls back to one scene instead of serializing all scene jobs."
+            "Number of scenes sampled at each validation. The first half is "
+            "pinned and is the only source of the validation/sample_* numbers; "
+            "the second half rotates through the split for fresh mosaics and "
+            "contributes no numbers. If world_size is smaller than scenes "
+            "times the number of CFG scales, validation falls back to "
+            f"{VALIDATION_SCENE_FALLBACK} scenes (one of each) rather than "
+            "serializing all scene jobs."
         ),
     )
     parser.add_argument(
@@ -6963,8 +7977,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda_sky_flow",
         type=float,
-        default=0.1,
+        default=DEFAULT_LAMBDA_SKY_FLOW,
         help="Flow-matching loss weight for generated scene-level sky RGB tokens.",
+    )
+    parser.add_argument(
+        "--sky_unobserved_loss_beta",
+        type=float,
+        default=DEFAULT_SKY_UNOBSERVED_LOSS_BETA,
+        help=(
+            "Weight of the spherical-completion prior relative to the observed "
+            "atlas in the sky flow loss, each normalized on its own region."
+        ),
     )
     parser.add_argument(
         "--lambda_sky_mask",
@@ -7011,8 +8034,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sky_mask_refine_boundary_loss_weight",
         type=float,
-        default=0.25,
-        help="Weight of the boundary BCE term inside the refined sky mask auxiliary loss.",
+        default=SKY_MASK_REFINE_BOUNDARY_LOSS_WEIGHT_DEFAULT,
+        help=(
+            "Weight of the boundary BCE term inside the refined sky mask "
+            "auxiliary loss. It enters as boundary_loss_weight * "
+            "boundary_weight, so 0.125 * 4 = 0.5. At the previous 0.25 the "
+            "product was 1.0 and the boundary BCE alone was 86% of "
+            "loss_sky_mask_refine and 5.4% of the whole training loss -- "
+            "seventeen times the entire world-feedback stack, on the slowest "
+            "moving term in the objective (-2.4%/1k against the flow loss's "
+            "-6.7%/1k)."
+        ),
     )
     parser.add_argument(
         "--lambda_rgb_render",
@@ -7028,14 +8060,26 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lambda_level_consistency",
         type=float,
-        default=0.1,
+        default=LEVEL_CONSISTENCY_LAMBDA_DEFAULT,
         help="Four-level tokenizer-decoder consistency weight, evaluated on RGB render steps.",
     )
     parser.add_argument(
         "--lambda_head_consistency",
         type=float,
-        default=0.1,
+        default=HEAD_CONSISTENCY_LAMBDA_DEFAULT,
         help="Frozen depth/GS/dynamic-head consistency weight, evaluated on RGB render steps.",
+    )
+    parser.add_argument(
+        "--head_dynamic_space",
+        type=str,
+        default="probability",
+        choices=list(DYNAMIC_HEAD_SPACES),
+        help=(
+            "Space the dynamic-head consistency term compares in. 'probability' "
+            "applies the sigmoid the renderer already uses for static opacity; "
+            "'logit' restores the unbounded pre-v6 comparison, where this single "
+            "term carried ~98% of the head loss and stopped improving."
+        ),
     )
     parser.add_argument("--rgb_render_every", type=int, default=1)
     parser.add_argument(
@@ -7111,9 +8155,31 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rgb_render_lpips_weight", type=float, default=0.01)
     parser.add_argument("--rgb_render_lpips_net", type=str, default="alex")
-    parser.add_argument("--lambda_sky_view_reconstruction", type=float, default=0.1)
+    parser.add_argument(
+        "--lambda_sky_view_reconstruction",
+        type=float,
+        default=SKY_VIEW_LAMBDA_DEFAULT,
+    )
     parser.add_argument("--sky_view_lpips_weight", type=float, default=0.01)
-    parser.add_argument("--sky_view_high_frequency_weight", type=float, default=0.25)
+    parser.add_argument(
+        "--sky_view_high_frequency_weight",
+        type=float,
+        default=SKY_VIEW_HIGH_FREQUENCY_WEIGHT_DEFAULT,
+    )
+    parser.add_argument(
+        "--sky_view_start_step",
+        type=int,
+        default=SKY_VIEW_START_STEP_DEFAULT,
+        help=(
+            "First step at which the sky-view reconstruction loss applies. It "
+            "is independent of --rgb_render_start_step because the sky atlas "
+            "renders by rotation only, so it needs the gauge FOV but neither "
+            "the scene latent nor the gauge scale."
+        ),
+    )
+    parser.add_argument(
+        "--sky_view_warmup_steps", type=int, default=SKY_VIEW_WARMUP_STEPS_DEFAULT
+    )
 
     parser.add_argument(
         "--cfg",
@@ -7593,6 +8659,7 @@ def main() -> None:
             static_far_plane_m=float(args.static_far_plane_m),
             pretrain_instance_cache_size=args.pretrain_instance_cache_size,
             trunk_major_samples=True,
+            deterministic_layout_reference=True,
             trunk_frames=29,
             return_full_dggt_context=True,
             trunk_major_window_offsets=validation_offsets,
@@ -7605,7 +8672,9 @@ def main() -> None:
             # do not read and collate depth arrays that no validation consumer uses.
             load_metric_depth_diagnostic=False,
         )
-        val_sampler = CyclicSequentialSampler(val_dataset)
+        val_sampler = SpreadSequentialSampler(
+            val_dataset, int(args.val_batches) * int(args.batch_size)
+        )
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
@@ -7632,6 +8701,7 @@ def main() -> None:
             static_far_plane_m=float(args.static_far_plane_m),
             pretrain_instance_cache_size=args.pretrain_instance_cache_size,
             trunk_major_samples=True,
+            deterministic_layout_reference=True,
             trunk_frames=29,
             return_full_dggt_context=True,
             load_dynamic_masks=False,
@@ -7656,18 +8726,26 @@ def main() -> None:
             int(args.val_inference_scenes),
             world_size=world_size,
         )
-        if len(val_scene_names) < validation_scene_count:
+        available_long_scenes = validation_available_scene_count(
+            val_long_dataset.trunk_major_index
+        )
+        if available_long_scenes < validation_scene_count:
             raise ValueError(
-                "validation scene range contains fewer scenes than the "
-                f"requested concurrent inference count: {len(val_scene_names)} "
+                "long-form validation contains fewer distinct usable complete-trunk "
+                "scenes than the requested concurrent inference count: "
+                f"{available_long_scenes} "
                 f"< {validation_scene_count}"
             )
         if is_main_process():
             print(
                 f"[validation] scenes={len(val_scene_names)} batches_per_eval={args.val_batches} "
+                f"usable_long_scenes={available_long_scenes} "
                 f"local_offsets={validation_offsets} long_rollout_frames=29 "
                 f"workers_per_active_rank={args.val_num_workers} "
                 f"inference_scenes={validation_scene_count}/{args.val_inference_scenes} "
+                f"pinned={validation_pinned_scene_count(validation_scene_count)}"
+                f"+rotating={validation_scene_count - validation_pinned_scene_count(validation_scene_count)} "
+                f"scalar_cover={val_sampler.indices} "
                 f"cfg_scales={validation_scales} "
                 f"active_ranks={validation_scene_count * len(validation_scales)}",
                 flush=True,
@@ -7868,8 +8946,18 @@ def main() -> None:
                 step_wait_seconds = 0.0
 
                 params = unwrap_ddp(scene_flow).parameters()
+                grad_norm: torch.Tensor | None = None
                 if args.grad_clip_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(params, args.grad_clip_norm)
+                    # ``clip_grad_norm_`` already computes the pre-clip norm, so
+                    # reporting it is free.  It decides how to read every loss
+                    # weight: once the total norm sits above --grad_clip_norm the
+                    # whole gradient is rescaled by clip/||g||, so raising any
+                    # auxiliary lambda no longer adds signal, it takes it away
+                    # from the flow objective.  Without this series the tradeoff
+                    # is invisible.
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        params, args.grad_clip_norm
+                    )
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -7889,6 +8977,14 @@ def main() -> None:
                     lr_now = optimizer.param_groups[0]["lr"]
                     train_metrics = dict(logs)
                     train_metrics["lr"] = float(lr_now)
+                    if grad_norm is not None:
+                        # Added after the all-rank reduce for the same reason as
+                        # ``lr``: it is a rank-0 optimizer property, not a shard
+                        # measurement, and DDP has already averaged the grads.
+                        train_metrics["grad_norm"] = float(grad_norm)
+                        train_metrics["grad_clip_active"] = float(
+                            float(grad_norm) > float(args.grad_clip_norm)
+                        )
                     if progress is not None:
                         progress.set_postfix(
                             progress_postfix(train_metrics), refresh=False
@@ -7934,12 +9030,12 @@ def main() -> None:
                     and global_step > 0
                     and global_step % args.val_every == 0
                 ):
-                    # Continue through trunk-major validation samples instead
-                    # of restarting from scene 000 at every validation call.
+                    # The scalar block reads a fixed spread cover (see
+                    # SpreadSequentialSampler) so its series stay comparable
+                    # across steps.  ``validation_index`` reaches only the
+                    # long-form sampling loader, where it advances the rotating
+                    # half of the scene slots and leaves the pinned half alone.
                     validation_index = global_step // args.val_every - 1
-                    val_loader.sampler.set_offset(
-                        validation_index * args.val_batches * args.batch_size
-                    )
                     run_validation(
                         val_loader,
                         vggt_model,

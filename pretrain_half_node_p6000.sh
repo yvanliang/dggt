@@ -197,8 +197,7 @@ build_train_args() {
         --lambda_repa 0.5
         --base_model_coeff 0.25
         --lambda_boundary 0.25
-        --lambda_sky_flow 0.1
-        --lambda_rgb_render 0.005
+        --lambda_sky_flow 0.5
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
         --cfg "${CFG_SCALE}"
         --layout_guidance_scale "${LAYOUT_GUIDANCE_SCALE}"
@@ -209,7 +208,7 @@ build_train_args() {
         --val_scene_start 0
         --val_scene_end 100
         --val_every 2000
-        --val_batches 1
+        --val_batches 8
         --val_log_images 10
         --val_sample_steps 50
         --grad_clip_norm 1.0

@@ -105,7 +105,7 @@ MAX_STEPS="${MAX_STEPS:-200000}"
 DECAY_END_STEPS="${DECAY_END_STEPS:-0}"
 SAVE_EVERY="${SAVE_EVERY:-2500}"
 VAL_EVERY="${VAL_EVERY:-2000}"
-VAL_BATCHES="${VAL_BATCHES:-1}"
+VAL_BATCHES="${VAL_BATCHES:-8}"
 VAL_LOG_IMAGES="${VAL_LOG_IMAGES:-10}"
 VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-50}"
 for value_name in \
@@ -609,8 +609,7 @@ build_train_args() {
         --lambda_repa 0.5
         --base_model_coeff 0.25
         --lambda_boundary 0.25
-        --lambda_sky_flow 0.1
-        --lambda_rgb_render 0.005
+        --lambda_sky_flow 0.5
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
         --cfg "${CFG_SCALE}"
         --layout_guidance_scale "${LAYOUT_GUIDANCE_SCALE}"

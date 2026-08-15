@@ -635,6 +635,7 @@ class WaymoOpenDataset(Dataset):
         expected_scene_gauge_split=None,
         load_metric_depth_diagnostic=False,
         return_metric_depth_diagnostic_paths=False,
+        deterministic_layout_reference=False,
     ):
         #mode 1 : train
         #mode 2 : pure reconstruction
@@ -700,6 +701,12 @@ class WaymoOpenDataset(Dataset):
                 f"{pretrain_instance_cache_size}"
             )
         self.trunk_major_samples = bool(trunk_major_samples)
+        # Training deliberately samples appearance references.  Fixed-index
+        # validation loaders opt into a stable reference so persistent worker
+        # RNG state cannot change the conditioning attached to the same row.
+        self.deterministic_layout_reference = bool(
+            deterministic_layout_reference
+        )
         self.trunk_frames = int(trunk_frames)
         if self.trunk_frames <= 0:
             raise ValueError(f"trunk_frames must be positive, got {trunk_frames}")
@@ -2631,6 +2638,7 @@ class WaymoOpenDataset(Dataset):
                         layout_raw_image_size_hw,
                         layout_anchor_to_world,
                         output_indices=indices,
+                        deterministic_reference=self.deterministic_layout_reference,
                     )
                 else:
                     layout_payload = self._build_layout_payload_from_camera_gt(
@@ -2640,6 +2648,7 @@ class WaymoOpenDataset(Dataset):
                         intrinsics,
                         raw_image_size_hw,
                         camera_anchor_to_world,
+                        deterministic_reference=self.deterministic_layout_reference,
                     )
                 input_dict.update(layout_payload)
 

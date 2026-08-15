@@ -99,9 +99,9 @@ MAX_STEPS="${MAX_STEPS:-200000}"
 WARMUP_STEPS="${WARMUP_STEPS:-4000}"
 SAVE_EVERY="${SAVE_EVERY:-2000}"
 VAL_EVERY="${VAL_EVERY:-2000}"
-VAL_BATCHES="${VAL_BATCHES:-1}"
+VAL_BATCHES="${VAL_BATCHES:-8}"
 VAL_LOG_IMAGES="${VAL_LOG_IMAGES:-10}"
-VAL_INFERENCE_SCENES="${VAL_INFERENCE_SCENES:-5}"
+VAL_INFERENCE_SCENES="${VAL_INFERENCE_SCENES:-10}"
 VAL_SAMPLE_STEPS="${VAL_SAMPLE_STEPS:-50}"
 LOG_EVERY="${LOG_EVERY:-1}"
 
@@ -269,8 +269,7 @@ build_train_args() {
         --lambda_repa 0.5
         --base_model_coeff 0.25
         --lambda_boundary 0.25
-        --lambda_sky_flow 0.1
-        --lambda_rgb_render 0.005
+        --lambda_sky_flow 0.5
         --text_uncond_drop_prob "${TEXT_UNCOND_DROP_PROB}"
         --cfg "${CFG_SCALE}"
         --layout_guidance_scale "${LAYOUT_GUIDANCE_SCALE}"
@@ -310,7 +309,7 @@ echo "DGGT_DEVICE_BACKEND=${DGGT_DEVICE_BACKEND}"
 echo "DGGT_PPU_MHA_BATCH_CHUNK_SIZE=${DGGT_PPU_MHA_BATCH_CHUNK_SIZE}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${NNODES} node x ${NPROC_PER_NODE} ppu/node x ${BATCH_SIZE_PER_PPU} batch/ppu x ${GRAD_ACCUM_STEPS} accum"
 echo "training logs: tqdm Web-console mode (ETA/rate enabled; one update per optimizer step)"
-echo "validation: every=${VAL_EVERY}, inference_scenes=${VAL_INFERENCE_SCENES} (5 scenes x 3 CFG on >=15 ranks; otherwise 1 scene)"
+echo "validation: every=${VAL_EVERY}, inference_scenes=${VAL_INFERENCE_SCENES} (10 scenes x 3 CFG on >=30 ranks; otherwise 2 scenes: 1 pinned + 1 rotating)"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG_DIR}/ppu_2card.log"
 

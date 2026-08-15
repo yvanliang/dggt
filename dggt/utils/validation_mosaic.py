@@ -1,7 +1,7 @@
 """Fold validation dumps into one legible mosaic per scene slot.
 
 Validation used to emit one JPEG per ``(scene, CFG scale, quantity)``.  A
-five-scene / three-scale sweep produced 95 files and 95 W&B panels, and the
+ten-scene / three-scale sweep produced 190 files and 190 W&B panels, and the
 panel keys carried the *scene name*, so the panel set kept growing every time
 the cyclic sampler rotated onto new scenes.
 
@@ -35,7 +35,7 @@ except ImportError:  # pragma: no cover - Pillow is a hard dependency in practic
 
 # Width in pixels each *frame* occupies in the composed mosaic.  Ten frames at
 # 256px give a 2560px-wide image: wide enough to judge a render, small enough
-# that five scenes per validation stay a few MB in W&B.
+# that ten scenes per validation stay a few MB in W&B.
 MOSAIC_CELL_WIDTH_DEFAULT = 256
 
 # Rows that describe ground truth rather than one CFG scale sort above every
@@ -82,7 +82,11 @@ MOSAIC_GROUPS: tuple[MosaicGroup, ...] = (
         "sky mask · GT red · predicted green · agreement yellow",
         False,
     ),
-    MosaicGroup("latent", "scene latent · 3-component PCA", False),
+    MosaicGroup(
+        "latent",
+        "scene latent · 3-component PCA · one basis fitted on GT, so colour is comparable",
+        False,
+    ),
     MosaicGroup(
         "latent_err",
         "latent abs(generated - GT) · fixed 0..1 scale, comparable across steps",
