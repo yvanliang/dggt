@@ -140,6 +140,17 @@ case "${WORLD_FEEDBACK_PROFILE}" in
         ;;
 esac
 
+# ``auto`` preserves the five low-level switches used by A3/ISLO. Explicit
+# profiles atomically override those switches below, keeping A4/MLO orthogonal.
+LAYOUT_PATH_PROFILE="${LAYOUT_PATH_PROFILE:-auto}"
+case "${LAYOUT_PATH_PROFILE}" in
+    auto|full|metric_layout_only) ;;
+    *)
+        echo "[错误] LAYOUT_PATH_PROFILE 必须是 auto、full 或 metric_layout_only，当前值：${LAYOUT_PATH_PROFILE}" >&2
+        exit 1
+        ;;
+esac
+
 # ============================================================
 # 训练配置
 # global batch = 节点数 × 每节点 PPU 数 × 每 PPU batch × 梯度累积。
@@ -199,8 +210,8 @@ if [[ -z "${RESUME_PATH}" && "${RESUME_EXPECTED_STEP}" != "-1" ]]; then
     echo "[错误] 未设置 RESUME_PATH 时 RESUME_EXPECTED_STEP 必须为 -1。" >&2
     exit 1
 fi
-if [[ -n "${RESUME_PATH}" && "${RESUME_EXPECTED_STEP}" == "-1" ]]; then
-    echo "[错误] 设置 RESUME_PATH 时必须同时设置 RESUME_EXPECTED_STEP。" >&2
+if [[ -n "${RESUME_PATH}" && ! "${RESUME_EXPECTED_STEP}" =~ ^[0-9]+$ ]]; then
+    echo "[错误] 设置 RESUME_PATH 时必须同时设置非负 RESUME_EXPECTED_STEP。" >&2
     exit 1
 fi
 if (( MAX_STEPS <= 0 || SAVE_EVERY <= 0 || VAL_INFERENCE_SCENES <= 0 || LOG_EVERY <= 0 )); then
@@ -231,6 +242,24 @@ LAYOUT_MAP_METRIC_INJECTION="${LAYOUT_MAP_METRIC_INJECTION:-1}"
 LAYOUT_ACTOR_METRIC_INJECTION="${LAYOUT_ACTOR_METRIC_INJECTION:-1}"
 APPEARANCE_CONTEXT_INJECTION="${APPEARANCE_CONTEXT_INJECTION:-1}"
 
+case "${LAYOUT_PATH_PROFILE}" in
+    full)
+        LAYOUT_MAP_INJECTION=1
+        LAYOUT_ACTOR_INJECTION=1
+        LAYOUT_MAP_METRIC_INJECTION=1
+        LAYOUT_ACTOR_METRIC_INJECTION=1
+        APPEARANCE_CONTEXT_INJECTION=1
+        ;;
+    metric_layout_only)
+        LAYOUT_MAP_INJECTION=0
+        LAYOUT_ACTOR_INJECTION=0
+        LAYOUT_MAP_METRIC_INJECTION=1
+        LAYOUT_ACTOR_METRIC_INJECTION=1
+        APPEARANCE_CONTEXT_INJECTION=1
+        ;;
+    auto) ;;
+esac
+
 for boolean_name in \
     LAYOUT_MAP_INJECTION LAYOUT_ACTOR_INJECTION \
     LAYOUT_MAP_METRIC_INJECTION LAYOUT_ACTOR_METRIC_INJECTION \
@@ -241,6 +270,18 @@ for boolean_name in \
         exit 1
     fi
 done
+
+LAYOUT_RESOLVED_PROFILE=custom
+if [[ "${LAYOUT_MAP_INJECTION}${LAYOUT_ACTOR_INJECTION}${LAYOUT_MAP_METRIC_INJECTION}${LAYOUT_ACTOR_METRIC_INJECTION}${APPEARANCE_CONTEXT_INJECTION}" == "11111" ]]; then
+    LAYOUT_RESOLVED_PROFILE=full
+elif [[ "${LAYOUT_MAP_INJECTION}${LAYOUT_ACTOR_INJECTION}${LAYOUT_MAP_METRIC_INJECTION}${LAYOUT_ACTOR_METRIC_INJECTION}${APPEARANCE_CONTEXT_INJECTION}" == "00111" ]]; then
+    LAYOUT_RESOLVED_PROFILE=metric_layout_only
+fi
+if [[ "${LAYOUT_MAP_INJECTION}" == "1" ]]; then LAYOUT_EARLY_MAP=true; else LAYOUT_EARLY_MAP=false; fi
+if [[ "${LAYOUT_ACTOR_INJECTION}" == "1" ]]; then LAYOUT_EARLY_ACTOR=true; else LAYOUT_EARLY_ACTOR=false; fi
+if [[ "${LAYOUT_MAP_METRIC_INJECTION}" == "1" ]]; then LAYOUT_LATE_MAP=true; else LAYOUT_LATE_MAP=false; fi
+if [[ "${LAYOUT_ACTOR_METRIC_INJECTION}" == "1" ]]; then LAYOUT_LATE_ACTOR=true; else LAYOUT_LATE_ACTOR=false; fi
+if [[ "${APPEARANCE_CONTEXT_INJECTION}" == "1" ]]; then LAYOUT_LATE_APPEARANCE=true; else LAYOUT_LATE_APPEARANCE=false; fi
 
 # layout-v2 v6 使用独立的新 wandb run，不续接旧 run。
 WANDB_PROJECT="${WANDB_PROJECT:-dggt-flow}"
@@ -470,6 +511,7 @@ build_train_args() {
         --asset_control_guidance_scale "${ASSET_CONTROL_GUIDANCE_SCALE}"
         --layout_max_actors "${LAYOUT_MAX_ACTORS}"
         --static_far_plane_m "${STATIC_FAR_PLANE_M}"
+        --layout_path_profile "${LAYOUT_PATH_PROFILE}"
         --val_guidance_scales "${VAL_GUIDANCE_SCALES}"
         --val_scene_start 0
         --val_scene_end 100
@@ -545,6 +587,7 @@ echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+
 echo "scene units profile: ${SCENE_UNITS_PROFILE}"
 echo "world feedback: profile=${WORLD_FEEDBACK_PROFILE}, raw=1/1/1, effective=${WORLD_FEEDBACK_EFFECTIVE}, compute_matched=true"
 echo "layout injection: early M/G=${LAYOUT_MAP_INJECTION}/${LAYOUT_ACTOR_INJECTION}, late M/G/A=${LAYOUT_MAP_METRIC_INJECTION}/${LAYOUT_ACTOR_METRIC_INJECTION}/${APPEARANCE_CONTEXT_INJECTION}"
+echo "layout path: requested_profile=${LAYOUT_PATH_PROFILE} resolved_profile=${LAYOUT_RESOLVED_PROFILE} early_map=${LAYOUT_EARLY_MAP} early_actor=${LAYOUT_EARLY_ACTOR} late_map=${LAYOUT_LATE_MAP} late_actor=${LAYOUT_LATE_ACTOR} late_appearance=${LAYOUT_LATE_APPEARANCE}"
 echo "resume checkpoint: ${RESUME_PATH:-<none>} (expected step=${RESUME_EXPECTED_STEP})"
 if [[ -z "${RESUME_PATH}" ]]; then
     echo "training start: step 0"

@@ -1461,7 +1461,6 @@ PRETRAIN_RESUME_REPRODUCIBILITY = (
     "model_optimizer_scheduler_ema_only_rng_and_data_stream_not_restored"
 )
 
-
 def sky_mask_refine_boundary_loss_weight(args: argparse.Namespace) -> float:
     """Resolve the refined-mask boundary coefficient from one shared default."""
 
@@ -1688,6 +1687,203 @@ def scene_units_contract_identity(contract: Any, *, path: str | Path) -> dict[st
     identity = dict(validated)
     identity.pop("source", None)
     return identity
+
+
+LAYOUT_PATH_PROFILE_SCHEMA = "layout_path_profile_v1"
+LAYOUT_PATH_PROFILE_AUTO = "auto"
+LAYOUT_PATH_PROFILE_FULL = "full"
+LAYOUT_PATH_PROFILE_METRIC_LAYOUT_ONLY = "metric_layout_only"
+LAYOUT_PATH_PROFILE_CUSTOM = "custom"
+LAYOUT_PATH_PROFILE_CHOICES = (
+    LAYOUT_PATH_PROFILE_AUTO,
+    LAYOUT_PATH_PROFILE_FULL,
+    LAYOUT_PATH_PROFILE_METRIC_LAYOUT_ONLY,
+)
+LAYOUT_INJECTION_FLAGS = (
+    "layout_map_injection",
+    "layout_actor_injection",
+    "layout_map_metric_injection",
+    "layout_actor_metric_injection",
+    "appearance_context_injection",
+)
+LAYOUT_PATH_PROFILE_INJECTIONS = {
+    LAYOUT_PATH_PROFILE_FULL: {
+        name: True for name in LAYOUT_INJECTION_FLAGS
+    },
+    LAYOUT_PATH_PROFILE_METRIC_LAYOUT_ONLY: {
+        "layout_map_injection": False,
+        "layout_actor_injection": False,
+        "layout_map_metric_injection": True,
+        "layout_actor_metric_injection": True,
+        "appearance_context_injection": True,
+    },
+}
+
+
+def _resolved_layout_path_profile(injections: dict[str, bool]) -> str:
+    for profile, expected in LAYOUT_PATH_PROFILE_INJECTIONS.items():
+        if injections == expected:
+            return profile
+    return LAYOUT_PATH_PROFILE_CUSTOM
+
+
+def validate_layout_path_profile_contract(
+    contract: Any,
+    *,
+    path: str | Path,
+) -> dict[str, Any]:
+    """Validate and normalize one exact v1 layout-path provenance record."""
+
+    if not isinstance(contract, dict):
+        raise ValueError(f"{path} is missing layout_path_profile_contract")
+    expected_keys = {
+        "schema",
+        "requested_profile",
+        "resolved_profile",
+        "resolved_injections",
+    }
+    if set(contract) != expected_keys:
+        raise ValueError(f"{path} has an invalid layout-path profile contract shape")
+    if contract.get("schema") != LAYOUT_PATH_PROFILE_SCHEMA:
+        raise ValueError(f"{path} has an unsupported layout-path profile schema")
+    requested = contract.get("requested_profile")
+    if requested not in LAYOUT_PATH_PROFILE_CHOICES:
+        raise ValueError(f"{path} has an invalid requested layout-path profile")
+    raw_injections = contract.get("resolved_injections")
+    if not isinstance(raw_injections, dict) or set(raw_injections) != set(
+        LAYOUT_INJECTION_FLAGS
+    ):
+        raise ValueError(f"{path} does not record all five resolved layout injections")
+    if any(not isinstance(raw_injections[name], bool) for name in LAYOUT_INJECTION_FLAGS):
+        raise ValueError(f"{path} layout injection values must be bool")
+    injections = {
+        name: bool(raw_injections[name]) for name in LAYOUT_INJECTION_FLAGS
+    }
+    resolved = _resolved_layout_path_profile(injections)
+    if contract.get("resolved_profile") != resolved:
+        raise ValueError(f"{path} resolved layout-path profile disagrees with its injections")
+    if requested != LAYOUT_PATH_PROFILE_AUTO and requested != resolved:
+        raise ValueError(f"{path} explicit layout-path profile was not resolved atomically")
+    return {
+        "schema": LAYOUT_PATH_PROFILE_SCHEMA,
+        "requested_profile": str(requested),
+        "resolved_profile": resolved,
+        "resolved_injections": injections,
+    }
+
+
+def resolve_layout_path_profile(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve the orthogonal layout-path selector and persist its v1 contract.
+
+    Repeated calls are intentionally harmless. Explicit profiles atomically set
+    all five switches, while ``auto`` observes the switches without changing
+    them so legacy command lines retain their exact behavior.
+    """
+
+    requested = str(
+        getattr(args, "layout_path_profile", LAYOUT_PATH_PROFILE_AUTO)
+    )
+    if requested not in LAYOUT_PATH_PROFILE_CHOICES:
+        raise ValueError(f"unsupported layout path profile {requested!r}")
+    if requested != LAYOUT_PATH_PROFILE_AUTO:
+        for name, value in LAYOUT_PATH_PROFILE_INJECTIONS[requested].items():
+            setattr(args, name, value)
+    missing = [name for name in LAYOUT_INJECTION_FLAGS if not hasattr(args, name)]
+    if missing:
+        raise ValueError(f"runtime is missing layout injection arguments: {missing}")
+    invalid = [
+        name
+        for name in LAYOUT_INJECTION_FLAGS
+        if not isinstance(getattr(args, name), bool)
+    ]
+    if invalid:
+        raise ValueError(f"layout injection arguments must be bool: {invalid}")
+    injections = {
+        name: bool(getattr(args, name)) for name in LAYOUT_INJECTION_FLAGS
+    }
+    contract = {
+        "schema": LAYOUT_PATH_PROFILE_SCHEMA,
+        "requested_profile": requested,
+        "resolved_profile": _resolved_layout_path_profile(injections),
+        "resolved_injections": injections,
+    }
+    contract = validate_layout_path_profile_contract(contract, path="runtime")
+    args.layout_path_profile = requested
+    args.layout_path_profile_contract = contract
+    return contract
+
+
+def _legacy_layout_path_profile_contract(
+    payload: dict[str, Any],
+    *,
+    path: str | Path,
+) -> dict[str, Any]:
+    """Infer old checkpoint routing only when all saved sources agree."""
+
+    candidates: list[tuple[str, dict[str, bool]]] = []
+    for source_name in ("args", "scene_flow_config"):
+        source = payload.get(source_name)
+        if not isinstance(source, dict):
+            continue
+        present = [name for name in LAYOUT_INJECTION_FLAGS if name in source]
+        if present and len(present) != len(LAYOUT_INJECTION_FLAGS):
+            missing = sorted(set(LAYOUT_INJECTION_FLAGS) - set(present))
+            raise ValueError(
+                f"{path} legacy {source_name} has an incomplete layout route: {missing}"
+            )
+        if not present:
+            continue
+        if any(not isinstance(source[name], bool) for name in LAYOUT_INJECTION_FLAGS):
+            raise ValueError(f"{path} legacy {source_name} layout flags must be bool")
+        candidates.append(
+            (
+                source_name,
+                {name: bool(source[name]) for name in LAYOUT_INJECTION_FLAGS},
+            )
+        )
+    if not candidates:
+        raise ValueError(
+            f"{path} has no layout-path contract and cannot derive all five saved flags"
+        )
+    injections = candidates[0][1]
+    for source_name, candidate in candidates[1:]:
+        if candidate != injections:
+            raise ValueError(
+                f"{path} legacy layout flags disagree between saved sources "
+                f"({candidates[0][0]} and {source_name})"
+            )
+    return validate_layout_path_profile_contract(
+        {
+            "schema": LAYOUT_PATH_PROFILE_SCHEMA,
+            "requested_profile": LAYOUT_PATH_PROFILE_AUTO,
+            "resolved_profile": _resolved_layout_path_profile(injections),
+            "resolved_injections": injections,
+        },
+        path=f"{path} inferred legacy contract",
+    )
+
+
+def validate_layout_path_profile_resume_contract(
+    payload: Any,
+    args: argparse.Namespace,
+    path: str | Path,
+) -> None:
+    """Reject cross-profile resumes, with active-route fallback for old files."""
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} is not a versioned pretraining checkpoint")
+    runtime = resolve_layout_path_profile(args)
+    saved_raw = payload.get("layout_path_profile_contract")
+    if saved_raw is None:
+        saved = _legacy_layout_path_profile_contract(payload, path=path)
+        if saved["resolved_injections"] != runtime["resolved_injections"]:
+            raise ValueError(f"{path} legacy layout active paths do not match runtime")
+        return
+    saved = validate_layout_path_profile_contract(
+        saved_raw, path=f"{path} checkpoint"
+    )
+    if saved != runtime:
+        raise ValueError(f"{path} layout-path profile contract does not match runtime")
 
 RGB_RENDER_RESUME_ARGS = (
     "lambda_rgb_render",
@@ -2110,6 +2306,7 @@ def validate_pretrain_resume_contract(
     }
     if saved_arg_contract != expected_critical:
         raise ValueError(f"{path} saved argparse values do not match runtime")
+    validate_layout_path_profile_resume_contract(payload, args, path)
 
 
 def render_sky_probability_from_primary_output(
@@ -2949,6 +3146,7 @@ def save_checkpoint(
         prediction_type=scene_flow_prediction_type(sf),
         t_eps=scene_flow_t_eps(sf),
     )
+    layout_path_profile_contract = resolve_layout_path_profile(args)
     shared = {
         "pretrain_resume_contract_version": PRETRAIN_RESUME_CONTRACT_VERSION,
         "pretrain_resume_reproducibility": PRETRAIN_RESUME_REPRODUCIBILITY,
@@ -2958,6 +3156,7 @@ def save_checkpoint(
             path="runtime SceneFlow",
         ),
         "flow_schedule_config": flow_schedule_config,
+        "layout_path_profile_contract": layout_path_profile_contract,
         "layout_task_probabilities": list(LAYOUT_TASK_PROBABILITIES),
         "layout_condition_version": LAYOUT_CONDITION_VERSION,
         "raster_schema_hash": RASTER_SCHEMA_HASH,
@@ -8812,6 +9011,17 @@ def build_argparser() -> argparse.ArgumentParser:
             default=True,
         )
     parser.add_argument(
+        "--layout_path_profile",
+        type=str,
+        choices=LAYOUT_PATH_PROFILE_CHOICES,
+        default=LAYOUT_PATH_PROFILE_AUTO,
+        help=(
+            "Atomic layout computation profile. auto preserves the five low-level "
+            "injection flags; full enables all paths; metric_layout_only disables "
+            "the two early raster stems while retaining all three late readers."
+        ),
+    )
+    parser.add_argument(
         "--text_uncond_drop_prob",
         dest="text_uncond_drop_prob",
         type=float,
@@ -8927,6 +9137,7 @@ def main() -> None:
         "schema": SCENE_UNITS_CONTRACT_SCHEMA,
         "profile": str(args.scene_units_profile),
     }
+    layout_path_profile_contract = resolve_layout_path_profile(args)
     args.patch_grid = (int(args.patch_grid_h), int(args.patch_grid_w))
     args.sky_grid = sky_grid_shape(args)
     args.sky_atlas_hw = (int(args.sky_atlas_h), int(args.sky_atlas_w))
@@ -9100,10 +9311,39 @@ def main() -> None:
             f"{rgb_render_summary['rgb_render_continuous_sigma_weighting']}",
             flush=True,
         )
+        resolved_injections = layout_path_profile_contract["resolved_injections"]
+        print(
+            "[layout-path] "
+            f"requested_profile={layout_path_profile_contract['requested_profile']} "
+            f"resolved_profile={layout_path_profile_contract['resolved_profile']} "
+            f"early_map={str(resolved_injections['layout_map_injection']).lower()} "
+            f"early_actor={str(resolved_injections['layout_actor_injection']).lower()} "
+            f"late_map={str(resolved_injections['layout_map_metric_injection']).lower()} "
+            f"late_actor={str(resolved_injections['layout_actor_metric_injection']).lower()} "
+            f"late_appearance={str(resolved_injections['appearance_context_injection']).lower()}",
+            flush=True,
+        )
     wandb_run = init_wandb(args, log_dir)
     if wandb_run is not None:
         wandb_run.summary.update(rgb_render_summary)
         wandb_run.summary["world_feedback_contract"] = world_feedback_contract
+        wandb_run.summary.update(
+            {
+                "layout_path_profile_contract": layout_path_profile_contract,
+                "layout_path_profile_requested": layout_path_profile_contract[
+                    "requested_profile"
+                ],
+                "layout_path_profile_resolved": layout_path_profile_contract[
+                    "resolved_profile"
+                ],
+                **{
+                    f"layout_path/{name}": value
+                    for name, value in layout_path_profile_contract[
+                        "resolved_injections"
+                    ].items()
+                },
+            }
+        )
 
     vggt_model = load_dggt_aggregator_and_tokenizer(
         args.dggt_ckpt_path,
