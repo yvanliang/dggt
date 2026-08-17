@@ -1447,9 +1447,16 @@ SKY_MASK_REFINE_BOUNDARY_LOSS_WEIGHT_DEFAULT = 0.125
 # contribution exactly while giving depth/GS ten times the pull they had.
 LEVEL_CONSISTENCY_LAMBDA_DEFAULT = 1.0
 HEAD_CONSISTENCY_LAMBDA_DEFAULT = 1.0
+WORLD_FEEDBACK_PROFILES = ("full", "latent_only")
+WORLD_FEEDBACK_CONTRACT_SCHEMA = "world_feedback_contract_v1"
+WORLD_FEEDBACK_FIELDS = (
+    "lambda_rgb_render",
+    "lambda_level_consistency",
+    "lambda_head_consistency",
+)
 RGB_RENDER_ROW_CAP = "per_rank_input_order_v1"
 RGB_RENDER_CONTINUOUS_SIGMA_WEIGHT = "(1-sigma)^rgb_render_sigma_power"
-PRETRAIN_RESUME_CONTRACT_VERSION = "layout_v2_pretrain_resume_v2"
+PRETRAIN_RESUME_CONTRACT_VERSION = "layout_v2_pretrain_resume_v3"
 PRETRAIN_RESUME_REPRODUCIBILITY = (
     "model_optimizer_scheduler_ema_only_rng_and_data_stream_not_restored"
 )
@@ -1732,6 +1739,7 @@ RGB_RENDER_RESUME_DEFAULTS = {
 }
 
 PRETRAIN_RESUME_CRITICAL_ARGS = (
+    "world_feedback_profile",
     "image_dir",
     "hdmap_root",
     "caption_root",
@@ -1826,6 +1834,101 @@ def _pretrain_resume_critical_value(name: str, value: Any) -> Any:
     return path.name
 
 
+def resolve_world_feedback_profile(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve the compute-matched scene world-feedback objective profile.
+
+    The raw production coefficients stay in the argparse namespace for every
+    profile.  Only the effective values consumed when the three decoded loss
+    tensors are added to the total loss differ.  Keeping the raw RGB weight
+    positive also leaves the render schedule, decoder, frozen heads, renderer,
+    and LPIPS setup active for ``latent_only``.
+    """
+
+    profile = str(getattr(args, "world_feedback_profile", "full"))
+    if profile not in WORLD_FEEDBACK_PROFILES:
+        raise ValueError(
+            f"Unsupported world feedback profile {profile!r}; expected one of "
+            f"{WORLD_FEEDBACK_PROFILES}."
+        )
+    missing = [name for name in WORLD_FEEDBACK_FIELDS if not hasattr(args, name)]
+    if missing:
+        raise ValueError(
+            f"world feedback profile cannot resolve missing raw fields: {missing}"
+        )
+    raw_baseline = {
+        name: float(getattr(args, name)) for name in WORLD_FEEDBACK_FIELDS
+    }
+    if profile == "latent_only":
+        inactive = [
+            name
+            for name, value in raw_baseline.items()
+            if not math.isfinite(value) or value <= 0.0
+        ]
+        if inactive:
+            raise ValueError(
+                "latent_only requires all raw world-feedback weights to be "
+                f"positive; non-positive fields: {inactive}"
+            )
+        if int(getattr(args, "rgb_render_every", 0)) <= 0:
+            raise ValueError("latent_only requires rgb_render_every > 0")
+
+    effective = dict(raw_baseline)
+    if profile == "latent_only":
+        effective = {name: 0.0 for name in WORLD_FEEDBACK_FIELDS}
+    for name, value in effective.items():
+        setattr(args, f"{name}_effective", float(value))
+
+    contract: dict[str, Any] = {
+        "schema": WORLD_FEEDBACK_CONTRACT_SCHEMA,
+        "profile": profile,
+        "raw_baseline": raw_baseline,
+        "effective": effective,
+        "compute_matched": True,
+    }
+    args.world_feedback_profile = profile
+    args.world_feedback_contract = contract
+    return contract
+
+
+def world_feedback_effective_value(
+    args: argparse.Namespace,
+    field: str,
+) -> float:
+    """Return one resolved coefficient without exposing raw lambdas to callers."""
+
+    if field not in WORLD_FEEDBACK_FIELDS:
+        raise ValueError(
+            f"{field!r} is not a world-feedback field; expected one of "
+            f"{WORLD_FEEDBACK_FIELDS}"
+        )
+    contract = resolve_world_feedback_profile(args)
+    return float(contract["effective"][field])
+
+
+def weighted_world_feedback_terms(
+    args: argparse.Namespace,
+    *,
+    ramp: float,
+    rgb_loss: torch.Tensor,
+    level_loss: torch.Tensor,
+    head_loss: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Weight the three decoded losses through the resolved profile only."""
+
+    ramp_value = float(ramp)
+    return (
+        world_feedback_effective_value(args, "lambda_rgb_render")
+        * ramp_value
+        * rgb_loss,
+        world_feedback_effective_value(args, "lambda_level_consistency")
+        * ramp_value
+        * level_loss,
+        world_feedback_effective_value(args, "lambda_head_consistency")
+        * ramp_value
+        * head_loss,
+    )
+
+
 def capped_render_row_indices(
     batch_size: int,
     max_samples: int,
@@ -1847,7 +1950,7 @@ def capped_render_row_indices(
 def rgb_render_run_summary(args: argparse.Namespace) -> dict[str, Any]:
     """Run-summary fields for capped rows with continuous sigma weighting."""
 
-    effective = float(getattr(args, "lambda_rgb_render", RGB_RENDER_LAMBDA_DEFAULT))
+    resolve_world_feedback_profile(args)
     profile = str(
         getattr(args, "scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
     )
@@ -1861,7 +1964,16 @@ def rgb_render_run_summary(args: argparse.Namespace) -> dict[str, Any]:
         "rgb_render_sigma_power": float(
             getattr(args, "rgb_render_sigma_power", 2.0)
         ),
-        "lambda_rgb_render_effective": effective,
+        "lambda_rgb_render_effective": world_feedback_effective_value(
+            args, "lambda_rgb_render"
+        ),
+        "lambda_level_consistency_effective": world_feedback_effective_value(
+            args, "lambda_level_consistency"
+        ),
+        "lambda_head_consistency_effective": world_feedback_effective_value(
+            args, "lambda_head_consistency"
+        ),
+        "world_feedback_profile": str(args.world_feedback_profile),
         "camera_source": "requested_C",
         "scene_units_profile": profile,
         "gauge_source": scene_units_gauge_source(profile),
@@ -1930,6 +2042,15 @@ def validate_pretrain_resume_contract(
         raise ValueError(
             f"{path} layout task probabilities do not match TC/TCMG/TCMGA "
             f"{expected_probabilities}"
+        )
+    expected_world_feedback = resolve_world_feedback_profile(args)
+    saved_world_feedback = payload.get("world_feedback_contract")
+    if _normalize_config_value(saved_world_feedback) != _normalize_config_value(
+        expected_world_feedback
+    ):
+        raise ValueError(
+            f"{path} world-feedback contract does not match runtime profile "
+            f"{args.world_feedback_profile!r}"
         )
     expected_rgb = rgb_render_run_summary(args)
     saved_rgb = payload.get("rgb_render")
@@ -2841,6 +2962,7 @@ def save_checkpoint(
         "layout_condition_version": LAYOUT_CONDITION_VERSION,
         "raster_schema_hash": RASTER_SCHEMA_HASH,
         "static_far_plane_m": float(args.static_far_plane_m),
+        "world_feedback_contract": resolve_world_feedback_profile(args),
         "rgb_render": rgb_render_run_summary(args),
         "pretrain_resume_critical_args": pretrain_resume_critical_args(args),
     }
@@ -7002,17 +7124,19 @@ def train_step(
                         defer_log_values=True,
                         collect_logs=collect_logs,
                     )
-                    weighted_rgb = (
-                        float(args.lambda_rgb_render)
-                        * float(ramp)
-                        * rgb_result.loss
+                    weighted_rgb, weighted_level, weighted_head = (
+                        weighted_world_feedback_terms(
+                            args,
+                            ramp=float(ramp),
+                            rgb_loss=rgb_result.loss,
+                            level_loss=getattr(
+                                rgb_result, "level_loss", rgb_result.loss * 0.0
+                            ),
+                            head_loss=getattr(
+                                rgb_result, "head_loss", rgb_result.loss * 0.0
+                            ),
+                        )
                     )
-                    weighted_level = float(
-                        getattr(args, "lambda_level_consistency", 0.0)
-                    ) * float(ramp) * getattr(rgb_result, "level_loss", rgb_result.loss * 0.0)
-                    weighted_head = float(
-                        getattr(args, "lambda_head_consistency", 0.0)
-                    ) * float(ramp) * getattr(rgb_result, "head_loss", rgb_result.loss * 0.0)
                     loss = loss + weighted_rgb + weighted_level + weighted_head
                     if loss_terms_out is not None:
                         # Kept separable so the gradient-balance audit can probe each
@@ -8507,6 +8631,17 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--world_feedback_profile",
+        type=str,
+        default="full",
+        choices=WORLD_FEEDBACK_PROFILES,
+        help=(
+            "Scene world-feedback objective profile. 'latent_only' keeps the "
+            "full RGB/decoder/head/render/LPIPS computation but gives the RGB, "
+            "decoded-feature, and frozen-head losses zero effective weight."
+        ),
+    )
+    parser.add_argument(
         "--lambda_rgb_render",
         type=float,
         default=RGB_RENDER_LAMBDA_DEFAULT,
@@ -8795,6 +8930,7 @@ def main() -> None:
     args.patch_grid = (int(args.patch_grid_h), int(args.patch_grid_w))
     args.sky_grid = sky_grid_shape(args)
     args.sky_atlas_hw = (int(args.sky_atlas_h), int(args.sky_atlas_w))
+    world_feedback_contract = resolve_world_feedback_profile(args)
     if args.patch_grid[0] <= 0 or args.patch_grid[1] <= 0:
         raise ValueError("--patch_grid_h and --patch_grid_w must be positive.")
     if int(args.sky_mask_refine_scale) <= 0 or int(args.sky_mask_refine_scale) & (int(args.sky_mask_refine_scale) - 1):
@@ -8946,20 +9082,28 @@ def main() -> None:
         log_dir.mkdir(parents=True, exist_ok=True)
         config = dict(vars(args))
         config["patch_grid"] = list(args.patch_grid)
+        config["world_feedback_contract"] = world_feedback_contract
         (log_dir / "config.json").write_text(json.dumps(config, indent=2))
         print(
-            "[rgb-render] "
+            "[world-feedback] "
+            f"profile={rgb_render_summary['world_feedback_profile']} "
+            "raw="
+            f"{args.lambda_rgb_render:g}/{args.lambda_level_consistency:g}/"
+            f"{args.lambda_head_consistency:g} "
+            "effective="
+            f"{rgb_render_summary['lambda_rgb_render_effective']:g}/"
+            f"{rgb_render_summary['lambda_level_consistency_effective']:g}/"
+            f"{rgb_render_summary['lambda_head_consistency_effective']:g} "
             f"hard_sigma_selection={rgb_render_summary['hard_sigma_selection']} "
             f"row_cap={rgb_render_summary['rgb_render_row_cap']} "
             "continuous_sigma_weighting="
-            f"{rgb_render_summary['rgb_render_continuous_sigma_weighting']} "
-            "lambda="
-            f"{rgb_render_summary['lambda_rgb_render_effective']:g}",
+            f"{rgb_render_summary['rgb_render_continuous_sigma_weighting']}",
             flush=True,
         )
     wandb_run = init_wandb(args, log_dir)
     if wandb_run is not None:
         wandb_run.summary.update(rgb_render_summary)
+        wandb_run.summary["world_feedback_contract"] = world_feedback_contract
 
     vggt_model = load_dggt_aggregator_and_tokenizer(
         args.dggt_ckpt_path,

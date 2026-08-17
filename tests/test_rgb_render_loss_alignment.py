@@ -714,6 +714,9 @@ def test_pretrain_resume_contract_fails_closed_on_tasks_rgb_and_args() -> None:
         "layout_task_probabilities": list(
             pretrain_train.LAYOUT_TASK_PROBABILITIES
         ),
+        "world_feedback_contract": (
+            pretrain_train.resolve_world_feedback_profile(args)
+        ),
         "rgb_render": pretrain_train.rgb_render_run_summary(args),
         "pretrain_resume_critical_args": (
             pretrain_train.pretrain_resume_critical_args(args)

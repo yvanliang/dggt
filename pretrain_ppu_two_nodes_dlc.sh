@@ -130,6 +130,16 @@ case "${SCENE_UNITS_PROFILE}" in
         ;;
 esac
 
+WORLD_FEEDBACK_PROFILE="${WORLD_FEEDBACK_PROFILE:-full}"
+case "${WORLD_FEEDBACK_PROFILE}" in
+    full) WORLD_FEEDBACK_EFFECTIVE="1/1/1" ;;
+    latent_only) WORLD_FEEDBACK_EFFECTIVE="0/0/0" ;;
+    *)
+        echo "[错误] WORLD_FEEDBACK_PROFILE 必须是 full 或 latent_only，当前值：${WORLD_FEEDBACK_PROFILE}" >&2
+        exit 1
+        ;;
+esac
+
 # ============================================================
 # 训练配置
 # global batch = 节点数 × 每节点 PPU 数 × 每 PPU batch × 梯度累积。
@@ -218,6 +228,16 @@ WANDB_PROJECT="${WANDB_PROJECT:-dggt-flow}"
 WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v6}"
 WANDB_RESUME="${WANDB_RESUME:-never}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-}"
+
+if [[ "${WORLD_FEEDBACK_PROFILE}" == "latent_only" && -n "${RESUME_PATH}" ]]; then
+    if (( RESUME_EXPECTED_STEP < 0 )); then
+        echo "[错误] latent_only 恢复必须显式设置非负 RESUME_EXPECTED_STEP。" >&2
+        exit 1
+    fi
+    if [[ "${WANDB_RESUME}" != "must" ]]; then
+        echo "[警告] latent_only 断点恢复建议设置 WANDB_RESUME=must 并提供 WANDB_RUN_ID。" >&2
+    fi
+fi
 
 GLOBAL_BATCH_SIZE=$((DLC_NNODES * DLC_NPROC_PER_NODE * BATCH_SIZE_PER_PPU * GRAD_ACCUM_STEPS))
 
@@ -406,6 +426,7 @@ build_train_args() {
         --base_model_coeff 0.25
         --lambda_boundary 0.25
         --lambda_sky_flow 0.5
+        --world_feedback_profile "${WORLD_FEEDBACK_PROFILE}"
         # World-feedback weights (rgb render / level / head consistency) are
         # deliberately NOT overridden here: they are a balance argument that
         # lives with the loss code, in RGB_RENDER_LAMBDA_DEFAULT and its two
@@ -484,6 +505,7 @@ echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${DLC_NNODES} nodes × ${DLC_NPR
 echo "dataloader: train_workers/rank=${NUM_WORKERS}, prefetch/worker=${PREFETCH_FACTOR}, validation_workers/active_rank=${VAL_NUM_WORKERS}, worker_threads=${DATALOADER_WORKER_THREADS}, out_of_order=${DATALOADER_OUT_OF_ORDER}"
 echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+1/2, three_quarter=21/28+2/2, 1=full)"
 echo "scene units profile: ${SCENE_UNITS_PROFILE}"
+echo "world feedback: profile=${WORLD_FEEDBACK_PROFILE}, raw=1/1/1, effective=${WORLD_FEEDBACK_EFFECTIVE}, compute_matched=true"
 echo "resume checkpoint: ${RESUME_PATH:-<none>} (expected step=${RESUME_EXPECTED_STEP})"
 if [[ -z "${RESUME_PATH}" ]]; then
     echo "training start: step 0"
