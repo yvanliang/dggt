@@ -223,6 +223,25 @@ VAL_GUIDANCE_SCALES="${VAL_GUIDANCE_SCALES:-1.0,2.0,4.0}"
 LAYOUT_MAX_ACTORS="${LAYOUT_MAX_ACTORS:-96}"
 STATIC_FAR_PLANE_M="${STATIC_FAR_PLANE_M:-120}"
 
+# Keep the Full launcher backward-compatible while allowing architecture-only
+# layout ablations to select the five already-versioned SceneFlow switches.
+LAYOUT_MAP_INJECTION="${LAYOUT_MAP_INJECTION:-1}"
+LAYOUT_ACTOR_INJECTION="${LAYOUT_ACTOR_INJECTION:-1}"
+LAYOUT_MAP_METRIC_INJECTION="${LAYOUT_MAP_METRIC_INJECTION:-1}"
+LAYOUT_ACTOR_METRIC_INJECTION="${LAYOUT_ACTOR_METRIC_INJECTION:-1}"
+APPEARANCE_CONTEXT_INJECTION="${APPEARANCE_CONTEXT_INJECTION:-1}"
+
+for boolean_name in \
+    LAYOUT_MAP_INJECTION LAYOUT_ACTOR_INJECTION \
+    LAYOUT_MAP_METRIC_INJECTION LAYOUT_ACTOR_METRIC_INJECTION \
+    APPEARANCE_CONTEXT_INJECTION; do
+    boolean_value="${!boolean_name}"
+    if [[ "${boolean_value}" != "0" && "${boolean_value}" != "1" ]]; then
+        echo "[错误] ${boolean_name} 必须是 0 或 1，当前值：${boolean_value}" >&2
+        exit 1
+    fi
+done
+
 # layout-v2 v6 使用独立的新 wandb run，不续接旧 run。
 WANDB_PROJECT="${WANDB_PROJECT:-dggt-flow}"
 WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v6}"
@@ -375,6 +394,20 @@ PY
     "${PYTHON_BIN}" -m torch.distributed.run --help >/dev/null
 }
 
+append_boolean_optional_arg() {
+    local option="$1"
+    local value="$2"
+
+    case "${value}" in
+        1) TRAIN_ARGS+=("--${option}") ;;
+        0) TRAIN_ARGS+=("--no-${option}") ;;
+        *)
+            echo "[错误] ${option} 的内部布尔值非法：${value}" >&2
+            exit 1
+            ;;
+    esac
+}
+
 build_train_args() {
     TRAIN_ARGS=(
         train_scene_flow_pretrain.py
@@ -456,6 +489,11 @@ build_train_args() {
         --wandb_name "${WANDB_NAME}"
         --wandb_resume "${WANDB_RESUME}"
     )
+    append_boolean_optional_arg layout_map_injection "${LAYOUT_MAP_INJECTION}"
+    append_boolean_optional_arg layout_actor_injection "${LAYOUT_ACTOR_INJECTION}"
+    append_boolean_optional_arg layout_map_metric_injection "${LAYOUT_MAP_METRIC_INJECTION}"
+    append_boolean_optional_arg layout_actor_metric_injection "${LAYOUT_ACTOR_METRIC_INJECTION}"
+    append_boolean_optional_arg appearance_context_injection "${APPEARANCE_CONTEXT_INJECTION}"
     if [[ -n "${RESUME_PATH}" ]]; then
         TRAIN_ARGS+=(
             --resume_path "${RESUME_PATH}"
@@ -506,6 +544,7 @@ echo "dataloader: train_workers/rank=${NUM_WORKERS}, prefetch/worker=${PREFETCH_
 echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+1/2, three_quarter=21/28+2/2, 1=full)"
 echo "scene units profile: ${SCENE_UNITS_PROFILE}"
 echo "world feedback: profile=${WORLD_FEEDBACK_PROFILE}, raw=1/1/1, effective=${WORLD_FEEDBACK_EFFECTIVE}, compute_matched=true"
+echo "layout injection: early M/G=${LAYOUT_MAP_INJECTION}/${LAYOUT_ACTOR_INJECTION}, late M/G/A=${LAYOUT_MAP_METRIC_INJECTION}/${LAYOUT_ACTOR_METRIC_INJECTION}/${APPEARANCE_CONTEXT_INJECTION}"
 echo "resume checkpoint: ${RESUME_PATH:-<none>} (expected step=${RESUME_EXPECTED_STEP})"
 if [[ -z "${RESUME_PATH}" ]]; then
     echo "training start: step 0"
