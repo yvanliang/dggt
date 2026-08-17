@@ -70,6 +70,9 @@ from dggt.utils.scene_gauge import (
     PULLBACK_RENDER_BOUNDARY,
     SCENE_GAUGE_DIM,
     SCENE_GAUGE_REPRESENTATION,
+    SCENE_UNITS_CONTRACT_SCHEMA,
+    SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN,
+    SCENE_UNITS_PROFILE_GENERATED,
     PullbackCalibration,
     PullbackResult,
     apply_pullback_calibration,
@@ -94,10 +97,13 @@ from train_scene_flow_pretrain import (
     load_scene_flow_state_dict_strict,
     render_validation_generated_rgb,
     requested_render_pose_encoding,
+    scene_units_gauge_source,
+    scene_units_profile,
     seed_everything,
     setup_text_encoder,
     sky_generation_enabled,
     validate_scene_flow_checkpoint_config,
+    validate_scene_units_contract,
 )
 
 
@@ -505,7 +511,12 @@ def layout_run_provenance(
         "windows": list(windows),
         "gauge_scope": "scene_global",
         "render_camera_source": "requested_C",
-        "render_gauge_source": "predicted_gauge",
+        "scene_units_profile": str(
+            getattr(bundle, "scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
+        ),
+        "render_gauge_source": str(
+            getattr(bundle, "render_gauge_source", "predicted_gauge")
+        ),
     }
 
 
@@ -546,6 +557,9 @@ def _require_current_checkpoint(
     )
 
     constructor_config = dict(config)
+    constructor_config.setdefault(
+        "scene_units_profile", SCENE_UNITS_PROFILE_GENERATED
+    )
     missing_derived = sorted(
         key for key in SCENE_FLOW_DERIVED_CONFIG_KEYS if key not in constructor_config
     )
@@ -557,6 +571,17 @@ def _require_current_checkpoint(
     for key in SCENE_FLOW_DERIVED_CONFIG_KEYS:
         constructor_config.pop(key)
     model = WanSceneFlow(**constructor_config)
+    profile = scene_units_profile(model)
+    checkpoint_contract = payload.get("scene_units_contract")
+    if checkpoint_contract is None and profile == SCENE_UNITS_PROFILE_GENERATED:
+        checkpoint_contract = {
+            "schema": SCENE_UNITS_CONTRACT_SCHEMA,
+            "profile": SCENE_UNITS_PROFILE_GENERATED,
+        }
+    model._scene_units_contract = validate_scene_units_contract(
+        checkpoint_contract,
+        path=checkpoint_path,
+    )
     validate_scene_flow_checkpoint_config(model, payload, checkpoint_path)
 
     ema_used = False
@@ -595,6 +620,14 @@ def _require_current_checkpoint(
     )
     model.to(device).eval()
     model.require_gauge_stats()
+    if profile == SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN:
+        contract_mean = torch.tensor(
+            model._scene_units_contract["raw_mean"], dtype=torch.float32
+        )
+        if not torch.equal(model.gauge_mean.detach().cpu().float(), contract_mean):
+            raise ValueError(
+                f"{checkpoint_path} fixed scene-units mean does not match model buffer"
+            )
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     return model, {
@@ -604,6 +637,10 @@ def _require_current_checkpoint(
         "ema_used": ema_used,
         "ema_note": ema_note,
         "step": int(payload.get("step", -1)),
+        "scene_units_profile": profile,
+        "scene_units_contract": model._scene_units_contract,
+        "gauge_source": scene_units_gauge_source(profile),
+        "render_gauge_source": scene_units_gauge_source(profile),
         "flow_schedule": dict(flow_schedule),
         "flow_schedule_config": dict(flow_schedule),
         "prediction_type": str(model.config.prediction_type),
@@ -631,6 +668,8 @@ def _sync_args_from_model(
     args.patch_grid = tuple(int(value) for value in config.patch_grid)
     args.latent_dim = int(config.out_channels)
     args.prediction_type = str(config.prediction_type)
+    args.scene_units_profile = scene_units_profile(scene_flow)
+    args.scene_units_contract = checkpoint_info["scene_units_contract"]
     args.sequence_length = int(args.num_frames)
     args.sky_grid = tuple(int(value) for value in config.sky_grid)
     args.sky_grid_h, args.sky_grid_w = args.sky_grid
@@ -774,10 +813,16 @@ def offline_sample_tensor_payload(
     canvas_hw = tuple(int(value) for value in bundle.camera_requested_canvas_image_size_hw)
     if len(canvas_hw) != 2 or any(value <= 0 for value in canvas_hw):
         raise ValueError("camera_requested_canvas_image_size_hw must be positive [H,W]")
+    profile = str(
+        getattr(bundle, "scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
+    )
+    contract = getattr(bundle, "scene_units_contract", None)
     return {
         "layout_condition_version": LAYOUT_CONDITION_VERSION,
         "render_camera_source": "requested_C",
-        "render_gauge_source": "predicted_gauge",
+        "scene_units_profile": profile,
+        "scene_units_contract": contract,
+        "render_gauge_source": scene_units_gauge_source(profile),
         "video_latent_normalized": sampled.video.detach().cpu(),
         "sky_tokens": (
             None if sampled.sky is None else sampled.sky.detach().cpu()
@@ -1150,6 +1195,11 @@ def run_inference(args: argparse.Namespace, cfg_scales: Sequence[float]) -> dict
             "layout": provenance,
             "sample_steps": int(args.val_sample_steps),
             "flow_shift": float(args.shift),
+            "scene_units_profile": str(args.scene_units_profile),
+            "scene_units_contract": args.scene_units_contract,
+            "render_gauge_source": scene_units_gauge_source(
+                args.scene_units_profile
+            ),
             "sliding_window_active": len(windows) > 1,
             "window": int(windows[0][1] - windows[0][0]),
             "window_stride": int(args.val_sliding_stride),
@@ -1180,6 +1230,11 @@ def run_inference(args: argparse.Namespace, cfg_scales: Sequence[float]) -> dict
     )
     run_summary = {
         "contract": LAYOUT_CONDITION_VERSION,
+        "scene_units_profile": str(args.scene_units_profile),
+        "scene_units_contract": args.scene_units_contract,
+        "render_gauge_source": scene_units_gauge_source(
+            args.scene_units_profile
+        ),
         "condition_mode": str(args.condition_mode),
         "selected_range": [start, end],
         "hdmap_root": str(args.hdmap_root),

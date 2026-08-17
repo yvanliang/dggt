@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import io
+import inspect
 from itertools import islice
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +15,31 @@ from torch.utils.data import DataLoader, DistributedSampler
 import train_scene_flow_pretrain as trainer
 from datasets.dataset import load_metric_depth_diagnostic_paths
 from dggt.losses.flow_losses import compute_total_loss
+
+
+def test_literal_train_step_logs_are_registered_for_all_rank_reduction() -> None:
+    """Every direct log assignment must survive the fixed DDP wire schema."""
+
+    tree = ast.parse(inspect.getsource(trainer.train_step))
+    assigned: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        for target in targets:
+            if (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "logs"
+                and isinstance(target.slice, ast.Constant)
+                and isinstance(target.slice.value, str)
+            ):
+                assigned.add(target.slice.value)
+
+    allowed = set(trainer.ALL_RANK_TRAIN_LOG_KEYS) | set(
+        trainer.UNINFORMATIVE_TRAIN_LOG_KEYS
+    )
+    assert assigned <= allowed, f"unregistered train_step logs: {sorted(assigned - allowed)}"
 
 
 def _flow_loss_inputs() -> dict[str, object]:

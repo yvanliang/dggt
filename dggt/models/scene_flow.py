@@ -55,6 +55,9 @@ from dggt.utils.scene_gauge import (
     SCENE_GAUGE_REPRESENTATION,
     SCENE_GAUGE_STATS_STD_FLOOR,
     SCENE_GAUGE_STATS_VERSION,
+    SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN,
+    SCENE_UNITS_PROFILE_GENERATED,
+    SCENE_UNITS_PROFILES,
     denormalize_scene_gauge,
     normalize_scene_gauge,
 )
@@ -844,6 +847,7 @@ class RAEVideoSceneFlow(nn.Module):
         gauge_gen_dim: int = SCENE_GAUGE_DIM,
         scene_gauge_representation: str = SCENE_GAUGE_REPRESENTATION,
         scene_gauge_stats_version: str = SCENE_GAUGE_STATS_VERSION,
+        scene_units_profile: str = SCENE_UNITS_PROFILE_GENERATED,
         camera_condition_representation: str = CAMERA_CONDITION_REPRESENTATION,
         mask_compositing_version: str = "soft_opacity_premultiplied_v2",
         layout_condition_version: str = LAYOUT_CONDITION_VERSION,
@@ -932,6 +936,12 @@ class RAEVideoSceneFlow(nn.Module):
             raise ValueError(
                 "unsupported scene gauge stats version "
                 f"{scene_gauge_stats_version!r}; expected {SCENE_GAUGE_STATS_VERSION!r}"
+            )
+        scene_units_profile = str(scene_units_profile)
+        if scene_units_profile not in SCENE_UNITS_PROFILES:
+            raise ValueError(
+                f"scene_units_profile must be one of {SCENE_UNITS_PROFILES}, "
+                f"got {scene_units_profile!r}"
             )
         layout_condition_version = str(layout_condition_version)
         if layout_condition_version not in (LAYOUT_CONDITION_VERSION, "none"):
@@ -1092,6 +1102,7 @@ class RAEVideoSceneFlow(nn.Module):
             gauge_gen_dim=int(gauge_gen_dim),
             scene_gauge_representation=str(scene_gauge_representation),
             scene_gauge_stats_version=str(scene_gauge_stats_version),
+            scene_units_profile=scene_units_profile,
             camera_condition_representation=str(camera_condition_representation),
             mask_compositing_version=str(mask_compositing_version),
             layout_condition_version=layout_condition_version,
@@ -1366,7 +1377,7 @@ class RAEVideoSceneFlow(nn.Module):
         self.gradient_checkpointing_mode = "half"
 
     def enable_three_quarter_gradient_checkpointing(self) -> None:
-        """Checkpoint three of every four encoder blocks, but no DDT blocks."""
+        """Checkpoint three of every four encoder blocks and every DDT block."""
         self.gradient_checkpointing = True
         self.gradient_checkpointing_mode = "three_quarter"
 
@@ -1385,7 +1396,7 @@ class RAEVideoSceneFlow(nn.Module):
         if mode == "half":
             return int(block_index) % 2 == 0
         if mode == "three_quarter":
-            return block_group == "encoder" and int(block_index) % 4 != 3
+            return block_group == "ddt" or int(block_index) % 4 != 3
         if mode == "off":
             return False
         raise RuntimeError(f"Unsupported gradient checkpointing mode: {mode!r}")
@@ -1447,6 +1458,28 @@ class RAEVideoSceneFlow(nn.Module):
     def denormalize_gauge(self, normalized: torch.Tensor) -> torch.Tensor:
         self.require_gauge_stats()
         return denormalize_scene_gauge(normalized, self.gauge_mean, self.gauge_std)
+
+    def uses_generated_scene_units(self) -> bool:
+        """Whether this model integrates a per-scene gauge generation stream."""
+
+        return str(self.config.scene_units_profile) == SCENE_UNITS_PROFILE_GENERATED
+
+    def fixed_scene_gauge(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return the physical training-mean gauge as ``[B,1,3]``."""
+
+        batch_size = int(batch_size)
+        if batch_size < 0:
+            raise ValueError("batch_size must be non-negative")
+        self.require_gauge_stats()
+        return self.gauge_mean.to(device=device, dtype=dtype).view(
+            1, 1, SCENE_GAUGE_DIM
+        ).expand(batch_size, 1, SCENE_GAUGE_DIM)
 
     def normalize(self, z: torch.Tensor) -> torch.Tensor:
         return (z - self.mu_z.to(device=z.device, dtype=z.dtype)) / self.sigma_z.to(
@@ -2380,6 +2413,20 @@ class RAEVideoSceneFlow(nn.Module):
 
         b = int(z_t.shape[0])
         hidden_size = int(self.config.hidden_size)
+        if not self.uses_generated_scene_units():
+            if gauge_gen_tokens is not None or gauge_gen_attention_mask is not None:
+                raise ValueError(
+                    "fixed_train_mean forbids caller-provided gauge generation "
+                    "tokens and attention masks"
+                )
+            # Retain the generation-token shape without exposing a readable or
+            # writable scene-specific channel.  The public forward masks this
+            # placeholder after every encoder block.
+            tokens = z_t.new_zeros((b, 1, hidden_size))
+            mask = torch.zeros((b, 1), device=z_t.device, dtype=torch.bool)
+            return tokens, mask, self._gauge_position_ids(
+                batch_size=b, device=z_t.device
+            )
         if gauge_gen_tokens is None:
             empty_tokens = z_t.new_zeros((b, 0, hidden_size))
             empty_pos = torch.zeros((b, 0, 3), device=z_t.device, dtype=torch.long)
@@ -2545,6 +2592,8 @@ class RAEVideoSceneFlow(nn.Module):
             raise ValueError(
                 "runtime layout_to_gauge_grad_scale must lie in [0, configured maximum]"
             )
+        if not self.uses_generated_scene_units():
+            layout_to_gauge_grad_scale = 0.0
         self._validate_video_control_inputs(z_t, z_splat, scaffold_tok, M_preserve, M_source, M_dest)
         b, s, p, _ = z_t.shape
         if frame_ids is not None:
@@ -2810,8 +2859,10 @@ class RAEVideoSceneFlow(nn.Module):
                 batch=b,
                 gauge_dim=int(self.config.gauge_gen_dim),
             )
+            if not self.uses_generated_scene_units():
+                gauge_out = gauge_out * 0.0
         gauge_context = enc_video.new_zeros((b, 1, int(self.config.hidden_size)))
-        if gauge_hidden is not None:
+        if gauge_hidden is not None and self.uses_generated_scene_units():
             gauge_context = gauge_hidden
         map_context = enc_video.new_zeros((b, s * p, int(self.config.hidden_size)))
         actor_context = enc_video.new_zeros((b, s * p, int(self.config.hidden_size)))
@@ -2831,16 +2882,26 @@ class RAEVideoSceneFlow(nn.Module):
                 )
             )
             if late_enabled:
-                if gauge_out is None or gauge_gen_tokens is None:
-                    raise ValueError("layout_v2 late readers require the gauge generation stream")
-                if gauge_gen_mask is None:
-                    raise RuntimeError("gauge mask was not materialized")
-                gauge_physical, gauge_valid = self._clean_predicted_gauge(
-                    gauge_out,
-                    gauge_gen_tokens,
-                    gauge_gen_mask,
-                    sigma,
-                )
+                if self.uses_generated_scene_units():
+                    if gauge_out is None or gauge_gen_tokens is None:
+                        raise ValueError("layout_v2 late readers require the gauge generation stream")
+                    if gauge_gen_mask is None:
+                        raise RuntimeError("gauge mask was not materialized")
+                    gauge_physical, gauge_valid = self._clean_predicted_gauge(
+                        gauge_out,
+                        gauge_gen_tokens,
+                        gauge_gen_mask,
+                        sigma,
+                    )
+                else:
+                    gauge_physical = self.fixed_scene_gauge(
+                        b,
+                        device=z_t.device,
+                        dtype=torch.float32,
+                    )[:, 0]
+                    gauge_valid = torch.ones(
+                        (b,), device=z_t.device, dtype=torch.bool
+                    )
                 if bool(self.config.layout_map_metric_injection):
                     map_context = self._build_map_metric_context(
                         map_metric,
@@ -2996,6 +3057,8 @@ class RAEVideoSceneFlow(nn.Module):
                 "checkpoint inspection or conversion; standard weight loading does "
                 "not accept v3."
             )
+        # Checkpoints predating the explicit profile are Full/generated only.
+        config.setdefault("scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
         for derived_name in (
             "hidden_size",
             "rope_layout_version",

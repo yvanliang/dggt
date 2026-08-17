@@ -11,6 +11,7 @@ import torch.nn as nn
 import dggt.losses.reconstruction_feedback_loss as feedback_loss_module
 import dggt.losses.rgb_render_loss as rgb_render_module
 import train_scene_flow_pretrain as pretrain_train
+from dggt.models.scene_flow import RAEVideoSceneFlow
 from dggt.losses.reconstruction_feedback_loss import (
     compute_reconstruction_feedback_losses,
 )
@@ -49,6 +50,7 @@ PRETRAIN_LAUNCH_SCRIPTS = (
     "pretrain_ppu.sh",
     "pretrain_ppu_four_nodes_dlc.sh",
     "pretrain_ppu_two_nodes_dlc.sh",
+    "pretrain_single_node_fsu_ablation.sh",
     "pretrain_single_node.sh",
     "pretrain_two_nodes26.sh",
     "pretrain_two_nodes31.sh",
@@ -111,6 +113,18 @@ def test_dlc_launchers_use_three_quarter_gradient_checkpointing_by_default() -> 
     assert "TRAIN_ARGS+=(--three_quarter_gradient_checkpointing)" in common
     assert "TRAIN_ARGS+=(--gradient_checkpointing)" in common
     assert 'GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-three_quarter}"' in four_node
+
+
+def test_three_quarter_checkpoints_21_encoder_and_all_ddt_blocks() -> None:
+    model = RAEVideoSceneFlow.__new__(RAEVideoSceneFlow)
+    nn.Module.__init__(model)
+    model.enable_three_quarter_gradient_checkpointing()
+
+    assert model.gradient_checkpointing_mode == "three_quarter"
+    assert model.checkpointed_block_indices(28, block_group="encoder") == tuple(
+        index for index in range(28) if index % 4 != 3
+    )
+    assert model.checkpointed_block_indices(2, block_group="ddt") == (0, 1)
 
 
 class _Tokenizer(nn.Module):

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 from functools import partial
+import hashlib
 from itertools import islice
 import json
 import math
@@ -76,6 +77,7 @@ from dggt.models.vggt import VGGT
 from dggt.utils.feature_stats import (
     DEFAULT_SCENE_FLOW_FEATURE_STATS_PATH,
     load_all_stats_into_buffers,
+    validate_production_stats_coverage,
 )
 from dggt.utils.gaussian_render import composite_gsplat_rgb, composite_original_sky
 from dggt.utils.camera_condition import (
@@ -107,6 +109,10 @@ from dggt.utils.scene_gauge import (
     SCENE_GAUGE_DIM,
     SCENE_GAUGE_REPRESENTATION,
     SCENE_GAUGE_STATS_VERSION,
+    SCENE_UNITS_CONTRACT_SCHEMA,
+    SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN,
+    SCENE_UNITS_PROFILE_GENERATED,
+    SCENE_UNITS_PROFILES,
     PullbackCalibration,
     apply_depth_pullback_calibration,
     assemble_dggt_pose_encoding,
@@ -738,14 +744,61 @@ def validate_scene_flow_checkpoint_config(
     )
     if not isinstance(saved_cfg, dict) or not isinstance(current_cfg, dict):
         raise ValueError(f"{path} is missing the exact SceneFlow config")
+    saved_cfg = dict(saved_cfg)
+    current_cfg = dict(current_cfg)
+    # Old checkpoints can only mean the historical generated/Full behavior.
+    saved_cfg.setdefault("scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
+    current_cfg.setdefault("scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
     if _normalize_config_value(saved_cfg) != _normalize_config_value(current_cfg):
         raise ValueError(f"{path} SceneFlow config is not an exact match for this run")
-    validate_scene_flow_state_dict_exact(
+    saved_profile = str(saved_cfg["scene_units_profile"])
+    if saved_profile == SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN and (
+        not isinstance(payload.get("scene_flow_config"), dict)
+        or "scene_units_profile" not in payload["scene_flow_config"]
+    ):
+        raise ValueError(f"{path} fixed_train_mean profile must be recorded explicitly")
+    runtime_contract = getattr(unwrap_ddp(scene_flow), "_scene_units_contract", None)
+    checkpoint_contract = payload.get("scene_units_contract")
+    if saved_profile == SCENE_UNITS_PROFILE_GENERATED and checkpoint_contract is None:
+        checkpoint_contract = {
+            "schema": SCENE_UNITS_CONTRACT_SCHEMA,
+            "profile": SCENE_UNITS_PROFILE_GENERATED,
+        }
+    if (
+        saved_profile == SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN
+        and checkpoint_contract is None
+    ):
+        raise ValueError(f"{path} fixed_train_mean checkpoint is missing scene_units_contract")
+    if checkpoint_contract is not None:
+        validated_checkpoint_contract = validate_scene_units_contract(
+            checkpoint_contract, path=f"{path} checkpoint"
+        )
+        if validated_checkpoint_contract["profile"] != saved_profile:
+            raise ValueError(
+                f"{path} scene-units contract profile does not match model config"
+            )
+    if runtime_contract is not None:
+        if scene_units_contract_identity(
+            checkpoint_contract, path=f"{path} checkpoint"
+        ) != scene_units_contract_identity(
+            runtime_contract, path="runtime SceneFlow"
+        ):
+            raise ValueError(f"{path} scene-units contract does not match runtime")
+    prepared_state = validate_scene_flow_state_dict_exact(
         scene_flow,
         payload.get("scene_flow"),
         path=path,
         source="scene_flow",
     )
+    if saved_profile == SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN:
+        checkpoint_mean = prepared_state.get("gauge_mean")
+        runtime_mean = unwrap_ddp(scene_flow).gauge_mean.detach().cpu().float()
+        if not torch.is_tensor(checkpoint_mean) or not torch.equal(
+            checkpoint_mean.detach().cpu().float(), runtime_mean
+        ):
+            raise ValueError(
+                f"{path} fixed gauge_mean buffer does not match the runtime stats artifact"
+            )
 
 
 def model_prediction_to_velocity(scene_flow: nn.Module, prediction: torch.Tensor, target) -> torch.Tensor:
@@ -806,6 +859,8 @@ def _init_pretrain_gauge_noise(
     *,
     return_gauge: bool,
 ) -> torch.Tensor | None:
+    if not uses_generated_scene_units(scene_flow):
+        return None
     gauge_clean = getattr(bundle, "scene_gauge_clean_n", None)
     if torch.is_tensor(gauge_clean):
         gauge_z = torch.empty_like(gauge_clean)
@@ -1412,6 +1467,221 @@ def sky_mask_refine_boundary_loss_weight(args: argparse.Namespace) -> float:
     )
 
 
+def scene_units_profile(scene_flow: nn.Module) -> str:
+    profile = str(
+        getattr(
+            getattr(unwrap_ddp(scene_flow), "config", None),
+            "scene_units_profile",
+            SCENE_UNITS_PROFILE_GENERATED,
+        )
+    )
+    if profile not in SCENE_UNITS_PROFILES:
+        raise RuntimeError(f"unsupported SceneFlow scene_units_profile={profile!r}")
+    return profile
+
+
+def uses_generated_scene_units(scene_flow: nn.Module) -> bool:
+    model = unwrap_ddp(scene_flow)
+    helper = getattr(model, "uses_generated_scene_units", None)
+    if callable(helper):
+        return bool(helper())
+    return scene_units_profile(model) == SCENE_UNITS_PROFILE_GENERATED
+
+
+def scene_units_gauge_source(scene_flow_or_profile: nn.Module | str) -> str:
+    profile = (
+        str(scene_flow_or_profile)
+        if isinstance(scene_flow_or_profile, str)
+        else scene_units_profile(scene_flow_or_profile)
+    )
+    if profile == SCENE_UNITS_PROFILE_GENERATED:
+        return "predicted_gauge"
+    if profile == SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN:
+        return SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN
+    raise ValueError(f"unsupported scene-units profile {profile!r}")
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_scene_gauge_artifact_metadata(path: str | Path) -> dict[str, Any]:
+    artifact_path = Path(path).expanduser().resolve()
+    try:
+        payload = json.loads(artifact_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid scene-gauge artifact {artifact_path}: {error}") from error
+    if not isinstance(payload, dict) or payload.get("status") != "complete":
+        raise ValueError(
+            f"fixed_train_mean requires a complete scene-gauge artifact: {artifact_path}"
+        )
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError(f"scene-gauge artifact is missing metadata: {artifact_path}")
+    return metadata
+
+
+def build_scene_units_contract(
+    scene_flow: nn.Module,
+    *,
+    feature_stats_path: str | Path,
+    scene_gauge_path: str | Path,
+) -> dict[str, Any]:
+    """Build the portable fixed-unit identity after loading model buffers."""
+
+    model = unwrap_ddp(scene_flow)
+    profile = scene_units_profile(model)
+    if profile == SCENE_UNITS_PROFILE_GENERATED:
+        return {
+            "schema": SCENE_UNITS_CONTRACT_SCHEMA,
+            "profile": profile,
+        }
+
+    stats_path = Path(feature_stats_path).expanduser().resolve()
+    gauge_path = Path(scene_gauge_path).expanduser().resolve()
+    payload = torch.load(stats_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError(f"feature stats at {stats_path} must be a mapping")
+    validate_production_stats_coverage(payload)
+    source = payload.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("fixed_train_mean feature stats are missing source metadata")
+    source_image_dir = source.get("image_dir")
+    explicit_source_split = source.get("split", source.get("scene_gauge_split"))
+    source_split = (
+        str(explicit_source_split)
+        if isinstance(explicit_source_split, str)
+        else (
+            Path(str(source_image_dir)).name
+            if isinstance(source_image_dir, str)
+            else ""
+        )
+    )
+    gauge_metadata = _load_scene_gauge_artifact_metadata(gauge_path)
+    table_split = str(gauge_metadata.get("split", ""))
+    if source_split != "training" or table_split != "training":
+        raise ValueError(
+            "fixed_train_mean requires feature statistics and a scene-gauge "
+            f"artifact sourced from the training split; got stats={source_split!r}, "
+            f"table={table_split!r}"
+        )
+    missing_stats = [
+        name
+        for name in ("gauge_mean", "gauge_std", "gauge_count")
+        if name not in payload
+    ]
+    if missing_stats:
+        raise ValueError(
+            f"fixed_train_mean feature stats are missing {missing_stats}"
+        )
+    mean_raw = torch.as_tensor(payload["gauge_mean"]).detach().cpu()
+    std_raw = torch.as_tensor(payload["gauge_std"]).detach().cpu()
+    counts_raw = torch.as_tensor(payload["gauge_count"]).detach().cpu()
+    mean = mean_raw.float()
+    std = std_raw.float()
+    for name, value in (("gauge_mean", mean), ("gauge_std", std)):
+        if tuple(value.shape) != (SCENE_GAUGE_DIM,) or not bool(torch.isfinite(value).all()):
+            raise ValueError(f"fixed_train_mean {name} must be a finite [3] vector")
+    if bool((std <= 0.0).any()):
+        raise ValueError("fixed_train_mean gauge_std must be positive")
+    if (
+        tuple(counts_raw.shape) != (SCENE_GAUGE_DIM,)
+        or not bool(torch.isfinite(counts_raw.float()).all())
+        or not torch.equal(counts_raw.float(), counts_raw.float().round())
+    ):
+        raise ValueError("fixed_train_mean gauge_count must be an integer [3] vector")
+    counts = counts_raw.long()
+    if bool((counts <= 0).any()):
+        raise ValueError("fixed_train_mean requires three positive gauge_count values")
+    model_mean = model.gauge_mean.detach().cpu().float().reshape(-1)
+    if not torch.equal(model_mean, mean):
+        raise ValueError(
+            "fixed_train_mean model gauge_mean does not exactly match the feature-stats artifact"
+        )
+    contract = {
+        "schema": SCENE_UNITS_CONTRACT_SCHEMA,
+        "profile": profile,
+        "raw_mean": [float(value) for value in mean.tolist()],
+        "normalized_zero": [0.0] * SCENE_GAUGE_DIM,
+        "channel_counts": [int(value) for value in counts.tolist()],
+        "source_split": "training",
+        "source": {
+            # Paths are provenance for humans, not resume identity.
+            "feature_stats_path": str(stats_path),
+            "scene_gauge_path": str(gauge_path),
+        },
+        "feature_stats_sha256": _sha256_file(stats_path),
+        "gauge_table_sha256": _sha256_file(gauge_path),
+    }
+    return validate_scene_units_contract(contract, path="runtime scene-units contract")
+
+
+def validate_scene_units_contract(
+    contract: Any,
+    *,
+    path: str | Path,
+) -> dict[str, Any]:
+    if not isinstance(contract, dict):
+        raise ValueError(f"{path} is missing scene_units_contract")
+    profile = str(contract.get("profile", ""))
+    if contract.get("schema") != SCENE_UNITS_CONTRACT_SCHEMA or profile not in SCENE_UNITS_PROFILES:
+        raise ValueError(f"{path} has an invalid scene_units_contract")
+    if profile == SCENE_UNITS_PROFILE_GENERATED:
+        return dict(contract)
+    required = {
+        "raw_mean",
+        "normalized_zero",
+        "channel_counts",
+        "source_split",
+        "source",
+        "feature_stats_sha256",
+        "gauge_table_sha256",
+    }
+    missing = sorted(required - set(contract))
+    if missing:
+        raise ValueError(f"{path} scene_units_contract is missing {missing}")
+    mean = torch.as_tensor(contract["raw_mean"], dtype=torch.float32).reshape(-1)
+    zero = torch.as_tensor(contract["normalized_zero"], dtype=torch.float32).reshape(-1)
+    counts_raw = torch.as_tensor(contract["channel_counts"]).reshape(-1)
+    counts = counts_raw.to(dtype=torch.long)
+    if tuple(mean.shape) != (3,) or not bool(torch.isfinite(mean).all()):
+        raise ValueError(f"{path} fixed raw_mean must be finite [3]")
+    if tuple(zero.shape) != (3,) or not torch.equal(zero, torch.zeros_like(zero)):
+        raise ValueError(f"{path} fixed normalized_zero must be exactly [0,0,0]")
+    if (
+        tuple(counts.shape) != (3,)
+        or not bool(torch.isfinite(counts_raw.float()).all())
+        or not torch.equal(counts_raw.float(), counts_raw.float().round())
+        or bool((counts <= 0).any())
+    ):
+        raise ValueError(f"{path} fixed channel_counts must be three positive integers")
+    if contract["source_split"] != "training" or not isinstance(contract["source"], dict):
+        raise ValueError(f"{path} fixed source must identify the training split")
+    source = contract["source"]
+    for name in ("feature_stats_path", "scene_gauge_path"):
+        if not isinstance(source.get(name), str) or not source[name].strip():
+            raise ValueError(f"{path} fixed source is missing {name}")
+    for name in ("feature_stats_sha256", "gauge_table_sha256"):
+        value = contract[name]
+        if not isinstance(value, str) or len(value) != 64 or any(
+            character not in "0123456789abcdef" for character in value
+        ):
+            raise ValueError(f"{path} {name} must be a lowercase SHA-256")
+    return dict(contract)
+
+
+def scene_units_contract_identity(contract: Any, *, path: str | Path) -> dict[str, Any]:
+    """Drop location-only provenance before strict resume comparison."""
+
+    validated = validate_scene_units_contract(contract, path=path)
+    identity = dict(validated)
+    identity.pop("source", None)
+    return identity
+
 RGB_RENDER_RESUME_ARGS = (
     "lambda_rgb_render",
     "lambda_level_consistency",
@@ -1466,6 +1736,7 @@ PRETRAIN_RESUME_CRITICAL_ARGS = (
     "hdmap_root",
     "caption_root",
     "scene_gauge_path",
+    "scene_units_profile",
     "pullback_calibration_path",
     "dggt_ckpt_path",
     "tokenizer_ckpt_path",
@@ -1530,6 +1801,30 @@ PRETRAIN_RESUME_CRITICAL_ARGS = (
     "val_sample_steps",
 ) + RGB_RENDER_RESUME_ARGS
 
+PRETRAIN_RESUME_PORTABLE_PATH_ARGS = frozenset(
+    {
+        "image_dir",
+        "hdmap_root",
+        "caption_root",
+        "scene_gauge_path",
+        "pullback_calibration_path",
+        "dggt_ckpt_path",
+        "tokenizer_ckpt_path",
+        "feature_stats_path",
+        "text_encoder_path",
+    }
+)
+
+
+def _pretrain_resume_critical_value(name: str, value: Any) -> Any:
+    normalized = _normalize_config_value(value)
+    if name not in PRETRAIN_RESUME_PORTABLE_PATH_ARGS or normalized is None:
+        return normalized
+    path = Path(str(normalized))
+    # Absolute mount roots are deployment details.  Substantive fixed-unit
+    # identity comes from the content hashes in scene_units_contract.
+    return path.name
+
 
 def capped_render_row_indices(
     batch_size: int,
@@ -1553,6 +1848,9 @@ def rgb_render_run_summary(args: argparse.Namespace) -> dict[str, Any]:
     """Run-summary fields for capped rows with continuous sigma weighting."""
 
     effective = float(getattr(args, "lambda_rgb_render", RGB_RENDER_LAMBDA_DEFAULT))
+    profile = str(
+        getattr(args, "scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
+    )
     return {
         "hard_sigma_selection": False,
         "rgb_render_row_cap": RGB_RENDER_ROW_CAP,
@@ -1565,7 +1863,23 @@ def rgb_render_run_summary(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "lambda_rgb_render_effective": effective,
         "camera_source": "requested_C",
-        "gauge_source": "predicted_gauge",
+        "scene_units_profile": profile,
+        "gauge_source": scene_units_gauge_source(profile),
+        "rgb_render_gauge_pose_grad_scale_effective": (
+            1.0 if profile == SCENE_UNITS_PROFILE_GENERATED else 0.0
+        ),
+        "lambda_gauge_flow_raw": float(getattr(args, "lambda_gauge_flow", 0.1)),
+        "lambda_gauge_direct_raw": float(getattr(args, "lambda_gauge_direct", 1.0)),
+        "lambda_gauge_flow_effective": (
+            float(getattr(args, "lambda_gauge_flow", 0.1))
+            if profile == SCENE_UNITS_PROFILE_GENERATED
+            else 0.0
+        ),
+        "lambda_gauge_direct_effective": (
+            float(getattr(args, "lambda_gauge_direct", 1.0))
+            if profile == SCENE_UNITS_PROFILE_GENERATED
+            else 0.0
+        ),
         **{
             name: _normalize_config_value(
                 getattr(args, name, RGB_RENDER_RESUME_DEFAULTS[name])
@@ -1582,7 +1896,7 @@ def pretrain_resume_critical_args(args: argparse.Namespace) -> dict[str, Any]:
     if missing:
         raise ValueError(f"runtime is missing critical resume arguments: {missing}")
     return {
-        name: _normalize_config_value(getattr(args, name))
+        name: _pretrain_resume_critical_value(name, getattr(args, name))
         for name in PRETRAIN_RESUME_CRITICAL_ARGS
     }
 
@@ -1618,12 +1932,42 @@ def validate_pretrain_resume_contract(
             f"{expected_probabilities}"
         )
     expected_rgb = rgb_render_run_summary(args)
-    if _normalize_config_value(payload.get("rgb_render")) != _normalize_config_value(
+    saved_rgb = payload.get("rgb_render")
+    if isinstance(saved_rgb, dict):
+        saved_rgb = dict(saved_rgb)
+        # A profile-less checkpoint is historical Full/generated.  Materialize
+        # only the newly explicit derived fields; no Fixed checkpoint may use
+        # this compatibility path.
+        saved_rgb.setdefault("scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
+        saved_rgb.setdefault("gauge_source", "predicted_gauge")
+        if saved_rgb["scene_units_profile"] == SCENE_UNITS_PROFILE_GENERATED:
+            saved_rgb.setdefault("rgb_render_gauge_pose_grad_scale_effective", 1.0)
+            saved_rgb.setdefault(
+                "lambda_gauge_flow_raw", float(getattr(args, "lambda_gauge_flow", 0.1))
+            )
+            saved_rgb.setdefault(
+                "lambda_gauge_direct_raw", float(getattr(args, "lambda_gauge_direct", 1.0))
+            )
+            saved_rgb.setdefault(
+                "lambda_gauge_flow_effective", saved_rgb["lambda_gauge_flow_raw"]
+            )
+            saved_rgb.setdefault(
+                "lambda_gauge_direct_effective", saved_rgb["lambda_gauge_direct_raw"]
+            )
+    if _normalize_config_value(saved_rgb) != _normalize_config_value(
         expected_rgb
     ):
         raise ValueError(f"{path} RGB/HDS render contract does not match runtime")
     expected_critical = pretrain_resume_critical_args(args)
     saved_critical = payload.get("pretrain_resume_critical_args")
+    if isinstance(saved_critical, dict):
+        saved_critical = {
+            name: _pretrain_resume_critical_value(name, value)
+            for name, value in saved_critical.items()
+        }
+        saved_critical.setdefault(
+            "scene_units_profile", SCENE_UNITS_PROFILE_GENERATED
+        )
     if _normalize_config_value(saved_critical) != _normalize_config_value(
         expected_critical
     ):
@@ -1631,6 +1975,8 @@ def validate_pretrain_resume_contract(
     saved_args = payload.get("args")
     if not isinstance(saved_args, dict):
         raise ValueError(f"{path} strict state resume requires the saved argparse mapping")
+    saved_args = dict(saved_args)
+    saved_args.setdefault("scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
     missing_saved_args = sorted(set(PRETRAIN_RESUME_CRITICAL_ARGS) - set(saved_args))
     if missing_saved_args:
         raise ValueError(
@@ -1638,7 +1984,7 @@ def validate_pretrain_resume_contract(
             f"{missing_saved_args}"
         )
     saved_arg_contract = {
-        name: _normalize_config_value(saved_args[name])
+        name: _pretrain_resume_critical_value(name, saved_args[name])
         for name in PRETRAIN_RESUME_CRITICAL_ARGS
     }
     if saved_arg_contract != expected_critical:
@@ -2486,6 +2832,10 @@ def save_checkpoint(
         "pretrain_resume_contract_version": PRETRAIN_RESUME_CONTRACT_VERSION,
         "pretrain_resume_reproducibility": PRETRAIN_RESUME_REPRODUCIBILITY,
         "scene_flow_config": scene_flow_config,
+        "scene_units_contract": validate_scene_units_contract(
+            getattr(sf, "_scene_units_contract", None),
+            path="runtime SceneFlow",
+        ),
         "flow_schedule_config": flow_schedule_config,
         "layout_task_probabilities": list(LAYOUT_TASK_PROBABILITIES),
         "layout_condition_version": LAYOUT_CONDITION_VERSION,
@@ -2756,6 +3106,10 @@ ALL_RANK_TRAIN_LOG_KEYS: tuple[str, ...] = (
     "gauge_scale_available",
     "gauge_valid_frac",
     "gauge_vs_prior_gain",
+    "lambda_gauge_direct_effective",
+    "lambda_gauge_direct_raw",
+    "lambda_gauge_flow_effective",
+    "lambda_gauge_flow_raw",
     "layout/actor_count_mean",
     "layout/actor_metric_support_fraction",
     "layout/actor_residual_rms",
@@ -5174,6 +5528,10 @@ def validation_layout_to_gauge_grad_scale(args: argparse.Namespace) -> float:
     scale = float(getattr(args, "layout_to_gauge_grad_scale", 1.0))
     if not math.isfinite(scale) or not 0.0 <= scale <= 1.0:
         raise ValueError("layout_to_gauge_grad_scale must be finite and in [0,1]")
+    if str(
+        getattr(args, "scene_units_profile", SCENE_UNITS_PROFILE_GENERATED)
+    ) == SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN:
+        return 0.0
     return scale
 
 
@@ -5272,7 +5630,8 @@ def _cfg_sample_pretrain_latents_sliding(
     gauge_z = _init_pretrain_gauge_noise(
         scene_flow, bundle, generator, return_gauge=True
     )
-    if gauge_z is None:
+    generated_scene_units = uses_generated_scene_units(scene_flow)
+    if generated_scene_units and gauge_z is None:
         raise RuntimeError("layout-v2 sampling requires a generated gauge state")
     sky_z = None
     if return_sky or torch.is_tensor(getattr(bundle, "sky_gen_clean", None)):
@@ -5290,7 +5649,11 @@ def _cfg_sample_pretrain_latents_sliding(
     text_scale, layout_scale, appearance_scale = _layout_cfg_scales(
         args, guidance_scale
     )
-    gauge_grad_scale = validation_layout_to_gauge_grad_scale(args)
+    gauge_grad_scale = (
+        validation_layout_to_gauge_grad_scale(args)
+        if generated_scene_units
+        else 0.0
+    )
     branches = required_cfg_branches(
         text_scale=text_scale,
         layout_scale=layout_scale,
@@ -5358,7 +5721,7 @@ def _cfg_sample_pretrain_latents_sliding(
                 camera_attention_mask=camera_mask,
                 sky_gen_tokens=sky_z,
                 sky_gen_attention_mask=None,
-                gauge_gen_tokens=gauge_z,
+                gauge_gen_tokens=gauge_z if generated_scene_units else None,
                 gauge_gen_attention_mask=None,
                 return_mid=False,
                 return_dict=True,
@@ -5385,9 +5748,15 @@ def _cfg_sample_pretrain_latents_sliding(
             (1, seq_len, 1, 1), device=device, dtype=z.dtype
         )
         sky_acc = torch.zeros_like(sky_z) if sky_z is not None else None
-        gauge_acc = torch.zeros_like(gauge_z)
         sky_weight = 0.0
-        gauge_weight = 0.0
+        if generated_scene_units:
+            if gauge_z is None:
+                raise RuntimeError("generated gauge state was not initialized")
+            gauge_acc = torch.zeros_like(gauge_z)
+            gauge_weight: float | None = 0.0
+        else:
+            gauge_acc = None
+            gauge_weight = None
         patch_acc = (
             torch.zeros(z.shape[:3] + (1,), device=device, dtype=z.dtype)
             if capture_sky_mask
@@ -5458,11 +5827,15 @@ def _cfg_sample_pretrain_latents_sliding(
                 )
                 sky_acc += sky_velocity * global_weight.to(dtype=sky_velocity.dtype)
                 sky_weight += float(global_weight.item())
-            gauge_velocity = sampler_prediction_to_velocity(
-                sf, combined["gauge"], gauge_z, sigma
-            )
-            gauge_acc += gauge_velocity * global_weight.to(dtype=gauge_velocity.dtype)
-            gauge_weight += float(global_weight.item())
+            if generated_scene_units:
+                if gauge_z is None or gauge_acc is None:
+                    raise RuntimeError("generated gauge state was not initialized")
+                gauge_velocity = sampler_prediction_to_velocity(
+                    sf, combined["gauge"], gauge_z, sigma
+                )
+                gauge_acc += gauge_velocity * global_weight.to(dtype=gauge_velocity.dtype)
+                assert gauge_weight is not None
+                gauge_weight += float(global_weight.item())
         if capture_sky_mask:
             if (
                 patch_acc is None
@@ -5481,11 +5854,17 @@ def _cfg_sample_pretrain_latents_sliding(
         z = M_keep * z_splat + M_edit * z
         if sky_z is not None and sky_acc is not None and sky_weight > 0.0:
             sky_z = sky_z - step_h.to(dtype=sky_z.dtype) * (sky_acc / sky_weight)
-        if gauge_weight <= 0.0:
-            raise RuntimeError("sliding gauge aggregation received zero window weight")
-        gauge_z = gauge_z - step_h.to(dtype=gauge_z.dtype) * (
-            gauge_acc / gauge_weight
-        )
+        if generated_scene_units:
+            if (
+                gauge_weight is None
+                or gauge_weight <= 0.0
+                or gauge_z is None
+                or gauge_acc is None
+            ):
+                raise RuntimeError("sliding gauge aggregation received zero window weight")
+            gauge_z = gauge_z - step_h.to(dtype=gauge_z.dtype) * (
+                gauge_acc / gauge_weight
+            )
 
     z = M_keep * z_splat + M_edit * z
     mask_patch = (
@@ -5504,7 +5883,13 @@ def _cfg_sample_pretrain_latents_sliding(
         return SimpleNamespace(
             video=z,
             sky=sky_z,
-            gauge=sf.denormalize_gauge(gauge_z),
+            gauge=(
+                sf.denormalize_gauge(gauge_z)
+                if generated_scene_units
+                else sf.fixed_scene_gauge(
+                    batch_size, device=z.device, dtype=torch.float32
+                )
+            ),
             sky_mask_logits=mask_logits,
             sky_mask_patch=mask_patch,
             sky_mask_refined_logits=refined_logits,
@@ -5572,7 +5957,8 @@ def cfg_sample_pretrain_latents(
     gauge_z = _init_pretrain_gauge_noise(
         scene_flow, bundle, generator, return_gauge=True
     )
-    if gauge_z is None:
+    generated_scene_units = uses_generated_scene_units(scene_flow)
+    if generated_scene_units and gauge_z is None:
         raise RuntimeError("layout-v2 sampling requires a generated gauge state")
     sky_z = None
     if return_sky or torch.is_tensor(getattr(bundle, "sky_gen_clean", None)):
@@ -5590,7 +5976,11 @@ def cfg_sample_pretrain_latents(
     text_scale, layout_scale, appearance_scale = _layout_cfg_scales(
         args, guidance_scale
     )
-    gauge_grad_scale = validation_layout_to_gauge_grad_scale(args)
+    gauge_grad_scale = (
+        validation_layout_to_gauge_grad_scale(args)
+        if generated_scene_units
+        else 0.0
+    )
     branches = required_cfg_branches(
         text_scale=text_scale,
         layout_scale=layout_scale,
@@ -5645,7 +6035,7 @@ def cfg_sample_pretrain_latents(
                 camera_attention_mask=bundle.camera_attention_mask,
                 sky_gen_tokens=sky_z,
                 sky_gen_attention_mask=None,
-                gauge_gen_tokens=gauge_z,
+                gauge_gen_tokens=gauge_z if generated_scene_units else None,
                 gauge_gen_attention_mask=None,
                 return_mid=False,
                 return_dict=True,
@@ -5693,10 +6083,13 @@ def cfg_sample_pretrain_latents(
                 sf, combined["sky"], sky_z, sigma
             )
             sky_z = sky_z - step_h.to(dtype=sky_z.dtype) * sky_velocity
-        gauge_velocity = sampler_prediction_to_velocity(
-            sf, combined["gauge"], gauge_z, sigma
-        )
-        gauge_z = gauge_z - step_h.to(dtype=gauge_z.dtype) * gauge_velocity
+        if generated_scene_units:
+            if gauge_z is None:
+                raise RuntimeError("generated gauge state was not initialized")
+            gauge_velocity = sampler_prediction_to_velocity(
+                sf, combined["gauge"], gauge_z, sigma
+            )
+            gauge_z = gauge_z - step_h.to(dtype=gauge_z.dtype) * gauge_velocity
 
     z = M_keep * z_splat + M_edit * z
     mask_patch = (
@@ -5715,7 +6108,13 @@ def cfg_sample_pretrain_latents(
         return SimpleNamespace(
             video=z,
             sky=sky_z,
-            gauge=sf.denormalize_gauge(gauge_z),
+            gauge=(
+                sf.denormalize_gauge(gauge_z)
+                if generated_scene_units
+                else sf.fixed_scene_gauge(
+                    batch_size, device=z.device, dtype=torch.float32
+                )
+            ),
             sky_mask_logits=mask_logits,
             sky_mask_patch=mask_patch,
             sky_mask_refined_logits=refined_logits,
@@ -5735,6 +6134,7 @@ def build_full_scene_bundle(
     scene_gauge_clean_n: torch.Tensor | None = None,
     scene_gauge_clean: torch.Tensor | None = None,
     scene_gauge_valid: torch.Tensor | None = None,
+    scene_gauge_effective: torch.Tensor | None = None,
     sky_mask_clean: torch.Tensor | None = None,
     sky_mask_refined_clean: torch.Tensor | None = None,
     frame_ids: torch.Tensor | None = None,
@@ -5755,6 +6155,7 @@ def build_full_scene_bundle(
         scene_gauge_clean_n=scene_gauge_clean_n,
         scene_gauge_clean=scene_gauge_clean,
         scene_gauge_valid=scene_gauge_valid,
+        scene_gauge_effective=scene_gauge_effective,
         sky_mask_clean=sky_mask_clean,
         sky_mask_refined_clean=sky_mask_refined_clean,
         frame_ids=frame_ids,
@@ -6075,12 +6476,17 @@ def train_step(
         generator=generator,
         observation=getattr(bundle, "sky_gen_observation", None),
     )
-    gauge_target = build_gauge_rectified_flow_target(
-        getattr(bundle, "scene_gauge_clean_n", None),
-        target,
-        generator=generator,
+    generated_scene_units = uses_generated_scene_units(scene_flow)
+    gauge_target = (
+        build_gauge_rectified_flow_target(
+            getattr(bundle, "scene_gauge_clean_n", None),
+            target,
+            generator=generator,
+        )
+        if generated_scene_units
+        else None
     )
-    if gauge_target is None:
+    if generated_scene_units and gauge_target is None:
         raise RuntimeError("layout-v2 training requires the scene-gauge target")
     boundary = boundary_mask_from_edit_mask(M_edit, args.patch_grid, radius=1)
     scaffold_tok = torch.zeros_like(bundle.z_clean_n)
@@ -6094,6 +6500,8 @@ def train_step(
         0 if global_step is None else int(global_step),
         upper=float(getattr(args, "layout_to_gauge_grad_scale", 1.0)),
     )
+    if not generated_scene_units:
+        gauge_grad_scale = 0.0
 
     with autocast_context(args, device):
         out = scene_flow(
@@ -6115,7 +6523,7 @@ def train_step(
             camera_attention_mask=bundle.camera_attention_mask,
             sky_gen_tokens=None if sky_target is None else sky_target.z_t,
             sky_gen_attention_mask=None,
-            gauge_gen_tokens=gauge_target.z_t,
+            gauge_gen_tokens=(None if gauge_target is None else gauge_target.z_t),
             gauge_gen_attention_mask=None,
             return_mid=use_repa,
             return_dict=True,
@@ -6262,53 +6670,75 @@ def train_step(
         pred_gauge_physical = None
         if not torch.is_tensor(pred_gauge):
             raise RuntimeError("layout-v2 SceneFlow must return gauge prediction")
-        v_gauge_pred = model_prediction_to_velocity(
-            scene_flow, pred_gauge, gauge_target
-        )
-        z_gauge_pred = model_prediction_to_clean(
-            scene_flow, pred_gauge, gauge_target
-        )
         gauge_valid = bundle.scene_gauge_valid.to(
-            device=v_gauge_pred.device, dtype=torch.bool
+            device=pred_gauge.device, dtype=torch.bool
         )
         if gauge_valid.ndim == 2:
             gauge_valid = gauge_valid.unsqueeze(1)
-        if gauge_valid.shape != v_gauge_pred.shape:
+        if gauge_valid.shape != pred_gauge.shape:
             raise ValueError(
                 "scene_gauge_valid must be [B,1,3], got "
                 f"{tuple(gauge_valid.shape)}"
             )
-        gauge_sq_error = (
-            v_gauge_pred.float()
-            - gauge_target.v_gt.to(
-                device=v_gauge_pred.device, dtype=torch.float32
+        if generated_scene_units:
+            assert gauge_target is not None
+            v_gauge_pred = model_prediction_to_velocity(
+                scene_flow, pred_gauge, gauge_target
             )
-        ).square()
-        gauge_mask = gauge_valid.to(dtype=gauge_sq_error.dtype)
-        loss_gauge_flow = (gauge_sq_error * gauge_mask).sum() / gauge_mask.sum().clamp_min(1.0)
-        pred_gauge_physical = unwrap_ddp(scene_flow).denormalize_gauge(
-            z_gauge_pred.float()
-        )
-        loss_gauge_direct = masked_gauge_direct_loss(
-            pred_gauge_physical,
-            bundle.scene_gauge_clean,
-            gauge_valid,
-        )
+            z_gauge_pred = model_prediction_to_clean(
+                scene_flow, pred_gauge, gauge_target
+            )
+            gauge_sq_error = (
+                v_gauge_pred.float()
+                - gauge_target.v_gt.to(
+                    device=v_gauge_pred.device, dtype=torch.float32
+                )
+            ).square()
+            gauge_mask = gauge_valid.to(dtype=gauge_sq_error.dtype)
+            loss_gauge_flow = (gauge_sq_error * gauge_mask).sum() / gauge_mask.sum().clamp_min(1.0)
+            pred_gauge_physical = unwrap_ddp(scene_flow).denormalize_gauge(
+                z_gauge_pred.float()
+            )
+            loss_gauge_direct = masked_gauge_direct_loss(
+                pred_gauge_physical,
+                bundle.scene_gauge_clean,
+                gauge_valid,
+            )
+            gauge_flow_weight = float(args.lambda_gauge_flow)
+            gauge_direct_weight = float(args.lambda_gauge_direct)
+        else:
+            # Keep the decoder in the graph with exactly zero influence.  The
+            # physical readout is the same training mean used by every active
+            # layout/render consumer, while the offline per-clip row remains
+            # available only as the diagnostic target below.
+            loss_gauge_flow = pred_gauge.float().sum() * 0.0
+            loss_gauge_direct = pred_gauge.float().sum() * 0.0
+            pred_gauge_physical = unwrap_ddp(scene_flow).fixed_scene_gauge(
+                batch_size,
+                device=pred_gauge.device,
+                dtype=torch.float32,
+            )
+            gauge_flow_weight = 0.0
+            gauge_direct_weight = 0.0
         loss = (
             loss
-            + float(args.lambda_gauge_flow) * loss_gauge_flow
-            + float(args.lambda_gauge_direct) * loss_gauge_direct
+            + gauge_flow_weight * loss_gauge_flow
+            + gauge_direct_weight * loss_gauge_direct
         )
         if loss_terms_out is not None:
             loss_terms_out["gauge_flow"] = (
-                float(args.lambda_gauge_flow) * loss_gauge_flow
+                gauge_flow_weight * loss_gauge_flow
             )
             loss_terms_out["gauge_direct"] = (
-                float(args.lambda_gauge_direct) * loss_gauge_direct
+                gauge_direct_weight * loss_gauge_direct
             )
         if collect_logs:
             logs["loss_gauge_flow"] = loss_gauge_flow.detach().float().reshape(())
             logs["loss_gauge_direct"] = loss_gauge_direct.detach().float().reshape(())
+            logs["lambda_gauge_flow_raw"] = float(args.lambda_gauge_flow)
+            logs["lambda_gauge_direct_raw"] = float(args.lambda_gauge_direct)
+            logs["lambda_gauge_flow_effective"] = gauge_flow_weight
+            logs["lambda_gauge_direct_effective"] = gauge_direct_weight
             gauge_logs = gauge_diagnostic_metrics(
                 pred_gauge_physical,
                 bundle.scene_gauge_clean,
@@ -6549,7 +6979,7 @@ def train_step(
                         patch_weight_mask=select_rows(target.M_edit, "M_edit"),
                         sky_weight=float(args.rgb_render_sky_weight),
                         camera_grad_scale=0.0,
-                        gauge_pose_grad_scale=1.0,
+                        gauge_pose_grad_scale=(1.0 if generated_scene_units else 0.0),
                         sky_mask_grad_scale=(
                             float(args.rgb_render_sky_mask_grad_scale) * float(ramp)
                         ),
@@ -6611,7 +7041,7 @@ def train_step(
                             metric_lidar, "metric_lidar_depth_m"
                         )
                         selected_scale_valid = select_rows(
-                            bundle.scene_gauge_valid[..., 0],
+                            bundle.scene_gauge_effective_valid[..., 0],
                             "scene_gauge_scale_valid",
                         )
                         selected_lidar_valid = (
@@ -6659,7 +7089,10 @@ def train_step(
                                             "_pullback_calibration",
                                             None,
                                         ),
-                                        scale_valid=selected_scale_valid,
+                                        scale_valid=select_rows(
+                                            bundle.scene_gauge_valid[..., 0],
+                                            "scene_gauge_teacher_scale_valid",
+                                        ),
                                         lidar_valid=selected_lidar_valid,
                                     ),
                                     prefix="metric_depth_rel_err_teacher_gauge",
@@ -6726,7 +7159,9 @@ def train_step(
                         calibration=getattr(
                             unwrap_ddp(scene_flow), "_pullback_calibration", None
                         ),
-                        scale_valid=bundle.scene_gauge_valid[:row_count, ..., 0],
+                        scale_valid=bundle.scene_gauge_effective_valid[
+                            :row_count, ..., 0
+                        ],
                         lidar_valid=(
                             bundle.metric_lidar_depth_valid[:row_count]
                             if torch.is_tensor(
@@ -7049,10 +7484,20 @@ def build_pretrain_bundle_from_batch(
         # The dataset uses a finite zero sentinel for a JSON-null invalid
         # channel. Keep that raw value only for masked direct supervision;
         # every physical consumer must receive the training-mean fallback.
-        scene_gauge_effective = torch.where(
-            scene_gauge_valid, scene_gauge_clean, gauge_fill
-        )
-        scene_gauge_clean_n = sf_root.normalize_gauge(scene_gauge_effective)
+        if uses_generated_scene_units(sf_root):
+            scene_gauge_effective = torch.where(
+                scene_gauge_valid, scene_gauge_clean, gauge_fill
+            )
+            scene_gauge_clean_n = sf_root.normalize_gauge(scene_gauge_effective)
+            scene_gauge_effective_valid = scene_gauge_valid
+        else:
+            scene_gauge_effective = sf_root.fixed_scene_gauge(
+                int(images.shape[0]),
+                device=device,
+                dtype=scene_gauge_clean.dtype,
+            )
+            scene_gauge_clean_n = torch.zeros_like(scene_gauge_effective)
+            scene_gauge_effective_valid = torch.ones_like(scene_gauge_valid)
         del outputs, aggregated_tokens_list, image_tokens_context, image_tokens_list, tokens_4, z_clean
 
     masks = batch.get("masks", batch.get("sky_mask"))
@@ -7151,6 +7596,7 @@ def build_pretrain_bundle_from_batch(
         scene_gauge_clean_n=scene_gauge_clean_n,
         scene_gauge_clean=scene_gauge_clean,
         scene_gauge_valid=scene_gauge_valid,
+        scene_gauge_effective=scene_gauge_effective,
         sky_mask_clean=sky_mask_clean,
         sky_mask_refined_clean=sky_mask_refined_clean,
         frame_ids=frame_ids.contiguous(),
@@ -7158,6 +7604,10 @@ def build_pretrain_bundle_from_batch(
     bundle.sky_atlas_clean = sky_atlas_clean
     bundle.sky_atlas_observation_mask = sky_atlas_observation_mask
     bundle.scene_gauge_effective = scene_gauge_effective
+    bundle.scene_gauge_effective_valid = scene_gauge_effective_valid
+    bundle.scene_units_profile = scene_units_profile(sf_root)
+    bundle.scene_units_contract = getattr(sf_root, "_scene_units_contract", None)
+    bundle.render_gauge_source = scene_units_gauge_source(sf_root)
     bundle.camera_trajectory_anchor_to_world_metric = trajectory_anchor_metric
     bundle.camera_to_world_requested_metric = (
         c2w_all[:, :, 0] if c2w_all.ndim == 5 else c2w_all
@@ -7653,6 +8103,16 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         required=True,
         help="Offline full-29-frame teacher gauge table for the training split.",
+    )
+    parser.add_argument(
+        "--scene_units_profile",
+        type=str,
+        choices=SCENE_UNITS_PROFILES,
+        default=SCENE_UNITS_PROFILE_GENERATED,
+        help=(
+            "Scene-unit generation profile. fixed_train_mean uses the validated "
+            "training-split gauge mean for every clip and must train from step 0."
+        ),
     )
     parser.add_argument(
         "--val_scene_gauge_path",
@@ -8328,6 +8788,10 @@ def dataloader_runtime_kwargs_for_workers(
 
 def main() -> None:
     args = build_argparser().parse_args()
+    args.scene_units_contract = {
+        "schema": SCENE_UNITS_CONTRACT_SCHEMA,
+        "profile": str(args.scene_units_profile),
+    }
     args.patch_grid = (int(args.patch_grid_h), int(args.patch_grid_w))
     args.sky_grid = sky_grid_shape(args)
     args.sky_atlas_hw = (int(args.sky_atlas_h), int(args.sky_atlas_w))
@@ -8516,6 +8980,7 @@ def main() -> None:
         gauge_gen_dim=SCENE_GAUGE_DIM,
         scene_gauge_representation=SCENE_GAUGE_REPRESENTATION,
         scene_gauge_stats_version=SCENE_GAUGE_STATS_VERSION,
+        scene_units_profile=str(args.scene_units_profile),
         layout_condition_version=LAYOUT_CONDITION_VERSION,
         layout_raster_channels=33,
         layout_raster_hw=(100, 148),
@@ -8564,6 +9029,38 @@ def main() -> None:
         args.feature_stats_path,
         token_dim=int(args.latent_dim),
     )
+    scene_units_contract = build_scene_units_contract(
+        scene_flow,
+        feature_stats_path=args.feature_stats_path,
+        scene_gauge_path=args.scene_gauge_path,
+    )
+    scene_flow._scene_units_contract = scene_units_contract
+    args.scene_units_contract = scene_units_contract
+    if is_main_process():
+        config = dict(vars(args))
+        config["patch_grid"] = list(args.patch_grid)
+        (log_dir / "config.json").write_text(json.dumps(config, indent=2))
+        print(
+            "[scene-units] "
+            f"profile={args.scene_units_profile} "
+            f"gauge_source={scene_units_gauge_source(args.scene_units_profile)}",
+            flush=True,
+        )
+    if wandb_run is not None:
+        wandb_run.config.update(
+            {
+                "scene_units_profile": str(args.scene_units_profile),
+                "scene_units_contract": scene_units_contract,
+            },
+            allow_val_change=True,
+        )
+        wandb_run.summary.update(
+            {
+                "scene_units_profile": str(args.scene_units_profile),
+                "scene_units_contract": scene_units_contract,
+                "gauge_source": scene_units_gauge_source(args.scene_units_profile),
+            }
+        )
     pullback_calibration = load_pullback_calibration(
         args.pullback_calibration_path,
         expected_window_len=int(args.sequence_length),

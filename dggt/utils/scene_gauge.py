@@ -33,6 +33,18 @@ SCENE_GAUGE_STATS_VERSION = "scene_gauge_per_channel_v1"
 SCENE_GAUGE_STATS_STD_FLOOR = 1.0e-6
 GAUGE_MROPE_TEMPORAL_OFFSET = 15100
 
+# Scene-unit generation is a single-factor training profile.  Keep this as one
+# enum rather than a set of independently configurable switches: every physical
+# consumer must agree on whether units are generated per scene or fixed to the
+# training-split mean.
+SCENE_UNITS_PROFILE_GENERATED = "generated"
+SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN = "fixed_train_mean"
+SCENE_UNITS_PROFILES = (
+    SCENE_UNITS_PROFILE_GENERATED,
+    SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN,
+)
+SCENE_UNITS_CONTRACT_SCHEMA = "scene_units_profile_v1"
+
 METRIC_BOX_MAPPING_MODE = "metric_gauge_v4"
 GENERIC_BOX_MAPPING_MODE = "generic_sim3"
 
@@ -1396,6 +1408,10 @@ def apply_pullback_calibration(
 
 
 __all__ = [
+    "SCENE_UNITS_CONTRACT_SCHEMA",
+    "SCENE_UNITS_PROFILE_FIXED_TRAIN_MEAN",
+    "SCENE_UNITS_PROFILE_GENERATED",
+    "SCENE_UNITS_PROFILES",
     "GAUGE_MROPE_TEMPORAL_OFFSET",
     "PULLBACK_ARTIFACT_ROLE",
     "PULLBACK_BOUNDARIES",

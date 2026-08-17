@@ -252,7 +252,7 @@ head-consistency 内部对 dynamic-confidence 通道使用
 | metric-gauge 输入 | v5 stats artifact（schema v4）+ training/validation gauge table + pullback artifact | ✅ 四者都由启动器逐文件检查；任何一项缺失都会在 `torchrun` 前失败 |
 | `--feature_stats_path` | `feature_stats_pretrain_v5.pt` | tokenizer v2 正式统计；必须包含 9D metric camera、3D gauge、factorized-v3 16D placement 统计和 v2 tokenizer provenance |
 | `--latent_dim 1024` / `--patch_grid_h 25 --patch_grid_w 37` | — | ✅ 与 tokenizer / 数据一致 |
-| gradient checkpointing | DLC 默认 three_quarter | ✅ 公共 DLC launcher 传 `--three_quarter_gradient_checkpointing`，交错 checkpoint 21/28 encoder blocks，DDT 为 0/2；`GRADIENT_CHECKPOINTING=1` 使用 full，`half` 使用 14/28 + 1/2，`0` 完全关闭 |
+| gradient checkpointing | DLC 默认 three_quarter | ✅ 公共 DLC launcher 传 `--three_quarter_gradient_checkpointing`，交错 checkpoint 21/28 encoder blocks，并 checkpoint 全部 2/2 DDT blocks；`GRADIENT_CHECKPOINTING=1` 使用 full，`half` 使用 14/28 + 1/2，`0` 完全关闭 |
 | `--shift 10 --weighting_scheme waver --mode_scale 1.29 --prediction_type x` | — | ✅ 与 RAEv2 数值对拍一致；冻结的 `--val_sample_steps 50` 满足 `steps ≤ shift/t_eps-shift+1 = 191` |
 | 全局 batch | 64（3 节点为 72） | ✅ 但 3 节点的 72 与其它拓扑不可严格互比，`WANDB_NAME` 已按 `gb72` 区分 |
 | `--lr 1e-4 --final_lr 1e-5` | — | ✅ 可用。RAEv2 t2i 在 gmuon + 全局 batch 1024 下用 2e-4；这里 batch 64 用 1e-4 偏保守，若前 2 万步 loss 下降过慢可以试 2e-4 |

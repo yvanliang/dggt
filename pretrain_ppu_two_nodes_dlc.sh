@@ -119,6 +119,16 @@ QWEN_TEXT_ENCODER="${QWEN_TEXT_ENCODER:-${MODEL_ROOT}/Qwen/Qwen3-0.6B}"
 
 LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/scene_flow_pretrain_v6}"
 LAUNCH_LOG_DIR="${LAUNCH_LOG_DIR:-${PROJECT_ROOT}/logs/ppu_dlc_v6_launch}"
+RESUME_PATH="${RESUME_PATH:-}"
+RESUME_EXPECTED_STEP="${RESUME_EXPECTED_STEP:--1}"
+SCENE_UNITS_PROFILE="${SCENE_UNITS_PROFILE:-generated}"
+case "${SCENE_UNITS_PROFILE}" in
+    generated|fixed_train_mean) ;;
+    *)
+        echo "[错误] SCENE_UNITS_PROFILE 必须是 generated 或 fixed_train_mean，当前值：${SCENE_UNITS_PROFILE}" >&2
+        exit 1
+        ;;
+esac
 
 # ============================================================
 # 训练配置
@@ -133,7 +143,7 @@ PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 VAL_NUM_WORKERS="${VAL_NUM_WORKERS:-0}"
 DATALOADER_WORKER_THREADS="${DATALOADER_WORKER_THREADS:-1}"
 DATALOADER_OUT_OF_ORDER="${DATALOADER_OUT_OF_ORDER:-0}"
-# three_quarter checkpoints 21/28 encoder blocks and no DDT blocks. Use 1
+# three_quarter checkpoints 21/28 encoder blocks and all 2/2 DDT blocks. Use 1
 # for full activation checkpointing, half for 14/28 + 1/2, or 0 to disable.
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-three_quarter}"
 if [[ "${GRADIENT_CHECKPOINTING}" != "0" && "${GRADIENT_CHECKPOINTING}" != "1" && "${GRADIENT_CHECKPOINTING}" != "half" && "${GRADIENT_CHECKPOINTING}" != "three_quarter" ]]; then
@@ -171,6 +181,18 @@ for value_name in \
         exit 1
     fi
 done
+if [[ ! "${RESUME_EXPECTED_STEP}" =~ ^-?[0-9]+$ ]]; then
+    echo "[错误] RESUME_EXPECTED_STEP 必须是整数，当前值：${RESUME_EXPECTED_STEP}" >&2
+    exit 1
+fi
+if [[ -z "${RESUME_PATH}" && "${RESUME_EXPECTED_STEP}" != "-1" ]]; then
+    echo "[错误] 未设置 RESUME_PATH 时 RESUME_EXPECTED_STEP 必须为 -1。" >&2
+    exit 1
+fi
+if [[ -n "${RESUME_PATH}" && "${RESUME_EXPECTED_STEP}" == "-1" ]]; then
+    echo "[错误] 设置 RESUME_PATH 时必须同时设置 RESUME_EXPECTED_STEP。" >&2
+    exit 1
+fi
 if (( MAX_STEPS <= 0 || SAVE_EVERY <= 0 || VAL_INFERENCE_SCENES <= 0 || LOG_EVERY <= 0 )); then
     echo "[错误] MAX_STEPS、SAVE_EVERY 和 LOG_EVERY 必须大于 0。" >&2
     exit 1
@@ -195,6 +217,7 @@ STATIC_FAR_PLANE_M="${STATIC_FAR_PLANE_M:-120}"
 WANDB_PROJECT="${WANDB_PROJECT:-dggt-flow}"
 WANDB_NAME="${WANDB_NAME:-scene_flow_pretrain_waymo_gb64_lr1e4_v6}"
 WANDB_RESUME="${WANDB_RESUME:-never}"
+WANDB_RUN_ID="${WANDB_RUN_ID:-}"
 
 GLOBAL_BATCH_SIZE=$((DLC_NNODES * DLC_NPROC_PER_NODE * BATCH_SIZE_PER_PPU * GRAD_ACCUM_STEPS))
 
@@ -280,6 +303,9 @@ check_required_paths() {
     check_file "SCENE_GAUGE_PATH" "${SCENE_GAUGE_PATH}"
     check_file "VAL_SCENE_GAUGE_PATH" "${VAL_SCENE_GAUGE_PATH}"
     check_file "PULLBACK_CALIBRATION_PATH" "${PULLBACK_CALIBRATION_PATH}"
+    if [[ -n "${RESUME_PATH}" ]]; then
+        check_file "RESUME_PATH" "${RESUME_PATH}"
+    fi
     check_dir "SCENE_CAPTION_ROOT" "${SCENE_CAPTION_ROOT}"
     check_dir "SCENE_CAPTION_VAL_ROOT" "${SCENE_CAPTION_VAL_ROOT}"
     check_dir "QWEN_TEXT_ENCODER" "${QWEN_TEXT_ENCODER}"
@@ -340,6 +366,7 @@ build_train_args() {
         --tokenizer_ckpt_path "${TOKENIZER_CKPT}"
         --feature_stats_path "${FEATURE_STATS}"
         --scene_gauge_path "${SCENE_GAUGE_PATH}"
+        --scene_units_profile "${SCENE_UNITS_PROFILE}"
         --val_scene_gauge_path "${VAL_SCENE_GAUGE_PATH}"
         --pullback_calibration_path "${PULLBACK_CALIBRATION_PATH}"
         --log_dir "${LOG_DIR}"
@@ -408,6 +435,15 @@ build_train_args() {
         --wandb_name "${WANDB_NAME}"
         --wandb_resume "${WANDB_RESUME}"
     )
+    if [[ -n "${RESUME_PATH}" ]]; then
+        TRAIN_ARGS+=(
+            --resume_path "${RESUME_PATH}"
+            --resume_expected_step "${RESUME_EXPECTED_STEP}"
+        )
+    fi
+    if [[ -n "${WANDB_RUN_ID}" ]]; then
+        TRAIN_ARGS+=(--wandb_run_id "${WANDB_RUN_ID}")
+    fi
     if [[ "${DATALOADER_OUT_OF_ORDER}" == "1" ]]; then
         TRAIN_ARGS+=(--dataloader_out_of_order)
     fi
@@ -446,14 +482,20 @@ echo "NCCL_IB_DISABLE: ${NCCL_IB_DISABLE}"
 echo "DGGT_DEVICE_BACKEND: ${DGGT_DEVICE_BACKEND}"
 echo "global batch size: ${GLOBAL_BATCH_SIZE} = ${DLC_NNODES} nodes × ${DLC_NPROC_PER_NODE} ppu/node × ${BATCH_SIZE_PER_PPU} batch/ppu × ${GRAD_ACCUM_STEPS} accum"
 echo "dataloader: train_workers/rank=${NUM_WORKERS}, prefetch/worker=${PREFETCH_FACTOR}, validation_workers/active_rank=${VAL_NUM_WORKERS}, worker_threads=${DATALOADER_WORKER_THREADS}, out_of_order=${DATALOADER_OUT_OF_ORDER}"
-echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+1/2, three_quarter=21/28+0/2, 1=full)"
-echo "training start: step 0 (layout-v2 v6; no legacy checkpoint)"
+echo "gradient checkpointing: ${GRADIENT_CHECKPOINTING} (0=disabled, half=14/28+1/2, three_quarter=21/28+2/2, 1=full)"
+echo "scene units profile: ${SCENE_UNITS_PROFILE}"
+echo "resume checkpoint: ${RESUME_PATH:-<none>} (expected step=${RESUME_EXPECTED_STEP})"
+if [[ -z "${RESUME_PATH}" ]]; then
+    echo "training start: step 0"
+else
+    echo "training start: strict resume from step ${RESUME_EXPECTED_STEP}"
+fi
 echo "training steps: max=${MAX_STEPS}, lr_decay_end=${DECAY_END_STEPS}, save_every=${SAVE_EVERY}"
 echo "training logs: tqdm Web-console mode (ETA/rate enabled; one update per optimizer step)"
 echo "validation: every=${VAL_EVERY}, batches=${VAL_BATCHES}, inference_scenes=${VAL_INFERENCE_SCENES} (10 scenes x 3 CFG on >=30 ranks; otherwise 2 scenes: 1 pinned + 1 rotating), log_images=${VAL_LOG_IMAGES}, sample_steps=${VAL_SAMPLE_STEPS}"
 echo "training log dir: ${LOG_DIR}"
 echo "launch log: ${LAUNCH_LOG}"
-echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME} (resume=${WANDB_RESUME})"
+echo "wandb: ${WANDB_PROJECT}/${WANDB_NAME} (resume=${WANDB_RESUME}, run_id=${WANDB_RUN_ID:-<new>})"
 echo "============================================================"
 
 "${PYTHON_BIN}" -m torch.distributed.run \
